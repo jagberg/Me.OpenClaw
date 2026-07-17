@@ -43,3 +43,8 @@ SPOUSE_EMAIL = os.environ.get("SPOUSE_EMAIL", "")
 OWNER_BANK_ACCOUNT_NAME = os.environ.get("OWNER_BANK_ACCOUNT_NAME", "")
 OWNER_BANK_BSB = os.environ.get("OWNER_BANK_BSB", "")
 OWNER_BANK_ACCOUNT_NUMBER = os.environ.get("OWNER_BANK_ACCOUNT_NUMBER", "")
+
+# Telegram bot: single authorized user, identified by username (not a manually
+# copied chat ID — the bot self-registers its chat ID via /start, see telegram_bot.py).
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_USERNAME = os.environ.get("TELEGRAM_USERNAME", "jagberg")

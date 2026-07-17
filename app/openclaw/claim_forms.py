@@ -256,6 +256,83 @@ def process_claim_batch(claim_ids: list[int], continuation: bool | None = None) 
             )
 
 
+def set_condition_text(claim_id: int, condition_text: str) -> dict:
+    """Shared update path for condition text — used by the dashboard route and
+    the Telegram /mark command so both stay identical."""
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim is None:
+            return {"ok": False, "message": f"No claim #{claim_id} found."}
+        conn.execute(
+            "UPDATE vet_claims SET condition_text = ?, updated_at = ? WHERE id = ?",
+            (condition_text, datetime.now(timezone.utc).isoformat(), claim_id),
+        )
+    process_claim(claim_id)
+    return {"ok": True, "message": f"Claim #{claim_id} condition set: {condition_text}"}
+
+
+def assign_pet(claim_id: int, pet_id: int) -> dict:
+    """Shared update path for pet assignment — used by the dashboard route and
+    the Telegram /pet command so both stay identical."""
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim is None:
+            return {"ok": False, "message": f"No claim #{claim_id} found."}
+        pet = conn.execute("SELECT * FROM pets WHERE id = ?", (pet_id,)).fetchone()
+        if pet is None:
+            return {"ok": False, "message": f"No pet #{pet_id} found."}
+        conn.execute(
+            "UPDATE vet_claims SET pet_id = ?, updated_at = ? WHERE id = ?",
+            (pet_id, datetime.now(timezone.utc).isoformat(), claim_id),
+        )
+    return {"ok": True, "message": f"Claim #{claim_id} assigned to {pet['name']}."}
+
+
+def mark_reviewed(claim_id: int) -> dict:
+    """Telegram-only action: records that Justin has reviewed a drafted claim.
+    Never touches status or the draft itself — sending stays manual (spec:
+    no autonomous send via Telegram)."""
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim is None:
+            return {"ok": False, "message": f"No claim #{claim_id} found."}
+        if claim["status"] != "drafted":
+            return {
+                "ok": False,
+                "message": f"Claim #{claim_id} isn't drafted yet (status: {claim['status']}) — nothing to review.",
+            }
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE vet_claims SET reviewed_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, claim_id),
+        )
+    return {"ok": True, "message": f"Claim #{claim_id} marked reviewed. Send the Gmail draft yourself when ready."}
+
+
+def process_and_report(claim_id: int) -> dict:
+    """Telegram /process: runs the matched->drafted advance for one claim on
+    demand instead of waiting for the scheduled pipeline tick, and reports the
+    resulting state (reuses process_claim's own validation, doesn't duplicate it)."""
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+    if claim is None:
+        return {"ok": False, "message": f"No claim #{claim_id} found."}
+    if claim["status"] != "matched":
+        return {
+            "ok": False,
+            "message": f"Claim #{claim_id} is at status '{claim['status']}' — nothing to process.",
+        }
+    process_claim(claim_id)
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+    if claim["status"] == "drafted":
+        return {"ok": True, "message": f"Claim #{claim_id} drafted — check Gmail drafts."}
+    return {
+        "ok": False,
+        "message": f"Claim #{claim_id} still matched — {claim['flag'] or 'missing a required field'}.",
+    }
+
+
 def process_claim(claim_id: int, continuation: bool | None = None) -> None:
     """Advances a claim from 'matched' to 'drafted' if pet/process/condition/invoice
     fields are all present; otherwise flags what's missing and stays at 'matched'

@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from . import claim_forms, db, gmail_ingest, netbank_csv, pipeline, tasks
+from . import claim_forms, db, gmail_ingest, netbank_csv, pipeline, tasks, telegram_bot
 from .scheduler import scheduler
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,9 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     gmail_ingest.start_polling()
     pipeline.start()
+    await telegram_bot.start_polling()
     yield
+    await telegram_bot.stop_polling()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -106,22 +108,13 @@ async def upload_transactions(file: UploadFile = File(...)):
 
 @app.post("/claims/{claim_id}/pet")
 def assign_pet(claim_id: int, pet_id: int = Form(...)):
-    with db.get_connection() as conn:
-        conn.execute(
-            "UPDATE vet_claims SET pet_id = ?, updated_at = ? WHERE id = ?",
-            (pet_id, datetime.now(timezone.utc).isoformat(), claim_id),
-        )
+    claim_forms.assign_pet(claim_id, pet_id)
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/claims/{claim_id}/condition")
 def set_condition(claim_id: int, condition_text: str = Form(...)):
-    with db.get_connection() as conn:
-        conn.execute(
-            "UPDATE vet_claims SET condition_text = ?, updated_at = ? WHERE id = ?",
-            (condition_text, datetime.now(timezone.utc).isoformat(), claim_id),
-        )
-    claim_forms.process_claim(claim_id)
+    claim_forms.set_condition_text(claim_id, condition_text)
     return RedirectResponse("/", status_code=303)
 
 

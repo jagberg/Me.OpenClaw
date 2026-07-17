@@ -1,7 +1,34 @@
 from datetime import datetime, timedelta, timezone
 
-from . import claim_forms, config, db, invoice_matching, vet_detection
+from . import claim_forms, config, db, invoice_matching, telegram_bot, vet_detection
 from .scheduler import scheduler
+
+DRAFT_LINK = "https://mail.google.com/mail/u/0/#drafts/{draft_id}"
+
+
+def notify_claim_states(send_fn=None) -> None:
+    """Pushes a Telegram message for claims newly stuck at `matched` (missing a
+    required field) or newly `drafted`, and skips claims still sitting in the
+    same state as last notified. `send_fn` is overridable for tests (spy) —
+    defaults to the real Telegram send."""
+    send = send_fn or telegram_bot.send_message_sync
+    with db.get_connection() as conn:
+        rows = conn.execute("SELECT * FROM vet_claims WHERE status IN ('matched', 'drafted')").fetchall()
+    for claim in rows:
+        if claim["status"] == "matched" and not claim["flag"]:
+            continue  # not actually blocked, nothing to tell Justin about
+        if claim["status"] == claim["telegram_notified_status"] and claim["flag"] == claim["telegram_notified_flag"]:
+            continue
+        if claim["status"] == "matched":
+            text = f"Claim #{claim['id']}: matched, needs input — {claim['flag']}"
+        else:
+            text = f"Claim #{claim['id']}: drafted, ready to review — {DRAFT_LINK.format(draft_id=claim['draft_id'])}"
+        send(text)
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE vet_claims SET telegram_notified_status = ?, telegram_notified_flag = ? WHERE id = ?",
+                (claim["status"], claim["flag"], claim["id"]),
+            )
 
 
 def _pending_claims():
@@ -45,6 +72,8 @@ def run_once() -> None:
         matched_ids = [r["id"] for r in conn.execute("SELECT id FROM vet_claims WHERE status = 'matched'")]
     for claim_id in matched_ids:
         claim_forms.process_claim(claim_id)
+
+    notify_claim_states()
 
 
 def start() -> None:

@@ -84,7 +84,22 @@ CREATE TABLE IF NOT EXISTS vet_claims (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS telegram_registrations (
+    username TEXT PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    registered_at TEXT NOT NULL
+);
 """
+
+# vet_claims columns added after the table's initial release — CREATE TABLE IF
+# NOT EXISTS won't add these to an already-created DB, so they're migrated in
+# explicitly (see _migrate_vet_claims_columns).
+_VET_CLAIMS_ADDED_COLUMNS = {
+    "telegram_notified_status": "TEXT",
+    "telegram_notified_flag": "TEXT",
+    "reviewed_at": "TEXT",
+}
 
 # Echo's claim_email stays NULL until Justin supplies Bow Wow Insurance's process
 # (tasks.md 6.0) — claim_process_defined=0 blocks fill/draft for Echo's claims.
@@ -95,11 +110,19 @@ VALUES ('Aari', 'Petcover', 'claims.au@petcovergroup.com', 1),
 """
 
 
+def _migrate_vet_claims_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(vet_claims)")}
+    for column, col_type in _VET_CLAIMS_ADDED_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE vet_claims ADD COLUMN {column} {col_type}")
+
+
 def init_db(path: str | None = None) -> None:
     path = path or config.DATABASE_PATH
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA)
+        _migrate_vet_claims_columns(conn)
         conn.executescript(SEED_PETS)
 
 
