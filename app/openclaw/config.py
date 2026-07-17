@@ -21,6 +21,11 @@ GMAIL_TOKEN_PATH = os.environ.get("GMAIL_TOKEN_PATH", "./data/token.json")
 GMAIL_POLL_INTERVAL_MINUTES = _int_env("GMAIL_POLL_INTERVAL_MINUTES", 5)
 
 PETCOVER_TEMPLATE_PATH = os.environ.get("PETCOVER_TEMPLATE_PATH", "./data/petcover-claim-template.pdf")
+# Status polling ignores Petcover emails older than this (Gmail after: format).
+# Guards against first-run backfill: without it the first poll would ingest
+# years of historical replies about long-settled claims and could mis-correlate
+# them onto currently open ones. Default = the date this feature shipped.
+PETCOVER_STATUS_SINCE = os.environ.get("PETCOVER_STATUS_SINCE", "2026/07/18")
 CLAIM_OUTPUT_DIR = os.environ.get("CLAIM_OUTPUT_DIR", "./data/claims")
 VET_CLAIM_PIPELINE_INTERVAL_MINUTES = _int_env("VET_CLAIM_PIPELINE_INTERVAL_MINUTES", 15)
 INVOICE_MATCH_WINDOW_DAYS = _int_env("INVOICE_MATCH_WINDOW_DAYS", 3)

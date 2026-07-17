@@ -1,27 +1,69 @@
 import base64
 import json
 from datetime import date, datetime, timedelta, timezone
-from io import BytesIO
-
-from pypdf import PdfReader
 
 from . import config, db, gemini, gmail_client
 
-# Flat cent tolerance covers float rounding only. Card-surcharge fees mean the
-# bank-charged amount often legitimately differs from the vet's invoice total
-# by ~0.5-1.5% (confirmed live: a real $580.74 invoice showed as $585.39 on
-# the statement, a 0.8% surcharge) — so tolerance scales with the amount too.
+# The bank charge is the CEILING on what can be claimed — it can exceed the
+# invoice total via card surcharge (confirmed live: real $580.74 invoice
+# charged as $585.39, 0.8%) or cover several invoices at once (confirmed live:
+# one $177.50 charge = a $35 + a $142.50 invoice, different pets). So a
+# candidate invoice matches when its total is AT MOST the charge (+1c float
+# rounding); an invoice larger than the charge can't be the right one.
 AMOUNT_TOLERANCE_FLAT = 0.01
-AMOUNT_TOLERANCE_PCT = 0.03
+# Gap beyond a plausible surcharge — flags "another invoice may exist".
+SURCHARGE_MARGIN_PCT = 0.02
+
+# Invoice line items that are routine/preventive care, not illness or injury —
+# excluded from the claimable amount (most pet policies exclude them; Justin
+# maintains this list).
+NON_CLAIMABLE_KEYWORDS = [
+    "vaccination",
+    "vaccine",
+    "desexing",
+    "worming",
+    "deworm",
+    "heartworm",
+    "flea",
+    "tick prevention",
+    "milbemax",
+]
 
 
-def _within_tolerance(invoice_amount: float, txn_amount: float) -> bool:
-    tolerance = max(AMOUNT_TOLERANCE_FLAT, abs(txn_amount) * AMOUNT_TOLERANCE_PCT)
-    return abs(invoice_amount - abs(txn_amount)) <= tolerance
+def _within_ceiling(invoice_amount: float, txn_amount: float) -> bool:
+    return invoice_amount <= abs(txn_amount) + AMOUNT_TOLERANCE_FLAT
+
+
+def _unexplained_remainder(invoice_amount: float, txn_amount: float) -> float | None:
+    """Bank charge minus invoice total, when it exceeds a plausible card
+    surcharge — a sign the charge covered another invoice too."""
+    remainder = abs(txn_amount) - invoice_amount
+    if remainder > abs(txn_amount) * SURCHARGE_MARGIN_PCT:
+        return round(remainder, 2)
+    return None
+
+
+def claimable_amount(invoice: dict) -> float | None:
+    """Sum of line items that aren't routine/preventive care. Falls back to
+    the invoice total when no itemization is available (extraction gave no
+    items); None only when neither exists."""
+    items = invoice.get("items") or []
+    if not items:
+        return invoice.get("amount")
+    claimable = 0.0
+    for item in items:
+        description = (item.get("description") or "").lower()
+        if any(kw in description for kw in NON_CLAIMABLE_KEYWORDS):
+            continue
+        claimable += float(item.get("amount") or 0)
+    return round(claimable, 2)
+
 
 EXTRACTION_PROMPT = """Extract invoice details from this email as strict JSON:
-{{"date": "<ISO 8601 date, or null>", "amount": <number, or null>, "services": "<comma-separated \
-itemized services, or null>"}}
+{{"date": "<ISO 8601 date, or null>", "amount": <total as number, or null>, "services": "<comma-separated \
+itemized services, or null>", "items": [{{"description": "<line item>", "amount": <number>}}, ...]}}
+
+"items" lists each charged line item with its own amount; use [] if the itemization is unreadable.
 
 Email:
 {email_text}
@@ -32,53 +74,6 @@ INVOICE_REQUEST_BODY = (
     "Hi,\n\nCould you please send through the invoice for our recent visit "
     "(transaction on {txn_date} for {amount})?\n\nThanks."
 )
-
-
-def _decode_part(data: str) -> str:
-    return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
-
-
-def _message_text(message: dict) -> str:
-    """Best-effort plain-text body extraction; falls back to the snippet if no
-    text/plain part is found (sufficient for Gemini extraction either way)."""
-    payload = message.get("payload", {})
-    parts = payload.get("parts") or [payload]
-    for part in parts:
-        if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
-            return _decode_part(part["body"]["data"])
-    return message.get("snippet", "")
-
-
-def _iter_attachment_parts(payload: dict):
-    for part in payload.get("parts") or []:
-        if part.get("filename") and part.get("body", {}).get("attachmentId"):
-            yield part
-        if part.get("parts"):
-            yield from _iter_attachment_parts(part)
-
-
-def _pdf_attachment_text(service, message_id: str, attachment_id: str) -> str:
-    attachment = service.users().messages().attachments().get(
-        userId="me", messageId=message_id, id=attachment_id
-    ).execute()
-    data = base64.urlsafe_b64decode(attachment["data"] + "==")
-    reader = PdfReader(BytesIO(data))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
-
-
-def _full_message_text(service, message: dict) -> str:
-    """Body text plus any PDF attachment text — receipts are frequently
-    forwarded with the actual amount only in an attached PDF, none in the
-    body. Image attachments (PNG/JPG) are skipped: no OCR support."""
-    text = _message_text(message)
-    for part in _iter_attachment_parts(message.get("payload", {})):
-        if part.get("mimeType") != "application/pdf":
-            continue
-        try:
-            text += "\n" + _pdf_attachment_text(service, message["id"], part["body"]["attachmentId"])
-        except Exception:
-            continue  # unreadable attachment — fall back to whatever text we already have
-    return text
 
 
 def _extract_invoice(email_text: str) -> dict | None:
@@ -126,19 +121,20 @@ def _build_queries(merchant: str, txn_date: date, invoice_request_sent_at: str |
     return queries
 
 
-def _mark_matched(claim_id: int, email_id: str, invoice: dict) -> None:
+def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None = None) -> None:
     with db.get_connection() as conn:
         conn.execute(
             "UPDATE vet_claims SET status = 'matched', matched_email_id = ?, invoice_data = ?, "
-            "flag = NULL, updated_at = ? WHERE id = ?",
-            (email_id, json.dumps(invoice), datetime.now(timezone.utc).isoformat(), claim_id),
+            "flag = ?, updated_at = ? WHERE id = ?",
+            (email_id, json.dumps(invoice), flag, datetime.now(timezone.utc).isoformat(), claim_id),
         )
 
 
 def match_claim(claim) -> bool:
     """Searches Gmail for an invoice matching claim's transaction (merchant name,
-    then spouse's address if configured, as a fallback). Returns True and advances
-    the claim to 'matched' if found within amount tolerance."""
+    then spouse's address if configured, as a fallback). The bank charge is the
+    ceiling: an invoice matches when its total is at most the charged amount.
+    Returns True and advances the claim to 'matched' on success."""
     txn_date = date.fromisoformat(claim["txn_date"])
     queries = _build_queries(claim["txn_merchant"], txn_date, claim["invoice_request_sent_at"])
 
@@ -147,12 +143,17 @@ def match_claim(claim) -> bool:
         response = service.users().messages().list(userId="me", q=query, maxResults=5).execute()
         for item in response.get("messages", []):
             message = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
-            invoice = _extract_invoice(_full_message_text(service, message))
+            invoice = _extract_invoice(gmail_client.full_message_text(service, message))
             if not invoice or invoice.get("amount") is None:
                 continue
-            if _within_tolerance(float(invoice["amount"]), claim["txn_amount"]):
-                _mark_matched(claim["id"], item["id"], invoice)
-                return True
+            total = float(invoice["amount"])
+            if not _within_ceiling(total, claim["txn_amount"]):
+                continue
+            invoice["claimable_amount"] = claimable_amount(invoice)
+            remainder = _unexplained_remainder(total, claim["txn_amount"])
+            flag = f"possible additional invoice — unexplained ${remainder:.2f}" if remainder else None
+            _mark_matched(claim["id"], item["id"], invoice, flag)
+            return True
     return False
 
 

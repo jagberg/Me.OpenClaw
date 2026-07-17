@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from . import claim_forms, db, gmail_ingest, netbank_csv, pipeline, tasks, telegram_bot
+from . import claim_forms, claim_status, db, gmail_ingest, netbank_csv, pipeline, tasks, telegram_bot
 from .scheduler import scheduler
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,7 @@ def dashboard(request: Request, upload_error: str | None = None):
             "LEFT JOIN pets ON pets.id = vet_claims.pet_id WHERE vet_claims.status = 'drafted'"
         ).fetchall()
         pets = conn.execute("SELECT * FROM pets").fetchall()
+
     return templates.TemplateResponse(
         "index.html",
         {
@@ -76,6 +77,7 @@ def dashboard(request: Request, upload_error: str | None = None):
             "drafted": drafted,
             "pets": pets,
             "upload_error": upload_error,
+            **claim_status.dashboard_lists(),
         },
     )
 
@@ -115,6 +117,38 @@ def assign_pet(claim_id: int, pet_id: int = Form(...)):
 @app.post("/claims/{claim_id}/condition")
 def set_condition(claim_id: int, condition_text: str = Form(...)):
     claim_forms.set_condition_text(claim_id, condition_text)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/claims/{claim_id}/sent")
+def mark_sent(claim_id: int):
+    # A batch submission is several claims sharing one draft — sending that
+    # one email sends them all, so one click advances the whole group.
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT draft_id FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim and claim["draft_id"]:
+            conn.execute(
+                "UPDATE vet_claims SET status = 'sent', updated_at = ? WHERE draft_id = ? AND status = 'drafted'",
+                (now, claim["draft_id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE vet_claims SET status = 'sent', updated_at = ? WHERE id = ? AND status = 'drafted'",
+                (now, claim_id),
+            )
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/claims/{claim_id}/confirm-resolved")
+def confirm_resolved(claim_id: int):
+    claim_status.confirm_resolved(claim_id)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/events/{event_id}/link")
+def link_event(event_id: int, claim_id: int = Form(...)):
+    claim_status.link_event(event_id, claim_id)
     return RedirectResponse("/", status_code=303)
 
 

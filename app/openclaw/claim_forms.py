@@ -61,19 +61,8 @@ FIELD_MAP = {
     "Text Field 97": "declaration_date",
 }
 
-# Invoice line items that are routine/preventive care, not illness or injury —
-# most pet insurance policies exclude these; Justin maintains this list.
-NON_CLAIMABLE_KEYWORDS = [
-    "vaccination",
-    "vaccine",
-    "desexing",
-    "worming",
-    "deworm",
-    "heartworm",
-    "flea",
-    "tick prevention",
-    "milbemax",
-]
+# NON_CLAIMABLE_KEYWORDS lives in invoice_matching (applied at extraction time,
+# stored as invoice_data.claimable_amount) — the claim form just reads it.
 
 
 class ClaimFillError(Exception):
@@ -174,13 +163,24 @@ def _shared_fields(pet, continuation: bool | None) -> dict:
     return fields
 
 
+def _charge(invoice: dict, transaction) -> float:
+    """What goes on the claim form: the claimable subtotal (routine-care items
+    excluded), not the bank charge — the charge is only the ceiling (it can
+    include card surcharge and non-claimable items)."""
+    if invoice.get("claimable_amount") is not None:
+        return invoice["claimable_amount"]
+    if invoice.get("amount") is not None:
+        return invoice["amount"]
+    return abs(transaction["amount"])
+
+
 def _build_form_data(pet, transaction, invoice: dict, condition_text: str, continuation: bool | None = None) -> dict:
     return {
         **_shared_fields(pet, continuation),
         "condition_1": condition_text,
         "treatment_date_1": invoice.get("date") or transaction["date"],
         "first_signs_date_1": invoice.get("date") or transaction["date"],
-        "charge_1": abs(transaction["amount"]),
+        "charge_1": _charge(invoice, transaction),
     }
 
 
@@ -221,10 +221,13 @@ def process_claim_batch(claim_ids: list[int], continuation: bool | None = None) 
     for i, c in enumerate(claims, start=1):
         invoice = json.loads(c["invoice_data"]) if c["invoice_data"] else {}
         txn = transactions[c["id"]]
+        if _charge(invoice, txn) == 0:
+            _flag(c["id"], "routine care only — not claimable")
+            return
         data[f"condition_{i}"] = c["condition_text"]
         data[f"treatment_date_{i}"] = invoice.get("date") or txn["date"]
         data[f"first_signs_date_{i}"] = invoice.get("date") or txn["date"]
-        data[f"charge_{i}"] = invoice.get("amount") if invoice.get("amount") is not None else abs(txn["amount"])
+        data[f"charge_{i}"] = _charge(invoice, txn)
 
     output_path = str(Path(config.CLAIM_OUTPUT_DIR) / f"claim-batch-{'-'.join(map(str, claim_ids))}.pdf")
     try:
@@ -364,6 +367,10 @@ def process_claim(claim_id: int, continuation: bool | None = None) -> None:
     invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
     if not invoice.get("services"):
         _flag(claim_id, "invoice missing itemized services — enter manually")
+        return
+
+    if _charge(invoice, transaction) == 0:
+        _flag(claim_id, "routine care only — not claimable")
         return
 
     output_path = str(Path(config.CLAIM_OUTPUT_DIR) / f"claim-{claim_id}.pdf")

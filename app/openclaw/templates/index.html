@@ -109,6 +109,54 @@
       <li>
         {{ c.pet_name or 'no pet' }} — {{ c.txn_merchant }} —
         <a href="https://mail.google.com/mail/u/0/#drafts/{{ c.draft_id }}" target="_blank">open Gmail draft</a>
+        <form class="outcome" method="post" action="/claims/{{ c.id }}/sent">
+          <button type="submit">Mark sent</button>
+        </form>
+      </li>
+    {% else %}
+      <li>None.</li>
+    {% endfor %}
+  </ul>
+
+  <h2>Needs your action (Petcover replied)</h2>
+  <ul>
+    {% for item in needs_action %}
+      <li>
+        {{ item.claim.pet_name or 'no pet' }} — ref {{ item.claim.petcover_reference or 'unknown' }}
+        <ul>
+          {% for e in item.events %}<li>{{ e.event_type }} ({{ e.created_at }})</li>{% endfor %}
+        </ul>
+        <form class="outcome" method="post" action="/claims/{{ item.claim.id }}/confirm-resolved">
+          <button type="submit">Confirm resolved</button>
+        </form>
+      </li>
+    {% else %}
+      <li>None.</li>
+    {% endfor %}
+  </ul>
+
+  <h2>Settlement reconciliation</h2>
+  <ul>
+    {% for s in settled_reconciliation %}
+      <li>
+        {{ s.claim.pet_name or 'no pet' }} — ref {{ s.claim.petcover_reference or 'unknown' }} —
+        claimed {{ s.claimed_amount if s.claimed_amount is defined else 'unknown' }},
+        paid {{ s.paid_amount if s.paid_amount is defined else 'unknown' }}
+      </li>
+    {% else %}
+      <li>None.</li>
+    {% endfor %}
+  </ul>
+
+  <h2>Unclassified Petcover replies (needs manual review)</h2>
+  <ul>
+    {% for e in unclassified %}
+      <li>
+        {{ e.event_type }} ({{ e.created_at }}) — {{ e.detail }}
+        <form class="outcome" method="post" action="/events/{{ e.id }}/link">
+          <input type="number" name="claim_id" placeholder="claim id" size="6" required>
+          <button type="submit">Link to claim</button>
+        </form>
       </li>
     {% else %}
       <li>None.</li>
