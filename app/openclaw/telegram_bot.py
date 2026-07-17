@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from . import claim_forms, config, db
+from . import claim_forms, claim_status, config, db
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,10 @@ HELP_TEXT = (
     "/mark <claim_id> <condition text> — set the condition being claimed for\n"
     "/mark <claim_id> reviewed — confirm a drafted claim looks right (does not send it)\n"
     "/pet <claim_id> <pet name> — assign a pet to a vet-flagged transaction\n"
-    "/process <claim_id> — run the matched→drafted advance now"
+    "/process <claim_id> — run the matched→drafted advance now\n"
+    "/sent <claim_id> — mark a drafted claim as sent (starts Petcover reply tracking)\n"
+    "/resolved <claim_id> — confirm you've dealt with an info request/suspension\n"
+    "/vetemail <merchant name> <email> — set a vet's contact address for invoice requests"
 )
 
 _application: Application | None = None
@@ -76,6 +79,37 @@ def handle_process(username: str | None, claim_id: int) -> dict:
     return claim_forms.process_and_report(claim_id)
 
 
+def handle_sent(username: str | None, claim_id: int) -> dict:
+    if not _is_authorized(username):
+        return {"ok": False, "message": "Not authorized."}
+    return claim_status.mark_sent(claim_id)
+
+
+def handle_resolved(username: str | None, claim_id: int) -> dict:
+    if not _is_authorized(username):
+        return {"ok": False, "message": "Not authorized."}
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT 1 FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+    if claim is None:
+        return {"ok": False, "message": f"No claim #{claim_id} found."}
+    claim_status.confirm_resolved(claim_id)
+    return {"ok": True, "message": f"Claim #{claim_id} confirmed resolved."}
+
+
+def handle_vetemail(username: str | None, merchant: str, email: str) -> dict:
+    if not _is_authorized(username):
+        return {"ok": False, "message": "Not authorized."}
+    if "@" not in email:
+        return {"ok": False, "message": f"'{email}' doesn't look like an email address."}
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT INTO vet_contacts (merchant, email) VALUES (?, ?) "
+            "ON CONFLICT(merchant) DO UPDATE SET email = excluded.email",
+            (merchant, email),
+        )
+    return {"ok": True, "message": f"Vet contact saved: {merchant} → {email}"}
+
+
 # Thin async adapters — extract args from the Update/Context, call the pure
 # handler above, reply with its message. No business logic lives here.
 
@@ -135,6 +169,44 @@ async def process_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(result["message"])
 
 
+def _single_claim_id_command(handler):
+    """Adapter factory for commands whose only argument is a claim id —
+    /process, /sent, /resolved all share this exact shape."""
+
+    async def command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        username = update.effective_user.username if update.effective_user else None
+        if not context.args:
+            await update.message.reply_text(f"Usage: /{command.__name__} <claim_id>")
+            return
+        try:
+            claim_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("claim_id must be a number.")
+            return
+        result = handler(username, claim_id)
+        await update.message.reply_text(result["message"])
+
+    return command
+
+
+sent_command = _single_claim_id_command(handle_sent)
+sent_command.__name__ = "sent"
+resolved_command = _single_claim_id_command(handle_resolved)
+resolved_command.__name__ = "resolved"
+
+
+async def vetemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    username = update.effective_user.username if update.effective_user else None
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /vetemail <merchant name> <email>")
+        return
+    # Email is the last token; the merchant name is everything before it
+    # (NetBank merchant strings contain spaces, e.g. "CITY VET CLINIC SYDNEY").
+    merchant = " ".join(context.args[:-1])
+    result = handle_vetemail(username, merchant, context.args[-1])
+    await update.message.reply_text(result["message"])
+
+
 def build_application() -> Application:
     application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
@@ -142,6 +214,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("mark", mark_command))
     application.add_handler(CommandHandler("pet", pet_command))
     application.add_handler(CommandHandler("process", process_command))
+    application.add_handler(CommandHandler("sent", sent_command))
+    application.add_handler(CommandHandler("resolved", resolved_command))
+    application.add_handler(CommandHandler("vetemail", vetemail_command))
     return application
 
 

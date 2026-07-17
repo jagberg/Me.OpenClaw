@@ -47,12 +47,12 @@ def _seed_matched_claim(merchant: str, condition_text: str | None = "ear infecti
     return claim_id
 
 
-def _seed_drafted_claim(merchant: str) -> int:
+def _seed_drafted_claim(merchant: str, draft_id: str = "draft-abc") -> int:
     claim_id = _seed_matched_claim(merchant)
     with db.get_connection() as conn:
         conn.execute(
-            "UPDATE vet_claims SET status = 'drafted', draft_id = 'draft-abc' WHERE id = ?",
-            (claim_id,),
+            "UPDATE vet_claims SET status = 'drafted', draft_id = ? WHERE id = ?",
+            (draft_id, claim_id),
         )
     return claim_id
 
@@ -194,6 +194,82 @@ def test_notification_skipped_when_unregistered():
     with db.get_connection() as conn:
         conn.execute("DELETE FROM telegram_registrations")
     telegram_bot.send_message_sync("should be skipped, no registered chat")  # must not raise
+
+
+def test_vetemail_upserts_contact():
+    db.init_db()
+    telegram_bot.handle_vetemail(AUTHORIZED_USER, "TEST VET CLINIC SYDNEY", "vet@example.com")
+    telegram_bot.handle_vetemail(AUTHORIZED_USER, "TEST VET CLINIC SYDNEY", "reception@example.com")
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT email FROM vet_contacts WHERE merchant = 'TEST VET CLINIC SYDNEY'"
+        ).fetchall()
+    assert len(rows) == 1, "second /vetemail for the same merchant must update, not duplicate"
+    assert rows[0]["email"] == "reception@example.com"
+
+
+def test_vetemail_rejected_for_unauthorized_user():
+    db.init_db()
+    result = telegram_bot.handle_vetemail(UNAUTHORIZED_USER, "SNEAKY VET", "evil@example.com")
+    assert result["ok"] is False
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT 1 FROM vet_contacts WHERE merchant = 'SNEAKY VET'").fetchone()
+    assert row is None
+
+
+def test_notification_fires_on_info_requested():
+    claim_id = _seed_matched_claim("INFO REQ VET")
+    with db.get_connection() as conn:
+        conn.execute("UPDATE vet_claims SET status = 'info_requested' WHERE id = ?", (claim_id,))
+    sent = []
+    pipeline.notify_claim_states(send_fn=sent.append)
+    pipeline.notify_claim_states(send_fn=sent.append)
+    own_sent = [t for t in sent if f"#{claim_id}:" in t]
+    assert len(own_sent) == 1, "info_requested must notify exactly once"
+    assert "information" in own_sent[0]
+
+
+def test_settled_notification_includes_amounts():
+    claim_id = _seed_matched_claim("SETTLED VET")
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        conn.execute("UPDATE vet_claims SET status = 'settled' WHERE id = ?", (claim_id,))
+        conn.execute(
+            "INSERT INTO claim_status_events (claim_id, event_type, detail, created_at) VALUES (?, 'settled', ?, ?)",
+            (claim_id, json.dumps({"claimed_amount": 100.0, "paid_amount": 80.0}), now),
+        )
+    sent = []
+    pipeline.notify_claim_states(send_fn=sent.append)
+    own_sent = [t for t in sent if f"#{claim_id}:" in t]
+    assert len(own_sent) == 1
+    assert "100.00" in own_sent[0] and "80.00" in own_sent[0]
+
+
+def test_sent_command_advances_batch():
+    claim_a = _seed_drafted_claim("BATCH VET A", draft_id="draft-batch-1")
+    claim_b = _seed_drafted_claim("BATCH VET B", draft_id="draft-batch-1")
+    result = telegram_bot.handle_sent(AUTHORIZED_USER, claim_a)
+    assert result["ok"] is True
+    with db.get_connection() as conn:
+        statuses = [
+            r["status"]
+            for r in conn.execute(
+                "SELECT status FROM vet_claims WHERE id IN (?, ?)", (claim_a, claim_b)
+            ).fetchall()
+        ]
+    assert statuses == ["sent", "sent"], "one /sent must advance every claim sharing the draft"
+
+
+def test_resolved_records_event():
+    claim_id = _seed_drafted_claim("RESOLVED VET", draft_id="draft-resolved-1")
+    result = telegram_bot.handle_resolved(AUTHORIZED_USER, claim_id)
+    assert result["ok"] is True
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM claim_status_events WHERE claim_id = ? AND event_type = 'confirmed_resolved'",
+            (claim_id,),
+        ).fetchone()
+    assert row is not None
 
 
 if __name__ == "__main__":

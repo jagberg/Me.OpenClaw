@@ -122,21 +122,7 @@ def set_condition(claim_id: int, condition_text: str = Form(...)):
 
 @app.post("/claims/{claim_id}/sent")
 def mark_sent(claim_id: int):
-    # A batch submission is several claims sharing one draft — sending that
-    # one email sends them all, so one click advances the whole group.
-    now = datetime.now(timezone.utc).isoformat()
-    with db.get_connection() as conn:
-        claim = conn.execute("SELECT draft_id FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
-        if claim and claim["draft_id"]:
-            conn.execute(
-                "UPDATE vet_claims SET status = 'sent', updated_at = ? WHERE draft_id = ? AND status = 'drafted'",
-                (now, claim["draft_id"]),
-            )
-        else:
-            conn.execute(
-                "UPDATE vet_claims SET status = 'sent', updated_at = ? WHERE id = ? AND status = 'drafted'",
-                (now, claim_id),
-            )
+    claim_status.mark_sent(claim_id)
     return RedirectResponse("/", status_code=303)
 
 

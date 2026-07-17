@@ -194,6 +194,33 @@ def link_event(event_id: int, claim_id: int) -> bool:
     return True
 
 
+def mark_sent(claim_id: int) -> dict:
+    """Advances drafted->sent, which is what starts Petcover reply polling for
+    the claim. A batch submission is several claims sharing one draft — sending
+    that one email sends them all, so one action advances the whole group.
+    Shared by the dashboard route and the Telegram /sent command."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT status, draft_id FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim is None:
+            return {"ok": False, "message": f"No claim #{claim_id} found."}
+        if claim["status"] != "drafted":
+            return {"ok": False, "message": f"Claim #{claim_id} isn't drafted (status: {claim['status']})."}
+        if claim["draft_id"]:
+            cur = conn.execute(
+                "UPDATE vet_claims SET status = 'sent', updated_at = ? WHERE draft_id = ? AND status = 'drafted'",
+                (now, claim["draft_id"]),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE vet_claims SET status = 'sent', updated_at = ? WHERE id = ? AND status = 'drafted'",
+                (now, claim_id),
+            )
+        count = cur.rowcount
+    suffix = f" ({count} claims in this submission)" if count > 1 else ""
+    return {"ok": True, "message": f"Claim #{claim_id} marked sent{suffix} — Petcover replies now tracked."}
+
+
 def confirm_resolved(claim_id: int) -> None:
     _record_event(claim_id, "confirmed_resolved", None, {})
 

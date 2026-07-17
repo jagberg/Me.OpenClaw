@@ -12,6 +12,8 @@ The claim pipeline (`vet-claim-automation`) stalls at `matched` whenever a requi
 - Add a `/process <claim_id>` command that runs the matched→drafted advance for one claim immediately, instead of waiting for the next scheduled pipeline tick (`VET_CLAIM_PIPELINE_INTERVAL_MINUTES`).
 - The dashboard remains fully functional and unchanged — Telegram is an additional entry point, not a replacement.
 - No change to send behavior: Gmail drafts are still never auto-sent from Telegram or anywhere else (existing `claim-form-automation` requirement stands).
+- Add `/vetemail <merchant> <email>` — the only write path to `vet_contacts`, closing the previously un-actionable "no vet email on file" flag on invoice requests.
+- After merging master's `petcover-claim-status-tracking`: notifications cover the full claim lifecycle (`info_requested`/`suspended` urgent; `acknowledged`/`settled`-with-amounts/`declined` informational), plus `/sent <claim_id>` (batch-aware drafted→sent, starts reply tracking) and `/resolved <claim_id>` (confirms an info request/suspension handled).
 
 ## Capabilities
 

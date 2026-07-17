@@ -55,6 +55,39 @@ The system SHALL let Justin mark a `drafted` claim as reviewed from Telegram, re
 - **WHEN** Justin sends `/mark <claim_id> reviewed` for a claim not at `drafted`
 - **THEN** the command is rejected with a message explaining the claim isn't ready for review yet
 
+### Requirement: Supply a vet's contact email via Telegram
+The system SHALL let the authorized user set or update a vet merchant's contact email via `/vetemail <merchant name> <email>`, writing to the `vet_contacts` override table that invoice-request drafting reads first. This closes the previously un-actionable "no vet email on file" flag.
+
+#### Scenario: First-time vet email
+- **WHEN** Justin sends `/vetemail <merchant> <email>` for a merchant with no `vet_contacts` row
+- **THEN** the row is created and subsequent invoice-request drafts for that merchant address it
+
+#### Scenario: Updating an existing vet email
+- **WHEN** Justin sends `/vetemail` for a merchant that already has a row
+- **THEN** the email is replaced, not duplicated
+
+### Requirement: Notification on Petcover lifecycle status changes
+The system SHALL notify on claims entering Petcover lifecycle states: urgent tone for `info_requested` and `suspended` (Justin must act), informational for `acknowledged`, `settled` (with claimed-vs-paid amounts when available from the settlement event), and `declined` — with the same once-per-state dedup as the matched/drafted notifications.
+
+#### Scenario: Info request pushed urgently
+- **WHEN** a claim's status becomes `info_requested`
+- **THEN** a Telegram message stating a reply is needed is sent once
+
+#### Scenario: Settlement includes reconciliation figures
+- **WHEN** a claim settles and the settlement event carries claimed/paid amounts
+- **THEN** the Telegram message includes both figures
+
+### Requirement: Mark sent and confirm resolved via Telegram
+The system SHALL provide `/sent <claim_id>` (advances drafted→sent, batch-aware across claims sharing one draft, which starts Petcover reply tracking) and `/resolved <claim_id>` (records a `confirmed_resolved` event clearing the needs-action state), reusing the same logic as the dashboard routes.
+
+#### Scenario: Sent advances the whole submission
+- **WHEN** Justin sends `/sent` for one claim of a multi-claim batch draft
+- **THEN** every claim sharing that draft advances to `sent`
+
+#### Scenario: Resolved clears needs-action
+- **WHEN** Justin sends `/resolved <claim_id>` after answering an info request
+- **THEN** a `confirmed_resolved` event is recorded for the claim
+
 ### Requirement: No autonomous send via Telegram
 The system SHALL NOT expose any Telegram command that sends the Gmail claim email. Reviewing and sending remains a manual action Justin takes from the Gmail draft link.
 

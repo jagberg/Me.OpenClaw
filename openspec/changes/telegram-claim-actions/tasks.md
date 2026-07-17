@@ -32,6 +32,14 @@
 - [x] 5.8 Add `/help` command listing available commands (basic usability, not in spec but trivial)
 - [x] 5.9 Outbound-send helper reads `chat_id` from `telegram_registrations`; if no row exists, logs the gap loudly and skips the send rather than raising or silently dropping
 
+## 5b. Status-tracking integration (post-merge of petcover-claim-status-tracking)
+
+- [x] 5b.1 Merge master (claim status tracking + bank-as-ceiling matching) into this branch, resolving db/main/pipeline/.env conflicts; `petcover_reference` added to the live-DB column migration
+- [x] 5b.2 Add `/vetemail <merchant name> <email>` — upsert into `vet_contacts` (only write path to that table)
+- [x] 5b.3 Extract `mark_sent` route body into `claim_status.mark_sent()` (batch-aware), add `/sent <claim_id>` command
+- [x] 5b.4 Add `/resolved <claim_id>` — records `confirmed_resolved` via `claim_status.confirm_resolved`
+- [x] 5b.5 Extend `notify_claim_states()` to the full lifecycle: urgent (`matched`-blocked, `info_requested`, `suspended`), informational (`drafted`, `acknowledged`, `settled` with claimed/paid amounts from the settlement event, `declined`)
+
 ## 6. Outbound notifications
 
 - [x] 6.1 In `pipeline.run_once()`, after existing matching/drafting steps, diff each claim's current `(status, flag)` against `(telegram_notified_status, telegram_notified_flag)`
@@ -52,6 +60,12 @@
 - [x] 7.9 `test_reviewed_mark_requires_drafted`: call the reviewed-mark function against a `matched` (not `drafted`) claim → asserts `reviewed_at` stays unset and the call reports rejection
 - [x] 7.10 `test_reviewed_mark_sets_timestamp_on_drafted`: call the reviewed-mark function against a `drafted` claim → asserts `reviewed_at` is set and no Gmail-send function is called (spy/mock the send path)
 - [x] 7.11 `test_notification_skipped_when_unregistered`: no row in `telegram_registrations`, call the outbound-send helper → asserts it returns without raising and without attempting a network call
+- [x] 7.12 `test_vetemail_upserts_contact`: /vetemail twice for the same merchant → one row, latest email wins
+- [x] 7.13 `test_vetemail_rejected_for_unauthorized_user`: non-matching username → no `vet_contacts` row
+- [x] 7.14 `test_notification_fires_on_info_requested`: `info_requested` status notifies once (urgent wording), dedups on repeat
+- [x] 7.15 `test_settled_notification_includes_amounts`: settled event detail `{claimed_amount, paid_amount}` → both figures in the message
+- [x] 7.16 `test_sent_command_advances_batch`: two drafted claims sharing a draft_id, `/sent` on one → both `sent`
+- [x] 7.17 `test_resolved_records_event`: `/resolved` → `confirmed_resolved` event row for the claim
 
 ## 8. Live verification (manual, real Telegram + Gmail)
 
@@ -60,3 +74,5 @@
 - [ ] 8.3 A real claim reaching `drafted` produces a Telegram message with a working Gmail draft link
 - [ ] 8.4 `/mark <claim_id> reviewed` on a real `drafted` claim sets `reviewed_at` and does not touch the Gmail draft; same command on a non-`drafted` claim is rejected
 - [ ] 8.5 Confirm no command or code path can trigger a Gmail send
+- [ ] 8.6 `/vetemail` for a real merchant with no prior invoice history, then confirm the invoice-request draft addresses it
+- [ ] 8.7 `/sent` on a real drafted claim, then confirm Petcover's acknowledgement reply produces a Telegram push (and `/resolved` clears a real info request)
