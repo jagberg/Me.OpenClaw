@@ -1,0 +1,45 @@
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return int(value) if value else default
+
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_RATE_LIMIT_PER_MIN = _int_env("GEMINI_RATE_LIMIT_PER_MIN", 15)
+
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "./data/openclaw.db")
+
+GMAIL_CREDENTIALS_PATH = os.environ.get("GMAIL_CREDENTIALS_PATH", "./data/credentials.json")
+GMAIL_TOKEN_PATH = os.environ.get("GMAIL_TOKEN_PATH", "./data/token.json")
+GMAIL_POLL_INTERVAL_MINUTES = _int_env("GMAIL_POLL_INTERVAL_MINUTES", 5)
+
+PETCOVER_TEMPLATE_PATH = os.environ.get("PETCOVER_TEMPLATE_PATH", "./data/petcover-claim-template.pdf")
+CLAIM_OUTPUT_DIR = os.environ.get("CLAIM_OUTPUT_DIR", "./data/claims")
+VET_CLAIM_PIPELINE_INTERVAL_MINUTES = _int_env("VET_CLAIM_PIPELINE_INTERVAL_MINUTES", 15)
+INVOICE_MATCH_WINDOW_DAYS = _int_env("INVOICE_MATCH_WINDOW_DAYS", 3)
+
+# Policyholder details for the claim form's "Your details" section — not
+# tracked anywhere else in OpenClaw. Left blank (non-blocking) until set.
+OWNER_NAME = os.environ.get("OWNER_NAME", "")
+OWNER_PHONE = os.environ.get("OWNER_PHONE", "")
+OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "")
+OWNER_ADDRESS = os.environ.get("OWNER_ADDRESS", "")
+OWNER_POSTCODE = os.environ.get("OWNER_POSTCODE", "")
+OWNER_STATE = os.environ.get("OWNER_STATE", "")
+
+# Invoices sometimes arrive forwarded from a spouse's address instead of the
+# vet directly — searched as a fallback alongside the merchant-name query.
+SPOUSE_EMAIL = os.environ.get("SPOUSE_EMAIL", "")
+
+# Bank details for the claim form's payment section — same account for every
+# claim regardless of pet, so kept owner-level rather than per-pet.
+OWNER_BANK_ACCOUNT_NAME = os.environ.get("OWNER_BANK_ACCOUNT_NAME", "")
+OWNER_BANK_BSB = os.environ.get("OWNER_BANK_BSB", "")
+OWNER_BANK_ACCOUNT_NUMBER = os.environ.get("OWNER_BANK_ACCOUNT_NUMBER", "")
