@@ -79,10 +79,24 @@ CREATE TABLE IF NOT EXISTS vet_claims (
     claim_file_path TEXT,
     draft_id TEXT,
     invoice_request_sent_at TEXT,
+    petcover_reference TEXT,
     status TEXT NOT NULL DEFAULT 'pending_match',
     flag TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+-- Append-only: a claim's status can flip back and forth (suspended, resolved,
+-- settled) — a single mutable column can't represent that history, this can.
+-- event_type: acknowledged | info_requested | suspended | settled | declined
+--            | unclassified | confirmed_resolved
+CREATE TABLE IF NOT EXISTS claim_status_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id INTEGER REFERENCES vet_claims(id),
+    event_type TEXT NOT NULL,
+    raw_email_id TEXT,
+    detail TEXT,
+    created_at TEXT NOT NULL
 );
 """
 

@@ -1,7 +1,10 @@
 from datetime import datetime, timedelta, timezone
 
-from . import claim_forms, config, db, invoice_matching, vet_detection
+from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, vet_detection
 from .scheduler import scheduler
+
+# marketing.au@ deliberately excluded — not claims-relevant (design.md).
+PETCOVER_STATUS_SENDERS = ["claims.au@petcovergroup.com", "requiredinfo.au@petcovergroup.com", "accounts.au@petcovergroup.com"]
 
 
 def _pending_claims():
@@ -34,6 +37,43 @@ def _maybe_draft_invoice_request(claim) -> None:
         )
 
 
+def poll_petcover_status() -> None:
+    """Polls Petcover's claims-relevant senders for status replies (ack, info
+    request, suspended, settled, declined) and records them via claim_status.
+    Raises on Gmail API failure — same retry-next-interval behavior as
+    gmail_ingest.poll_once; unprocessed messages stay unmarked so they retry."""
+    service = gmail_client.build_service()
+    unprocessed = []
+    for sender in PETCOVER_STATUS_SENDERS:
+        page_token = None
+        while True:
+            response = service.users().messages().list(
+                userId="me",
+                q=f"from:{sender} after:{config.PETCOVER_STATUS_SINCE}",
+                maxResults=100,
+                pageToken=page_token,
+            ).execute()
+            for item in response.get("messages", []):
+                if gmail_ingest._already_processed(item["id"]):
+                    continue
+                message = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
+                unprocessed.append(message)
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+    # Oldest first: Gmail lists newest-first, and processing a settlement
+    # before the acknowledgement it follows would leave the claim's status
+    # regressed to the older event.
+    unprocessed.sort(key=lambda m: int(m.get("internalDate", 0)))
+    for message in unprocessed:
+        headers = {h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])}
+        subject = headers.get("Subject", "")
+        body = gmail_client.full_message_text(service, message)
+        claim_status.process_reply(message["id"], subject, body)
+        gmail_ingest._mark_processed(message["id"], None)
+
+
 def run_once() -> None:
     vet_detection.classify_unflagged()
 
@@ -45,6 +85,8 @@ def run_once() -> None:
         matched_ids = [r["id"] for r in conn.execute("SELECT id FROM vet_claims WHERE status = 'matched'")]
     for claim_id in matched_ids:
         claim_forms.process_claim(claim_id)
+
+    poll_petcover_status()
 
 
 def start() -> None:
