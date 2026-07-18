@@ -245,6 +245,15 @@ def condition_keyboard(claim_id: int, pet_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def pet_keyboard(claim_id: int) -> InlineKeyboardMarkup:
+    """One button per known pet, to assign an unattributed claim in a tap."""
+    with db.get_connection() as conn:
+        pets = conn.execute("SELECT id, name FROM pets ORDER BY name").fetchall()
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(p["name"], callback_data=f"setpet:{claim_id}:{p['id']}")] for p in pets]
+    )
+
+
 # chat_id -> claim_id awaiting a free-text condition reply. In-memory: a lost
 # entry (container restart) just means Justin taps the button again.
 _pending_condition: dict[int, int] = {}
@@ -276,6 +285,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             text="Reply to this message with the condition being claimed:",
             reply_markup=ForceReply(),
         )
+    elif data.startswith("setpet:"):
+        _, cid, pet_id = data.split(":")
+        result = claim_forms.assign_pet(int(cid), int(pet_id))
+        await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
 
 
 async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

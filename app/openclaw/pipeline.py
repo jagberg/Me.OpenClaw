@@ -94,13 +94,33 @@ def _summarize_needs_condition(claim) -> str:
     ])
 
 
+def _summarize_matched_flag(claim, label: str) -> str:
+    """Explain, in plain terms, why a matched claim is still blocked — so Justin
+    can act from the message instead of decoding a raw flag string."""
+    flag = claim["flag"] or ""
+    pet = claim["pet_name"]
+    parts = []
+    if "possible additional invoice" in flag:
+        gap = flag.split("unexplained")[-1].strip() or "some amount"
+        parts.append(
+            f"The bank charge is {gap} more than the matched invoice covers — likely a second "
+            "invoice for this payment not yet found, or a wrong match. Worth a look in Gmail."
+        )
+    if claim["pet_id"] is None:
+        parts.append("No pet assigned yet — tap the pet below.")
+    if not parts:
+        parts.append(flag)
+    who = label if pet else "Unassigned claim"
+    return f"⚠ {who}: " + " ".join(parts)
+
+
 def _summarize_group(group) -> str | None:
     status = group[0]["status"]
     label = _submission_label(group)
     if status == "matched":  # matched claims aren't batched (no draft yet) — group is one claim
         if _needs_condition(group[0]):
             return _summarize_needs_condition(group[0])
-        return f"{label}: claim matched, needs input — {group[0]['flag']}"
+        return _summarize_matched_flag(group[0], label)
     if status == "drafted":
         return _summarize_drafted(group)
     if status == "info_requested":
@@ -157,6 +177,8 @@ def notify_claim_states(send_fn=None) -> None:
         lead = group[0]
         if lead["status"] == "drafted":
             markup = telegram_bot.mark_sent_button(lead["id"])
+        elif lead["status"] == "matched" and lead["pet_id"] is None:
+            markup = telegram_bot.pet_keyboard(lead["id"])  # assign pet first
         elif _needs_condition(lead) and lead["pet_id"]:
             markup = telegram_bot.condition_keyboard(lead["id"], lead["pet_id"])
         else:

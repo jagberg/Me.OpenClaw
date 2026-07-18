@@ -323,6 +323,25 @@ def test_condition_prompt_lists_items_and_offers_prior_conditions():
         assert conn.execute("SELECT condition_text FROM vet_claims WHERE id = ?", (cid,)).fetchone()[0] == "Arthritis"
 
 
+def test_unassigned_claim_explains_why_and_offers_pet_buttons():
+    cid = _seed_matched_claim("UNASSIGNED VET", pet_name="TmpPet")
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE vet_claims SET pet_id = NULL, flag = 'possible additional invoice — unexplained $500.00' "
+            "WHERE id = ?",
+            (cid,),
+        )
+    captured = []
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: captured.append((text, markup)))
+    mine = [(t, m) for t, m in captured if "$500.00" in t]
+    assert len(mine) == 1
+    text, markup = mine[0]
+    assert "more than the matched invoice" in text  # explains the unexplained gap
+    assert "no pet assigned" in text.lower()
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert "Aari" in labels and "Echo" in labels
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
