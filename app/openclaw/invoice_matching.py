@@ -71,8 +71,11 @@ Email:
 
 INVOICE_REQUEST_SUBJECT = "Invoice request for recent visit"
 INVOICE_REQUEST_BODY = (
-    "Hi,\n\nCould you please send through the invoice for our recent visit "
-    "(transaction on {txn_date} for {amount})?\n\nThanks."
+    "Hi,\n\n"
+    "Please could you send through the invoice for visit on {visit_date} for our dog "
+    "{pet} {surname}. The amount was for {amount}.\n\n"
+    "Many thanks in advance,\n\n"
+    "{owner}"
 )
 
 
@@ -222,7 +225,22 @@ def draft_invoice_request(claim) -> str | None:
     if not to:
         return None
 
-    body = INVOICE_REQUEST_BODY.format(txn_date=claim["txn_date"], amount=abs(claim["txn_amount"]))
+    owner = config.OWNER_NAME or "Justin Goldberg"
+    surname = owner.split()[-1]
+    if claim["pet_id"]:
+        with db.get_connection() as conn:
+            pet = conn.execute("SELECT name FROM pets WHERE id = ?", (claim["pet_id"],)).fetchone()
+        pet_name = pet["name"] if pet else "Aari or Echo"
+    else:
+        pet_name = "Aari or Echo"
+    visit_date = date.fromisoformat(claim["txn_date"]).strftime("%d-%b-%Y")
+    body = INVOICE_REQUEST_BODY.format(
+        visit_date=visit_date,
+        pet=pet_name,
+        surname=surname,
+        amount=f"${abs(claim['txn_amount']):.2f}",
+        owner=owner,
+    )
     raw = base64.urlsafe_b64encode(
         f"To: {to}\r\nSubject: {INVOICE_REQUEST_SUBJECT}\r\n\r\n{body}".encode()
     ).decode()
