@@ -6,3 +6,5 @@ data/
 .env
 token.json
 credentials.json
+*.log
+docker-compose.override.yml
