@@ -115,6 +115,7 @@ _VET_CLAIMS_ADDED_COLUMNS = {
     "reviewed_at": "TEXT",
     "petcover_reference": "TEXT",
     "rejected_email_ids": "TEXT",  # JSON list of invoice emails Justin unmatched — never re-match these
+    "item_conditions": "TEXT",  # JSON [{description, amount, condition}] when one invoice spans >1 condition
 }
 
 # Echo's claim_email stays NULL until Justin supplies Bow Wow Insurance's process

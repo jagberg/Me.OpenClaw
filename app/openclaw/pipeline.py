@@ -186,7 +186,8 @@ def notify_claim_states(send_fn=None) -> None:
         elif lead["status"] == "matched" and lead["pet_id"] is None:
             markup = telegram_bot.pet_keyboard(lead["id"])  # assign pet first
         elif _needs_condition(lead) and lead["pet_id"]:
-            markup = telegram_bot.condition_keyboard(lead["id"], lead["pet_id"])
+            multi = len(_invoice_lines(lead)) > 1
+            markup = telegram_bot.condition_keyboard(lead["id"], lead["pet_id"], multi_item=multi)
         else:
             markup = None
         send(text, markup)

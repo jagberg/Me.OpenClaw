@@ -184,6 +184,55 @@ def _build_form_data(pet, transaction, invoice: dict, condition_text: str, conti
     }
 
 
+def _group_by_condition(item_conditions: list[dict]) -> dict[str, float]:
+    """Sum item amounts per assigned condition; items with no condition
+    (skipped / not claimable) drop out."""
+    groups: dict[str, float] = {}
+    for item in item_conditions:
+        cond = item.get("condition")
+        if not cond:
+            continue
+        groups[cond] = groups.get(cond, 0.0) + float(item.get("amount") or 0)
+    return groups
+
+
+def _build_grouped_form_data(pet, transaction, item_conditions: list[dict], continuation: bool | None = None) -> dict:
+    data = _shared_fields(pet, continuation)
+    treatment_date = transaction["date"]
+    for i, (condition, amount) in enumerate(_group_by_condition(item_conditions).items(), start=1):
+        data[f"condition_{i}"] = condition
+        data[f"treatment_date_{i}"] = treatment_date
+        data[f"first_signs_date_{i}"] = treatment_date
+        data[f"charge_{i}"] = round(amount, 2)
+    return data
+
+
+def apply_item_conditions(claim_id: int, item_conditions: list[dict]) -> dict:
+    """Store per-item condition assignments (from the Telegram split flow) and
+    advance the claim. Groups items by condition into one form row each."""
+    groups = _group_by_condition(item_conditions)
+    if not groups:
+        return {"ok": False, "message": "Nothing claimable assigned."}
+    if len(groups) > 4:
+        return {"ok": False, "message": f"{len(groups)} conditions — the Petcover form holds 4. Combine some."}
+    if sum(groups.values()) == 0:  # items had no per-item amounts — can't split the charge, don't fill $0 rows
+        return {
+            "ok": False,
+            "message": "These invoice items have no amounts extracted, so I can't split the charge. "
+            "Use a single condition instead, or re-match the invoice to re-read the line items.",
+        }
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        if conn.execute("SELECT 1 FROM vet_claims WHERE id = ?", (claim_id,)).fetchone() is None:
+            return {"ok": False, "message": f"No claim #{claim_id} found."}
+        conn.execute(
+            "UPDATE vet_claims SET item_conditions = ?, condition_text = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(item_conditions), "; ".join(groups), now, claim_id),
+        )
+    process_claim(claim_id)
+    return {"ok": True, "message": f"Claim #{claim_id}: {', '.join(f'{k} (${v:.2f})' for k, v in groups.items())}."}
+
+
 def process_claim_batch(claim_ids: list[int], continuation: bool | None = None) -> None:
     """Bundles up to 4 matched claims for the SAME pet into one filled claim
     document and one Gmail draft (never sends) — mirrors real submissions,
@@ -374,7 +423,11 @@ def process_claim(claim_id: int, continuation: bool | None = None) -> None:
         return
 
     output_path = str(Path(config.CLAIM_OUTPUT_DIR) / f"claim-{claim_id}.pdf")
-    data = _build_form_data(pet, transaction, invoice, claim["condition_text"], continuation)
+    if claim["item_conditions"]:
+        # one invoice spanning several conditions → one form row per condition
+        data = _build_grouped_form_data(pet, transaction, json.loads(claim["item_conditions"]), continuation)
+    else:
+        data = _build_form_data(pet, transaction, invoice, claim["condition_text"], continuation)
     try:
         fill_petcover_form(data, output_path)
     except ClaimFillError as exc:

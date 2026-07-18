@@ -233,16 +233,72 @@ def prior_conditions(pet_id: int) -> list[str]:
     return [r["condition_text"] for r in rows]
 
 
-def condition_keyboard(claim_id: int, pet_id: int) -> InlineKeyboardMarkup:
+def condition_keyboard(claim_id: int, pet_id: int, multi_item: bool = False) -> InlineKeyboardMarkup:
     """Past conditions as one-tap buttons + an 'Other' that prompts for free
     text. callback_data carries an index into prior_conditions (re-queried on
-    tap) to stay under Telegram's 64-byte limit — condition text can be long."""
+    tap) to stay under Telegram's 64-byte limit — condition text can be long.
+    multi_item adds a 'Split by item' button when the invoice has >1 line."""
     buttons = [
         [InlineKeyboardButton(cond[:60], callback_data=f"cond:{claim_id}:{i}")]
         for i, cond in enumerate(prior_conditions(pet_id)[:6])
     ]
     buttons.append([InlineKeyboardButton("✏️ Other (type it)", callback_data=f"condother:{claim_id}")])
+    if multi_item:
+        buttons.append([InlineKeyboardButton("🔀 Different conditions per item", callback_data=f"split:{claim_id}")])
     return InlineKeyboardMarkup(buttons)
+
+
+def _invoice_items(claim_id: int) -> list[dict]:
+    """Line items for the split flow — itemised list if the extraction split
+    them, else the services string as single-description rows with no amount."""
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT invoice_data FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+    invoice = json.loads(row["invoice_data"]) if row and row["invoice_data"] else {}
+    items = invoice.get("items")
+    if isinstance(items, list) and items:
+        return [{"description": it.get("description", "item"), "amount": it.get("amount")} for it in items]
+    services = invoice.get("services")
+    if isinstance(services, list):
+        services = ", ".join(str(s) for s in services)
+    return [{"description": s.strip(), "amount": None} for s in services.split(",")] if services else []
+
+
+# chat_id -> {claim_id, pet_id, items, idx, assigned, await_type} for the
+# per-item condition split. In-memory (same trade-off as _pending_condition).
+_pending_split: dict[int, dict] = {}
+
+
+def _item_keyboard(pet_id: int) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(cond[:60], callback_data=f"si:{i}")]
+        for i, cond in enumerate(prior_conditions(pet_id)[:6])
+    ]
+    buttons.append([InlineKeyboardButton("✏️ Type", callback_data="sitype")])
+    buttons.append([InlineKeyboardButton("🚫 Not claimable", callback_data="siskip")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _prompt_current_item(chat_id: int, bot) -> None:
+    state = _pending_split[chat_id]
+    item = state["items"][state["idx"]]
+    amt = f" (${float(item['amount']):.2f})" if item["amount"] is not None else ""
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"Item {state['idx'] + 1}/{len(state['items'])}: {item['description']}{amt}\nWhich condition?",
+        reply_markup=_item_keyboard(state["pet_id"]),
+    )
+
+
+async def _record_and_advance(chat_id: int, condition: str | None, bot) -> None:
+    state = _pending_split[chat_id]
+    state["items"][state["idx"]]["condition"] = condition
+    state["idx"] += 1
+    if state["idx"] < len(state["items"]):
+        await _prompt_current_item(chat_id, bot)
+    else:
+        result = claim_forms.apply_item_conditions(state["claim_id"], state["items"])
+        _pending_split.pop(chat_id, None)
+        await bot.send_message(chat_id=chat_id, text=result["message"])
 
 
 def wrong_invoice_button(claim_id: int) -> InlineKeyboardMarkup:
@@ -297,6 +353,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif data.startswith("unmatch:"):
         result = invoice_matching.unmatch(int(data.split(":", 1)[1]))
         await query.edit_message_text(text=f"{query.message.text}\n\n❌ {result['message']}")
+    elif data.startswith("split:"):
+        cid = int(data.split(":", 1)[1])
+        with db.get_connection() as conn:
+            pet = conn.execute("SELECT pet_id FROM vet_claims WHERE id = ?", (cid,)).fetchone()
+        items = _invoice_items(cid)
+        if not items or not pet or pet["pet_id"] is None:
+            await context.bot.send_message(chat_id=query.message.chat_id, text="Can't split — no line items or pet.")
+            return
+        _pending_split[query.message.chat_id] = {"claim_id": cid, "pet_id": pet["pet_id"], "items": items, "idx": 0}
+        await _prompt_current_item(query.message.chat_id, context.bot)
+    elif data == "siskip":
+        if query.message.chat_id in _pending_split:
+            await _record_and_advance(query.message.chat_id, None, context.bot)
+    elif data == "sitype":
+        state = _pending_split.get(query.message.chat_id)
+        if state:
+            state["await_type"] = True
+            await context.bot.send_message(
+                chat_id=query.message.chat_id, text="Reply with the condition for this item:", reply_markup=ForceReply()
+            )
+    elif data.startswith("si:"):
+        state = _pending_split.get(query.message.chat_id)
+        if state:
+            conds = prior_conditions(state["pet_id"])
+            idx = int(data.split(":", 1)[1])
+            if 0 <= idx < len(conds):
+                await _record_and_advance(query.message.chat_id, conds[idx], context.bot)
 
 
 async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -305,10 +388,18 @@ async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     username = update.effective_user.username if update.effective_user else None
     if not _is_authorized(username):
         return
-    claim_id = _pending_condition.pop(update.effective_chat.id, None)
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+    # A typed condition for the current item in a split flow takes priority.
+    split = _pending_split.get(chat_id)
+    if split and split.get("await_type"):
+        split["await_type"] = False
+        await _record_and_advance(chat_id, text, context.bot)
+        return
+    claim_id = _pending_condition.pop(chat_id, None)
     if claim_id is None:
         return
-    result = claim_forms.set_condition_text(claim_id, update.message.text.strip())
+    result = claim_forms.set_condition_text(claim_id, text)
     await update.message.reply_text(result["message"])
 
 

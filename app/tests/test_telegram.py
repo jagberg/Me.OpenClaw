@@ -349,6 +349,44 @@ def test_suspicious_match_explains_why_and_offers_unmatch():
     assert "wrongemail123" in r["rejected_email_ids"]
 
 
+def test_apply_item_conditions_groups_and_fills_rows():
+    cid = _seed_matched_claim("MULTI VET", condition_text=None, pet_name="MultiPet")
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
+            (json.dumps({"date": "2026-06-19", "amount": 580.74, "services": "x",
+                         "items": [{"description": "Arthritis Package", "amount": 250.0},
+                                   {"description": "Blood Profile", "amount": 135.0},
+                                   {"description": "Consult", "amount": 140.0}]}), cid),
+        )
+    # Arthritis Package + Consult → Arthritis; Blood Profile → Raised ALT/ALP
+    assignments = [
+        {"description": "Arthritis Package", "amount": 250.0, "condition": "Arthritis"},
+        {"description": "Blood Profile", "amount": 135.0, "condition": "Raised ALT/ALP"},
+        {"description": "Consult", "amount": 140.0, "condition": "Arthritis"},
+    ]
+    captured = {}
+
+    def stub_fill(data, output_path):
+        captured.update(data)
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text("stub")
+
+    orig_fill, orig_draft = claim_forms.fill_petcover_form, claim_forms.create_claim_draft
+    claim_forms.fill_petcover_form = stub_fill
+    claim_forms.create_claim_draft = lambda **k: "draft-multi"
+    try:
+        result = claim_forms.apply_item_conditions(cid, assignments)
+    finally:
+        claim_forms.fill_petcover_form, claim_forms.create_claim_draft = orig_fill, orig_draft
+    assert result["ok"] is True
+    # two condition rows, Arthritis summed to 390.00, ALT/ALP 135.00
+    rows = {captured[f"condition_{i}"]: captured[f"charge_{i}"] for i in (1, 2)}
+    assert rows["Arthritis"] == 390.0 and rows["Raised ALT/ALP"] == 135.0
+    with db.get_connection() as conn:
+        assert conn.execute("SELECT status FROM vet_claims WHERE id = ?", (cid,)).fetchone()[0] == "drafted"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
