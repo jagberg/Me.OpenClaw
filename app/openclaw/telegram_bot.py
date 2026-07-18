@@ -2,8 +2,8 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram import Bot, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from . import claim_forms, claim_status, config, db
 
@@ -219,23 +219,76 @@ def mark_sent_button(claim_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Mark sent", callback_data=f"sent:{claim_id}")]])
 
 
-async def sent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def prior_conditions(pet_id: int) -> list[str]:
+    """Conditions Justin has claimed for this pet before — offered as tap
+    options so a repeat condition (arthritis, ear infection…) is one tap, not
+    retyping. This is the reusable condition history the original spec deferred."""
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT condition_text FROM vet_claims "
+            "WHERE pet_id = ? AND condition_text IS NOT NULL AND condition_text != '' "
+            "ORDER BY condition_text",
+            (pet_id,),
+        ).fetchall()
+    return [r["condition_text"] for r in rows]
+
+
+def condition_keyboard(claim_id: int, pet_id: int) -> InlineKeyboardMarkup:
+    """Past conditions as one-tap buttons + an 'Other' that prompts for free
+    text. callback_data carries an index into prior_conditions (re-queried on
+    tap) to stay under Telegram's 64-byte limit — condition text can be long."""
+    buttons = [
+        [InlineKeyboardButton(cond[:60], callback_data=f"cond:{claim_id}:{i}")]
+        for i, cond in enumerate(prior_conditions(pet_id)[:6])
+    ]
+    buttons.append([InlineKeyboardButton("✏️ Other (type it)", callback_data=f"condother:{claim_id}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+# chat_id -> claim_id awaiting a free-text condition reply. In-memory: a lost
+# entry (container restart) just means Justin taps the button again.
+_pending_condition: dict[int, int] = {}
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     username = query.from_user.username if query.from_user else None
     if not _is_authorized(username):
         return
     data = query.data or ""
-    if not data.startswith("sent:"):
+    if data.startswith("sent:"):
+        result = claim_status.mark_sent(int(data.split(":", 1)[1]))
+        await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+    elif data.startswith("cond:"):
+        _, cid, idx = data.split(":")
+        cid, idx = int(cid), int(idx)
+        with db.get_connection() as conn:
+            claim = conn.execute("SELECT pet_id FROM vet_claims WHERE id = ?", (cid,)).fetchone()
+        conds = prior_conditions(claim["pet_id"]) if claim else []
+        if 0 <= idx < len(conds):
+            result = claim_forms.set_condition_text(cid, conds[idx])
+            await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+    elif data.startswith("condother:"):
+        _pending_condition[query.message.chat_id] = int(data.split(":", 1)[1])
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Reply to this message with the condition being claimed:",
+            reply_markup=ForceReply(),
+        )
+
+
+async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Free-text condition entry: after 'Other', the next plain-text message
+    from the authorized user sets the condition for the pending claim."""
+    username = update.effective_user.username if update.effective_user else None
+    if not _is_authorized(username):
         return
-    try:
-        claim_id = int(data.split(":", 1)[1])
-    except ValueError:
+    claim_id = _pending_condition.pop(update.effective_chat.id, None)
+    if claim_id is None:
         return
-    result = claim_status.mark_sent(claim_id)
-    # Drop the button so it can't be tapped twice, and append the outcome to
-    # the original message rather than sending a new one (keeps the thread tidy).
-    await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+    result = claim_forms.set_condition_text(claim_id, update.message.text.strip())
+    await update.message.reply_text(result["message"])
 
 
 def build_application() -> Application:
@@ -248,7 +301,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("sent", sent_command))
     application.add_handler(CommandHandler("resolved", resolved_command))
     application.add_handler(CommandHandler("vetemail", vetemail_command))
-    application.add_handler(CallbackQueryHandler(sent_callback))
+    application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_reply))
     return application
 
 

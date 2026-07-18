@@ -69,10 +69,37 @@ def _summarize_drafted(group) -> str:
     )
 
 
+def _needs_condition(claim) -> bool:
+    return claim["status"] == "matched" and bool(claim["flag"]) and "condition" in claim["flag"].lower()
+
+
+def _summarize_needs_condition(claim) -> str:
+    """Matched-but-blocked-on-condition: show what was claimed (the invoice line
+    items) and why a condition is needed, so Justin can answer from the message."""
+    pet = claim["pet_name"] or "your pet"
+    invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
+    items = invoice.get("services")
+    if isinstance(items, list):
+        items = ", ".join(str(s) for s in items)
+    amount = invoice.get("amount")
+    date = invoice.get("date") or claim["txn_date"]
+    line = f"  • {date} — {items or 'vet visit'}"
+    if amount is not None:
+        line += f" — ${float(amount):.2f}"
+    return "\n".join([
+        f"{pet}'s vet claim needs a condition:",
+        line,
+        "Why: insurers need the illness/injury being claimed — it isn't in the invoice line items.",
+        "Tap a past condition below, or tap ✏️ to type a new one.",
+    ])
+
+
 def _summarize_group(group) -> str | None:
     status = group[0]["status"]
     label = _submission_label(group)
     if status == "matched":  # matched claims aren't batched (no draft yet) — group is one claim
+        if _needs_condition(group[0]):
+            return _summarize_needs_condition(group[0])
         return f"{label}: claim matched, needs input — {group[0]['flag']}"
     if status == "drafted":
         return _summarize_drafted(group)
@@ -125,9 +152,15 @@ def notify_claim_states(send_fn=None) -> None:
         text = _summarize_group(group)
         if text is None:
             continue
-        # Drafted batches get a one-tap "Mark sent" button (no typing /sent,
-        # no per-claim id juggling — one action covers the whole submission).
-        markup = telegram_bot.mark_sent_button(group[0]["id"]) if group[0]["status"] == "drafted" else None
+        # Attach the right inline controls: drafted → one-tap Mark-sent;
+        # matched-needs-condition → past-condition pick-list + type-your-own.
+        lead = group[0]
+        if lead["status"] == "drafted":
+            markup = telegram_bot.mark_sent_button(lead["id"])
+        elif _needs_condition(lead) and lead["pet_id"]:
+            markup = telegram_bot.condition_keyboard(lead["id"], lead["pet_id"])
+        else:
+            markup = None
         send(text, markup)
         with db.get_connection() as conn:
             for c in group:

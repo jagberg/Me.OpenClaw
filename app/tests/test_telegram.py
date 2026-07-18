@@ -298,6 +298,31 @@ def test_drafted_batch_notifies_once_with_button():
     assert statuses == ["sent", "sent"]
 
 
+def test_condition_prompt_lists_items_and_offers_prior_conditions():
+    # a past claim gives this pet a known condition to offer as a button
+    _seed_matched_claim("PRIOR VET", condition_text="Arthritis", pet_name="CondPet")
+    cid = _seed_matched_claim("NEW COND VET", condition_text=None, pet_name="CondPet")
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE vet_claims SET flag = 'condition text missing — enter manually on dashboard' WHERE id = ?",
+            (cid,),
+        )
+        pet_id = conn.execute("SELECT pet_id FROM vet_claims WHERE id = ?", (cid,)).fetchone()["pet_id"]
+    captured = []
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: captured.append((text, markup)))
+    mine = [(t, m) for t, m in captured if "CondPet" in t and "needs a condition" in t]
+    assert len(mine) == 1, "matched-needs-condition claim must prompt once"
+    text, markup = mine[0]
+    assert "Why:" in text and "$" in text  # explains why, shows the claimed item(s)
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert "Arthritis" in labels and any("Other" in x for x in labels)
+    # tapping the Arthritis button (its index) applies that condition
+    conds = telegram_bot.prior_conditions(pet_id)
+    _with_stubbed_claim_fill(lambda: claim_forms.set_condition_text(cid, conds[conds.index("Arthritis")]))
+    with db.get_connection() as conn:
+        assert conn.execute("SELECT condition_text FROM vet_claims WHERE id = ?", (cid,)).fetchone()[0] == "Arthritis"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
