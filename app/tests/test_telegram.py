@@ -310,10 +310,10 @@ def test_condition_prompt_lists_items_and_offers_prior_conditions():
         pet_id = conn.execute("SELECT pet_id FROM vet_claims WHERE id = ?", (cid,)).fetchone()["pet_id"]
     captured = []
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: captured.append((text, markup)))
-    mine = [(t, m) for t, m in captured if "CondPet" in t and "needs a condition" in t]
+    mine = [(t, m) for t, m in captured if "CondPet" in t and "What condition?" in t]
     assert len(mine) == 1, "matched-needs-condition claim must prompt once"
     text, markup = mine[0]
-    assert "Why:" in text and "$" in text  # explains why, shows the claimed item(s)
+    assert "•" in text  # lists the claimed item(s)
     labels = [b.text for row in markup.inline_keyboard for b in row]
     assert "Arthritis" in labels and any("Other" in x for x in labels)
     # tapping the Arthritis button (its index) applies that condition
@@ -337,7 +337,7 @@ def test_unassigned_claim_explains_why_and_offers_pet_buttons():
     assert len(mine) == 1
     text, markup = mine[0]
     assert "more than the matched invoice" in text  # explains the unexplained gap
-    assert "no pet assigned" in text.lower()
+    assert "Which pet?" in text
     labels = [b.text for row in markup.inline_keyboard for b in row]
     assert "Aari" in labels and "Echo" in labels
 

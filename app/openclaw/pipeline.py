@@ -73,45 +73,47 @@ def _needs_condition(claim) -> bool:
     return claim["status"] == "matched" and bool(claim["flag"]) and "condition" in claim["flag"].lower()
 
 
-def _summarize_needs_condition(claim) -> str:
-    """Matched-but-blocked-on-condition: show what was claimed (the invoice line
-    items) and why a condition is needed, so Justin can answer from the message."""
-    pet = claim["pet_name"] or "your pet"
+def _invoice_lines(claim) -> list[str]:
+    """The invoice line items, itemised if the extraction split them, else the
+    services string broken on commas."""
     invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
-    items = invoice.get("services")
-    if isinstance(items, list):
-        items = ", ".join(str(s) for s in items)
-    amount = invoice.get("amount")
-    date = invoice.get("date") or claim["txn_date"]
-    line = f"  • {date} — {items or 'vet visit'}"
-    if amount is not None:
-        line += f" — ${float(amount):.2f}"
-    return "\n".join([
-        f"{pet}'s vet claim needs a condition:",
-        line,
-        "Why: insurers need the illness/injury being claimed — it isn't in the invoice line items.",
-        "Tap a past condition below, or tap ✏️ to type a new one.",
-    ])
+    items = invoice.get("items")
+    if isinstance(items, list) and items:
+        out = []
+        for it in items:
+            amt = it.get("amount")
+            desc = it.get("description", "item")
+            out.append(f"  • {desc} — ${float(amt):.2f}" if amt is not None else f"  • {desc}")
+        return out
+    services = invoice.get("services")
+    if isinstance(services, list):
+        services = ", ".join(str(s) for s in services)
+    return [f"  • {s.strip()}" for s in services.split(",")] if services else []
+
+
+def _summarize_needs_condition(claim) -> str:
+    pet = claim["pet_name"] or "your pet"
+    header = f"{pet} — {claim['txn_date']}, {claim['txn_merchant']}. What condition?"
+    return "\n".join([header, *_invoice_lines(claim)])
 
 
 def _summarize_matched_flag(claim, label: str) -> str:
     """Explain, in plain terms, why a matched claim is still blocked — so Justin
     can act from the message instead of decoding a raw flag string."""
     flag = claim["flag"] or ""
-    pet = claim["pet_name"]
-    parts = []
+    who = label if claim["pet_name"] else "Unassigned claim"
+    lines = [f"⚠ {who} — {claim['txn_date']}, {claim['txn_merchant']}", *_invoice_lines(claim)]
     if "possible additional invoice" in flag:
         gap = flag.split("unexplained")[-1].strip() or "some amount"
-        parts.append(
-            f"The bank charge is {gap} more than the matched invoice covers — likely a second "
-            "invoice for this payment not yet found, or a wrong match. Worth a look in Gmail."
+        lines.append(
+            f"Bank charge is {gap} more than the matched invoice — possibly the wrong invoice or a "
+            "missing one. Worth checking Gmail."
         )
+    elif "condition" not in flag.lower():
+        lines.append(flag)
     if claim["pet_id"] is None:
-        parts.append("No pet assigned yet — tap the pet below.")
-    if not parts:
-        parts.append(flag)
-    who = label if pet else "Unassigned claim"
-    return f"⚠ {who}: " + " ".join(parts)
+        lines.append("Which pet?")
+    return "\n".join(lines)
 
 
 def _summarize_group(group) -> str | None:
@@ -149,7 +151,8 @@ def notify_claim_states(send_fn=None) -> None:
     send = send_fn or telegram_bot.send_message_sync
     with db.get_connection() as conn:
         rows = conn.execute(
-            "SELECT vc.*, p.name AS pet_name, bt.date AS txn_date, bt.amount AS txn_amount "
+            "SELECT vc.*, p.name AS pet_name, bt.date AS txn_date, bt.amount AS txn_amount, "
+            "bt.merchant AS txn_merchant "
             "FROM vet_claims vc "
             "LEFT JOIN pets p ON p.id = vc.pet_id "
             "JOIN bank_transactions bt ON bt.id = vc.transaction_id "
