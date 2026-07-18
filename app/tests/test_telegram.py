@@ -4,7 +4,6 @@ python tests/test_telegram.py"""
 
 import json
 import os
-import re
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -23,11 +22,18 @@ AUTHORIZED_USER = "jagberg"
 UNAUTHORIZED_USER = "someone_else"
 
 
-def _seed_matched_claim(merchant: str, condition_text: str | None = "ear infection") -> int:
+def _seed_matched_claim(merchant: str, condition_text: str | None = "ear infection", pet_name: str = "Aari") -> int:
     db.init_db()
     now = datetime.now(timezone.utc).isoformat()
     with db.get_connection() as conn:
-        pet = conn.execute("SELECT * FROM pets WHERE name = 'Aari'").fetchone()
+        pet = conn.execute("SELECT * FROM pets WHERE name = ?", (pet_name,)).fetchone()
+        if pet is None:  # unique pet per notification test → isolates its message in the shared DB
+            conn.execute(
+                "INSERT INTO pets (name, insurer, claim_email, claim_process_defined) "
+                "VALUES (?, 'Petcover', 'claims.au@petcovergroup.com', 1)",
+                (pet_name,),
+            )
+            pet = conn.execute("SELECT * FROM pets WHERE name = ?", (pet_name,)).fetchone()
         txn_id = conn.execute(
             "INSERT INTO bank_transactions (date, amount, merchant, category, vet_flag, created_at) "
             "VALUES (?, ?, ?, ?, 1, ?)",
@@ -48,8 +54,8 @@ def _seed_matched_claim(merchant: str, condition_text: str | None = "ear infecti
     return claim_id
 
 
-def _seed_drafted_claim(merchant: str, draft_id: str = "draft-abc") -> int:
-    claim_id = _seed_matched_claim(merchant)
+def _seed_drafted_claim(merchant: str, draft_id: str = "draft-abc", pet_name: str = "Aari") -> int:
+    claim_id = _seed_matched_claim(merchant, pet_name=pet_name)
     with db.get_connection() as conn:
         conn.execute(
             "UPDATE vet_claims SET status = 'drafted', draft_id = ? WHERE id = ?",
@@ -138,18 +144,18 @@ def test_notification_dedup():
     # notify_claim_states scans the whole table by design (correct for real
     # use) — the shared test DB may hold other un-notified claims from earlier
     # tests, so filter sent messages down to this test's own claim.
-    claim_id = _seed_matched_claim("DEDUP VET")
+    claim_id = _seed_matched_claim("DEDUP VET", pet_name="DedupPet")
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", ("condition text missing", claim_id))
     sent = []
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
-    own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
+    own_sent = [t for t in sent if "DedupPet" in t]
     assert len(own_sent) == 1, "unchanged state must not notify twice"
 
 
 def test_notification_fires_on_new_state():
-    claim_id = _seed_matched_claim("NEW STATE VET")
+    claim_id = _seed_matched_claim("NEW STATE VET", pet_name="NewStatePet")
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", ("condition text missing", claim_id))
     sent = []
@@ -157,7 +163,7 @@ def test_notification_fires_on_new_state():
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", ("invoice missing itemized services", claim_id))
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
-    own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
+    own_sent = [t for t in sent if "NewStatePet" in t]
     assert len(own_sent) == 2, "a genuinely new flag/status must notify again"
 
 
@@ -219,19 +225,19 @@ def test_vetemail_rejected_for_unauthorized_user():
 
 
 def test_notification_fires_on_info_requested():
-    claim_id = _seed_matched_claim("INFO REQ VET")
+    claim_id = _seed_matched_claim("INFO REQ VET", pet_name="InfoPet")
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET status = 'info_requested' WHERE id = ?", (claim_id,))
     sent = []
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
-    own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
+    own_sent = [t for t in sent if "InfoPet" in t]
     assert len(own_sent) == 1, "info_requested must notify exactly once"
     assert "information" in own_sent[0]
 
 
 def test_settled_notification_includes_amounts():
-    claim_id = _seed_matched_claim("SETTLED VET")
+    claim_id = _seed_matched_claim("SETTLED VET", pet_name="SettledPet")
     now = datetime.now(timezone.utc).isoformat()
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET status = 'settled' WHERE id = ?", (claim_id,))
@@ -241,7 +247,7 @@ def test_settled_notification_includes_amounts():
         )
     sent = []
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
-    own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
+    own_sent = [t for t in sent if "SettledPet" in t]
     assert len(own_sent) == 1
     assert "100.00" in own_sent[0] and "80.00" in own_sent[0]
 
@@ -274,11 +280,11 @@ def test_resolved_records_event():
 
 
 def test_drafted_batch_notifies_once_with_button():
-    a = _seed_drafted_claim("BTN VET A", draft_id="draft-btn-1")
-    b = _seed_drafted_claim("BTN VET B", draft_id="draft-btn-1")
+    a = _seed_drafted_claim("BTN VET A", draft_id="draft-btn-1", pet_name="BtnPet")
+    b = _seed_drafted_claim("BTN VET B", draft_id="draft-btn-1", pet_name="BtnPet")
     captured = []
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: captured.append((text, markup)))
-    mine = [(t, m) for t, m in captured if f"#{a}" in t and f"#{b}" in t]
+    mine = [(t, m) for t, m in captured if "BtnPet" in t]
     assert len(mine) == 1, "a 2-claim batch must produce exactly one message"
     text, markup = mine[0]
     assert markup is not None, "drafted batch must carry a mark-sent button"

@@ -35,8 +35,14 @@ def _batch_key(claim) -> str:
     return claim["draft_id"] or f"claim-{claim['id']}"
 
 
-def _claim_ids(group) -> str:
-    return ", ".join(f"#{c['id']}" for c in group)
+def _submission_label(group) -> str:
+    """A submission's identifier for Justin. Once Petcover assigns a claim
+    reference (learned from their reply), that IS the shared id across every
+    claim in the batch — it's what their emails cite. Before that, label by
+    pet. Internal claim ids are never shown — meaningless to Justin."""
+    pet = group[0]["pet_name"] or "your pet"
+    ref = group[0]["petcover_reference"]
+    return f"{ref} ({pet})" if ref else pet
 
 
 def _summarize_drafted(group) -> str:
@@ -57,7 +63,7 @@ def _summarize_drafted(group) -> str:
         else:
             lines.append(f"  • {date} — {service}")
     count = len(group)
-    header = f"Claim(s) {_claim_ids(group)} for {pet} — ready to send ({count} item{'s' if count > 1 else ''}, ${total:.2f})"
+    header = f"{pet}'s vet claim — ready to send ({count} item{'s' if count > 1 else ''}, ${total:.2f})"
     return "\n".join(
         [header, *lines, f'Open the Gmail app → Drafts (subject "Vet claim — {pet}"):', DRAFT_SEARCH_LINK]
     )
@@ -65,26 +71,25 @@ def _summarize_drafted(group) -> str:
 
 def _summarize_group(group) -> str | None:
     status = group[0]["status"]
-    pet = group[0]["pet_name"] or "your pet"
-    ids = _claim_ids(group)
+    label = _submission_label(group)
     if status == "matched":  # matched claims aren't batched (no draft yet) — group is one claim
-        return f"Claim #{group[0]['id']} ({pet}): matched, needs input — {group[0]['flag']}"
+        return f"{label}: claim matched, needs input — {group[0]['flag']}"
     if status == "drafted":
         return _summarize_drafted(group)
     if status == "info_requested":
-        return f"⚠ Claim(s) {ids} ({pet}): Petcover requested more information — reply needed."
+        return f"⚠ {label}: Petcover requested more information — reply needed."
     if status == "suspended":
-        return f"⚠ Claim(s) {ids} ({pet}): suspended by Petcover — action needed."
+        return f"⚠ {label}: suspended by Petcover — action needed."
     if status == "acknowledged":
-        return f"Claim(s) {ids} ({pet}): acknowledged by Petcover."
+        return f"{label}: acknowledged by Petcover."
     if status == "declined":
-        return f"Claim(s) {ids} ({pet}): declined by Petcover."
+        return f"{label}: declined by Petcover."
     if status == "settled":
         detail = _latest_settlement_detail(group[0]["id"])
         claimed, paid = detail.get("claimed_amount"), detail.get("paid_amount")
         if claimed is not None and paid is not None:
-            return f"Claim(s) {ids} ({pet}): settled — claimed ${claimed:.2f}, paid ${paid:.2f}."
-        return f"Claim(s) {ids} ({pet}): settled."
+            return f"{label}: settled — claimed ${claimed:.2f}, paid ${paid:.2f}."
+        return f"{label}: settled."
     return None
 
 
