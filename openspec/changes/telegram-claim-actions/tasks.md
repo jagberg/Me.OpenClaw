@@ -67,6 +67,18 @@
 - [x] 7.16 `test_sent_command_advances_batch`: two drafted claims sharing a draft_id, `/sent` on one → both `sent`
 - [x] 7.17 `test_resolved_records_event`: `/resolved` → `confirmed_resolved` event row for the claim
 
+## 7b. Interactive actions + refinements (live iteration)
+
+- [x] 7b.1 Interactive condition entry: prompt shows invoice line items; past conditions as tap buttons; "Other" → free-text reply; no dashboard mention
+- [x] 7b.2 Per-item condition split: assign a condition per line item; group into one form row per condition (summed amounts); guard when items lack amounts
+- [x] 7b.3 One-tap pet-assignment buttons on unassigned matched claims
+- [x] 7b.4 "Wrong invoice" unmatch button: record rejected email (`rejected_email_ids`), reset to `pending_match`, matcher skips rejected
+- [x] 7b.5 Submissions identified by Petcover reference / pet name, never internal claim ids; batched drafted claims notify once with a self-contained summary + ✅ Mark sent button
+- [x] 7b.6 Plain-language "why" summary for blocked/suspicious matched claims (date, vet, line items)
+- [x] 7b.7 Invoice-request email uses Justin's template (visit date dd-MMM-yyyy, pet + surname, amount, sign-off)
+- [x] 7b.8 Persistent Docker service (`restart: unless-stopped`); async-SSL `wrap_bio` fix; case-insensitive username auth
+- [x] 7b.9 Tests for all of the above in `tests/test_telegram.py` (22 checks, incl. the split-callback path that caught a missing-json regression)
+
 ## 8. Live verification (manual, real Telegram + Gmail)
 
 - [ ] 8.1 Unauthorized username sending a command has no effect against the running bot

@@ -95,6 +95,42 @@ The system SHALL provide `/sent <claim_id>` (advances drafted→sent, batch-awar
 - **WHEN** Justin sends `/resolved <claim_id>` after answering an info request
 - **THEN** a `confirmed_resolved` event is recorded for the claim
 
+### Requirement: Interactive condition entry via Telegram
+When a claim is blocked needing a condition, the notification SHALL show the invoice line items and offer the pet's previously-used conditions as one-tap buttons (a reusable condition history), an "Other" button that prompts for free-text entry, and — when the invoice has more than one line item — a "Different conditions per item" option. The message SHALL NOT tell Justin to use the dashboard.
+
+#### Scenario: Repeat condition in one tap
+- **WHEN** Justin taps a past condition on a blocked claim
+- **THEN** that condition is applied and the claim proceeds through the fill/draft flow
+
+#### Scenario: New condition typed
+- **WHEN** Justin taps "Other" and replies with text
+- **THEN** the replied text becomes the claim's condition
+
+### Requirement: Per-item condition split
+For an invoice covering more than one condition, the system SHALL let Justin assign a condition to each line item (tap a past condition, type a new one, or mark it not-claimable), then group items by condition into one claim-form row each with amounts summed per condition. If the line items carry no extracted amounts, the system SHALL refuse rather than fill $0 rows.
+
+#### Scenario: Two conditions on one invoice
+- **WHEN** Justin assigns some items to "Arthritis" and others to "Raised ALT/ALP"
+- **THEN** the claim form gets one row per condition, each charged the sum of its items' amounts
+
+#### Scenario: Items have no amounts
+- **WHEN** the invoice line items were extracted without per-item amounts
+- **THEN** the split is refused with a message to use a single condition or re-read the invoice, and no $0 rows are filled
+
+### Requirement: Assign a pet via Telegram
+An unattributed matched claim SHALL offer a one-tap button per known pet to assign it, replacing the dashboard pet picker.
+
+#### Scenario: Tap to assign
+- **WHEN** Justin taps a pet on an unassigned claim
+- **THEN** the claim's pet is set, identically to the dashboard picker
+
+### Requirement: Reject a wrong invoice match
+A matched claim whose bank charge greatly exceeds the matched invoice SHALL be flagged with a plain-language summary and a "Wrong invoice" button. Tapping it SHALL record the rejected invoice email so the matcher never re-selects it, and reset the claim to `pending_match` for re-search.
+
+#### Scenario: Unmatch a bad match
+- **WHEN** Justin taps "Wrong invoice"
+- **THEN** the claim returns to `pending_match`, the rejected email is remembered, and the next match attempt skips it
+
 ### Requirement: No autonomous send via Telegram
 The system SHALL NOT expose any Telegram command that sends the Gmail claim email. Reviewing and sending remains a manual action Justin takes from the Gmail draft link.
 

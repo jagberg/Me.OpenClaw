@@ -14,6 +14,10 @@ The claim pipeline (`vet-claim-automation`) stalls at `matched` whenever a requi
 - No change to send behavior: Gmail drafts are still never auto-sent from Telegram or anywhere else (existing `claim-form-automation` requirement stands).
 - Add `/vetemail <merchant> <email>` — the only write path to `vet_contacts`, closing the previously un-actionable "no vet email on file" flag on invoice requests.
 - After merging master's `petcover-claim-status-tracking`: notifications cover the full claim lifecycle (`info_requested`/`suspended` urgent; `acknowledged`/`settled`-with-amounts/`declined` informational), plus `/sent <claim_id>` (batch-aware drafted→sent, starts reply tracking) and `/resolved <claim_id>` (confirms an info request/suspension handled).
+- Interactive (tap-driven, no ids) actions on notifications: past-condition pick-list + type-your-own for the blocked-condition case; per-item condition split for one invoice covering several conditions; one-tap pet assignment; a ✅ Mark-sent button on drafted batches; a ❌ Wrong-invoice button that rejects a bad match and re-searches.
+- Submissions are identified by the Petcover claim reference (or pet name before it's learned), never internal claim ids; blocked claims carry a plain-language "why" summary with date/vet/line-items.
+- Invoice-request drafts to the vet use Justin's template (visit date, pet + surname, amount, sign-off).
+- Runs as a persistent Docker service so the bot handles taps and pipeline ticks 24/7.
 
 ## Capabilities
 

@@ -1,5 +1,19 @@
 ## ADDED Requirements
 
+### Requirement: One invoice spanning multiple conditions fills multiple form rows
+When per-item condition assignments are recorded for a claim, the fill SHALL emit one Petcover form row per distinct condition, with each row's charge the sum of that condition's item amounts (skipping items marked not-claimable), instead of a single condition/charge for the whole claim.
+
+#### Scenario: Grouped rows from per-item assignments
+- **WHEN** a claim has item assignments Arthritis→$390 and Raised ALT/ALP→$135
+- **THEN** the claim form has two condition rows charged $390 and $135 respectively
+
+### Requirement: Invoice-request email carries the visit details
+The system SHALL draft (never send) an invoice-request email to the vet using Justin's template: the visit date (`dd-MMM-yyyy`), the pet's name and surname (falling back to a generic pet placeholder when unassigned), the charged amount, and a sign-off. This replaces the terse prior body.
+
+#### Scenario: Invoice request for a known pet
+- **WHEN** an invoice request is drafted for an Aari transaction on 2025-08-08 charged $44.75
+- **THEN** the body reads "…invoice for visit on 08-Aug-2025 for our dog Aari Goldberg. The amount was for $44.75."
+
 ### Requirement: Telegram entry point for condition text and pet assignment
 In addition to the dashboard form, the system SHALL accept condition text and pet-assignment input via Telegram command, applying the identical update as the dashboard route so a claim can be unblocked from either surface.
 
