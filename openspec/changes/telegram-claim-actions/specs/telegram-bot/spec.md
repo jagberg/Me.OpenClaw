@@ -66,6 +66,13 @@ The system SHALL let the authorized user set or update a vet merchant's contact 
 - **WHEN** Justin sends `/vetemail` for a merchant that already has a row
 - **THEN** the email is replaced, not duplicated
 
+### Requirement: Batched claims notify once, self-contained
+Claims sharing one Gmail draft (a batch submission) SHALL be summarized in a single Telegram message, not one per claim. Because a specific Gmail draft cannot be deep-linked on mobile, the message SHALL carry the claim details (pet, per-item date/service/amount, total) so it can be reviewed without opening the draft, plus a best-effort Drafts subject-search link.
+
+#### Scenario: Three claims in one draft
+- **WHEN** three drafted claims share one `draft_id`
+- **THEN** a single message lists all three with amounts and a combined total, sent once
+
 ### Requirement: Notification on Petcover lifecycle status changes
 The system SHALL notify on claims entering Petcover lifecycle states: urgent tone for `info_requested` and `suspended` (Justin must act), informational for `acknowledged`, `settled` (with claimed-vs-paid amounts when available from the settlement event), and `declined` — with the same once-per-state dedup as the matched/drafted notifications.
 

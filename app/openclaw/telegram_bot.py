@@ -23,7 +23,12 @@ _application: Application | None = None
 
 
 def _is_authorized(username: str | None) -> bool:
-    return bool(username) and username == config.TELEGRAM_USERNAME
+    # Telegram usernames are case-insensitive; the API reports display casing
+    # (e.g. "Jagberg"), so an exact compare wrongly rejects the real user.
+    authorized = bool(username) and username.lower() == config.TELEGRAM_USERNAME.lower()
+    if not authorized:
+        logger.warning("Telegram update rejected — unauthorized username %r", username)
+    return authorized
 
 
 def get_registered_chat_id() -> int | None:

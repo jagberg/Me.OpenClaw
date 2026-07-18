@@ -8,12 +8,15 @@ from .scheduler import scheduler
 # marketing.au@ deliberately excluded — not claims-relevant (design.md).
 PETCOVER_STATUS_SENDERS = ["claims.au@petcovergroup.com", "requiredinfo.au@petcovergroup.com", "accounts.au@petcovergroup.com"]
 
-DRAFT_LINK = "https://mail.google.com/mail/u/0/#drafts/{draft_id}"
+# A specific Gmail draft can't be deep-linked on mobile (the #drafts/<id>
+# anchor is desktop-web only, and Gmail's app URL scheme has no open-draft-by-id
+# path). So notifications are self-contained — the claim summary is IN the
+# message — and the link just filters Drafts by subject as a best-effort jump.
+DRAFT_SEARCH_LINK = "https://mail.google.com/mail/u/0/#search/in%3Adrafts+subject%3A%22Vet+claim%22"
 
 # Statuses worth pushing to Justin's phone. Urgent = he has to act (blocked
 # claim, insurer waiting on him); the rest are informational lifecycle updates.
-NOTIFY_URGENT = ("matched", "info_requested", "suspended")
-NOTIFY_INFO = ("drafted", "acknowledged", "settled", "declined")
+NOTIFY_STATUSES = ("matched", "drafted", "info_requested", "suspended", "acknowledged", "settled", "declined")
 
 
 def _latest_settlement_detail(claim_id: int) -> dict:
@@ -26,54 +29,104 @@ def _latest_settlement_detail(claim_id: int) -> dict:
     return json.loads(row["detail"] or "{}") if row else {}
 
 
-def _notification_text(claim) -> str | None:
-    status = claim["status"]
-    if status == "matched":
-        return f"Claim #{claim['id']}: matched, needs input — {claim['flag']}"
+def _batch_key(claim) -> str:
+    """Claims sharing one draft are one submission (one Gmail draft, sent as a
+    unit) — notify about them together, not once per claim."""
+    return claim["draft_id"] or f"claim-{claim['id']}"
+
+
+def _claim_ids(group) -> str:
+    return ", ".join(f"#{c['id']}" for c in group)
+
+
+def _summarize_drafted(group) -> str:
+    pet = group[0]["pet_name"] or "your pet"
+    lines, total = [], 0.0
+    for c in sorted(group, key=lambda r: r["txn_date"]):
+        invoice = json.loads(c["invoice_data"]) if c["invoice_data"] else {}
+        amount = invoice.get("amount")
+        services = invoice.get("services")
+        if isinstance(services, list):
+            services = ", ".join(str(s) for s in services)
+        # trim the parenthetical split-notes off the service text for brevity
+        service = (services or c["condition_text"] or "claim").split(" (")[0].strip()
+        date = invoice.get("date") or c["txn_date"]
+        if amount is not None:
+            total += float(amount)
+            lines.append(f"  • {date} — {service} — ${float(amount):.2f}")
+        else:
+            lines.append(f"  • {date} — {service}")
+    count = len(group)
+    header = f"Claim(s) {_claim_ids(group)} for {pet} — ready to send ({count} item{'s' if count > 1 else ''}, ${total:.2f})"
+    return "\n".join(
+        [header, *lines, f'Open the Gmail app → Drafts (subject "Vet claim — {pet}"):', DRAFT_SEARCH_LINK]
+    )
+
+
+def _summarize_group(group) -> str | None:
+    status = group[0]["status"]
+    pet = group[0]["pet_name"] or "your pet"
+    ids = _claim_ids(group)
+    if status == "matched":  # matched claims aren't batched (no draft yet) — group is one claim
+        return f"Claim #{group[0]['id']} ({pet}): matched, needs input — {group[0]['flag']}"
     if status == "drafted":
-        return f"Claim #{claim['id']}: drafted, ready to review — {DRAFT_LINK.format(draft_id=claim['draft_id'])}"
+        return _summarize_drafted(group)
     if status == "info_requested":
-        return f"Claim #{claim['id']}: Petcover requested more information — reply needed."
+        return f"⚠ Claim(s) {ids} ({pet}): Petcover requested more information — reply needed."
     if status == "suspended":
-        return f"Claim #{claim['id']}: suspended by Petcover — action needed."
+        return f"⚠ Claim(s) {ids} ({pet}): suspended by Petcover — action needed."
     if status == "acknowledged":
-        return f"Claim #{claim['id']}: acknowledged by Petcover."
+        return f"Claim(s) {ids} ({pet}): acknowledged by Petcover."
     if status == "declined":
-        return f"Claim #{claim['id']}: declined by Petcover."
+        return f"Claim(s) {ids} ({pet}): declined by Petcover."
     if status == "settled":
-        detail = _latest_settlement_detail(claim["id"])
+        detail = _latest_settlement_detail(group[0]["id"])
         claimed, paid = detail.get("claimed_amount"), detail.get("paid_amount")
         if claimed is not None and paid is not None:
-            return f"Claim #{claim['id']}: settled — claimed ${claimed:.2f}, paid ${paid:.2f}."
-        return f"Claim #{claim['id']}: settled."
+            return f"Claim(s) {ids} ({pet}): settled — claimed ${claimed:.2f}, paid ${paid:.2f}."
+        return f"Claim(s) {ids} ({pet}): settled."
     return None
 
 
 def notify_claim_states(send_fn=None) -> None:
-    """Pushes a Telegram message when a claim enters a state Justin should
-    hear about (blocked at matched, drafted, or any Petcover lifecycle status),
-    and skips claims still sitting in the same (status, flag) as last notified.
+    """Pushes a Telegram message when a claim enters a state Justin should hear
+    about (blocked at matched, drafted, or any Petcover lifecycle status).
+    Claims sharing one draft are summarized in a single message; a group is
+    skipped when no member's (status, flag) changed since last notified.
     `send_fn` is overridable for tests (spy) — defaults to the real send."""
     send = send_fn or telegram_bot.send_message_sync
-    statuses = NOTIFY_URGENT + NOTIFY_INFO
     with db.get_connection() as conn:
         rows = conn.execute(
-            f"SELECT * FROM vet_claims WHERE status IN ({','.join('?' * len(statuses))})", statuses
+            "SELECT vc.*, p.name AS pet_name, bt.date AS txn_date, bt.amount AS txn_amount "
+            "FROM vet_claims vc "
+            "LEFT JOIN pets p ON p.id = vc.pet_id "
+            "JOIN bank_transactions bt ON bt.id = vc.transaction_id "
+            f"WHERE vc.status IN ({','.join('?' * len(NOTIFY_STATUSES))})",
+            NOTIFY_STATUSES,
         ).fetchall()
+
+    groups: dict[str, list] = {}
     for claim in rows:
         if claim["status"] == "matched" and not claim["flag"]:
             continue  # not actually blocked, nothing to tell Justin about
-        if claim["status"] == claim["telegram_notified_status"] and claim["flag"] == claim["telegram_notified_flag"]:
+        groups.setdefault(_batch_key(claim), []).append(claim)
+
+    for group in groups.values():
+        changed = any(
+            c["status"] != c["telegram_notified_status"] or c["flag"] != c["telegram_notified_flag"] for c in group
+        )
+        if not changed:
             continue
-        text = _notification_text(claim)
+        text = _summarize_group(group)
         if text is None:
             continue
         send(text)
         with db.get_connection() as conn:
-            conn.execute(
-                "UPDATE vet_claims SET telegram_notified_status = ?, telegram_notified_flag = ? WHERE id = ?",
-                (claim["status"], claim["flag"], claim["id"]),
-            )
+            for c in group:
+                conn.execute(
+                    "UPDATE vet_claims SET telegram_notified_status = ?, telegram_notified_flag = ? WHERE id = ?",
+                    (c["status"], c["flag"], c["id"]),
+                )
 
 
 def _pending_claims():

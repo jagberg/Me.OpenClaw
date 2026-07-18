@@ -15,13 +15,14 @@ non-conformant.
 `requests`/`urllib3` build their own SSLContext internally per-request and
 don't reliably honor one injected via the adapter/pool-manager layer (verified
 empirically — an injected context is silently dropped several layers deep in
-urllib3's connection-pool plumbing). The one choke point every TLS handshake
-in the process actually goes through is `SSLContext.wrap_socket`, so both fixes
-are applied there, right before the handshake: the OS trust store is merged in
-(`load_default_certs`, additive to whatever certifi certs are already loaded)
-and VERIFY_X509_STRICT is cleared — full chain and hostname verification stay
-on in both cases, only the missing local CA and the one strict flag are added
-back / relaxed.
+urllib3's connection-pool plumbing). Sync handshakes all go through
+`SSLContext.wrap_socket`; async ones (httpx/anyio, e.g. python-telegram-bot)
+go through `SSLContext.wrap_bio` instead — memory BIOs, no socket — so both
+choke points get the same treatment right before the handshake: the OS trust
+store is merged in (`load_default_certs`, additive to whatever certifi certs
+are already loaded) and VERIFY_X509_STRICT is cleared — full chain and
+hostname verification stay on in both cases, only the missing local CA and
+the one strict flag are added back / relaxed.
 """
 
 import ssl
@@ -35,11 +36,20 @@ def patch_requests_to_use_os_trust_store() -> None:
         return
 
     original_wrap_socket = ssl.SSLContext.wrap_socket
+    original_wrap_bio = ssl.SSLContext.wrap_bio
+
+    def _fix(context: ssl.SSLContext) -> None:
+        context.load_default_certs()
+        context.verify_flags &= ~ssl.VERIFY_X509_STRICT
 
     def wrap_socket(self, *args, **kwargs):
-        self.load_default_certs()
-        self.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        _fix(self)
         return original_wrap_socket(self, *args, **kwargs)
 
+    def wrap_bio(self, *args, **kwargs):
+        _fix(self)
+        return original_wrap_bio(self, *args, **kwargs)
+
     ssl.SSLContext.wrap_socket = wrap_socket
+    ssl.SSLContext.wrap_bio = wrap_bio
     _patched = True

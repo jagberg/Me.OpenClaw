@@ -4,6 +4,7 @@ python tests/test_telegram.py"""
 
 import json
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -143,7 +144,7 @@ def test_notification_dedup():
     sent = []
     pipeline.notify_claim_states(send_fn=sent.append)
     pipeline.notify_claim_states(send_fn=sent.append)
-    own_sent = [t for t in sent if f"#{claim_id}:" in t]
+    own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
     assert len(own_sent) == 1, "unchanged state must not notify twice"
 
 
@@ -156,7 +157,7 @@ def test_notification_fires_on_new_state():
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", ("invoice missing itemized services", claim_id))
     pipeline.notify_claim_states(send_fn=sent.append)
-    own_sent = [t for t in sent if f"#{claim_id}:" in t]
+    own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
     assert len(own_sent) == 2, "a genuinely new flag/status must notify again"
 
 
@@ -224,7 +225,7 @@ def test_notification_fires_on_info_requested():
     sent = []
     pipeline.notify_claim_states(send_fn=sent.append)
     pipeline.notify_claim_states(send_fn=sent.append)
-    own_sent = [t for t in sent if f"#{claim_id}:" in t]
+    own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
     assert len(own_sent) == 1, "info_requested must notify exactly once"
     assert "information" in own_sent[0]
 
@@ -240,7 +241,7 @@ def test_settled_notification_includes_amounts():
         )
     sent = []
     pipeline.notify_claim_states(send_fn=sent.append)
-    own_sent = [t for t in sent if f"#{claim_id}:" in t]
+    own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
     assert len(own_sent) == 1
     assert "100.00" in own_sent[0] and "80.00" in own_sent[0]
 
