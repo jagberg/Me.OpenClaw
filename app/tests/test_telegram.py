@@ -349,6 +349,19 @@ def test_suspicious_match_explains_why_and_offers_unmatch():
     assert "wrongemail123" in r["rejected_email_ids"]
 
 
+def test_invoice_items_reads_itemised_lines():
+    cid = _seed_matched_claim("ITEMS VET", pet_name="ItemsPet")
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
+            (json.dumps({"items": [{"description": "Consult", "amount": 140.0},
+                                   {"description": "Blood Profile", "amount": 135.0}]}), cid),
+        )
+    items = telegram_bot._invoice_items(cid)  # split-callback path — must not NameError on json
+    assert [i["description"] for i in items] == ["Consult", "Blood Profile"]
+    assert items[0]["amount"] == 140.0
+
+
 def test_apply_item_conditions_groups_and_fills_rows():
     cid = _seed_matched_claim("MULTI VET", condition_text=None, pet_name="MultiPet")
     with db.get_connection() as conn:
