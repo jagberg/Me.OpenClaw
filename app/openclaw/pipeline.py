@@ -120,7 +120,10 @@ def notify_claim_states(send_fn=None) -> None:
         text = _summarize_group(group)
         if text is None:
             continue
-        send(text)
+        # Drafted batches get a one-tap "Mark sent" button (no typing /sent,
+        # no per-claim id juggling — one action covers the whole submission).
+        markup = telegram_bot.mark_sent_button(group[0]["id"]) if group[0]["status"] == "drafted" else None
+        send(text, markup)
         with db.get_connection() as conn:
             for c in group:
                 conn.execute(

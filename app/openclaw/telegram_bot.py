@@ -2,8 +2,8 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from . import claim_forms, claim_status, config, db
 
@@ -212,6 +212,32 @@ async def vetemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(result["message"])
 
 
+def mark_sent_button(claim_id: int) -> InlineKeyboardMarkup:
+    """Inline '✅ Mark sent' button for a drafted-batch notification. One tap
+    marks the whole submission sent (any claim id in the batch resolves to the
+    shared draft), so Justin never types /sent or juggles per-claim ids."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Mark sent", callback_data=f"sent:{claim_id}")]])
+
+
+async def sent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    username = query.from_user.username if query.from_user else None
+    if not _is_authorized(username):
+        return
+    data = query.data or ""
+    if not data.startswith("sent:"):
+        return
+    try:
+        claim_id = int(data.split(":", 1)[1])
+    except ValueError:
+        return
+    result = claim_status.mark_sent(claim_id)
+    # Drop the button so it can't be tapped twice, and append the outcome to
+    # the original message rather than sending a new one (keeps the thread tidy).
+    await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+
+
 def build_application() -> Application:
     application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
@@ -222,6 +248,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("sent", sent_command))
     application.add_handler(CommandHandler("resolved", resolved_command))
     application.add_handler(CommandHandler("vetemail", vetemail_command))
+    application.add_handler(CallbackQueryHandler(sent_callback))
     return application
 
 
@@ -246,10 +273,10 @@ async def stop_polling() -> None:
     _application = None
 
 
-def send_message_sync(text: str) -> None:
+def send_message_sync(text: str, reply_markup=None) -> None:
     """Outbound push from synchronous callers (the APScheduler pipeline job
     runs on its own thread, not the FastAPI event loop) — spins up a throwaway
-    event loop for the one call."""
+    event loop for the one call. Optional reply_markup attaches inline buttons."""
     chat_id = get_registered_chat_id()
     if chat_id is None:
         logger.warning("Telegram notification skipped — no registered chat ID (send /start to the bot).")
@@ -260,6 +287,6 @@ def send_message_sync(text: str) -> None:
 
     async def _send() -> None:
         bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
-        await bot.send_message(chat_id=chat_id, text=text)
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
 
     asyncio.run(_send())

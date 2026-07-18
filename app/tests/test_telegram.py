@@ -142,8 +142,8 @@ def test_notification_dedup():
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", ("condition text missing", claim_id))
     sent = []
-    pipeline.notify_claim_states(send_fn=sent.append)
-    pipeline.notify_claim_states(send_fn=sent.append)
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
     assert len(own_sent) == 1, "unchanged state must not notify twice"
 
@@ -153,10 +153,10 @@ def test_notification_fires_on_new_state():
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", ("condition text missing", claim_id))
     sent = []
-    pipeline.notify_claim_states(send_fn=sent.append)
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", ("invoice missing itemized services", claim_id))
-    pipeline.notify_claim_states(send_fn=sent.append)
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
     assert len(own_sent) == 2, "a genuinely new flag/status must notify again"
 
@@ -223,8 +223,8 @@ def test_notification_fires_on_info_requested():
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET status = 'info_requested' WHERE id = ?", (claim_id,))
     sent = []
-    pipeline.notify_claim_states(send_fn=sent.append)
-    pipeline.notify_claim_states(send_fn=sent.append)
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
     assert len(own_sent) == 1, "info_requested must notify exactly once"
     assert "information" in own_sent[0]
@@ -240,7 +240,7 @@ def test_settled_notification_includes_amounts():
             (claim_id, json.dumps({"claimed_amount": 100.0, "paid_amount": 80.0}), now),
         )
     sent = []
-    pipeline.notify_claim_states(send_fn=sent.append)
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     own_sent = [t for t in sent if re.search(rf"#{claim_id}(?!\d)", t)]
     assert len(own_sent) == 1
     assert "100.00" in own_sent[0] and "80.00" in own_sent[0]
@@ -271,6 +271,25 @@ def test_resolved_records_event():
             (claim_id,),
         ).fetchone()
     assert row is not None
+
+
+def test_drafted_batch_notifies_once_with_button():
+    a = _seed_drafted_claim("BTN VET A", draft_id="draft-btn-1")
+    b = _seed_drafted_claim("BTN VET B", draft_id="draft-btn-1")
+    captured = []
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: captured.append((text, markup)))
+    mine = [(t, m) for t, m in captured if f"#{a}" in t and f"#{b}" in t]
+    assert len(mine) == 1, "a 2-claim batch must produce exactly one message"
+    text, markup = mine[0]
+    assert markup is not None, "drafted batch must carry a mark-sent button"
+    cb = markup.inline_keyboard[0][0].callback_data
+    assert cb.startswith("sent:")
+    # tapping the button (its callback claim id) advances the whole batch
+    telegram_bot.handle_sent(AUTHORIZED_USER, int(cb.split(":", 1)[1]))
+    with db.get_connection() as conn:
+        statuses = [r["status"] for r in conn.execute(
+            "SELECT status FROM vet_claims WHERE id IN (?, ?)", (a, b)).fetchall()]
+    assert statuses == ["sent", "sent"]
 
 
 if __name__ == "__main__":
