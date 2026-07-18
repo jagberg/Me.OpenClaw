@@ -106,12 +106,12 @@ def _summarize_matched_flag(claim, label: str) -> str:
     if "possible additional invoice" in flag:
         gap = flag.split("unexplained")[-1].strip() or "some amount"
         lines.append(
-            f"Bank charge is {gap} more than the matched invoice — possibly the wrong invoice or a "
-            "missing one. Worth checking Gmail."
+            f"Bank charge is {gap} more than the matched invoice — likely the wrong invoice. "
+            "Tap below to reject it and re-search."
         )
     elif "condition" not in flag.lower():
         lines.append(flag)
-    if claim["pet_id"] is None:
+    if claim["pet_id"] is None and "possible additional invoice" not in flag:
         lines.append("Which pet?")
     return "\n".join(lines)
 
@@ -178,8 +178,11 @@ def notify_claim_states(send_fn=None) -> None:
         # Attach the right inline controls: drafted → one-tap Mark-sent;
         # matched-needs-condition → past-condition pick-list + type-your-own.
         lead = group[0]
+        suspicious = lead["flag"] and "possible additional invoice" in lead["flag"]
         if lead["status"] == "drafted":
             markup = telegram_bot.mark_sent_button(lead["id"])
+        elif lead["status"] == "matched" and suspicious:
+            markup = telegram_bot.wrong_invoice_button(lead["id"])  # bad match — fix it first
         elif lead["status"] == "matched" and lead["pet_id"] is None:
             markup = telegram_bot.pet_keyboard(lead["id"])  # assign pet first
         elif _needs_condition(lead) and lead["pet_id"]:

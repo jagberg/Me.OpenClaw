@@ -16,7 +16,7 @@ os.environ["DATABASE_PATH"] = os.path.join(_tmpdir, "test_telegram.db")
 os.environ.setdefault("GEMINI_API_KEY", "")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 
-from openclaw import claim_forms, db, pipeline, telegram_bot  # noqa: E402
+from openclaw import claim_forms, db, invoice_matching, pipeline, telegram_bot  # noqa: E402
 
 AUTHORIZED_USER = "jagberg"
 UNAUTHORIZED_USER = "someone_else"
@@ -323,12 +323,12 @@ def test_condition_prompt_lists_items_and_offers_prior_conditions():
         assert conn.execute("SELECT condition_text FROM vet_claims WHERE id = ?", (cid,)).fetchone()[0] == "Arthritis"
 
 
-def test_unassigned_claim_explains_why_and_offers_pet_buttons():
-    cid = _seed_matched_claim("UNASSIGNED VET", pet_name="TmpPet")
+def test_suspicious_match_explains_why_and_offers_unmatch():
+    cid = _seed_matched_claim("MISMATCH VET", pet_name="MisPet")
     with db.get_connection() as conn:
         conn.execute(
-            "UPDATE vet_claims SET pet_id = NULL, flag = 'possible additional invoice — unexplained $500.00' "
-            "WHERE id = ?",
+            "UPDATE vet_claims SET matched_email_id = 'wrongemail123', "
+            "flag = 'possible additional invoice — unexplained $500.00' WHERE id = ?",
             (cid,),
         )
     captured = []
@@ -337,9 +337,16 @@ def test_unassigned_claim_explains_why_and_offers_pet_buttons():
     assert len(mine) == 1
     text, markup = mine[0]
     assert "more than the matched invoice" in text  # explains the unexplained gap
-    assert "Which pet?" in text
-    labels = [b.text for row in markup.inline_keyboard for b in row]
-    assert "Aari" in labels and "Echo" in labels
+    assert markup.inline_keyboard[0][0].callback_data == f"unmatch:{cid}"
+    # unmatch resets to pending_match and remembers the rejected email
+    result = invoice_matching.unmatch(cid)
+    assert result["ok"] is True
+    with db.get_connection() as conn:
+        r = conn.execute(
+            "SELECT status, matched_email_id, rejected_email_ids FROM vet_claims WHERE id = ?", (cid,)
+        ).fetchone()
+    assert r["status"] == "pending_match" and r["matched_email_id"] is None
+    assert "wrongemail123" in r["rejected_email_ids"]
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from telegram import Bot, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from . import claim_forms, claim_status, config, db
+from . import claim_forms, claim_status, config, db, invoice_matching
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +245,11 @@ def condition_keyboard(claim_id: int, pet_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def wrong_invoice_button(claim_id: int) -> InlineKeyboardMarkup:
+    """'❌ Wrong invoice' for a suspicious match — rejects it and re-searches."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Wrong invoice", callback_data=f"unmatch:{claim_id}")]])
+
+
 def pet_keyboard(claim_id: int) -> InlineKeyboardMarkup:
     """One button per known pet, to assign an unattributed claim in a tap."""
     with db.get_connection() as conn:
@@ -289,6 +294,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         _, cid, pet_id = data.split(":")
         result = claim_forms.assign_pet(int(cid), int(pet_id))
         await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+    elif data.startswith("unmatch:"):
+        result = invoice_matching.unmatch(int(data.split(":", 1)[1]))
+        await query.edit_message_text(text=f"{query.message.text}\n\n❌ {result['message']}")
 
 
 async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

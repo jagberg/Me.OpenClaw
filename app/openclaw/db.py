@@ -114,6 +114,7 @@ _VET_CLAIMS_ADDED_COLUMNS = {
     "telegram_notified_flag": "TEXT",
     "reviewed_at": "TEXT",
     "petcover_reference": "TEXT",
+    "rejected_email_ids": "TEXT",  # JSON list of invoice emails Justin unmatched — never re-match these
 }
 
 # Echo's claim_email stays NULL until Justin supplies Bow Wow Insurance's process

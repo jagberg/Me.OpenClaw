@@ -138,10 +138,14 @@ def match_claim(claim) -> bool:
     txn_date = date.fromisoformat(claim["txn_date"])
     queries = _build_queries(claim["txn_merchant"], txn_date, claim["invoice_request_sent_at"])
 
+    rejected = set(json.loads(claim["rejected_email_ids"]) if claim["rejected_email_ids"] else [])
+
     service = gmail_client.build_service()
     for query in queries:
         response = service.users().messages().list(userId="me", q=query, maxResults=5).execute()
         for item in response.get("messages", []):
+            if item["id"] in rejected:
+                continue  # Justin unmatched this invoice — don't re-grab it
             message = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
             invoice = _extract_invoice(gmail_client.full_message_text(service, message))
             if not invoice or invoice.get("amount") is None:
@@ -155,6 +159,29 @@ def match_claim(claim) -> bool:
             _mark_matched(claim["id"], item["id"], invoice, flag)
             return True
     return False
+
+
+def unmatch(claim_id: int) -> dict:
+    """Rejects a wrong invoice match: remembers the rejected email so the
+    matcher won't re-grab it, then resets the claim to 'pending_match' so the
+    next pipeline run searches Gmail again. Shared by the Telegram button."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim is None:
+            return {"ok": False, "message": f"No claim #{claim_id} found."}
+        if not claim["matched_email_id"]:
+            return {"ok": False, "message": f"Claim #{claim_id} has no matched invoice to reject."}
+        rejected = json.loads(claim["rejected_email_ids"]) if claim["rejected_email_ids"] else []
+        if claim["matched_email_id"] not in rejected:
+            rejected.append(claim["matched_email_id"])
+        conn.execute(
+            "UPDATE vet_claims SET status = 'pending_match', matched_email_id = NULL, invoice_data = NULL, "
+            "invoice_file_path = NULL, flag = NULL, rejected_email_ids = ?, "
+            "telegram_notified_status = NULL, telegram_notified_flag = NULL, updated_at = ? WHERE id = ?",
+            (json.dumps(rejected), now, claim_id),
+        )
+    return {"ok": True, "message": f"Claim #{claim_id}: wrong invoice rejected — re-searching Gmail for the right one."}
 
 
 def _lookup_vet_email(merchant: str) -> str | None:
