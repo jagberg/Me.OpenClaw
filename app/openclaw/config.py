@@ -53,3 +53,12 @@ OWNER_BANK_ACCOUNT_NUMBER = os.environ.get("OWNER_BANK_ACCOUNT_NUMBER", "")
 # copied chat ID — the bot self-registers its chat ID via /start, see telegram_bot.py).
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USERNAME = os.environ.get("TELEGRAM_USERNAME", "jagberg")
+
+# Twice-daily Google Drive DB backup (drive_backup.py). Folder ID is from
+# https://drive.google.com/drive/folders/1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2
+DRIVE_BACKUP_FOLDER_ID = os.environ.get("DRIVE_BACKUP_FOLDER_ID", "1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2")
+DRIVE_BACKUP_PREFIX = os.environ.get("DRIVE_BACKUP_PREFIX", "OpenClawBettyVet")
+DRIVE_BACKUP_LOG_SUBFOLDER = os.environ.get("DRIVE_BACKUP_LOG_SUBFOLDER", "logs")
+# Durable local record: written even if Drive itself is unreachable, so a
+# backup failure is never silent (CLAUDE.md: failures must be visible).
+DB_BACKUP_LOCAL_LOG = os.environ.get("DB_BACKUP_LOCAL_LOG", "./data/backup.log")

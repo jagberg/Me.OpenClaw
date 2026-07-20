@@ -210,6 +210,42 @@ def _pending_claims():
         ).fetchall()
 
 
+def _reconcile_sent_invoice_requests() -> None:
+    """Justin sends invoice-request drafts himself (CLAUDE.md: never auto-send)
+    and is expected to click 'mark invoice-request sent' on the dashboard
+    afterward — but real usage shows that click gets missed. Missing it keeps
+    invoice_request_sent_at NULL, which keeps the Gmail search window pinned to
+    the original narrow +/-INVOICE_MATCH_WINDOW_DAYS range (see
+    invoice_matching._date_range_clause), so a reply arriving weeks later never
+    gets searched at all — confirmed live: two real vet replies sat unmatched
+    for this exact reason. Detected here via Gmail's own SENT/DRAFT labels on
+    the stored message id — unambiguous, no Sent-folder text-matching needed.
+    Runs every pipeline tick (every VET_CLAIM_PIPELINE_INTERVAL_MINUTES), so
+    the daily-check ask is covered many times over."""
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, draft_id FROM vet_claims WHERE flag = 'invoice_request_drafted' "
+            "AND invoice_request_sent_at IS NULL AND draft_id IS NOT NULL"
+        ).fetchall()
+    if not rows:
+        return
+
+    service = gmail_client.build_service()
+    now = datetime.now(timezone.utc).isoformat()
+    for row in rows:
+        try:
+            message = service.users().messages().get(userId="me", id=row["draft_id"], format="minimal").execute()
+        except Exception:
+            continue  # can't confirm either way this cycle — retry next run
+        labels = message.get("labelIds", [])
+        if "SENT" in labels and "DRAFT" not in labels:
+            with db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE vet_claims SET invoice_request_sent_at = ?, flag = NULL, updated_at = ? WHERE id = ?",
+                    (now, now, row["id"]),
+                )
+
+
 def _maybe_draft_invoice_request(claim) -> None:
     if claim["invoice_request_sent_at"] or claim["flag"] == "invoice_request_drafted":
         return  # already sent (rolling recheck handles it), or already drafted awaiting Justin
@@ -268,6 +304,7 @@ def poll_petcover_status() -> None:
 
 def run_once() -> None:
     vet_detection.classify_unflagged()
+    _reconcile_sent_invoice_requests()
 
     for claim in _pending_claims():
         if not invoice_matching.match_claim(claim):

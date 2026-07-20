@@ -13,10 +13,14 @@ ssl_compat.patch_requests_to_use_os_trust_store()
 
 # gmail.send alone does NOT cover drafts.create (confirmed live: 403 insufficient
 # scope) — drafts need gmail.compose. Requires re-running scripts/gmail_auth.py.
+# drive.file added for db_backup.py — scoped to files this app creates, not
+# full Drive access. Adding it to an existing token also requires re-running
+# scripts/gmail_auth.py once (new scope needs fresh consent).
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 

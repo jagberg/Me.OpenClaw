@@ -34,6 +34,26 @@ def _within_ceiling(invoice_amount: float, txn_amount: float) -> bool:
     return invoice_amount <= abs(txn_amount) + AMOUNT_TOLERANCE_FLAT
 
 
+def _invoice_date_plausible(invoice: dict, txn_date: date) -> bool:
+    """Guards against a real invoice for a DIFFERENT visit slipping through
+    under the ceiling. The Gmail search window is intentionally wide once
+    invoice_request_sent_at is reconciled (a reply can arrive months late),
+    but the invoice's OWN date should still sit close to the actual
+    transaction regardless of when the reply arrived — confirmed live: an
+    open-ended window let one Shire Vet claim grab another Shire Vet claim's
+    real invoice (correct vet, wrong visit) purely because it fit under the
+    ceiling. A missing/unparseable invoice date can't be checked — allow
+    through unchanged rather than reject on absence of evidence."""
+    raw_date = invoice.get("date")
+    if not raw_date:
+        return True
+    try:
+        invoice_date = date.fromisoformat(raw_date[:10])
+    except ValueError:
+        return True
+    return abs((invoice_date - txn_date).days) <= config.INVOICE_MATCH_WINDOW_DAYS
+
+
 def _unexplained_remainder(invoice_amount: float, txn_amount: float) -> float | None:
     """Bank charge minus invoice total, when it exceeds a plausible card
     surcharge — a sign the charge covered another invoice too."""
@@ -113,15 +133,41 @@ def _date_range_clause(txn_date: date, invoice_request_sent_at: str | None) -> s
     return f"after:{after.isoformat()} before:{before.isoformat()}"
 
 
-def _build_queries(merchant: str, txn_date: date, invoice_request_sent_at: str | None) -> list[str]:
+def _build_queries(merchant: str, txn_date: date, invoice_request_sent_at: str | None) -> list[tuple[str, bool]]:
+    """Each query pairs with whether a candidate it returns still needs
+    content-level vet confirmation (see _forward_confirms_vet) before being
+    trusted — the spouse fallback has no merchant term in the query itself,
+    so it needs that extra gate; the merchant query already searched on the
+    vet's name."""
     date_clause = _date_range_clause(txn_date, invoice_request_sent_at)
-    queries = [f"{_search_terms(merchant)} {date_clause}"]
+    queries = [(f"{_search_terms(merchant)} {date_clause}", False)]
     if config.SPOUSE_EMAIL:
         # Invoices sometimes get forwarded from a spouse's address instead of
         # arriving from the vet directly — same date window, no merchant terms
-        # required since a forward's subject/body rarely repeats it verbatim.
-        queries.append(f"from:{config.SPOUSE_EMAIL} {date_clause}")
+        # in the QUERY itself since a forward's subject/body rarely repeats it
+        # verbatim as an exact phrase (Gmail query-side phrase matching is
+        # brittle). Confirmed instead against the fetched message body below.
+        queries.append((f"from:{config.SPOUSE_EMAIL} {date_clause}", True))
     return queries
+
+
+def _forward_confirms_vet(text: str, merchant: str, known_vet_email: str | None) -> bool:
+    """A forwarded invoice's quoted content usually still names the vet or
+    shows their address in the quoted 'From:' line — require one of those to
+    actually appear before trusting a spouse-forward match. Without this, an
+    open-ended date window (set once invoice_request_sent_at is reconciled)
+    can match ANY forwarded invoice from the spouse, wrong vet included —
+    confirmed live: two claims for two different vets both matched the same
+    unrelated forward purely because it was under the ceiling."""
+    lowered = text.lower()
+    if known_vet_email and known_vet_email.lower() in lowered:
+        return True
+    # individual significant merchant words, not the full phrase — a forward
+    # rarely repeats a multi-word bank descriptor verbatim, but usually
+    # contains at least the vet's own name (e.g. "Kingsgrove" out of the bank
+    # descriptor "Kings Vet KINGSGROVE NSW").
+    words = [w for w in _search_terms(merchant).split() if len(w) > 3]
+    return any(w.lower() in lowered for w in words)
 
 
 def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None = None) -> None:
@@ -142,19 +188,32 @@ def match_claim(claim) -> bool:
     queries = _build_queries(claim["txn_merchant"], txn_date, claim["invoice_request_sent_at"])
 
     rejected = set(json.loads(claim["rejected_email_ids"]) if claim["rejected_email_ids"] else [])
+    known_vet_email = None
+    vet_email_looked_up = False
 
     service = gmail_client.build_service()
-    for query in queries:
+    for query, needs_vet_confirmation in queries:
         response = service.users().messages().list(userId="me", q=query, maxResults=5).execute()
         for item in response.get("messages", []):
             if item["id"] in rejected:
                 continue  # Justin unmatched this invoice — don't re-grab it
             message = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
-            invoice = _extract_invoice(gmail_client.full_message_text(service, message))
+            text = gmail_client.full_message_text(service, message)
+
+            if needs_vet_confirmation:
+                if not vet_email_looked_up:
+                    known_vet_email = _lookup_vet_email(claim["txn_merchant"])
+                    vet_email_looked_up = True
+                if not _forward_confirms_vet(text, claim["txn_merchant"], known_vet_email):
+                    continue
+
+            invoice = _extract_invoice(text)
             if not invoice or invoice.get("amount") is None:
                 continue
             total = float(invoice["amount"])
             if not _within_ceiling(total, claim["txn_amount"]):
+                continue
+            if not _invoice_date_plausible(invoice, txn_date):
                 continue
             invoice["claimable_amount"] = claimable_amount(invoice)
             remainder = _unexplained_remainder(total, claim["txn_amount"])
