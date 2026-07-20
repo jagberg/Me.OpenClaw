@@ -10,6 +10,10 @@ from pypdf import PdfReader, PdfWriter
 
 from . import config, db, gmail_client
 
+# Shared by the single-claim and batch draft guards: Petcover requires the
+# itemised invoice attached, so a claim without one on file isn't draftable yet.
+_AWAITING_INVOICE_FLAG = "awaiting itemised invoice from vet — not drafting until it can be attached"
+
 # Field map for Petcover's real fillable AcroForm (Petcover-AU-Claim-Vet-EN-V20211201),
 # verified against the actual file: field names are generic ("Text Field 90")
 # so this maps them to logical keys by their on-page position, cross-checked
@@ -271,7 +275,7 @@ def process_claim_batch(claim_ids: list[int], continuation: bool | None = None) 
     missing_invoice = [c["id"] for c in claims if not c["invoice_file_path"]]
     if missing_invoice:
         for cid in missing_invoice:
-            _flag(cid, "awaiting itemised invoice from vet — not drafting until it can be attached")
+            _flag(cid, _AWAITING_INVOICE_FLAG)
         return
 
     data = _shared_fields(pet, continuation)
@@ -424,7 +428,7 @@ def process_claim(claim_id: int, continuation: bool | None = None) -> None:
     # Petcover requires the itemised invoice attached, not just the form — so
     # don't draft until the invoice PDF is on file (awaiting the vet's reply).
     if not claim["invoice_file_path"]:
-        _flag(claim_id, "awaiting itemised invoice from vet — not drafting until it can be attached")
+        _flag(claim_id, _AWAITING_INVOICE_FLAG)
         return
 
     invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}

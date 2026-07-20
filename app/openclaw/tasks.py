@@ -15,8 +15,8 @@ Task: {description}
 def _extract_follow_up(description: str) -> datetime | None:
     prompt = FOLLOW_UP_PROMPT.format(now=datetime.now(timezone.utc).isoformat(), description=description)
     raw = llm.extract(prompt, purpose="follow_up_extraction")
-    # Gemini often wraps JSON in a ```json ... ``` markdown fence; pull out the
-    # {...} object itself rather than relying on the fence format.
+    # The model often wraps JSON in a ```json ... ``` markdown fence; pull out
+    # the {...} object itself rather than relying on the fence format.
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1 or end == -1:
         return None

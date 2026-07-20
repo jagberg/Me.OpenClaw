@@ -16,12 +16,14 @@ The system SHALL expose a single module (`llm`) providing `chat(messages, ...)` 
 
 ### Requirement: Configurable provider and model
 
-The provider and model SHALL be selected by environment variable, defaulting to Cerebras `gpt-oss-120b`. Switching provider (Cerebras, Groq, OpenAI, or the legacy Gemini) MUST require only configuration changes, not code changes, for any OpenAI-compatible provider.
+The provider and model SHALL be selected by environment variable, defaulting to Groq `llama-3.3-70b-versatile`. Switching provider (Groq, Cerebras, OpenAI, or the legacy Gemini) MUST require only configuration changes, not code changes, for any OpenAI-compatible provider.
+
+> Note: the default was originally Cerebras `gpt-oss-120b` (larger free budget), but Cerebras' free inference tier is sold-out for this account — every free model returns `402 payment_required` (verified live, tasks.md 5.1). Groq is the working default; Cerebras stays selectable for when capacity returns. This is the single-provider-failure the abstraction was built to absorb.
 
 #### Scenario: Default provider
 
 - **WHEN** no LLM provider env var is set
-- **THEN** the system uses the Cerebras provider with model `gpt-oss-120b`
+- **THEN** the system uses the Groq provider with model `llama-3.3-70b-versatile`
 
 #### Scenario: Switching provider by config
 
