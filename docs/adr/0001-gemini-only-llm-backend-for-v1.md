@@ -1,7 +1,7 @@
 # ADR-0001: Use Gemini 2.5 Flash (AI Studio free tier) as sole LLM backend for v1
 
 **Date**: 2026-07-08
-**Status**: accepted
+**Status**: superseded by ADR-0009
 **Deciders**: Justin
 
 ## Context

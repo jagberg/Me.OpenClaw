@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from . import config
 
@@ -66,6 +67,15 @@ CREATE TABLE IF NOT EXISTS bank_transactions (
 CREATE TABLE IF NOT EXISTS vet_contacts (
     merchant TEXT PRIMARY KEY,
     email TEXT NOT NULL
+);
+
+-- Merchants the keyword heuristic wrongly flags as vet (retail/online stores
+-- with "vet"/"pets" in the name, e.g. "sp vets love pets"). Justin adds these
+-- from Telegram; vet_detection checks them (substring, lowercased) before the
+-- keyword list so they never become claims.
+CREATE TABLE IF NOT EXISTS non_vet_merchants (
+    pattern TEXT PRIMARY KEY,
+    added_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS vet_claims (
@@ -153,3 +163,24 @@ def get_connection(path: str | None = None):
         conn.commit()
     finally:
         conn.close()
+
+
+def get_non_vet_patterns() -> list[str]:
+    """Lowercased merchant substrings that must never be classified as vet."""
+    with get_connection() as conn:
+        return [r[0] for r in conn.execute("SELECT pattern FROM non_vet_merchants")]
+
+
+def add_non_vet_pattern(pattern: str) -> bool:
+    """Records a non-vet merchant substring (lowercased). Returns False if the
+    pattern was blank or already present."""
+    pattern = pattern.strip().lower()
+    if not pattern:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO non_vet_merchants (pattern, added_at) VALUES (?, ?)",
+            (pattern, now),
+        )
+        return cur.rowcount > 0

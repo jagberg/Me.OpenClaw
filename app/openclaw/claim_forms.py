@@ -266,6 +266,14 @@ def process_claim_batch(claim_ids: list[int], continuation: bool | None = None) 
             _flag(cid, "condition text missing — enter manually on dashboard")
         return
 
+    # Petcover requires every invoice attached — don't draft the batch until all
+    # claims have their invoice PDF on file (awaiting the vet's reply).
+    missing_invoice = [c["id"] for c in claims if not c["invoice_file_path"]]
+    if missing_invoice:
+        for cid in missing_invoice:
+            _flag(cid, "awaiting itemised invoice from vet — not drafting until it can be attached")
+        return
+
     data = _shared_fields(pet, continuation)
     for i, c in enumerate(claims, start=1):
         invoice = json.loads(c["invoice_data"]) if c["invoice_data"] else {}
@@ -411,6 +419,12 @@ def process_claim(claim_id: int, continuation: bool | None = None) -> None:
 
     if not claim["condition_text"]:
         _flag(claim_id, "condition text missing — enter manually on dashboard")
+        return
+
+    # Petcover requires the itemised invoice attached, not just the form — so
+    # don't draft until the invoice PDF is on file (awaiting the vet's reply).
+    if not claim["invoice_file_path"]:
+        _flag(claim_id, "awaiting itemised invoice from vet — not drafting until it can be attached")
         return
 
     invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}

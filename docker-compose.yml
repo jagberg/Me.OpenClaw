@@ -7,7 +7,7 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - openclaw-data:/data
-
-volumes:
-  openclaw-data:
+      # Bind the real data dir (DB + Gmail token/credentials). Single source of
+      # truth shared with the main checkout; the feature worktree ships new code
+      # only, never its own copy of the data. ponytail: one data dir, not two.
+      - C:/code/Me.OpenClaw/app/data:/data
