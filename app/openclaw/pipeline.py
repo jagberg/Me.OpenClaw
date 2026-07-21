@@ -172,13 +172,23 @@ def notify_split_proposals(send_fn=None) -> None:
         if len(claims) != len(claim_ids):
             continue
         total = float(invoice["amount"])
+        combined = sum(abs(c["amount"]) for c in claims)
+        primary = max(claims, key=lambda c: (abs(c["amount"]), -c["id"]))
+        others = [c for c in claims if c["id"] != primary["id"]]
         lines = [
-            f"🔀 One invoice, {len(claims)} charges — {claims[0]['merchant']}",
-            f"Invoice {invoice.get('date') or '(no date)'} totals ${total:.2f}, matching these charges together:",
+            f"🔀 One invoice paid over {len(claims)} charges — {claims[0]['merchant']}",
+            f"Invoice {invoice.get('date') or '(no date)'} for ${total:.2f}:",
             *[f" • #{c['id']} — ${abs(c['amount']):.2f} ({c['date']})" for c in claims],
-            "Which claim should carry the invoice? The other will be closed as covered.",
+            f"Charges together: ${combined:.2f}.",
         ]
-        send("\n".join(lines), telegram_bot.split_bill_keyboard(proposal["id"], claims))
+        if invoice.get("payments_confirmed"):
+            lines.append("The invoice's own payment records list both charge amounts.")
+        lines.append(
+            f"Merge? #{primary['id']} will carry the invoice; "
+            f"#{', #'.join(str(c['id']) for c in others)} closes as its other payment. "
+            "(Petcover sees the invoice, not the bank charges — no split needed.)"
+        )
+        send("\n".join(lines), telegram_bot.merge_bill_keyboard(proposal["id"]))
         with db.get_connection() as conn:
             conn.execute(
                 "UPDATE split_proposals SET notified_at = ? WHERE id = ?",

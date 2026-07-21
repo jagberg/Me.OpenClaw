@@ -526,6 +526,96 @@ def test_split_proposal_created_resolved_and_sibling_absorbed():
     assert invoice_matching.resolve_split_proposal(999, claim_b)["ok"] is False
 
 
+def test_merge_split_proposal_auto_picks_larger_charge():
+    """No arbitrary pick: Petcover sees the invoice, not the bank charges, so
+    the larger charge's claim carries the invoice deterministically."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM split_proposals")
+        claim_small = _insert_pending_claim(conn, "MEDIPAWS TEST", -551.06, "2026-04-13")
+        claim_large = _insert_pending_claim(conn, "MEDIPAWS TEST", -1970.40, "2026-04-13")
+        import json as _json
+        conn.execute(
+            "INSERT INTO split_proposals (email_id, invoice_json, claim_ids, created_at) VALUES (?, ?, ?, ?)",
+            ("email-m-1", _json.dumps({"date": "2026-04-13", "amount": 2521.46, "items": []}),
+             _json.dumps([claim_small, claim_large]), datetime.now(timezone.utc).isoformat()),
+        )
+        pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    result = invoice_matching.merge_split_proposal(pid)
+    assert result["ok"], result["message"]
+    with db.get_connection() as conn:
+        large = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_large,)).fetchone()[0]
+        small = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_small,)).fetchone()[0]
+    assert large == "matched" and small == "absorbed", "larger charge must carry the invoice"
+
+
+def test_reject_split_proposal_flags_and_never_reproposes():
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM split_proposals")
+        claim_a = _insert_pending_claim(conn, "MEDIPAWS TEST", -551.06, "2026-04-13")
+        claim_b = _insert_pending_claim(conn, "MEDIPAWS TEST", -1970.40, "2026-04-13")
+        import json as _json
+        conn.execute(
+            "INSERT INTO split_proposals (email_id, invoice_json, claim_ids, created_at) VALUES (?, ?, ?, ?)",
+            ("email-r-1", _json.dumps({"date": "2026-04-13", "amount": 2521.46}),
+             _json.dumps([claim_a, claim_b]), datetime.now(timezone.utc).isoformat()),
+        )
+        pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    result = invoice_matching.reject_split_proposal(pid)
+    assert result["ok"]
+    with db.get_connection() as conn:
+        flags = [r[0] for r in conn.execute(
+            "SELECT flag FROM vet_claims WHERE id IN (?, ?)", (claim_a, claim_b))]
+        status = conn.execute("SELECT status FROM split_proposals WHERE id = ?", (pid,)).fetchone()[0]
+    assert status == "rejected"
+    assert all(f and "match this charge manually" in f for f in flags)
+    # a rejected pair must never be re-proposed
+    with db.get_connection() as conn:
+        claim_row = conn.execute(
+            "SELECT vet_claims.*, bank_transactions.amount AS txn_amount, "
+            "bank_transactions.merchant AS txn_merchant FROM vet_claims "
+            "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            "WHERE vet_claims.id = ?", (claim_a,),
+        ).fetchone()
+    oversized = {"date": "2026-04-13", "amount": 2521.46, "_email_id": "email-r-1"}
+    assert invoice_matching._propose_split(claim_row, oversized) is None, "rejected pair must not re-flag as a merge"
+    with db.get_connection() as conn:
+        assert conn.execute("SELECT count(*) FROM split_proposals").fetchone()[0] == 1, "no new proposal after reject"
+
+
+def test_propose_split_detects_payment_records():
+    """The invoice's own payment section listing both charge amounts is the
+    merge evidence — recorded on the proposal for the Telegram message."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM split_proposals")
+        claim_a = _insert_pending_claim(conn, "MEDIPAWS TEST", -551.06, "2026-04-13")
+        _insert_pending_claim(conn, "MEDIPAWS TEST", -1970.40, "2026-04-13")
+        claim_row = conn.execute(
+            "SELECT vet_claims.*, bank_transactions.amount AS txn_amount, "
+            "bank_transactions.merchant AS txn_merchant FROM vet_claims "
+            "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            "WHERE vet_claims.id = ?", (claim_a,),
+        ).fetchone()
+    # real payment-section shape: 'Eftpos/Visa/Mastercard : -1970.40'
+    text_amounts = invoice_matching._text_amounts(
+        "Total: $2521.46 Payment method: Eftpos/Visa/Mastercard : -1970.40 Eftpos/Visa/Mastercard : -551.06"
+    )
+    oversized = {"date": "2026-04-13", "amount": 2521.46, "_email_id": "email-p-1", "_text_amounts": text_amounts}
+    assert invoice_matching._propose_split(claim_row, oversized)
+    import json as _json
+    with db.get_connection() as conn:
+        stored = _json.loads(conn.execute("SELECT invoice_json FROM split_proposals").fetchone()[0])
+    assert stored["payments_confirmed"] is True
+
+
 def test_split_proposal_not_created_when_charges_dont_explain_invoice():
     db.init_db()
     with db.get_connection() as conn:

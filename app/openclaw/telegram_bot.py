@@ -329,16 +329,14 @@ def wrong_invoice_button(claim_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Wrong invoice", callback_data=f"unmatch:{claim_id}")]])
 
 
-def split_bill_keyboard(proposal_id: int, claims: list[dict]) -> InlineKeyboardMarkup:
-    """One button per charge for a multi-charge invoice — Justin picks which
-    claim carries the invoice; the other is closed as covered."""
+def merge_bill_keyboard(proposal_id: int) -> InlineKeyboardMarkup:
+    """Confirm/reject for a one-invoice-several-charges merge. No per-claim
+    pick: which claim carries the invoice is bookkeeping (Petcover sees the
+    invoice, never the bank charges) — the larger charge carries it."""
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(
-                f"Use #{c['id']} (${abs(c['amount']):.2f})",
-                callback_data=f"usebill:{proposal_id}:{c['id']}",
-            )]
-            for c in claims
+            [InlineKeyboardButton("✅ Merge — one invoice, one claim", callback_data=f"mergebill:{proposal_id}")],
+            [InlineKeyboardButton("❌ Not the same invoice", callback_data=f"rejectbill:{proposal_id}")],
         ]
     )
 
@@ -418,9 +416,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         result = invoice_matching.unmatch(int(data.split(":", 1)[1]))
         await query.edit_message_text(text=f"{query.message.text}\n\n❌ {result['message']}")
     elif data.startswith("usebill:"):
+        # legacy pick buttons from already-sent messages — still honored
         _, proposal_id, claim_id = data.split(":")
         result = invoice_matching.resolve_split_proposal(int(proposal_id), int(claim_id))
         icon = "✅" if result["ok"] else "⚠️"
+        await query.edit_message_text(text=f"{query.message.text}\n\n{icon} {result['message']}")
+    elif data.startswith("mergebill:"):
+        result = invoice_matching.merge_split_proposal(int(data.split(":", 1)[1]))
+        icon = "✅" if result["ok"] else "⚠️"
+        await query.edit_message_text(text=f"{query.message.text}\n\n{icon} {result['message']}")
+    elif data.startswith("rejectbill:"):
+        result = invoice_matching.reject_split_proposal(int(data.split(":", 1)[1]))
+        icon = "❌" if result["ok"] else "⚠️"
         await query.edit_message_text(text=f"{query.message.text}\n\n{icon} {result['message']}")
     elif data.startswith("split:"):
         cid = int(data.split(":", 1)[1])

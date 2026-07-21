@@ -39,6 +39,13 @@
 - [x] 7.4 Tests: proposal create/dedupe/resolve/absorb, no-proposal-when-sum-wrong, notify-once (40 tests total, all pass)
 - [ ] 7.5 Dashboard view of open split proposals — deferred ("at some stage")
 
+## 8. Split-bill rework: merge-confirm, not pick (2026-07-22 — "not clear how I should match it")
+
+- [x] 8.1 Verified against the real PDF: MediPaws invoice #411193 is ONE invoice, ONE pet (Aari), $2,521.46 — its payment section lists both card payments (−1,970.40, −551.06). The two bank charges are two payments of the same invoice; which claim carries it is bookkeeping (Petcover sees the invoice, never the charges), so a per-claim pick was meaningless
+- [x] 8.2 `merge_split_proposal` (auto-primary = larger charge) + `reject_split_proposal` (flags both claims, pair never re-proposed, manual flag not overwritten next tick); `resolve_split_proposal` kept for the legacy Use-# buttons
+- [x] 8.3 Telegram message rewritten: invoice + both charges + sum, "payment records list both charge amounts" evidence line when detected (`_text_amounts` captured at extraction time), ✅ Merge / ❌ Not the same invoice buttons
+- [x] 8.4 Tests: auto-primary merge, reject + never-re-propose + flag preserved, payments-confirmed detection (43 tests, all pass)
+
 ## 6. Ops (record what was actually done)
 
 - [x] 6.1 Kill the stray dashboard host process — DONE 2026-07-21: killed PIDs 38572 + 28480 (same `uvicorn --port 8787` tree from `C:\Code\Me.OpenClaw-dashboard`, stale pre-edit env → Gemini provider, shared Gmail quota burn); verified no python/uvicorn processes remain

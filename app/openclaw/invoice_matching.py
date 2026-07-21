@@ -366,7 +366,10 @@ def match_claim(claim) -> bool:
                 if oversized is None:
                     candidate = _oversized_candidate(invoices, claim["txn_amount"], txn_date)
                     if candidate:
-                        oversized = {**candidate, "_email_id": item["id"]}
+                        # keep the amounts the email/PDF text mentions — the
+                        # invoice's own payment lines listing both bank charges
+                        # is the strongest merge evidence (see _propose_split)
+                        oversized = {**candidate, "_email_id": item["id"], "_text_amounts": _text_amounts(text)}
                 continue
             total = float(invoice["amount"])
             invoice["claimable_amount"] = claimable_amount(invoice)
@@ -389,12 +392,25 @@ def match_claim(claim) -> bool:
     return False
 
 
+_TEXT_AMOUNT_RE = re.compile(r"-?\$?\s?\d[\d,]*\.\d{2}\b")
+
+
+def _text_amounts(text: str) -> list[float]:
+    """Every money-looking number in the email/PDF text, as positive floats —
+    an invoice's payment section lists each card payment (e.g. ': -1970.40')."""
+    return [abs(float(m.replace("$", "").replace(",", "").strip())) for m in _TEXT_AMOUNT_RE.findall(text)]
+
+
 def _propose_split(claim, oversized: dict) -> str | None:
-    """One invoice paid over two charges: if this claim plus ONE other pending
-    claim at the same vet sum to the oversized invoice's total (within the
-    ceiling tolerance), record a split proposal — Justin picks on Telegram
-    which claim carries the invoice. Returns the flag text, or None when no
-    sibling explains the total."""
+    """One invoice paid over several charges (confirmed live: MediPaws invoice
+    #411193, $2,521.46 for Aari, its own payment section listing the two card
+    payments -1970.40 and -551.06). If this claim plus ONE other pending claim
+    at the same vet sum to the oversized invoice's total (ceiling tolerance),
+    record a merge proposal. WHICH claim carries the invoice doesn't matter —
+    Petcover sees the invoice, never the bank charges — so nothing asks Justin
+    to pick: the larger charge carries it, and Telegram asks only to CONFIRM
+    the merge (with a reject escape hatch). Returns the flag text, or None
+    when no sibling explains the total."""
     total = float(oversized["amount"])
     email_id = oversized.get("_email_id", "")
     with db.get_connection() as conn:
@@ -412,30 +428,88 @@ def _propose_split(claim, oversized: dict) -> str | None:
     if match is None:
         return None
     claim_ids = sorted([claim["id"], match["id"]])
+    # The strongest evidence: the invoice's own payment records list BOTH bank
+    # charge amounts. Recorded on the proposal so the Telegram message can say so.
+    text_amounts = oversized.get("_text_amounts") or []
+    payments_confirmed = all(
+        any(abs(abs(amt) - candidate) < 0.005 for candidate in text_amounts)
+        for amt in (claim["txn_amount"], match["amount"])
+    )
     now = datetime.now(timezone.utc).isoformat()
     with db.get_connection() as conn:
+        # any prior proposal for this pair blocks a new one — and a REJECTED
+        # merge must not come back every tick, nor re-claim the flag text
         existing = conn.execute(
-            "SELECT 1 FROM split_proposals WHERE status = 'open' AND claim_ids = ?",
+            "SELECT status FROM split_proposals WHERE claim_ids = ? ORDER BY id DESC LIMIT 1",
             (json.dumps(claim_ids),),
         ).fetchone()
+        if existing and existing["status"] != "open":
+            return None  # Justin already decided (rejected) or it's history — keep the manual flag
         if not existing:
             invoice = {k: v for k, v in oversized.items() if not k.startswith("_")}
+            invoice["payments_confirmed"] = payments_confirmed
             conn.execute(
                 "INSERT INTO split_proposals (email_id, invoice_json, claim_ids, created_at) VALUES (?, ?, ?, ?)",
                 (email_id, json.dumps(invoice), json.dumps(claim_ids), now),
             )
     other = match["id"]
     return (
-        f"invoice dated {oversized['date']} totals ${total:.2f} — covers this charge and claim #{other}; "
-        f"pick which claim carries it on Telegram"
+        f"invoice dated {oversized['date']} totals ${total:.2f} — one invoice paid by this charge and "
+        f"claim #{other}'s together; confirm the merge on Telegram"
     )
 
 
+def merge_split_proposal(proposal_id: int) -> dict:
+    """Justin confirmed the merge: the larger charge's claim carries the
+    invoice (deterministic — the choice is bookkeeping, not Petcover-facing).
+    Shared by the Telegram ✅ Merge button."""
+    with db.get_connection() as conn:
+        proposal = conn.execute(
+            "SELECT * FROM split_proposals WHERE id = ? AND status = 'open'", (proposal_id,)
+        ).fetchone()
+        if proposal is None:
+            return {"ok": False, "message": "That merge proposal is gone or already resolved."}
+        claim_ids = json.loads(proposal["claim_ids"])
+        rows = conn.execute(
+            f"SELECT vet_claims.id, bank_transactions.amount FROM vet_claims "
+            f"JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            f"WHERE vet_claims.id IN ({','.join('?' * len(claim_ids))})",
+            claim_ids,
+        ).fetchall()
+    primary = max(rows, key=lambda r: (abs(r["amount"]), -r["id"]))["id"]
+    return resolve_split_proposal(proposal_id, primary)
+
+
+def reject_split_proposal(proposal_id: int) -> dict:
+    """Justin said the charges are NOT payments of this one invoice: close the
+    proposal (never re-proposed — see the any-status dedupe in _propose_split)
+    and flag both claims for manual matching."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        proposal = conn.execute(
+            "SELECT * FROM split_proposals WHERE id = ? AND status = 'open'", (proposal_id,)
+        ).fetchone()
+        if proposal is None:
+            return {"ok": False, "message": "That merge proposal is gone or already resolved."}
+        invoice = json.loads(proposal["invoice_json"])
+        conn.execute("UPDATE split_proposals SET status = 'rejected' WHERE id = ?", (proposal_id,))
+        for claim_id in json.loads(proposal["claim_ids"]):
+            conn.execute(
+                "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ? AND status = 'pending_match'",
+                (
+                    f"merge of ${float(invoice['amount']):.2f} invoice rejected — match this charge manually",
+                    now,
+                    claim_id,
+                ),
+            )
+    return {"ok": True, "message": "Merge rejected — both claims flagged for manual matching."}
+
+
 def resolve_split_proposal(proposal_id: int, chosen_claim_id: int) -> dict:
-    """Justin picked which claim carries a multi-charge invoice: that claim is
-    matched with the invoice (ceiling = the charges together, validated); the
-    other claim is closed as 'absorbed' so it stops re-matching — same money,
-    one claim. Shared by the Telegram button."""
+    """Attaches a multi-charge invoice to one claim: that claim is matched
+    (ceiling = the charges together, validated); the other claim is closed as
+    'absorbed' — same money, one claim. Called by merge_split_proposal (auto
+    primary) and the legacy per-claim pick buttons."""
     now = datetime.now(timezone.utc).isoformat()
     with db.get_connection() as conn:
         proposal = conn.execute(
@@ -460,26 +534,27 @@ def resolve_split_proposal(proposal_id: int, chosen_claim_id: int) -> dict:
     if not _within_ceiling(total, -combined):
         return {"ok": False, "message": f"Invoice ${total:.2f} exceeds the charges combined (${combined:.2f}) — refusing."}
 
+    invoice.pop("payments_confirmed", None)
     invoice["claimable_amount"] = claimable_amount(invoice)
     others = [c for c in claim_ids if c != chosen_claim_id]
     _mark_matched(
         chosen_claim_id,
         proposal["email_id"],
         invoice,
-        flag=f"invoice ${total:.2f} spans charges of claims #{chosen_claim_id} + #{', #'.join(map(str, others))} — attached here per your pick",
+        flag=f"one ${total:.2f} invoice paid via charges of claims #{chosen_claim_id} + #{', #'.join(map(str, others))} — merged here",
     )
     with db.get_connection() as conn:
         for other in others:
             conn.execute(
                 "UPDATE vet_claims SET status = 'absorbed', "
                 "flag = ?, updated_at = ? WHERE id = ?",
-                (f"covered by claim #{chosen_claim_id}'s ${total:.2f} invoice", now, other),
+                (f"second payment of claim #{chosen_claim_id}'s ${total:.2f} invoice", now, other),
             )
         conn.execute("UPDATE split_proposals SET status = 'resolved' WHERE id = ?", (proposal_id,))
     return {
         "ok": True,
-        "message": f"Invoice ${total:.2f} attached to claim #{chosen_claim_id}; "
-        f"claim{'s' if len(others) > 1 else ''} #{', #'.join(map(str, others))} closed as covered.",
+        "message": f"Merged: claim #{chosen_claim_id} carries the ${total:.2f} invoice; "
+        f"claim{'s' if len(others) > 1 else ''} #{', #'.join(map(str, others))} closed as its other payment.",
     }
 
 

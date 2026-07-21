@@ -24,16 +24,20 @@ An email MAY contain several invoices (confirmed live: a vet's bulk reply to a y
 - **WHEN** a long bulk email's extraction reply is cut mid-array (confirmed live on a 12k-char invoice PDF)
 - **THEN** the complete invoice objects are salvaged and the partial one is dropped
 
-### Requirement: An invoice exceeding the charge but matching the visit date is surfaced, never guessed
-One vet invoice can be paid over several card charges (confirmed live: one $2,521.46 invoice = a $551.06 and a $1,970.40 charge, same day). When this claim plus exactly one other pending claim at the same vet sum to the invoice's total (ceiling tolerance), the system SHALL record a split proposal and push a Telegram message showing the invoice and both charges with one button per claim; Justin picks which claim carries the invoice. On his pick, the chosen claim is matched with the invoice (ceiling validated against the charges combined) and the other claim is closed as `absorbed` (same money, one claim). When no sibling explains the total, the claim SHALL be flagged for manual review. The system SHALL never split or attach the invoice without Justin's explicit pick. (A dashboard view of open proposals is deferred.)
+### Requirement: One invoice paid over several charges merges into one claim on Justin's confirm — never a pick, never guessed
+One vet invoice can be paid in several card swipes (confirmed live: MediPaws invoice #411193, $2,521.46 for Aari, whose own payment section lists the two payments −$1,970.40 and −$551.06 = the two bank charges). Which claim row carries the invoice is internal bookkeeping — Petcover sees the invoice, never the bank charges — so the system SHALL NOT ask Justin to choose between claims. When this claim plus exactly one other pending claim at the same vet sum to the invoice's total (ceiling tolerance), the system SHALL record a merge proposal and push a Telegram message showing the invoice, both charges and their sum — stating additionally when the invoice's own payment records list both charge amounts — with two actions: ✅ Merge (the larger charge's claim carries the invoice, ceiling validated against the charges combined; the other claim closes as `absorbed`/"second payment") and ❌ Not the same invoice (proposal rejected, both claims flagged for manual matching, the pair never re-proposed). Nothing merges without the confirm tap. When no sibling explains the total, the claim SHALL be flagged for manual review. (A dashboard view of open proposals is deferred.)
 
-#### Scenario: One invoice, two charges — Telegram pick
-- **WHEN** a date-plausible invoice totals more than the claim's charge but equals this charge plus one sibling claim's charge, and Justin taps "Use #B"
-- **THEN** claim B is matched with the full invoice, claim A becomes `absorbed` with a flag naming claim B, and the proposal is resolved
+#### Scenario: One invoice, two charges — confirm merge
+- **WHEN** a date-plausible invoice equals this claim's charge plus one sibling claim's charge and Justin taps Merge
+- **THEN** the larger charge's claim is matched with the full invoice, the other becomes `absorbed` with a flag naming the carrier, and the proposal resolves
+
+#### Scenario: Justin rejects the merge
+- **WHEN** Justin taps "Not the same invoice"
+- **THEN** the proposal is rejected, both claims are flagged for manual matching, and the pair is never proposed again
 
 #### Scenario: Proposal notified exactly once
-- **WHEN** a split proposal is created
-- **THEN** the picker message is pushed once (not re-sent every tick) and remains actionable until resolved
+- **WHEN** a merge proposal is created
+- **THEN** the message is pushed once (not re-sent every tick) and remains actionable until resolved or rejected
 
 #### Scenario: No sibling explains the total
 - **WHEN** the only date-plausible invoice exceeds the charge and no pending sibling claim completes the sum
