@@ -1,8 +1,9 @@
 import base64
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 
-from . import config, db, gemini, gmail_client
+from . import config, db, gmail_client, llm
 
 # The bank charge is the CEILING on what can be claimed — it can exceed the
 # invoice total via card surcharge (confirmed live: real $580.74 invoice
@@ -79,11 +80,21 @@ def claimable_amount(invoice: dict) -> float | None:
     return round(claimable, 2)
 
 
-EXTRACTION_PROMPT = """Extract invoice details from this email as strict JSON:
-{{"date": "<ISO 8601 date, or null>", "amount": <total as number, or null>, "services": "<comma-separated \
-itemized services, or null>", "items": [{{"description": "<line item>", "amount": <number>}}, ...]}}
+# One email can carry SEVERAL invoices (confirmed live: a vet's reply to a
+# yearly bulk request listed three visits' invoices plus their grand total —
+# single-invoice extraction returned the total and the ceiling rejected it for
+# every claim). Extract every invoice; the matcher tests each one.
+EXTRACTION_PROMPT = """Extract ALL invoices from this email as strict JSON:
+{{"invoices": [{{"date": "<the visit/service date this invoice bills for — NOT the email, statement, \
+issue or print date — ISO 8601, or null>", "amount": <this single invoice's total as number, or null>, \
+"services": "<comma-separated itemized services, or null>", \
+"items": [{{"description": "<line item>", "amount": <number>}}, ...]}}, ...]}}
 
-"items" lists each charged line item with its own amount; use [] if the itemization is unreadable.
+One email may contain several invoices (e.g. a reply covering many visits) — return one entry per \
+invoice with its own date and total. Never combine invoices: no grand totals, and two invoices on \
+the SAME date (e.g. two pets seen the same day) stay two separate entries. "items" lists each \
+charged line item with its own amount; use [] if the itemization is unreadable. Use \
+{{"invoices": []}} if no invoice is present.
 
 Email:
 {email_text}
@@ -99,15 +110,73 @@ INVOICE_REQUEST_BODY = (
 )
 
 
-def _extract_invoice(email_text: str) -> dict | None:
-    raw = gemini.extract(EXTRACTION_PROMPT.format(email_text=email_text), purpose="invoice_extraction")
+def _salvage_truncated(raw: str, start: int):
+    """A long bulk email can push the reply past the model's output budget,
+    cutting the JSON mid-array (observed live on a 12k-char invoice PDF).
+    Walk back to the last complete object and close the invoices array —
+    only complete invoice objects survive, partial ones are dropped."""
+    pos = len(raw)
+    while True:
+        pos = raw.rfind("}", start, pos)
+        if pos <= start:
+            return None
+        try:
+            return json.loads(raw[start : pos + 1] + "]}")
+        except json.JSONDecodeError:
+            continue
+
+
+def _parse_invoices(raw: str) -> list | None:
+    """Parses the extraction reply into a list of invoice dicts. Accepts the
+    legacy single-invoice object too (cached rows / model regressions)."""
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1 or end == -1:
         return None
     try:
-        return json.loads(raw[start : end + 1])
+        data = json.loads(raw[start : end + 1])
     except json.JSONDecodeError:
-        return None
+        data = _salvage_truncated(raw, start)
+        if data is None:
+            return None
+    if isinstance(data, dict) and isinstance(data.get("invoices"), list):
+        return [inv for inv in data["invoices"] if isinstance(inv, dict)]
+    if isinstance(data, dict) and "amount" in data:
+        return [data]
+    return None
+
+
+def _extract_invoices(email_text: str) -> list | None:
+    raw = llm.extract(EXTRACTION_PROMPT.format(email_text=email_text), purpose="invoice_extraction")
+    return _parse_invoices(raw)
+
+
+def _cached_extraction(message_id: str) -> list | None:
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT extracted_json FROM email_extractions WHERE message_id = ?", (message_id,)
+        ).fetchone()
+    return json.loads(row["extracted_json"]) if row else None
+
+
+def _store_extraction(message_id: str, invoices: list) -> None:
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO email_extractions (message_id, extracted_json, extracted_at) VALUES (?, ?, ?)",
+            (message_id, json.dumps(invoices), datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def _invoices_for_email(message_id: str, text: str) -> list | None:
+    """One LLM extraction per email, ever — candidates get re-tested against
+    claims every tick and across claims, so the parsed result is cached.
+    A failed/unparseable extraction is NOT cached (retried next tick)."""
+    cached = _cached_extraction(message_id)
+    if cached is not None:
+        return cached
+    invoices = _extract_invoices(text)
+    if invoices is not None:
+        _store_extraction(message_id, invoices)
+    return invoices
 
 
 # NetBank descriptors append a trailing city/state (e.g. "...CARINGBAH NSW"),
@@ -123,51 +192,63 @@ def _search_terms(merchant: str) -> str:
     return " ".join(words)
 
 
-def _date_range_clause(txn_date: date, invoice_request_sent_at: str | None) -> str:
-    if invoice_request_sent_at:
-        # rolling recheck: search from the original transaction date through to now,
-        # not a fixed window, so a late reply after the request is still picked up.
-        return f"after:{txn_date.isoformat()}"
-    after = txn_date - timedelta(days=config.INVOICE_MATCH_WINDOW_DAYS)
-    before = txn_date + timedelta(days=config.INVOICE_MATCH_WINDOW_DAYS)
-    return f"after:{after.isoformat()} before:{before.isoformat()}"
-
-
-def _build_queries(merchant: str, txn_date: date, invoice_request_sent_at: str | None) -> list[tuple[str, bool]]:
+def _build_queries(merchant: str, txn_date: date) -> list[tuple[str, bool]]:
     """Each query pairs with whether a candidate it returns still needs
     content-level vet confirmation (see _forward_confirms_vet) before being
     trusted — the spouse fallback has no merchant term in the query itself,
     so it needs that extra gate; the merchant query already searched on the
-    vet's name."""
-    date_clause = _date_range_clause(txn_date, invoice_request_sent_at)
-    queries = [(f"{_search_terms(merchant)} {date_clause}", False)]
+    vet's name.
+
+    Two arrival windows per source: the narrow txn±window one (also covers an
+    invoice emailed a couple of days BEFORE the charge settled), and an
+    unconditional open-ended one — invoices and forwards arrive months after
+    the visit (confirmed live: February invoices forwarded in July). Arrival
+    date is only a search hint; eligibility is _invoice_date_plausible."""
+    after = txn_date - timedelta(days=config.INVOICE_MATCH_WINDOW_DAYS)
+    before = txn_date + timedelta(days=config.INVOICE_MATCH_WINDOW_DAYS)
+    narrow = f"after:{after.isoformat()} before:{before.isoformat()}"
+    wide = f"after:{txn_date.isoformat()}"
+    terms = _search_terms(merchant)
+    # -from:me — Justin's OWN outgoing invoice-request emails list visit dates
+    # and charge amounts, which extraction reads as invoices with exact
+    # amount+date fits (confirmed live: 12 claims matched his own requests the
+    # moment the wide window surfaced them). Own mail is never an invoice.
+    queries = [(f"{terms} {narrow} -from:me", False), (f"{terms} {wide} -from:me", False)]
     if config.SPOUSE_EMAIL:
         # Invoices sometimes get forwarded from a spouse's address instead of
-        # arriving from the vet directly — same date window, no merchant terms
-        # in the QUERY itself since a forward's subject/body rarely repeats it
-        # verbatim as an exact phrase (Gmail query-side phrase matching is
-        # brittle). Confirmed instead against the fetched message body below.
-        queries.append((f"from:{config.SPOUSE_EMAIL} {date_clause}", True))
+        # arriving from the vet directly — no merchant terms in the QUERY
+        # itself since a forward's subject/body rarely repeats it verbatim as
+        # an exact phrase (Gmail query-side phrase matching is brittle).
+        # Confirmed instead against the fetched message body below.
+        queries.append((f"from:{config.SPOUSE_EMAIL} {narrow}", True))
+        queries.append((f"from:{config.SPOUSE_EMAIL} {wide}", True))
     return queries
+
+
+# Merchant words too generic to identify a vet in forwarded content — matching
+# on these let a human-hospital forward pass as a vet invoice (confirmed live).
+GENERIC_MERCHANT_WORDS = {"veterinary", "animal", "hospital", "clinic", "sydney"}
 
 
 def _forward_confirms_vet(text: str, merchant: str, known_vet_email: str | None) -> bool:
     """A forwarded invoice's quoted content usually still names the vet or
     shows their address in the quoted 'From:' line — require one of those to
-    actually appear before trusting a spouse-forward match. Without this, an
-    open-ended date window (set once invoice_request_sent_at is reconciled)
-    can match ANY forwarded invoice from the spouse, wrong vet included —
-    confirmed live: two claims for two different vets both matched the same
-    unrelated forward purely because it was under the ceiling."""
+    actually appear before trusting a spouse-forward match. Without this, the
+    open-ended arrival window can match ANY forwarded invoice from the spouse,
+    wrong vet included — confirmed live: two claims for two different vets
+    both matched the same unrelated forward purely because it was under the
+    ceiling. Distinctive words only (≥5 chars, non-generic) and whole-word
+    matches only — substring matching let "Kings" (of "Kings Vet") fire inside
+    an unrelated human-medical forward (confirmed live)."""
     lowered = text.lower()
     if known_vet_email and known_vet_email.lower() in lowered:
         return True
-    # individual significant merchant words, not the full phrase — a forward
-    # rarely repeats a multi-word bank descriptor verbatim, but usually
-    # contains at least the vet's own name (e.g. "Kingsgrove" out of the bank
-    # descriptor "Kings Vet KINGSGROVE NSW").
-    words = [w for w in _search_terms(merchant).split() if len(w) > 3]
-    return any(w.lower() in lowered for w in words)
+    words = [
+        w.lower()
+        for w in _search_terms(merchant).split()
+        if len(w) >= 5 and w.lower() not in GENERIC_MERCHANT_WORDS
+    ]
+    return any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in words)
 
 
 def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None = None) -> None:
@@ -179,25 +260,84 @@ def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None 
         )
 
 
+def _pick_invoice(invoices: list, txn_amount: float, txn_date: date) -> dict | None:
+    """First invoice in the email that fits under the charge ceiling AND whose
+    own date sits near the transaction — a bulk reply's other invoices belong
+    to other claims."""
+    for invoice in invoices:
+        if invoice.get("amount") is None:
+            continue
+        total = float(invoice["amount"])
+        if not _within_ceiling(total, txn_amount):
+            continue
+        if not _invoice_date_plausible(invoice, txn_date):
+            continue
+        return invoice
+    return None
+
+
+def _oversized_candidate(invoices: list, txn_amount: float, txn_date: date) -> dict | None:
+    """An invoice whose date matches the visit but whose total EXCEEDS this
+    charge — the vet billed one invoice paid via several card charges
+    (confirmed live: one $2,521.46 invoice = a $551.06 + a $1,970.40 charge on
+    the same day). Can't be matched without guessing how to split it; surfaced
+    as a flag for Justin instead."""
+    for invoice in invoices:
+        if invoice.get("amount") is None:
+            continue
+        total = float(invoice["amount"])
+        if _invoice_date_plausible(invoice, txn_date) and invoice.get("date") and not _within_ceiling(total, txn_amount):
+            return invoice
+    return None
+
+
+_AMOUNT_RE = re.compile(r"\$\s?\d[\d,]*\.\d{2}")
+
+
+def _has_pdf_attachment(message: dict) -> bool:
+    return any(
+        part.get("mimeType") == "application/pdf"
+        for part in gmail_client._iter_attachment_parts(message.get("payload", {}))
+    )
+
+
+def _flag_claim(claim_id: int, flag: str | None) -> None:
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ?",
+            (flag, datetime.now(timezone.utc).isoformat(), claim_id),
+        )
+
+
 def match_claim(claim) -> bool:
     """Searches Gmail for an invoice matching claim's transaction (merchant name,
     then spouse's address if configured, as a fallback). The bank charge is the
     ceiling: an invoice matches when its total is at most the charged amount.
-    Returns True and advances the claim to 'matched' on success."""
+    An email may hold several invoices; each is tested individually. Returns
+    True and advances the claim to 'matched' on success. Raises
+    llm.LLMUnavailableError when extraction is down (caller isolates it)."""
     txn_date = date.fromisoformat(claim["txn_date"])
-    queries = _build_queries(claim["txn_merchant"], txn_date, claim["invoice_request_sent_at"])
+    queries = _build_queries(claim["txn_merchant"], txn_date)
 
     rejected = set(json.loads(claim["rejected_email_ids"]) if claim["rejected_email_ids"] else [])
     known_vet_email = None
     vet_email_looked_up = False
+    seen: set[str] = set()
+    unreadable_subject = None
+    oversized = None
 
     service = gmail_client.build_service()
     for query, needs_vet_confirmation in queries:
         response = service.users().messages().list(userId="me", q=query, maxResults=5).execute()
         for item in response.get("messages", []):
+            if item["id"] in seen:
+                continue  # narrow and wide windows overlap
+            seen.add(item["id"])
             if item["id"] in rejected:
                 continue  # Justin unmatched this invoice — don't re-grab it
             message = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
+            if "SENT" in message.get("labelIds", []):
+                continue  # own outgoing mail is never an invoice (second layer past -from:me)
             text = gmail_client.full_message_text(service, message)
 
             if needs_vet_confirmation:
@@ -207,20 +347,140 @@ def match_claim(claim) -> bool:
                 if not _forward_confirms_vet(text, claim["txn_merchant"], known_vet_email):
                     continue
 
-            invoice = _extract_invoice(text)
-            if not invoice or invoice.get("amount") is None:
+            invoices = _invoices_for_email(item["id"], text)
+            if not invoices:
+                # A vet-addressed candidate whose PDF gave us nothing readable
+                # (scanned/image PDF, no OCR) — surface it instead of silently
+                # skipping; Justin asks the vet for a text copy.
+                if (
+                    not needs_vet_confirmation
+                    and _has_pdf_attachment(message)
+                    and not _AMOUNT_RE.search(text)
+                ):
+                    headers = {h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])}
+                    unreadable_subject = headers.get("Subject", "(no subject)")
+                continue
+
+            invoice = _pick_invoice(invoices, claim["txn_amount"], txn_date)
+            if invoice is None:
+                if oversized is None:
+                    candidate = _oversized_candidate(invoices, claim["txn_amount"], txn_date)
+                    if candidate:
+                        oversized = {**candidate, "_email_id": item["id"]}
                 continue
             total = float(invoice["amount"])
-            if not _within_ceiling(total, claim["txn_amount"]):
-                continue
-            if not _invoice_date_plausible(invoice, txn_date):
-                continue
             invoice["claimable_amount"] = claimable_amount(invoice)
             remainder = _unexplained_remainder(total, claim["txn_amount"])
             flag = f"possible additional invoice — unexplained ${remainder:.2f}" if remainder else None
             _mark_matched(claim["id"], item["id"], invoice, flag)
             return True
+
+    if unreadable_subject:
+        flag = f"invoice attachment unreadable — {unreadable_subject}"
+    elif oversized:
+        flag = _propose_split(claim, oversized) or (
+            f"invoice dated {oversized['date']} totals ${float(oversized['amount']):.2f} — exceeds this "
+            f"charge; likely one invoice paid over several charges, split/confirm manually"
+        )
+    else:
+        return False
+    if claim["flag"] != flag:
+        _flag_claim(claim["id"], flag)
     return False
+
+
+def _propose_split(claim, oversized: dict) -> str | None:
+    """One invoice paid over two charges: if this claim plus ONE other pending
+    claim at the same vet sum to the oversized invoice's total (within the
+    ceiling tolerance), record a split proposal — Justin picks on Telegram
+    which claim carries the invoice. Returns the flag text, or None when no
+    sibling explains the total."""
+    total = float(oversized["amount"])
+    email_id = oversized.get("_email_id", "")
+    with db.get_connection() as conn:
+        siblings = conn.execute(
+            "SELECT vet_claims.id, bank_transactions.amount FROM vet_claims "
+            "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            "WHERE vet_claims.status = 'pending_match' AND vet_claims.id != ? "
+            "AND bank_transactions.merchant = ?",
+            (claim["id"], claim["txn_merchant"]),
+        ).fetchall()
+    match = next(
+        (s for s in siblings if _within_ceiling(total, -(abs(claim["txn_amount"]) + abs(s["amount"])))),
+        None,
+    )
+    if match is None:
+        return None
+    claim_ids = sorted([claim["id"], match["id"]])
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM split_proposals WHERE status = 'open' AND claim_ids = ?",
+            (json.dumps(claim_ids),),
+        ).fetchone()
+        if not existing:
+            invoice = {k: v for k, v in oversized.items() if not k.startswith("_")}
+            conn.execute(
+                "INSERT INTO split_proposals (email_id, invoice_json, claim_ids, created_at) VALUES (?, ?, ?, ?)",
+                (email_id, json.dumps(invoice), json.dumps(claim_ids), now),
+            )
+    other = match["id"]
+    return (
+        f"invoice dated {oversized['date']} totals ${total:.2f} — covers this charge and claim #{other}; "
+        f"pick which claim carries it on Telegram"
+    )
+
+
+def resolve_split_proposal(proposal_id: int, chosen_claim_id: int) -> dict:
+    """Justin picked which claim carries a multi-charge invoice: that claim is
+    matched with the invoice (ceiling = the charges together, validated); the
+    other claim is closed as 'absorbed' so it stops re-matching — same money,
+    one claim. Shared by the Telegram button."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        proposal = conn.execute(
+            "SELECT * FROM split_proposals WHERE id = ? AND status = 'open'", (proposal_id,)
+        ).fetchone()
+        if proposal is None:
+            return {"ok": False, "message": "That split proposal is gone or already resolved."}
+        claim_ids = json.loads(proposal["claim_ids"])
+        if chosen_claim_id not in claim_ids:
+            return {"ok": False, "message": f"Claim #{chosen_claim_id} isn't part of this proposal."}
+        rows = conn.execute(
+            f"SELECT vet_claims.id, vet_claims.status, bank_transactions.amount FROM vet_claims "
+            f"JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            f"WHERE vet_claims.id IN ({','.join('?' * len(claim_ids))})",
+            claim_ids,
+        ).fetchall()
+    if any(r["status"] != "pending_match" for r in rows):
+        return {"ok": False, "message": "A claim in this proposal already moved on — nothing changed."}
+    invoice = json.loads(proposal["invoice_json"])
+    total = float(invoice["amount"])
+    combined = sum(abs(r["amount"]) for r in rows)
+    if not _within_ceiling(total, -combined):
+        return {"ok": False, "message": f"Invoice ${total:.2f} exceeds the charges combined (${combined:.2f}) — refusing."}
+
+    invoice["claimable_amount"] = claimable_amount(invoice)
+    others = [c for c in claim_ids if c != chosen_claim_id]
+    _mark_matched(
+        chosen_claim_id,
+        proposal["email_id"],
+        invoice,
+        flag=f"invoice ${total:.2f} spans charges of claims #{chosen_claim_id} + #{', #'.join(map(str, others))} — attached here per your pick",
+    )
+    with db.get_connection() as conn:
+        for other in others:
+            conn.execute(
+                "UPDATE vet_claims SET status = 'absorbed', "
+                "flag = ?, updated_at = ? WHERE id = ?",
+                (f"covered by claim #{chosen_claim_id}'s ${total:.2f} invoice", now, other),
+            )
+        conn.execute("UPDATE split_proposals SET status = 'resolved' WHERE id = ?", (proposal_id,))
+    return {
+        "ok": True,
+        "message": f"Invoice ${total:.2f} attached to claim #{chosen_claim_id}; "
+        f"claim{'s' if len(others) > 1 else ''} #{', #'.join(map(str, others))} closed as covered.",
+    }
 
 
 def unmatch(claim_id: int) -> dict:

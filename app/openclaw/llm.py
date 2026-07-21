@@ -121,5 +121,9 @@ def extract(prompt: str, purpose: str = "extraction") -> str:
     if config.LLM_PROVIDER == "gemini":
         from . import gemini
 
-        return gemini.extract(prompt, purpose)
+        try:
+            return gemini.extract(prompt, purpose)
+        except gemini.GeminiUnavailableError as exc:
+            # callers handle one failure type regardless of provider
+            raise LLMUnavailableError(str(exc)) from exc
     return chat([{"role": "user", "content": prompt}], purpose=purpose)["text"]

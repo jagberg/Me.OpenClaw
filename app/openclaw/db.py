@@ -109,6 +109,29 @@ CREATE TABLE IF NOT EXISTS claim_status_events (
     created_at TEXT NOT NULL
 );
 
+-- One LLM extraction per email, ever: invoice candidates are re-tested against
+-- claims every pipeline tick and across claims; caching the parsed invoices
+-- makes re-tests free (deterministic gates only) and stops quota burn.
+CREATE TABLE IF NOT EXISTS email_extractions (
+    message_id TEXT PRIMARY KEY,
+    extracted_json TEXT NOT NULL,
+    extracted_at TEXT NOT NULL
+);
+
+-- One vet invoice paid over several card charges (confirmed live: $2,521.46
+-- invoice = $551.06 + $1,970.40 charges, same day). Which claim carries the
+-- invoice is Justin's call — the proposal holds the invoice + candidate claim
+-- ids until he picks one on Telegram. status: open | resolved
+CREATE TABLE IF NOT EXISTS split_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email_id TEXT NOT NULL,
+    invoice_json TEXT NOT NULL,
+    claim_ids TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    notified_at TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS telegram_registrations (
     username TEXT PRIMARY KEY,
     chat_id INTEGER NOT NULL,

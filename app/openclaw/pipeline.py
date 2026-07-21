@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 
-from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, telegram_bot, vet_detection
+from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, llm, telegram_bot, vet_detection
 from .scheduler import scheduler
 
 logger = logging.getLogger(__name__)
@@ -145,6 +145,47 @@ def _summarize_group(group) -> str | None:
     return None
 
 
+def notify_split_proposals(send_fn=None) -> None:
+    """Pushes the one invoice / several charges picker: shows the invoice and
+    each covered charge, with a button per claim — Justin picks which claim
+    carries the invoice (see invoice_matching.resolve_split_proposal). Sent
+    once per proposal (notified_at)."""
+    send = send_fn or telegram_bot.send_message_sync
+    with db.get_connection() as conn:
+        proposals = conn.execute(
+            "SELECT * FROM split_proposals WHERE status = 'open' AND notified_at IS NULL"
+        ).fetchall()
+    for proposal in proposals:
+        claim_ids = json.loads(proposal["claim_ids"])
+        invoice = json.loads(proposal["invoice_json"])
+        with db.get_connection() as conn:
+            claims = [
+                dict(r)
+                for r in conn.execute(
+                    f"SELECT vet_claims.id, bank_transactions.amount, bank_transactions.date, "
+                    f"bank_transactions.merchant FROM vet_claims "
+                    f"JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+                    f"WHERE vet_claims.id IN ({','.join('?' * len(claim_ids))}) ORDER BY vet_claims.id",
+                    claim_ids,
+                )
+            ]
+        if len(claims) != len(claim_ids):
+            continue
+        total = float(invoice["amount"])
+        lines = [
+            f"🔀 One invoice, {len(claims)} charges — {claims[0]['merchant']}",
+            f"Invoice {invoice.get('date') or '(no date)'} totals ${total:.2f}, matching these charges together:",
+            *[f" • #{c['id']} — ${abs(c['amount']):.2f} ({c['date']})" for c in claims],
+            "Which claim should carry the invoice? The other will be closed as covered.",
+        ]
+        send("\n".join(lines), telegram_bot.split_bill_keyboard(proposal["id"], claims))
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE split_proposals SET notified_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), proposal["id"]),
+            )
+
+
 def notify_claim_states(send_fn=None) -> None:
     """Pushes a Telegram message when a claim enters a state Justin should hear
     about (blocked at matched, drafted, or any Petcover lifecycle status).
@@ -217,17 +258,18 @@ def _reconcile_sent_invoice_requests() -> None:
     """Justin sends invoice-request drafts himself (CLAUDE.md: never auto-send)
     and is expected to click 'mark invoice-request sent' on the dashboard
     afterward — but real usage shows that click gets missed. Missing it keeps
-    invoice_request_sent_at NULL, which keeps the Gmail search window pinned to
-    the original narrow +/-INVOICE_MATCH_WINDOW_DAYS range (see
-    invoice_matching._date_range_clause), so a reply arriving weeks later never
-    gets searched at all — confirmed live: two real vet replies sat unmatched
-    for this exact reason. Detected here via Gmail's own SENT/DRAFT labels on
+    invoice_request_sent_at NULL. The search window no longer depends on it
+    (wide arrival window is unconditional now), but the dashboard's
+    request-sent state and the drafted-flag hygiene still do. Detected here
+    via Gmail's own SENT/DRAFT labels on
     the stored message id — unambiguous, no Sent-folder text-matching needed.
     Runs every pipeline tick (every VET_CLAIM_PIPELINE_INTERVAL_MINUTES), so
     the daily-check ask is covered many times over."""
     with db.get_connection() as conn:
+        # keyed on draft_id, not the flag — error/unreadable flags can overwrite
+        # 'invoice_request_drafted' without meaning the draft went away
         rows = conn.execute(
-            "SELECT id, draft_id FROM vet_claims WHERE flag = 'invoice_request_drafted' "
+            "SELECT id, draft_id FROM vet_claims WHERE status = 'pending_match' "
             "AND invoice_request_sent_at IS NULL AND draft_id IS NOT NULL"
         ).fetchall()
     if not rows:
@@ -246,14 +288,18 @@ def _reconcile_sent_invoice_requests() -> None:
         labels = message.get("labelIds", [])
         if "SENT" in labels and "DRAFT" not in labels:
             with db.get_connection() as conn:
+                # only clear the drafted marker — flag may hold other state
+                # (e.g. unreadable-attachment) that must survive reconciling
                 conn.execute(
-                    "UPDATE vet_claims SET invoice_request_sent_at = ?, flag = NULL, updated_at = ? WHERE id = ?",
+                    "UPDATE vet_claims SET invoice_request_sent_at = ?, "
+                    "flag = CASE WHEN flag = 'invoice_request_drafted' THEN NULL ELSE flag END, "
+                    "updated_at = ? WHERE id = ?",
                     (now, now, row["id"]),
                 )
 
 
 def _maybe_draft_invoice_request(claim) -> None:
-    if claim["invoice_request_sent_at"] or claim["flag"] == "invoice_request_drafted":
+    if claim["invoice_request_sent_at"] or claim["draft_id"]:
         return  # already sent (rolling recheck handles it), or already drafted awaiting Justin
     txn_date = datetime.fromisoformat(claim["txn_date"]).replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) - txn_date < timedelta(days=config.INVOICE_MATCH_WINDOW_DAYS):
@@ -308,12 +354,33 @@ def poll_petcover_status() -> None:
         gmail_ingest._mark_processed(message["id"], None)
 
 
+# flags run_once writes on match failure — cleared before the next attempt so
+# a recovered claim doesn't carry a stale error
+_TRANSIENT_MATCH_FLAGS = ("invoice extraction unavailable", "invoice matching error")
+
+
 def run_once() -> None:
     vet_detection.classify_unflagged()
     _reconcile_sent_invoice_requests()
 
+    # One claim's failure must never starve the rest of the tick (confirmed
+    # live: an extraction 429 on the first pending claim blocked Petcover
+    # status polling for days). LLM outage is global, so stop *matching* only;
+    # everything downstream still runs.
     for claim in _pending_claims():
-        if not invoice_matching.match_claim(claim):
+        if (claim["flag"] or "").startswith(_TRANSIENT_MATCH_FLAGS):
+            invoice_matching._flag_claim(claim["id"], None)
+        try:
+            matched = invoice_matching.match_claim(claim)
+        except llm.LLMUnavailableError as exc:
+            logger.warning("matching: LLM unavailable, skipping remaining matching this tick: %s", exc)
+            invoice_matching._flag_claim(claim["id"], f"invoice extraction unavailable — {str(exc)[:120]}")
+            break
+        except Exception as exc:
+            logger.exception("matching: claim %s failed", claim["id"])
+            invoice_matching._flag_claim(claim["id"], f"invoice matching error — {str(exc)[:120]}")
+            continue
+        if not matched:
             _maybe_draft_invoice_request(claim)
 
     with db.get_connection() as conn:
@@ -325,6 +392,7 @@ def run_once() -> None:
     # push to Telegram in the same tick, not the next one.
     poll_petcover_status()
     notify_claim_states()
+    notify_split_proposals()
 
 
 def start() -> None:

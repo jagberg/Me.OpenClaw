@@ -334,6 +334,339 @@ def test_unclassified_reply_never_overwrites_status():
     assert status == "acknowledged", "unclassified is a review-queue entry, not a lifecycle stage"
 
 
+def test_parse_invoices_multi_and_legacy_shapes():
+    multi = '{"invoices": [{"date": "2026-06-17", "amount": 141.87, "items": []}, {"date": "2026-07-06", "amount": 407.56, "items": []}]}'
+    parsed = invoice_matching._parse_invoices(multi)
+    assert [i["amount"] for i in parsed] == [141.87, 407.56]
+    # legacy single-invoice object (old cache rows / model regression) still parses
+    legacy = '```json\n{"date": "2026-06-19", "amount": 585.39, "items": []}\n```'
+    assert invoice_matching._parse_invoices(legacy) == [{"date": "2026-06-19", "amount": 585.39, "items": []}]
+    assert invoice_matching._parse_invoices("no json here") is None
+    assert invoice_matching._parse_invoices('{"invoices": "garbage"}') is None
+    assert invoice_matching._parse_invoices('{"invoices": []}') == []
+
+
+def test_pick_invoice_from_bulk_reply_uses_ceiling_and_invoice_date():
+    """Real case: Shire's bulk reply held 3 invoices; claim ($407.56, 2026-07-06)
+    must pick its own invoice — not the $141.87 one (fits the ceiling but is a
+    different visit, invoice dated 19 days earlier) and not the grand total."""
+    from datetime import date as _date
+    invoices = [
+        {"date": "2026-06-17", "amount": 141.87},  # under ceiling, wrong visit date
+        {"date": "2026-06-19", "amount": 585.39},  # over ceiling
+        {"date": "2026-07-06", "amount": 407.56},  # the right one
+        {"date": None, "amount": 1134.82},         # grand total — over ceiling
+    ]
+    picked = invoice_matching._pick_invoice(invoices, -407.56, _date(2026, 7, 6))
+    assert picked["amount"] == 407.56
+    # nothing fits: every invoice over the ceiling
+    assert invoice_matching._pick_invoice([{"date": "2026-07-06", "amount": 999.0}], -407.56, _date(2026, 7, 6)) is None
+    # amount missing entirely: skipped, not crashed
+    assert invoice_matching._pick_invoice([{"date": "2026-07-06", "amount": None}], -407.56, _date(2026, 7, 6)) is None
+    # missing invoice date can't be checked — allowed through (absence of evidence)
+    assert invoice_matching._pick_invoice([{"amount": 400.0}], -407.56, _date(2026, 7, 6))["amount"] == 400.0
+
+
+def test_build_queries_always_include_open_ended_window():
+    """Late forwards (real: February invoices forwarded in July) must be
+    searchable regardless of invoice_request_sent_at — every source gets an
+    open-ended after: query; the narrow window stays for pre-charge arrivals."""
+    from datetime import date as _date
+    original_spouse = invoice_matching.config.SPOUSE_EMAIL
+    invoice_matching.config.SPOUSE_EMAIL = "spouse@example.com"
+    try:
+        queries = invoice_matching._build_queries("Kings Vet KINGSGROVE NSW", _date(2026, 2, 23))
+    finally:
+        invoice_matching.config.SPOUSE_EMAIL = original_spouse
+    merchant_queries = [q for q, needs_confirm in queries if not needs_confirm]
+    spouse_queries = [q for q, needs_confirm in queries if needs_confirm]
+    assert any("after:" in q and "before:" not in q for q in merchant_queries), "merchant needs an open-ended window"
+    assert any("after:" in q and "before:" not in q for q in spouse_queries), "spouse forwards need an open-ended window"
+    assert any("before:" in q for q in merchant_queries), "narrow window must remain (invoice can arrive before the charge settles)"
+    assert all("NSW" not in q for q in merchant_queries), "state suffix must be stripped from search terms"
+    # real failure: Justin's own outgoing invoice-request emails list visit
+    # dates + amounts — extraction read them as invoices and 12 claims matched
+    # his own requests. Own mail must be excluded query-side.
+    assert all("-from:me" in q for q in merchant_queries), "own sent mail must never be an invoice candidate"
+
+
+def test_extraction_cached_per_email_no_second_llm_call():
+    db.init_db()
+    calls = []
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: calls.append(1) or '{"invoices": [{"date": "2026-01-20", "amount": 10.50, "items": []}]}'
+    try:
+        first = invoice_matching._invoices_for_email("cache-test-1", "some invoice text")
+        llm.extract = lambda *a, **k: (_ for _ in ()).throw(AssertionError("second extraction must come from cache"))
+        second = invoice_matching._invoices_for_email("cache-test-1", "some invoice text")
+    finally:
+        llm.extract = original_extract
+    assert len(calls) == 1
+    assert first == second == [{"date": "2026-01-20", "amount": 10.50, "items": []}]
+
+
+def test_unparseable_extraction_not_cached_so_it_retries():
+    db.init_db()
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: "total gibberish, no json"
+    try:
+        assert invoice_matching._invoices_for_email("cache-test-2", "text") is None
+    finally:
+        llm.extract = original_extract
+    assert invoice_matching._cached_extraction("cache-test-2") is None, "failed parse must not be cached"
+
+
+def test_forward_confirms_vet_needs_word_boundary_and_distinctive_word():
+    """Real case: a human-hospital forward passed the old substring check for
+    'Kings Vet KINGSGROVE NSW' — 'kings' matched inside an unrelated word."""
+    merchant = "Kings Vet KINGSGROVE NSW"
+    assert not invoice_matching._forward_confirms_vet(
+        "Procedure at Sydney Day Surgery near Kingsford Smith Drive", merchant, None
+    ), "substring inside another word must not confirm"
+    assert invoice_matching._forward_confirms_vet(
+        "Kind Regards, Kingsgrove Animal Hospital", merchant, None
+    )
+    assert invoice_matching._forward_confirms_vet(
+        "quoted From: info@kingsvet.com.au", merchant, "info@kingsvet.com.au"
+    ), "known vet email always confirms"
+    # generic words alone must never confirm a different vet's invoice
+    assert not invoice_matching._forward_confirms_vet(
+        "Sydney Animal Hospitals - Inner West", merchant, None
+    )
+
+
+def test_parse_invoices_salvages_truncated_reply():
+    """Real case: a 12k-char bulk invoice PDF pushed the reply past the model's
+    output budget, cutting the JSON mid-array — complete invoice objects must
+    survive, the partial one is dropped."""
+    truncated = (
+        '{"invoices": ['
+        '{"date": "2026-04-13", "amount": 551.06, "services": null, "items": []}, '
+        '{"date": "2026-04-13", "amount": 1970.40, "services": null, "items": []}, '
+        '{"date": "2026-06-17", "amount": 23'
+    )
+    parsed = invoice_matching._parse_invoices(truncated)
+    assert [i["amount"] for i in parsed] == [551.06, 1970.40]
+    # nothing complete to salvage
+    assert invoice_matching._parse_invoices('{"invoices": [{"date": "2026-') is None
+
+
+def test_oversized_invoice_detected_for_manual_split():
+    """Real case: MediPaws billed one $2,521.46 invoice paid via two card
+    charges ($551.06 + $1,970.40, same day). Neither claim may match it —
+    but it must be surfaced, not silently skipped."""
+    from datetime import date as _date
+    invoices = [{"date": "2026-04-13", "amount": 2521.46}]
+    assert invoice_matching._pick_invoice(invoices, -551.06, _date(2026, 4, 13)) is None
+    over = invoice_matching._oversized_candidate(invoices, -551.06, _date(2026, 4, 13))
+    assert over["amount"] == 2521.46
+    # an oversized invoice for a DIFFERENT visit is not this claim's business
+    assert invoice_matching._oversized_candidate(invoices, -551.06, _date(2026, 6, 19)) is None
+    # dateless big invoices can't be tied to the visit — never flagged
+    assert invoice_matching._oversized_candidate([{"date": None, "amount": 9999.0}], -551.06, _date(2026, 4, 13)) is None
+
+
+def _insert_pending_claim(conn, merchant: str, amount: float, txn_date: str) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO bank_transactions (date, amount, merchant, created_at) VALUES (?, ?, ?, ?)",
+        (txn_date, amount, merchant, now),
+    )
+    txn_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        "INSERT INTO vet_claims (transaction_id, status, created_at, updated_at) VALUES (?, 'pending_match', ?, ?)",
+        (txn_id, now, now),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def test_split_proposal_created_resolved_and_sibling_absorbed():
+    """Real case: MediPaws billed one $2,521.46 invoice paid via two charges
+    ($551.06 + $1,970.40). A proposal pairs the claims; Justin's pick attaches
+    the invoice to one claim and closes the other as covered."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM split_proposals")
+        claim_a = _insert_pending_claim(conn, "MEDIPAWS TEST", -551.06, "2026-04-13")
+        claim_b = _insert_pending_claim(conn, "MEDIPAWS TEST", -1970.40, "2026-04-13")
+
+    oversized = {"date": "2026-04-13", "amount": 2521.46, "items": [], "_email_id": "email-split-1"}
+    with db.get_connection() as conn:
+        claim_row = conn.execute(
+            "SELECT vet_claims.*, bank_transactions.amount AS txn_amount, "
+            "bank_transactions.merchant AS txn_merchant FROM vet_claims "
+            "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            "WHERE vet_claims.id = ?", (claim_a,),
+        ).fetchone()
+    flag = invoice_matching._propose_split(claim_row, oversized)
+    assert flag and f"#{claim_b}" in flag, "flag must name the sibling claim"
+    # second call dedupes — still exactly one open proposal
+    invoice_matching._propose_split(claim_row, oversized)
+    with db.get_connection() as conn:
+        proposals = conn.execute("SELECT * FROM split_proposals WHERE status='open'").fetchall()
+    assert len(proposals) == 1
+    proposal = proposals[0]
+
+    # wrong claim id refused; then the real pick works
+    assert invoice_matching.resolve_split_proposal(proposal["id"], 999999)["ok"] is False
+    result = invoice_matching.resolve_split_proposal(proposal["id"], claim_b)
+    assert result["ok"], result["message"]
+    with db.get_connection() as conn:
+        chosen = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_b,)).fetchone()
+        other = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()
+        proposal = conn.execute("SELECT status FROM split_proposals WHERE id = ?", (proposal["id"],)).fetchone()
+    assert chosen["status"] == "matched" and chosen["matched_email_id"] == "email-split-1"
+    import json as _json
+    assert _json.loads(chosen["invoice_data"])["amount"] == 2521.46
+    assert other["status"] == "absorbed" and f"#{claim_b}" in other["flag"]
+    assert proposal["status"] == "resolved"
+    # resolving a nonexistent/closed proposal refuses
+    assert invoice_matching.resolve_split_proposal(999, claim_b)["ok"] is False
+
+
+def test_split_proposal_not_created_when_charges_dont_explain_invoice():
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM split_proposals")
+        claim_a = _insert_pending_claim(conn, "SOME VET", -100.00, "2026-04-13")
+        _insert_pending_claim(conn, "SOME VET", -200.00, "2026-04-13")
+        _insert_pending_claim(conn, "OTHER VET", -2421.46, "2026-04-13")  # right sum, wrong vet
+    oversized = {"date": "2026-04-13", "amount": 2521.46, "_email_id": "email-split-2"}
+    with db.get_connection() as conn:
+        claim_row = conn.execute(
+            "SELECT vet_claims.*, bank_transactions.amount AS txn_amount, "
+            "bank_transactions.merchant AS txn_merchant FROM vet_claims "
+            "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            "WHERE vet_claims.id = ?", (claim_a,),
+        ).fetchone()
+    assert invoice_matching._propose_split(claim_row, oversized) is None
+    with db.get_connection() as conn:
+        assert conn.execute("SELECT count(*) FROM split_proposals").fetchone()[0] == 0
+
+
+def test_notify_split_proposals_sends_picker_once():
+    from openclaw import pipeline
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM split_proposals")
+        claim_a = _insert_pending_claim(conn, "MEDIPAWS TEST", -551.06, "2026-04-13")
+        claim_b = _insert_pending_claim(conn, "MEDIPAWS TEST", -1970.40, "2026-04-13")
+        import json as _json
+        conn.execute(
+            "INSERT INTO split_proposals (email_id, invoice_json, claim_ids, created_at) VALUES (?, ?, ?, ?)",
+            ("email-n-1", _json.dumps({"date": "2026-04-13", "amount": 2521.46}),
+             _json.dumps([claim_a, claim_b]), datetime.now(timezone.utc).isoformat()),
+        )
+    sent = []
+    pipeline.notify_split_proposals(send_fn=lambda text, markup=None: sent.append((text, markup)))
+    assert len(sent) == 1
+    text, markup = sent[0]
+    assert "$2521.46" in text and f"#{claim_a}" in text and f"#{claim_b}" in text
+    assert "$551.06" in text and "$1970.40" in text
+    assert markup is not None, "picker buttons must be attached"
+    # already notified — no re-send
+    pipeline.notify_split_proposals(send_fn=lambda text, markup=None: sent.append((text, markup)))
+    assert len(sent) == 1
+
+
+def test_run_once_isolates_one_claims_failure():
+    """Real failure mode: extraction error on the first pending claim starved
+    Petcover polling + notifications for days. One claim's crash must flag that
+    claim only; later claims and every downstream stage still run."""
+    from openclaw import pipeline
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        claim_a = _insert_pending_claim(conn, "CRASHY VET", -50.0, "2026-07-01")
+        claim_b = _insert_pending_claim(conn, "HEALTHY VET", -60.0, "2026-07-02")
+
+    attempted, stages = [], []
+    def fake_match(claim):
+        attempted.append(claim["id"])
+        if claim["id"] == claim_a:
+            raise RuntimeError("boom")
+        return False
+
+    originals = (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
+                 pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
+                 pipeline.poll_petcover_status, pipeline.notify_claim_states)
+    pipeline.vet_detection.classify_unflagged = lambda: stages.append("classify")
+    pipeline._reconcile_sent_invoice_requests = lambda: stages.append("reconcile")
+    pipeline.invoice_matching.match_claim = fake_match
+    pipeline._maybe_draft_invoice_request = lambda claim: stages.append(f"draft:{claim['id']}")
+    pipeline.poll_petcover_status = lambda: stages.append("poll")
+    pipeline.notify_claim_states = lambda: stages.append("notify")
+    try:
+        pipeline.run_once()
+    finally:
+        (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
+         pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
+         pipeline.poll_petcover_status, pipeline.notify_claim_states) = originals
+
+    assert attempted == [claim_a, claim_b], "claim B must still be attempted after claim A crashes"
+    assert "poll" in stages and "notify" in stages, "downstream stages must run despite the failure"
+    assert f"draft:{claim_b}" in stages, "claim B continues through the normal no-match path"
+    with db.get_connection() as conn:
+        flag_a = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
+    assert flag_a and flag_a.startswith("invoice matching error"), "failure must be visible on the claim"
+
+
+def test_run_once_llm_outage_skips_matching_but_runs_downstream():
+    """LLM outage is global — matching stops for the tick (no quota burn on the
+    rest), the first affected claim is flagged, downstream stages still run,
+    and the flag clears on the next healthy attempt."""
+    from openclaw import pipeline
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        claim_a = _insert_pending_claim(conn, "VET ONE", -50.0, "2026-07-01")
+        claim_b = _insert_pending_claim(conn, "VET TWO", -60.0, "2026-07-02")
+
+    attempted, stages = [], []
+    def unavailable_match(claim):
+        attempted.append(claim["id"])
+        raise llm.LLMUnavailableError("429 quota")
+
+    originals = (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
+                 pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
+                 pipeline.poll_petcover_status, pipeline.notify_claim_states)
+    pipeline.vet_detection.classify_unflagged = lambda: None
+    pipeline._reconcile_sent_invoice_requests = lambda: None
+    pipeline.invoice_matching.match_claim = unavailable_match
+    pipeline._maybe_draft_invoice_request = lambda claim: None
+    pipeline.poll_petcover_status = lambda: stages.append("poll")
+    pipeline.notify_claim_states = lambda: stages.append("notify")
+    try:
+        pipeline.run_once()
+        with db.get_connection() as conn:
+            flag_a = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
+            flag_b = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_b,)).fetchone()[0]
+        assert attempted == [claim_a], "outage must stop further matching this tick"
+        assert flag_a and flag_a.startswith("invoice extraction unavailable")
+        assert flag_b is None, "unattempted claims must not be flagged"
+        assert stages == ["poll", "notify"], "downstream stages must still run during an outage"
+
+        # next healthy tick: stale outage flag clears before the attempt
+        attempted.clear()
+        pipeline.invoice_matching.match_claim = lambda claim: attempted.append(claim["id"]) or False
+        pipeline.run_once()
+        with db.get_connection() as conn:
+            flag_a = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
+        assert flag_a is None, "recovered claim must not carry a stale outage flag"
+    finally:
+        (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
+         pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
+         pipeline.poll_petcover_status, pipeline.notify_claim_states) = originals
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
