@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from . import db, gemini
+from . import db, llm
 
 # Cheap heuristic first (keyword/allowlist), Gemini only for ambiguous cases —
 # keeps the 15rpm free-tier budget off the hot path (design.md decision).
@@ -20,6 +20,11 @@ VET_KEYWORDS = [
 
 # User-maintained allowlist for exact merchant names the keyword list misses.
 VET_ALLOWLIST: set[str] = set()
+
+# Denylist: merchants the keyword heuristic wrongly flags — retail/online stores
+# whose name contains "vet"/"pets" but aren't clinics. Checked before keywords so
+# they never become claims. Substring match, case-insensitive.
+NON_VET_KEYWORDS = ["sp vets love pets"]
 
 AMBIGUOUS_CATEGORY_HINTS = ["medical", "pet", "animal"]
 
@@ -46,10 +51,14 @@ def _looks_ambiguous(category: str | None) -> bool:
 def classify(merchant: str, category: str | None = None) -> bool:
     """Returns True if vet-related. Gemini is only called for the ambiguous case
     (medical/pet-adjacent category, no keyword hit)."""
+    merchant_lower = merchant.lower()
+    denylist = NON_VET_KEYWORDS + db.get_non_vet_patterns()
+    if any(k in merchant_lower for k in denylist):
+        return False
     if _keyword_match(merchant):
         return True
     if _looks_ambiguous(category):
-        raw = gemini.extract(
+        raw = llm.extract(
             CLASSIFY_PROMPT.format(merchant=merchant, category=category),
             purpose="vet_classification",
         )

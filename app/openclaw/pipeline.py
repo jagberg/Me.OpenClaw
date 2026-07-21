@@ -1,9 +1,12 @@
 from datetime import datetime, timedelta, timezone
 
 import json
+import logging
 
 from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, telegram_bot, vet_detection
 from .scheduler import scheduler
+
+logger = logging.getLogger(__name__)
 
 # marketing.au@ deliberately excluded — not claims-relevant (design.md).
 PETCOVER_STATUS_SENDERS = ["claims.au@petcovergroup.com", "requiredinfo.au@petcovergroup.com", "accounts.au@petcovergroup.com"]
@@ -235,8 +238,11 @@ def _reconcile_sent_invoice_requests() -> None:
     for row in rows:
         try:
             message = service.users().messages().get(userId="me", id=row["draft_id"], format="minimal").execute()
-        except Exception:
-            continue  # can't confirm either way this cycle — retry next run
+        except Exception as exc:
+            # Can't confirm either way this cycle — retry next tick. Not silent:
+            # a persistent failure (auth expiry, bad id) stays visible in logs.
+            logger.warning("reconcile: couldn't fetch draft %s for claim %s: %s", row["draft_id"], row["id"], exc)
+            continue
         labels = message.get("labelIds", [])
         if "SENT" in labels and "DRAFT" not in labels:
             with db.get_connection() as conn:

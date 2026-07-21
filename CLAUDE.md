@@ -28,7 +28,7 @@ Personal assistant for Justin: task/reminder capture from Gmail, plus a vet-insu
 
 ## Operational constraints
 
-- Gemini free tier: 5 requests/min and a hard 20/day cap. Don't add LLM calls where regex/keywords work (classification, references are keyword/regex on purpose).
+- LLM backend is provider-agnostic (`llm.py`, `chat()`/`extract()`); default is Groq free tier (`llama-3.3-70b-versatile`), swappable to Cerebras/OpenAI/Gemini by env var — ADR-0009 (supersedes 0001). Cerebras' free tier is sold-out for this account (402 on every model), hence Groq. Chat + extraction are the only LLM users. Don't add LLM calls where regex/keywords work (classification, references are keyword/regex on purpose).
 - Gmail OAuth token expires periodically (testing-app 7-day limit) — recovery: `python scripts/gmail_auth.py` (opens browser, Justin must click Allow).
 - Live DB schema changes need a manual `ALTER TABLE` against `app/data/openclaw.db` — `CREATE TABLE IF NOT EXISTS` in `db.py` won't touch existing tables.
 

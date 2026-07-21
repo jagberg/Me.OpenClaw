@@ -12,8 +12,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 _tmpdir = tempfile.mkdtemp()
 os.environ["DATABASE_PATH"] = os.path.join(_tmpdir, "test.db")
 os.environ.setdefault("GEMINI_API_KEY", "")
+# Keep the suite hermetic: force every LLM backend unconfigured so extraction
+# fails visibly (the intended assertion) instead of making a real API call from
+# a key that happens to be in .env. load_dotenv(override=False) won't overwrite
+# these explicit empties.
+os.environ["CEREBRAS_API_KEY"] = ""
+os.environ["GROQ_API_KEY"] = ""
+os.environ["OPENAI_API_KEY"] = ""
 
-from openclaw import claim_status, db, gemini, invoice_matching, netbank_csv, reminders, tasks, vet_detection  # noqa: E402
+from openclaw import claim_status, db, gemini, invoice_matching, llm, netbank_csv, reminders, tasks, vet_detection  # noqa: E402
 from openclaw.scheduler import scheduler  # noqa: E402
 
 
@@ -37,12 +44,12 @@ def test_rate_limiter_throttles_at_capacity():
 
 
 def test_extract_follow_up_handles_markdown_fenced_json():
-    original_extract = gemini.extract
-    gemini.extract = lambda *a, **k: '```json\n{"follow_up_at": "2026-07-10T09:00:00+00:00"}\n```'
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: '```json\n{"follow_up_at": "2026-07-10T09:00:00+00:00"}\n```'
     try:
         result = tasks._extract_follow_up("call painter, follow up Friday")
     finally:
-        gemini.extract = original_extract
+        llm.extract = original_extract
     assert result == datetime(2026, 7, 10, 9, 0, tzinfo=timezone.utc)
 
 
@@ -51,9 +58,9 @@ def test_create_task_without_gemini_key_raises_visibly():
     try:
         tasks.create_task("call painter", source="chat")
         raised = False
-    except gemini.GeminiUnavailableError:
+    except llm.LLMUnavailableError:
         raised = True
-    assert raised, "create_task must surface Gemini failures, not swallow them"
+    assert raised, "create_task must surface LLM failures, not swallow them"
 
 
 def test_schedule_reminder_marks_due():
@@ -102,34 +109,34 @@ def test_netbank_csv_bad_layout_raises_visibly():
 
 def test_classify_obvious_vet_merchant_skips_gemini():
     called = []
-    original_extract = gemini.extract
-    gemini.extract = lambda *a, **k: called.append(1) or "yes"
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: called.append(1) or "yes"
     try:
         assert vet_detection.classify("CITY VET CLINIC SYDNEY") is True
     finally:
-        gemini.extract = original_extract
+        llm.extract = original_extract
     assert not called, "obvious vet keyword match must not call Gemini"
 
 
 def test_classify_obvious_non_vet_merchant_skips_gemini():
     called = []
-    original_extract = gemini.extract
-    gemini.extract = lambda *a, **k: called.append(1) or "yes"
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: called.append(1) or "yes"
     try:
         assert vet_detection.classify("WOOLWORTHS SUPERMARKET", category="groceries") is False
     finally:
-        gemini.extract = original_extract
+        llm.extract = original_extract
     assert not called, "clearly unrelated merchant must not call Gemini"
 
 
 def test_classify_ambiguous_merchant_triggers_gemini():
     called = []
-    original_extract = gemini.extract
-    gemini.extract = lambda *a, **k: called.append(1) or "yes"
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: called.append(1) or "yes"
     try:
         assert vet_detection.classify("SUBURBAN PET SUPPLIES", category="medical") is True
     finally:
-        gemini.extract = original_extract
+        llm.extract = original_extract
     assert called, "ambiguous medical/pet category with no keyword hit must call Gemini"
 
 

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from telegram import Bot, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from . import claim_forms, claim_status, config, db, invoice_matching
+from . import agent, claim_forms, claim_status, config, db, invoice_matching, llm
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,8 @@ HELP_TEXT = (
     "/process <claim_id> — run the matched→drafted advance now\n"
     "/sent <claim_id> — mark a drafted claim as sent (starts Petcover reply tracking)\n"
     "/resolved <claim_id> — confirm you've dealt with an info request/suspension\n"
-    "/vetemail <merchant name> <email> — set a vet's contact address for invoice requests"
+    "/vetemail <merchant name> <email> — set a vet's contact address for invoice requests\n"
+    "/notvet <merchant text> — mark a merchant as not-a-vet so its charges never become claims"
 )
 
 _application: Application | None = None
@@ -116,6 +117,18 @@ def handle_vetemail(username: str | None, merchant: str, email: str) -> dict:
     return {"ok": True, "message": f"Vet contact saved: {merchant} → {email}"}
 
 
+def handle_notvet(username: str | None, pattern: str) -> dict:
+    if not _is_authorized(username):
+        return {"ok": False, "message": "Not authorized."}
+    if not pattern.strip():
+        return {"ok": False, "message": "Usage: /notvet <merchant text>"}
+    added = db.add_non_vet_pattern(pattern)
+    normalised = pattern.strip().lower()
+    if added:
+        return {"ok": True, "message": f"Added to non-vet list: '{normalised}'. Matching charges won't become claims."}
+    return {"ok": True, "message": f"'{normalised}' is already on the non-vet list."}
+
+
 # Thin async adapters — extract args from the Update/Context, call the pure
 # handler above, reply with its message. No business logic lives here.
 
@@ -210,6 +223,15 @@ async def vetemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # (NetBank merchant strings contain spaces, e.g. "CITY VET CLINIC SYDNEY").
     merchant = " ".join(context.args[:-1])
     result = handle_vetemail(username, merchant, context.args[-1])
+    await update.message.reply_text(result["message"])
+
+
+async def notvet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    username = update.effective_user.username if update.effective_user else None
+    if not context.args:
+        await update.message.reply_text("Usage: /notvet <merchant text>  (e.g. /notvet sp vets love pets)")
+        return
+    result = handle_notvet(username, " ".join(context.args))
     await update.message.reply_text(result["message"])
 
 
@@ -320,6 +342,33 @@ def pet_keyboard(claim_id: int) -> InlineKeyboardMarkup:
 # entry (container restart) just means Justin taps the button again.
 _pending_condition: dict[int, int] = {}
 
+# token -> proposed action awaiting the user's Confirm tap (from the chat agent).
+# In-memory like _pending_condition: a lost entry (restart) just means re-asking.
+_pending_actions: dict[str, dict] = {}
+
+
+def _register_action(proposal: dict) -> str:
+    # action:claim_id stays well under Telegram's 64-byte callback_data limit.
+    token = f"{proposal['action']}:{proposal['claim_id']}"
+    _pending_actions[token] = proposal
+    return token
+
+
+def _execute_action(proposal: dict) -> str:
+    """Run a confirmed mutation through the same domain functions the slash
+    commands use — the write happens here, only after a Confirm tap."""
+    action, claim_id, arg = proposal["action"], proposal["claim_id"], proposal.get("arg")
+    if action == "mark_sent":
+        return claim_status.mark_sent(claim_id)["message"]
+    if action == "set_condition":
+        return claim_forms.set_condition_text(claim_id, arg)["message"]
+    if action == "assign_pet":
+        return claim_forms.assign_pet(claim_id, arg)["message"]
+    if action == "mark_resolved":
+        claim_status.confirm_resolved(claim_id)
+        return f"Claim #{claim_id} confirmed resolved."
+    return f"Unknown action: {action}"
+
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -381,6 +430,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             idx = int(data.split(":", 1)[1])
             if 0 <= idx < len(conds):
                 await _record_and_advance(query.message.chat_id, conds[idx], context.bot)
+    elif data.startswith("act:"):
+        proposal = _pending_actions.pop(data.split(":", 1)[1], None)
+        if proposal is None:
+            await query.edit_message_text(text=f"{query.message.text}\n\n⚠️ Action expired — ask again.")
+            return
+        message = _execute_action(proposal)
+        await query.edit_message_text(text=f"{query.message.text}\n\n✅ {message}")
 
 
 async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -398,10 +454,32 @@ async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _record_and_advance(chat_id, text, context.bot)
         return
     claim_id = _pending_condition.pop(chat_id, None)
-    if claim_id is None:
+    if claim_id is not None:
+        result = claim_forms.set_condition_text(claim_id, text)
+        await update.message.reply_text(result["message"])
         return
-    result = claim_forms.set_condition_text(claim_id, text)
-    await update.message.reply_text(result["message"])
+    # No pending typed-reply flow owns this message — treat it as free-form chat.
+    await _handle_chat(update)
+
+
+async def _handle_chat(update: Update) -> None:
+    """Free-form message → conversational agent. A proposed mutation comes back
+    as a Confirm button; the write happens only on the tap (see on_callback)."""
+    try:
+        reply, proposal = await asyncio.to_thread(agent.handle_message, update.message.text)
+    except llm.LLMUnavailableError as exc:
+        await update.message.reply_text(f"⚠️ LLM unavailable: {exc}")
+        return
+    except Exception as exc:  # never leave the user staring at silence
+        logger.exception("chat handler failed")
+        await update.message.reply_text(f"⚠️ Something broke handling that: {type(exc).__name__}: {exc}")
+        return
+    if proposal:
+        token = _register_action(proposal)
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm", callback_data=f"act:{token}")]])
+        await update.message.reply_text(reply or f"Confirm: {proposal['label']}?", reply_markup=markup)
+    else:
+        await update.message.reply_text(reply or "…")
 
 
 def build_application() -> Application:
@@ -414,6 +492,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("sent", sent_command))
     application.add_handler(CommandHandler("resolved", resolved_command))
     application.add_handler(CommandHandler("vetemail", vetemail_command))
+    application.add_handler(CommandHandler("notvet", notvet_command))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_reply))
     return application
