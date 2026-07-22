@@ -545,6 +545,25 @@ async def stop_polling() -> None:
     _application = None
 
 
+def send_document_sync(caption: str, document: bytes, filename: str, reply_markup=None) -> None:
+    """Outbound document push (e.g. the PDF invoice a review alert is about),
+    same synchronous-caller pattern as send_message_sync. Telegram caps
+    captions at 1024 chars — truncated, the document is the point."""
+    chat_id = get_registered_chat_id()
+    if chat_id is None or not config.TELEGRAM_BOT_TOKEN:
+        logger.warning("Telegram document skipped — no chat id or token.")
+        return
+
+    async def _send() -> None:
+        bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
+        await bot.send_document(
+            chat_id=chat_id, document=document, filename=filename,
+            caption=caption[:1024], reply_markup=reply_markup,
+        )
+
+    asyncio.run(_send())
+
+
 def send_message_sync(text: str, reply_markup=None) -> None:
     """Outbound push from synchronous callers (the APScheduler pipeline job
     runs on its own thread, not the FastAPI event loop) — spins up a throwaway

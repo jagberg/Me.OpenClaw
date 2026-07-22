@@ -251,12 +251,24 @@ def _forward_confirms_vet(text: str, merchant: str, known_vet_email: str | None)
     return any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in words)
 
 
-def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None = None) -> None:
+def _single_pet_in_text(text: str) -> int | None:
+    """The pet id when the email names exactly ONE known pet (word-boundary,
+    case-insensitive) — e.g. a receipt itemising 'Echo 17 Jun 2026
+    Consultation'. Two names (a bulk reply covering both dogs) = no signal.
+    Reading a printed fact off the vet's own document, not guessing."""
+    with db.get_connection() as conn:
+        pets = conn.execute("SELECT id, name FROM pets").fetchall()
+    named = [p for p in pets if re.search(rf"\b{re.escape(p['name'])}\b", text, re.IGNORECASE)]
+    return named[0]["id"] if len(named) == 1 else None
+
+
+def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None = None,
+                  pet_id: int | None = None) -> None:
     with db.get_connection() as conn:
         conn.execute(
             "UPDATE vet_claims SET status = 'matched', matched_email_id = ?, invoice_data = ?, "
-            "flag = ?, updated_at = ? WHERE id = ?",
-            (email_id, json.dumps(invoice), flag, datetime.now(timezone.utc).isoformat(), claim_id),
+            "flag = ?, pet_id = COALESCE(?, pet_id), updated_at = ? WHERE id = ?",
+            (email_id, json.dumps(invoice), flag, pet_id, datetime.now(timezone.utc).isoformat(), claim_id),
         )
 
 
@@ -375,7 +387,8 @@ def match_claim(claim) -> bool:
             invoice["claimable_amount"] = claimable_amount(invoice)
             remainder = _unexplained_remainder(total, claim["txn_amount"])
             flag = f"possible additional invoice — unexplained ${remainder:.2f}" if remainder else None
-            _mark_matched(claim["id"], item["id"], invoice, flag)
+            pet_id = _single_pet_in_text(text) if claim["pet_id"] is None else None
+            _mark_matched(claim["id"], item["id"], invoice, flag, pet_id=pet_id)
             return True
 
     if unreadable_subject:

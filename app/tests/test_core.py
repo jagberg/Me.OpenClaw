@@ -779,11 +779,33 @@ def test_find_invoice_segment_picks_right_page_and_pet():
     assert claim_forms.find_invoice_segment(pages, 2521.46, "Aari") == (0, 0)
     assert claim_forms.find_invoice_segment(pages, 1328.25, "Echo") == (1, 1)
     # same total but the page names the OTHER pet — refused
-    assert claim_forms.find_invoice_segment(pages, 2521.46, "Echo") is None
+    assert claim_forms.find_invoice_segment(pages, 2521.46, "Echo", ("Aari",)) is None
     # pet unknown: amount alone picks the segment
     assert claim_forms.find_invoice_segment(pages, 1328.25, None) == (1, 1)
     # grouped thousands formatting still matches
     assert claim_forms.find_invoice_segment(["Tax Invoice\nPatient: Aari\nTotal: $2,521.46"], 2521.46, "Aari") == (0, 0)
+
+
+def test_find_invoice_segment_handles_colonless_patient_and_unknown_words():
+    """Real SAH format: 'Patient Echo' — no colon (the colon-required regex
+    missed it live). A patient-word that isn't a known pet carries no signal."""
+    sah_page = "Tax Invoice\nTransaction No 6351750 Patient Echo Reference Hannah\nTotal: $10.50"
+    assert claim_forms.find_invoice_segment([sah_page], 10.50, "Echo", ("Aari",)) == (0, 0)
+    assert claim_forms.find_invoice_segment([sah_page], 10.50, "Aari", ("Echo",)) is None, "names the other pet"
+    # 'Patient care' is not a pet — must not reject
+    care_page = "Tax Invoice\nPatient care plan discussed\nTotal: $45.00"
+    assert claim_forms.find_invoice_segment([care_page], 45.00, "Aari", ("Echo",)) == (0, 0)
+
+
+def test_single_pet_in_text_assigns_only_when_unambiguous():
+    db.init_db()
+    receipt = "Item Name Qty Total Echo 17 Jun 2026 Consultation - Standard 1.0 $140.74"
+    bulk = "all visits over the past 12 months for Aari and Echo Goldberg"
+    with db.get_connection() as conn:
+        echo_id = conn.execute("SELECT id FROM pets WHERE name='Echo'").fetchone()[0]
+    assert invoice_matching._single_pet_in_text(receipt) == echo_id
+    assert invoice_matching._single_pet_in_text(bulk) is None, "both pets named = no signal"
+    assert invoice_matching._single_pet_in_text("no pets here") is None
 
 
 def test_find_invoice_segment_rejects_account_statement():

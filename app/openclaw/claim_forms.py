@@ -244,7 +244,15 @@ def apply_item_conditions(claim_id: int, item_conditions: list[dict]) -> dict:
 # and no "Patient name:" — verified against MediPaws' real Financial Statement
 # vs its Individual Invoices bundle (0 header/patient hits vs 11 each).
 _INVOICE_HEADER_RE = re.compile(r"INVOICE\s*#\s*\d{4,}|Tax Invoice", re.IGNORECASE)
-_PATIENT_RE = re.compile(r"Patient\s*(?:name)?\s*:\s*\n?\s*(\w+)", re.IGNORECASE)
+# Colon optional — real formats: "Patient name:\nAari" (MediPaws), "Patient : Aari"
+# and "Patient Echo" (SAH, confirmed live — the colon-required version missed it).
+# Captured words are only ever acted on after matching a KNOWN pet name, so the
+# loose pattern can't misfire on e.g. "Patient care".
+_PATIENT_RE = re.compile(r"Patient\s*(?:name)?\s*:?\s*\n?\s*([A-Za-z]+)", re.IGNORECASE)
+
+
+def _patient_candidates(text: str) -> set[str]:
+    return {m.group(1).lower() for m in _PATIENT_RE.finditer(text)}
 
 
 def _amount_variants(amount: float) -> list[str]:
@@ -253,49 +261,79 @@ def _amount_variants(amount: float) -> list[str]:
     return [plain] if plain == grouped else [plain, grouped]
 
 
-def find_invoice_segment(page_texts: list[str], amount: float, pet_name: str | None) -> tuple[int, int] | None:
+def find_invoice_segment(
+    page_texts: list[str], amount: float, pet_name: str | None, other_pets: tuple[str, ...] = ()
+) -> tuple[int, int] | None:
     """Locates THIS claim's invoice inside a multi-invoice PDF bundle: pages are
     segmented at invoice headers (each segment = one per-visit invoice, running
     to the next header), and a segment matches when it contains the claim's
-    invoice total and doesn't name a different patient. Returns (start, end)
-    page indexes, or None — which doubles as the adequacy validation: an
-    account statement has no invoice headers, so nothing can match."""
+    invoice total and doesn't name a DIFFERENT known pet as the patient (loose
+    patient-word captures that aren't a known pet name carry no signal either
+    way). Returns (start, end) page indexes, or None — which doubles as the
+    adequacy validation: an account statement has no invoice headers, so
+    nothing can match."""
     headers = [i for i, t in enumerate(page_texts) if _INVOICE_HEADER_RE.search(t or "")]
     if not headers:
         return None
     variants = _amount_variants(float(amount))
+    others_lower = {p.lower() for p in other_pets}
     for k, start in enumerate(headers):
         end = (headers[k + 1] if k + 1 < len(headers) else len(page_texts)) - 1
         text = "\n".join(page_texts[start : end + 1])
         if not any(v in text for v in variants):
             continue
         if pet_name:
-            patient = _PATIENT_RE.search(text)
-            if patient and patient.group(1).lower() != pet_name.lower():
+            candidates = _patient_candidates(text)
+            if pet_name.lower() not in candidates and candidates & others_lower:
                 continue  # another pet's invoice happens to carry the same total
         return (start, end)
     return None
 
 
-def _email_pdf_documents(email_id: str) -> list[tuple[PdfReader, list[str]]]:
-    """Every PDF attachment of the email, as (reader, per-page texts). Unreadable
-    PDFs (image scans) yield empty texts and simply won't segment."""
+def email_pdf_attachments(email_id: str) -> list[tuple[str, bytes]]:
+    """Every PDF attachment of the email as (filename, raw bytes) — used both
+    for segmentation and for attaching the document to a review alert."""
     service = gmail_client.build_service()
     message = service.users().messages().get(userId="me", id=email_id, format="full").execute()
-    documents = []
+    attachments = []
     for part in gmail_client._iter_attachment_parts(message.get("payload", {})):
         if part.get("mimeType") != "application/pdf":
             continue
         attachment = service.users().messages().attachments().get(
             userId="me", messageId=email_id, id=part["body"]["attachmentId"]
         ).execute()
-        data = base64.urlsafe_b64decode(attachment["data"] + "==")
+        attachments.append((part.get("filename") or "attachment.pdf", base64.urlsafe_b64decode(attachment["data"] + "==")))
+    return attachments
+
+
+def _email_pdf_documents(email_id: str) -> list[tuple[PdfReader, list[str]]]:
+    """Every PDF attachment of the email, as (reader, per-page texts). Unreadable
+    PDFs (image scans) yield empty texts and simply won't segment."""
+    documents = []
+    for _filename, data in email_pdf_attachments(email_id):
         try:
             reader = PdfReader(BytesIO(data))
             documents.append((reader, [page.extract_text() or "" for page in reader.pages]))
         except Exception:
             continue  # corrupt attachment — treated like any other non-matching PDF
     return documents
+
+
+def invoice_segment_pdf(email_id: str, amount: float) -> tuple[str, bytes] | None:
+    """The claim-relevant invoice pages of an email's PDF bundle as their own
+    small PDF — attached to review/merge alerts so Justin sees the actual
+    document on his phone."""
+    for reader, page_texts in _email_pdf_documents(email_id):
+        segment = find_invoice_segment(page_texts, float(amount), None)
+        if segment is None:
+            continue
+        writer = PdfWriter()
+        for i in range(segment[0], segment[1] + 1):
+            writer.add_page(reader.pages[i])
+        buffer = BytesIO()
+        writer.write(buffer)
+        return (f"invoice-{amount:.2f}.pdf", buffer.getvalue())
+    return None
 
 
 def ensure_invoice_file(claim) -> None:
@@ -310,14 +348,13 @@ def ensure_invoice_file(claim) -> None:
     invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
     if invoice.get("amount") is None:
         return
-    pet_name = None
-    if claim["pet_id"]:
-        with db.get_connection() as conn:
-            pet = conn.execute("SELECT name FROM pets WHERE id = ?", (claim["pet_id"],)).fetchone()
-        pet_name = pet["name"] if pet else None
+    with db.get_connection() as conn:
+        all_pets = {p["name"]: p["id"] for p in conn.execute("SELECT id, name FROM pets")}
+    pet_name = next((n for n, pid in all_pets.items() if pid == claim["pet_id"]), None)
+    other_pets = tuple(n for n in all_pets if n != pet_name)
 
     for reader, page_texts in _email_pdf_documents(claim["matched_email_id"]):
-        segment = find_invoice_segment(page_texts, float(invoice["amount"]), pet_name)
+        segment = find_invoice_segment(page_texts, float(invoice["amount"]), pet_name, other_pets)
         if segment is None:
             continue
         start, end = segment
@@ -337,13 +374,11 @@ def ensure_invoice_file(claim) -> None:
                 (output_path, now, _AWAITING_INVOICE_FLAG, claim["id"]),
             )
         # The invoice states its patient — reading a printed fact, not guessing.
+        # Only assign when exactly ONE known pet is named in the segment.
         if claim["pet_id"] is None:
-            patient = _PATIENT_RE.search("\n".join(page_texts[start : end + 1]))
-            if patient:
-                with db.get_connection() as conn:
-                    pet = conn.execute("SELECT id FROM pets WHERE lower(name) = ?", (patient.group(1).lower(),)).fetchone()
-                if pet:
-                    assign_pet(claim["id"], pet["id"])
+            named = {n for n in all_pets if n.lower() in _patient_candidates("\n".join(page_texts[start : end + 1]))}
+            if len(named) == 1:
+                assign_pet(claim["id"], all_pets[named.pop()])
         return
 
     flag = (

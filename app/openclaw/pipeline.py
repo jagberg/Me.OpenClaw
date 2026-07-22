@@ -197,12 +197,48 @@ def notify_split_proposals(send_fn=None) -> None:
             f"#{', #'.join(str(c['id']) for c in others)} closes as its other payment. "
             "(Petcover sees the invoice, not the bank charges — no split needed.)"
         )
-        send("\n".join(lines), telegram_bot.merge_bill_keyboard(proposal["id"]))
+        text = "\n".join(lines)
+        markup = telegram_bot.merge_bill_keyboard(proposal["id"])
+        # attach the invoice pages themselves so the merge can be reviewed in place
+        document = None
+        if send_fn is None:
+            try:
+                document = claim_forms.invoice_segment_pdf(proposal["email_id"], total)
+            except Exception as exc:
+                logger.warning("merge-proposal pdf fetch failed (proposal %s): %s", proposal["id"], exc)
+        if document:
+            telegram_bot.send_document_sync(text, document[1], document[0], markup)
+        else:
+            send(text, markup)
         with db.get_connection() as conn:
             conn.execute(
                 "UPDATE split_proposals SET notified_at = ? WHERE id = ?",
                 (datetime.now(timezone.utc).isoformat(), proposal["id"]),
             )
+
+
+# Flags whose alert should carry the offending PDF so Justin can review it
+# from the message itself.
+_REVIEW_FLAG_MARKERS = ("isn't a per-visit itemised invoice", "invoice attachment unreadable")
+
+
+def _review_pdf(group) -> tuple[str, bytes] | None:
+    """The vet document behind a needs-review flag. Matched claims know their
+    email; unreadable-flagged pending claims only carry the subject in the flag
+    — recovered via a Gmail subject search, best-effort."""
+    lead = group[0]
+    email_id = lead["matched_email_id"]
+    if not email_id and lead["flag"] and "unreadable — " in lead["flag"]:
+        subject = lead["flag"].split("unreadable — ", 1)[1]
+        service = gmail_client.build_service()
+        messages = service.users().messages().list(
+            userId="me", q=f'subject:"{subject}" has:attachment', maxResults=1
+        ).execute().get("messages", [])
+        email_id = messages[0]["id"] if messages else None
+    if not email_id:
+        return None
+    attachments = claim_forms.email_pdf_attachments(email_id)
+    return attachments[0] if attachments else None
 
 
 def notify_claim_states(send_fn=None) -> None:
@@ -260,7 +296,18 @@ def notify_claim_states(send_fn=None) -> None:
             markup = telegram_bot.condition_keyboard(lead["id"], lead["pet_id"], multi_item=multi)
         else:
             markup = None
-        send(text, markup)
+        # Review alerts carry the offending PDF itself. Only when using the
+        # real sender — a test send_fn spy stays a plain text call.
+        document = None
+        if send_fn is None and lead["flag"] and any(m in lead["flag"] for m in _REVIEW_FLAG_MARKERS):
+            try:
+                document = _review_pdf(group)
+            except Exception as exc:
+                logger.warning("review-pdf fetch failed for claim %s: %s", lead["id"], exc)
+        if document:
+            telegram_bot.send_document_sync(text, document[1], document[0], markup)
+        else:
+            send(text, markup)
         with db.get_connection() as conn:
             for c in group:
                 conn.execute(
