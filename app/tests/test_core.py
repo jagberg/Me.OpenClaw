@@ -551,6 +551,35 @@ def test_merge_split_proposal_auto_picks_larger_charge():
     assert large == "matched" and small == "absorbed", "larger charge must carry the invoice"
 
 
+def test_append_result_falls_back_to_caption_on_document_message():
+    """Merge/review alerts are documents with a caption, no text —
+    edit_message_text raises BadRequest there, so the helper must edit the
+    caption instead (real failure: merge tap 'did nothing')."""
+    import asyncio
+    from openclaw import telegram_bot
+
+    class FakeQuery:
+        def __init__(self, text, caption):
+            self.message = type("M", (), {"text": text, "caption": caption})()
+            self.edited = None
+
+        async def edit_message_text(self, text):
+            if self.message.text is None:
+                raise AssertionError("edit_message_text called on captioned document")
+            self.edited = ("text", text)
+
+        async def edit_message_caption(self, caption):
+            self.edited = ("caption", caption)
+
+    q_doc = FakeQuery(text=None, caption="Invoice #411193 for $2521.46")
+    asyncio.run(telegram_bot._append_result(q_doc, "✅ merged"))
+    assert q_doc.edited[0] == "caption" and q_doc.edited[1].endswith("✅ merged"), q_doc.edited
+
+    q_txt = FakeQuery(text="plain message", caption=None)
+    asyncio.run(telegram_bot._append_result(q_txt, "✅ done"))
+    assert q_txt.edited[0] == "text" and "plain message" in q_txt.edited[1], q_txt.edited
+
+
 def test_reject_split_proposal_flags_and_never_reproposes():
     db.init_db()
     with db.get_connection() as conn:

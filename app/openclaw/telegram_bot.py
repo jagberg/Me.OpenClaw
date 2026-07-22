@@ -382,6 +382,17 @@ def _execute_action(proposal: dict) -> str:
     return f"Unknown action: {action}"
 
 
+async def _append_result(query, suffix: str) -> None:
+    """Append a result line to the tapped message. Keyboard messages may be
+    plain text OR a document with caption (merge/review alerts carry the PDF) —
+    edit_message_text crashes on the latter, so fall back to the caption."""
+    msg = query.message
+    if msg.text is not None:
+        await query.edit_message_text(text=f"{msg.text}\n\n{suffix}")
+    else:
+        await query.edit_message_caption(caption=f"{msg.caption or ''}\n\n{suffix}"[:1024])
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -391,7 +402,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data or ""
     if data.startswith("sent:"):
         result = claim_status.mark_sent(int(data.split(":", 1)[1]))
-        await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+        await _append_result(query, f"✅ {result['message']}")
     elif data.startswith("cond:"):
         _, cid, idx = data.split(":")
         cid, idx = int(cid), int(idx)
@@ -400,7 +411,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         conds = prior_conditions(claim["pet_id"]) if claim else []
         if 0 <= idx < len(conds):
             result = claim_forms.set_condition_text(cid, conds[idx])
-            await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+            await _append_result(query, f"✅ {result['message']}")
     elif data.startswith("condother:"):
         _pending_condition[query.message.chat_id] = int(data.split(":", 1)[1])
         await context.bot.send_message(
@@ -411,24 +422,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif data.startswith("setpet:"):
         _, cid, pet_id = data.split(":")
         result = claim_forms.assign_pet(int(cid), int(pet_id))
-        await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+        await _append_result(query, f"✅ {result['message']}")
     elif data.startswith("unmatch:"):
         result = invoice_matching.unmatch(int(data.split(":", 1)[1]))
-        await query.edit_message_text(text=f"{query.message.text}\n\n❌ {result['message']}")
+        await _append_result(query, f"❌ {result['message']}")
     elif data.startswith("usebill:"):
         # legacy pick buttons from already-sent messages — still honored
         _, proposal_id, claim_id = data.split(":")
         result = invoice_matching.resolve_split_proposal(int(proposal_id), int(claim_id))
         icon = "✅" if result["ok"] else "⚠️"
-        await query.edit_message_text(text=f"{query.message.text}\n\n{icon} {result['message']}")
+        await _append_result(query, f"{icon} {result['message']}")
     elif data.startswith("mergebill:"):
         result = invoice_matching.merge_split_proposal(int(data.split(":", 1)[1]))
         icon = "✅" if result["ok"] else "⚠️"
-        await query.edit_message_text(text=f"{query.message.text}\n\n{icon} {result['message']}")
+        await _append_result(query, f"{icon} {result['message']}")
     elif data.startswith("rejectbill:"):
         result = invoice_matching.reject_split_proposal(int(data.split(":", 1)[1]))
         icon = "❌" if result["ok"] else "⚠️"
-        await query.edit_message_text(text=f"{query.message.text}\n\n{icon} {result['message']}")
+        await _append_result(query, f"{icon} {result['message']}")
     elif data.startswith("split:"):
         cid = int(data.split(":", 1)[1])
         with db.get_connection() as conn:
@@ -459,10 +470,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif data.startswith("act:"):
         proposal = _pending_actions.pop(data.split(":", 1)[1], None)
         if proposal is None:
-            await query.edit_message_text(text=f"{query.message.text}\n\n⚠️ Action expired — ask again.")
+            await _append_result(query, "⚠️ Action expired — ask again.")
             return
         message = _execute_action(proposal)
-        await query.edit_message_text(text=f"{query.message.text}\n\n✅ {message}")
+        await _append_result(query, f"✅ {message}")
 
 
 async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
