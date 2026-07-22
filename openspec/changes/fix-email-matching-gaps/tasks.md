@@ -66,3 +66,13 @@
 - **Matched (4)**: #1 $407.56, #3 $141.87 (Shire bulk reply, multi-invoice); #13 $944.50, #15 $10.50 (Gabi's late SAH forwards)
 - **Flagged for Justin (8)**: #11/#12 one-invoice-two-charges (MediPaws $2,521.46); #6/7/8/17/20/22 unreadable scanned PDF (ask Kingsgrove for text invoices)
 - **Awaiting vet reply (2)**: #4/#5 Bankstown — invoice requests drafted, no reply exists in Gmail yet
+
+## 10. Vision-OCR fallback for scanned invoice PDFs (2026-07-23, "can I use the llm to decipher these?")
+
+- [x] 10.1 Verified live BEFORE building: this Groq account exposes ZERO vision models (models.list checked — llama-4 absent); Gemini 2.5 flash reads the Kings Vet photo scans accurately (page 1 → invoice 184556, 2025-07-28, Aari, $45.00 = claim #22's charge exactly)
+- [x] 10.2 `llm.extract_vision` / `gemini.extract_image` (prompt + JPEG page); `_vision_invoices` runs page-by-page ONLY where the unreadable flag used to be set, caches successes in `email_extractions` (vision never re-runs for a cached email), records `source_pdf`/`page` per invoice
+- [x] 10.3 Token budget (the "2-3 turns" requirement): `vision_ocr_attempts` hard cap = 3 attempts per email, consumed per try, REFUNDED on provider outage (real Gemini 503 hit during first live tick); after 3 real failures the email goes quiet with the unreadable flag standing
+- [x] 10.4 `ensure_invoice_file` page-slice path: vision invoices carry their page, so the claim's one-page PDF is written without a text layer; pet assigned from the extracted patient field (printed fact)
+- [x] 10.5 False-match found in first live run and fixed: #20's $152.50 charge grabbed #21's acknowledged $44.75 invoice (under ceiling, 3 days off). `_pick_invoice` now skips invoices carried by ANY other claim (invoice_number, else amount+date) and ranks by closest amount then closest date. Re-run picked 185106 ($152.50, same-day, Echo bundle) — correct
+- [x] 10.6 Live results: 5 of 6 Kingsgrove claims matched with invoice PDFs sliced (#22 $45, #20 $152.50, #8 $446.50, #7 $132.50, #6 $351.50 — all but #20 auto-assigned Aari from the scan's patient field); #17 $191.50 (3 Dec) NOT in either bundle — flag stands, Justin asks Kings Vet for that one invoice only
+- [x] 10.7 Tests: attempt cap, outage refund, page-slice + patient pet-assign, pick-prefers-exact-and-skips-claimed (59 tests, all pass)
