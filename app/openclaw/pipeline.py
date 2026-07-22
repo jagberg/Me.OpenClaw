@@ -34,7 +34,11 @@ def _latest_settlement_detail(claim_id: int) -> dict:
 
 def _batch_key(claim) -> str:
     """Claims sharing one draft are one submission (one Gmail draft, sent as a
-    unit) — notify about them together, not once per claim."""
+    unit) — notify about them together, not once per claim. Flagged pending
+    claims group by (merchant, flag) instead: six claims blocked on the same
+    unreadable vet attachment are one problem, one message."""
+    if claim["status"] == "pending_match":
+        return f"pending:{claim['txn_merchant']}:{claim['flag']}"
     return claim["draft_id"] or f"claim-{claim['id']}"
 
 
@@ -122,6 +126,11 @@ def _summarize_matched_flag(claim, label: str) -> str:
 def _summarize_group(group) -> str | None:
     status = group[0]["status"]
     label = _submission_label(group)
+    if status == "pending_match":  # flagged-but-unmatched: surface the flag verbatim
+        c = group[0]
+        lines = [f"⚠ {c['txn_merchant']} — {c['flag']}", "Affected charges:"]
+        lines += [f" • ${abs(m['txn_amount']):.2f} ({m['txn_date']})" for m in group]
+        return "\n".join(lines)
     if status == "matched":  # matched claims aren't batched (no draft yet) — group is one claim
         if _needs_condition(group[0]):
             return _summarize_needs_condition(group[0])
@@ -210,7 +219,14 @@ def notify_claim_states(send_fn=None) -> None:
             "FROM vet_claims vc "
             "LEFT JOIN pets p ON p.id = vc.pet_id "
             "JOIN bank_transactions bt ON bt.id = vc.transaction_id "
-            f"WHERE vc.status IN ({','.join('?' * len(NOTIFY_STATUSES))})",
+            f"WHERE vc.status IN ({','.join('?' * len(NOTIFY_STATUSES))}) "
+            # pending claims with an actionable flag (unreadable attachment,
+            # manual-match, merge pending) push too — transient LLM-outage and
+            # drafted-request flags are noise, not actions
+            "OR (vc.status = 'pending_match' AND vc.flag IS NOT NULL "
+            "AND vc.flag != 'invoice_request_drafted' "
+            "AND vc.flag NOT LIKE 'invoice extraction unavailable%' "
+            "AND vc.flag NOT LIKE 'invoice matching error%')",
             NOTIFY_STATUSES,
         ).fetchall()
 
@@ -369,6 +385,53 @@ def poll_petcover_status() -> None:
 _TRANSIENT_MATCH_FLAGS = ("invoice extraction unavailable", "invoice matching error")
 
 
+def _matched_claims():
+    with db.get_connection() as conn:
+        return conn.execute(
+            "SELECT vet_claims.*, bank_transactions.merchant AS txn_merchant, "
+            "bank_transactions.date AS txn_date, bank_transactions.amount AS txn_amount, "
+            "pets.claim_process_defined AS pet_process_defined "
+            "FROM vet_claims "
+            "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            "LEFT JOIN pets ON pets.id = vet_claims.pet_id "
+            "WHERE vet_claims.status = 'matched'"
+        ).fetchall()
+
+
+def _draft_matched_claims() -> None:
+    """matched → drafted. First auto-extract each claim's per-visit invoice
+    pages from its matched email (claim_forms.ensure_invoice_file — the step
+    that used to be manual), then draft: fully-ready claims are bundled per
+    pet into batches of ≤4 (the Petcover form's row limit) sharing one form +
+    one Gmail draft; anything not ready goes through process_claim so its
+    per-field flagging (pet/condition/invoice) still runs."""
+    for claim in _matched_claims():
+        try:
+            claim_forms.ensure_invoice_file(claim)
+        except Exception as exc:  # Gmail hiccup — retry next tick, keep the tick alive
+            logger.warning("ensure_invoice_file: claim %s: %s", claim["id"], exc)
+
+    ready_by_pet: dict[int, list] = {}
+    not_ready = []
+    for claim in _matched_claims():  # re-read: paths/pets may have just been set
+        if (
+            claim["pet_id"]
+            and claim["pet_process_defined"]
+            and claim["condition_text"]
+            and claim["invoice_file_path"]
+        ):
+            ready_by_pet.setdefault(claim["pet_id"], []).append(claim)
+        else:
+            not_ready.append(claim)
+
+    for claims in ready_by_pet.values():
+        claims.sort(key=lambda c: (c["txn_date"], c["id"]))
+        for i in range(0, len(claims), 4):
+            claim_forms.process_claim_batch([c["id"] for c in claims[i : i + 4]])
+    for claim in not_ready:
+        claim_forms.process_claim(claim["id"])
+
+
 def run_once() -> None:
     vet_detection.classify_unflagged()
     _reconcile_sent_invoice_requests()
@@ -393,10 +456,7 @@ def run_once() -> None:
         if not matched:
             _maybe_draft_invoice_request(claim)
 
-    with db.get_connection() as conn:
-        matched_ids = [r["id"] for r in conn.execute("SELECT id FROM vet_claims WHERE status = 'matched'")]
-    for claim_id in matched_ids:
-        claim_forms.process_claim(claim_id)
+    _draft_matched_claims()
 
     # Poll before notifying so status changes from fresh Petcover replies
     # push to Telegram in the same tick, not the next one.

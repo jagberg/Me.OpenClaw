@@ -41,6 +41,10 @@ PETCOVER_TEMPLATE_PATH = os.environ.get("PETCOVER_TEMPLATE_PATH", "./data/petcov
 # them onto currently open ones. Default = the date this feature shipped.
 PETCOVER_STATUS_SINCE = os.environ.get("PETCOVER_STATUS_SINCE", "2026/07/18")
 CLAIM_OUTPUT_DIR = os.environ.get("CLAIM_OUTPUT_DIR", "./data/claims")
+# Per-visit invoice PDFs auto-extracted from vet reply emails (claim_forms.
+# ensure_invoice_file). Inside app/data on purpose: it's the only host dir the
+# container can see (compose binds app/data -> /data; Google Drive is not visible).
+INVOICE_OUTPUT_DIR = os.environ.get("INVOICE_OUTPUT_DIR", "./data/invoices")
 VET_CLAIM_PIPELINE_INTERVAL_MINUTES = _int_env("VET_CLAIM_PIPELINE_INTERVAL_MINUTES", 15)
 INVOICE_MATCH_WINDOW_DAYS = _int_env("INVOICE_MATCH_WINDOW_DAYS", 3)
 

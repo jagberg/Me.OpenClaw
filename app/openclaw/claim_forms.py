@@ -1,9 +1,11 @@
 import base64
 import json
+import re
 from datetime import datetime, timezone
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from io import BytesIO
 from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
@@ -235,6 +237,121 @@ def apply_item_conditions(claim_id: int, item_conditions: list[dict]) -> dict:
         )
     process_claim(claim_id)
     return {"ok": True, "message": f"Claim #{claim_id}: {', '.join(f'{k} (${v:.2f})' for k, v in groups.items())}."}
+
+
+# A page starting a proper per-visit invoice: "INVOICE #411193" (MediPaws) or
+# "Tax Invoice ..." (SAH). Account statements carry amounts but no such header
+# and no "Patient name:" — verified against MediPaws' real Financial Statement
+# vs its Individual Invoices bundle (0 header/patient hits vs 11 each).
+_INVOICE_HEADER_RE = re.compile(r"INVOICE\s*#\s*\d{4,}|Tax Invoice", re.IGNORECASE)
+_PATIENT_RE = re.compile(r"Patient\s*(?:name)?\s*:\s*\n?\s*(\w+)", re.IGNORECASE)
+
+
+def _amount_variants(amount: float) -> list[str]:
+    plain = f"{amount:.2f}"
+    grouped = f"{amount:,.2f}"
+    return [plain] if plain == grouped else [plain, grouped]
+
+
+def find_invoice_segment(page_texts: list[str], amount: float, pet_name: str | None) -> tuple[int, int] | None:
+    """Locates THIS claim's invoice inside a multi-invoice PDF bundle: pages are
+    segmented at invoice headers (each segment = one per-visit invoice, running
+    to the next header), and a segment matches when it contains the claim's
+    invoice total and doesn't name a different patient. Returns (start, end)
+    page indexes, or None — which doubles as the adequacy validation: an
+    account statement has no invoice headers, so nothing can match."""
+    headers = [i for i, t in enumerate(page_texts) if _INVOICE_HEADER_RE.search(t or "")]
+    if not headers:
+        return None
+    variants = _amount_variants(float(amount))
+    for k, start in enumerate(headers):
+        end = (headers[k + 1] if k + 1 < len(headers) else len(page_texts)) - 1
+        text = "\n".join(page_texts[start : end + 1])
+        if not any(v in text for v in variants):
+            continue
+        if pet_name:
+            patient = _PATIENT_RE.search(text)
+            if patient and patient.group(1).lower() != pet_name.lower():
+                continue  # another pet's invoice happens to carry the same total
+        return (start, end)
+    return None
+
+
+def _email_pdf_documents(email_id: str) -> list[tuple[PdfReader, list[str]]]:
+    """Every PDF attachment of the email, as (reader, per-page texts). Unreadable
+    PDFs (image scans) yield empty texts and simply won't segment."""
+    service = gmail_client.build_service()
+    message = service.users().messages().get(userId="me", id=email_id, format="full").execute()
+    documents = []
+    for part in gmail_client._iter_attachment_parts(message.get("payload", {})):
+        if part.get("mimeType") != "application/pdf":
+            continue
+        attachment = service.users().messages().attachments().get(
+            userId="me", messageId=email_id, id=part["body"]["attachmentId"]
+        ).execute()
+        data = base64.urlsafe_b64decode(attachment["data"] + "==")
+        try:
+            reader = PdfReader(BytesIO(data))
+            documents.append((reader, [page.extract_text() or "" for page in reader.pages]))
+        except Exception:
+            continue  # corrupt attachment — treated like any other non-matching PDF
+    return documents
+
+
+def ensure_invoice_file(claim) -> None:
+    """Extracts THIS claim's per-visit invoice pages from its matched email's
+    PDF bundle into their own file and sets invoice_file_path — the step that
+    used to be manual (nothing wrote invoice_file_path before). When no
+    adequate per-visit invoice exists in any attachment (account statement,
+    image-only scan), the claim is flagged so Telegram/dashboard surface it.
+    `claim` needs txn_merchant joined in; never overwrites an existing path."""
+    if claim["invoice_file_path"] or not claim["matched_email_id"]:
+        return
+    invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
+    if invoice.get("amount") is None:
+        return
+    pet_name = None
+    if claim["pet_id"]:
+        with db.get_connection() as conn:
+            pet = conn.execute("SELECT name FROM pets WHERE id = ?", (claim["pet_id"],)).fetchone()
+        pet_name = pet["name"] if pet else None
+
+    for reader, page_texts in _email_pdf_documents(claim["matched_email_id"]):
+        segment = find_invoice_segment(page_texts, float(invoice["amount"]), pet_name)
+        if segment is None:
+            continue
+        start, end = segment
+        writer = PdfWriter()
+        for i in range(start, end + 1):
+            writer.add_page(reader.pages[i])
+        date_part = (invoice.get("date") or "undated")[:10]
+        output_path = str(Path(config.INVOICE_OUTPUT_DIR) / f"claim-{claim['id']}-{date_part}.pdf")
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            writer.write(f)
+        now = datetime.now(timezone.utc).isoformat()
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE vet_claims SET invoice_file_path = ?, updated_at = ?, "
+                "flag = CASE WHEN flag = ? THEN NULL ELSE flag END WHERE id = ?",
+                (output_path, now, _AWAITING_INVOICE_FLAG, claim["id"]),
+            )
+        # The invoice states its patient — reading a printed fact, not guessing.
+        if claim["pet_id"] is None:
+            patient = _PATIENT_RE.search("\n".join(page_texts[start : end + 1]))
+            if patient:
+                with db.get_connection() as conn:
+                    pet = conn.execute("SELECT id FROM pets WHERE lower(name) = ?", (patient.group(1).lower(),)).fetchone()
+                if pet:
+                    assign_pet(claim["id"], pet["id"])
+        return
+
+    flag = (
+        "vet attachment isn't a per-visit itemised invoice (statement/running-total or unreadable) — "
+        f"ask {claim['txn_merchant']} for individual invoices"
+    )
+    if claim["flag"] != flag:
+        _flag(claim["id"], flag)
 
 
 def process_claim_batch(claim_ids: list[int], continuation: bool | None = None) -> None:

@@ -46,6 +46,15 @@
 - [x] 8.3 Telegram message rewritten: invoice + both charges + sum, "payment records list both charge amounts" evidence line when detected (`_text_amounts` captured at extraction time), ✅ Merge / ❌ Not the same invoice buttons
 - [x] 8.4 Tests: auto-primary merge, reject + never-re-propose + flag preserved, payments-confirmed detection (43 tests, all pass)
 
+## 9. Invoice validation + per-visit splitting + batch chunking (2026-07-22, approved plan)
+
+- [x] 9.1 `find_invoice_segment` (claim_forms): segments PDFs at invoice headers (`INVOICE #NNN` / `Tax Invoice`), matches by claim's invoice total + patient name; the account statement fails by construction (verified: 0 headers/patients vs 11 in the individual-invoices bundle). Dry-run on real PDFs: Aari p1 found, Echo cross-pet refused, statement rejected
+- [x] 9.2 `ensure_invoice_file`: auto-extracts the claim's pages to `INVOICE_OUTPUT_DIR` (`/data/invoices` = host `app\data\invoices`), sets `invoice_file_path` (previously NOTHING wrote it — claims stalled forever on manual paths); auto-assigns pet from the invoice's printed `Patient name:`; inadequate/unreadable attachment → flag naming the vet (`matched`+flag ⇒ Telegram + dashboard). Never overwrites manual paths
+- [x] 9.3 Pipeline `_draft_matched_claims`: ready claims batched per pet, ≤4 per Petcover form via previously-uncalled `process_claim_batch` (overflow → next draft); not-ready claims keep per-field flagging via `process_claim`
+- [x] 9.4 Telegram: flagged `pending_match` claims now push too (transient LLM flags + `invoice_request_drafted` excluded), grouped by (merchant, flag) — the 6 Kingsgrove unreadable claims = one message
+- [x] 9.5 Tests: segmentation (real page texts incl. statement), inadequate flag, never-overwrite, 4+2 chunking order, grouped pending notify (49 tests, all pass)
+- [ ] 9.6 Dashboard list of inadequate-invoice/split-proposal items — deferred with 7.5
+
 ## 6. Ops (record what was actually done)
 
 - [x] 6.1 Kill the stray dashboard host process — DONE 2026-07-21: killed PIDs 38572 + 28480 (same `uvicorn --port 8787` tree from `C:\Code\Me.OpenClaw-dashboard`, stale pre-edit env → Gemini provider, shared Gmail quota burn); verified no python/uvicorn processes remain

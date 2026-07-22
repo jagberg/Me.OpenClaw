@@ -20,7 +20,7 @@ os.environ["CEREBRAS_API_KEY"] = ""
 os.environ["GROQ_API_KEY"] = ""
 os.environ["OPENAI_API_KEY"] = ""
 
-from openclaw import claim_status, db, gemini, invoice_matching, llm, netbank_csv, reminders, tasks, vet_detection  # noqa: E402
+from openclaw import claim_forms, claim_status, db, gemini, invoice_matching, llm, netbank_csv, reminders, tasks, vet_detection  # noqa: E402
 from openclaw.scheduler import scheduler  # noqa: E402
 
 
@@ -755,6 +755,155 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
         (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
          pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
          pipeline.poll_petcover_status, pipeline.notify_claim_states) = originals
+
+
+# Real-shape page texts (from MediPaws' actual PDFs): a per-visit invoice page
+# and an account-statement page that carries the same amounts but no header.
+_INVOICE_PAGE = (
+    "INVOICE\n#411193\nInvoice date:\n13th April 2026\nCustomer name: \nGoldberg, Gabi\n"
+    "Patient name:\nAari\nDescription Qty Total\nSpecialist Consultation (Initial) 1 $350.00\n"
+    "Imaging: Ultrasound - Abdomen +/-FNA (RFP) 1 $1155.00\nTotal: $2521.46\nAmount paid: $2521.46"
+)
+_ECHO_PAGE = (
+    "INVOICE\n#414503\nInvoice date:\n17th June 2026\nPatient name:\nEcho\n"
+    "Description Qty Total\nHospitalisation 1 $1328.25\nTotal: $1328.25"
+)
+_STATEMENT_PAGE = (
+    "Account Statement\nPrinted: Customer ID:\nFrom: To:\nInvoice 411193 13/04/2026 2521.46\n"
+    "Invoice 414503 17/06/2026 1328.25\nBalance: 0.00"
+)
+
+
+def test_find_invoice_segment_picks_right_page_and_pet():
+    pages = [_INVOICE_PAGE, _ECHO_PAGE]
+    assert claim_forms.find_invoice_segment(pages, 2521.46, "Aari") == (0, 0)
+    assert claim_forms.find_invoice_segment(pages, 1328.25, "Echo") == (1, 1)
+    # same total but the page names the OTHER pet — refused
+    assert claim_forms.find_invoice_segment(pages, 2521.46, "Echo") is None
+    # pet unknown: amount alone picks the segment
+    assert claim_forms.find_invoice_segment(pages, 1328.25, None) == (1, 1)
+    # grouped thousands formatting still matches
+    assert claim_forms.find_invoice_segment(["Tax Invoice\nPatient: Aari\nTotal: $2,521.46"], 2521.46, "Aari") == (0, 0)
+
+
+def test_find_invoice_segment_rejects_account_statement():
+    """The running-total statement carries the amounts but no invoice header —
+    it must never validate as an attachable invoice."""
+    assert claim_forms.find_invoice_segment([_STATEMENT_PAGE], 2521.46, "Aari") is None
+    assert claim_forms.find_invoice_segment([], 2521.46, "Aari") is None
+    assert claim_forms.find_invoice_segment(["", ""], 2521.46, None) is None  # image-only scan
+
+
+def _insert_matched_claim(conn, merchant, amount, txn_date, pet_id=None, email_id="em-x",
+                          invoice_amount=None, condition=None, invoice_path=None):
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO bank_transactions (date, amount, merchant, created_at) VALUES (?, ?, ?, ?)",
+        (txn_date, amount, merchant, now),
+    )
+    txn_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    import json as _json
+    conn.execute(
+        "INSERT INTO vet_claims (transaction_id, pet_id, status, matched_email_id, invoice_data, "
+        "condition_text, invoice_file_path, created_at, updated_at) VALUES (?, ?, 'matched', ?, ?, ?, ?, ?, ?)",
+        (txn_id, pet_id, email_id,
+         _json.dumps({"amount": invoice_amount if invoice_amount is not None else abs(amount), "date": txn_date}),
+         condition, invoice_path, now, now),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def _matched_row(claim_id):
+    with db.get_connection() as conn:
+        return conn.execute(
+            "SELECT vet_claims.*, bank_transactions.merchant AS txn_merchant, "
+            "bank_transactions.date AS txn_date, bank_transactions.amount AS txn_amount "
+            "FROM vet_claims JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            "WHERE vet_claims.id = ?", (claim_id,),
+        ).fetchone()
+
+
+def test_ensure_invoice_file_flags_inadequate_attachment():
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        cid = _insert_matched_claim(conn, "MEDIPAWS TEST", -2521.46, "2026-04-13")
+    original = claim_forms._email_pdf_documents
+    claim_forms._email_pdf_documents = lambda email_id: [(None, [_STATEMENT_PAGE])]
+    try:
+        claim_forms.ensure_invoice_file(_matched_row(cid))
+    finally:
+        claim_forms._email_pdf_documents = original
+    row = _matched_row(cid)
+    assert row["invoice_file_path"] is None
+    assert row["flag"] and "isn't a per-visit itemised invoice" in row["flag"] and "MEDIPAWS TEST" in row["flag"]
+
+
+def test_ensure_invoice_file_never_overwrites_manual_path():
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        cid = _insert_matched_claim(conn, "MEDIPAWS TEST", -100.0, "2026-04-13", invoice_path=r"G:\manual\inv.pdf")
+    original = claim_forms._email_pdf_documents
+    claim_forms._email_pdf_documents = lambda email_id: (_ for _ in ()).throw(AssertionError("must not fetch"))
+    try:
+        claim_forms.ensure_invoice_file(_matched_row(cid))
+    finally:
+        claim_forms._email_pdf_documents = original
+    assert _matched_row(cid)["invoice_file_path"] == r"G:\manual\inv.pdf"
+
+
+def test_draft_step_batches_ready_claims_by_four_per_pet():
+    """6 ready same-pet claims → one 4-claim batch + one 2-claim batch (the
+    Petcover form holds 4 rows); a not-ready claim still routes through
+    process_claim for its per-field flagging."""
+    from openclaw import pipeline
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        ready = [
+            _insert_matched_claim(conn, "BATCH VET", -50.0 - i, f"2026-05-{10 + i:02d}", pet_id=aari,
+                                  condition="arthritis", invoice_path=f"/data/invoices/t{i}.pdf")
+            for i in range(6)
+        ]
+        lone = _insert_matched_claim(conn, "BATCH VET", -70.0, "2026-05-20", pet_id=aari)  # no condition/invoice
+
+    batches, singles = [], []
+    originals = (claim_forms.ensure_invoice_file, claim_forms.process_claim_batch, claim_forms.process_claim)
+    claim_forms.ensure_invoice_file = lambda claim: None
+    claim_forms.process_claim_batch = lambda ids, continuation=None: batches.append(ids)
+    claim_forms.process_claim = lambda cid, continuation=None: singles.append(cid)
+    try:
+        pipeline._draft_matched_claims()
+    finally:
+        claim_forms.ensure_invoice_file, claim_forms.process_claim_batch, claim_forms.process_claim = originals
+
+    assert [len(b) for b in batches] == [4, 2], f"expected 4+2 chunks, got {batches}"
+    assert batches[0] == ready[:4] and batches[1] == ready[4:], "chunks must be in txn-date order"
+    assert singles == [lone], "not-ready claim must go through per-claim flagging"
+
+
+def test_notify_pushes_flagged_pending_claims_grouped_once():
+    from openclaw import pipeline
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        flag = "invoice attachment unreadable — Re: Invoice request"
+        for amt, d in [(-351.50, "2026-05-18"), (-132.50, "2026-04-17")]:
+            cid = _insert_pending_claim(conn, "KINGS TEST", amt, d)
+            conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", (flag, cid))
+
+    sent = []
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
+    assert len(sent) == 1, f"same merchant+flag must be ONE message, got {len(sent)}"
+    assert "unreadable" in sent[0] and "$351.50" in sent[0] and "$132.50" in sent[0]
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
+    assert len(sent) == 1, "already-notified flags must not re-send"
 
 
 if __name__ == "__main__":
