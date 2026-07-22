@@ -379,10 +379,34 @@ def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None 
         )
 
 
-def _pick_invoice(invoices: list, txn_amount: float, txn_date: date) -> dict | None:
-    """First invoice in the email that fits under the charge ceiling AND whose
-    own date sits near the transaction — a bulk reply's other invoices belong
-    to other claims."""
+def _already_claimed(invoice: dict, claim_id: int) -> bool:
+    """True when another claim already carries this invoice — a bulk bundle's
+    smaller invoice can slip under a different charge's ceiling (confirmed
+    live: claim #20's $152.50 charge grabbed the acknowledged #21's $44.75
+    invoice). Identity is invoice_number when both sides have one, else
+    amount+date."""
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT invoice_data FROM vet_claims WHERE id != ? AND invoice_data IS NOT NULL", (claim_id,)
+        ).fetchall()
+    number = invoice.get("invoice_number")
+    for row in rows:
+        other = json.loads(row["invoice_data"])
+        if number and other.get("invoice_number"):
+            if str(number) == str(other["invoice_number"]):
+                return True
+            continue
+        if other.get("amount") == invoice.get("amount") and other.get("date") == invoice.get("date"):
+            return True
+    return False
+
+
+def _pick_invoice(invoices: list, txn_amount: float, txn_date: date, claim_id: int | None = None) -> dict | None:
+    """The best-fitting invoice in the email: under the charge ceiling, date
+    near the transaction, not already carried by another claim — preferring
+    the closest amount then the closest date, so an exact match beats another
+    visit's smaller invoice that also clears the ceiling."""
+    candidates = []
     for invoice in invoices:
         if invoice.get("amount") is None:
             continue
@@ -391,8 +415,16 @@ def _pick_invoice(invoices: list, txn_amount: float, txn_date: date) -> dict | N
             continue
         if not _invoice_date_plausible(invoice, txn_date):
             continue
-        return invoice
-    return None
+        if claim_id is not None and _already_claimed(invoice, claim_id):
+            continue
+        try:
+            date_gap = abs((date.fromisoformat(str(invoice.get("date"))[:10]) - txn_date).days)
+        except ValueError:
+            date_gap = 999
+        candidates.append((abs(abs(txn_amount) - total), date_gap, invoice))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: (c[0], c[1]))[2]
 
 
 def _oversized_candidate(invoices: list, txn_amount: float, txn_date: date) -> dict | None:
@@ -484,7 +516,7 @@ def match_claim(claim) -> bool:
             if not invoices:
                 continue
 
-            invoice = _pick_invoice(invoices, claim["txn_amount"], txn_date)
+            invoice = _pick_invoice(invoices, claim["txn_amount"], txn_date, claim_id=claim["id"])
             if invoice is None:
                 if oversized is None:
                     candidate = _oversized_candidate(invoices, claim["txn_amount"], txn_date)

@@ -931,6 +931,35 @@ def test_ensure_invoice_file_never_overwrites_manual_path():
     assert _matched_row(cid)["invoice_file_path"] == r"G:\manual\inv.pdf"
 
 
+def test_pick_invoice_prefers_exact_amount_and_skips_claimed():
+    """Real false match: #20's $152.50 charge grabbed #21's $44.75 invoice
+    (under the ceiling, 3 days off) while the exact 185106 sat unpicked."""
+    import json as _json
+    from datetime import date as _date
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        other = _insert_matched_claim(conn, "KINGS VET TEST", -44.75, "2025-08-08")
+        conn.execute(
+            "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
+            (_json.dumps({"invoice_number": "185019", "amount": 44.75, "date": "2025-08-08"}), other),
+        )
+    invoices = [
+        {"invoice_number": "185019", "amount": 44.75, "date": "2025-08-08"},
+        {"invoice_number": "185106", "amount": 152.5, "date": "2025-08-11"},
+    ]
+    picked = invoice_matching._pick_invoice(invoices, -152.5, _date(2025, 8, 11), claim_id=999999)
+    assert picked["invoice_number"] == "185106", picked
+    # the claimed one alone no longer matches either
+    picked = invoice_matching._pick_invoice(invoices[:1], -152.5, _date(2025, 8, 11), claim_id=999999)
+    assert picked is None
+    # without DB context the exact amount+date still wins over first-in-list
+    picked = invoice_matching._pick_invoice(invoices, -152.5, _date(2025, 8, 11))
+    assert picked["invoice_number"] == "185106", picked
+
+
 def test_vision_fallback_attempt_cap():
     """A scan the model can't parse consumes attempts and goes quiet after
     VISION_MAX_ATTEMPTS — no token burn every tick forever."""
