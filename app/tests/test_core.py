@@ -931,6 +931,82 @@ def test_ensure_invoice_file_never_overwrites_manual_path():
     assert _matched_row(cid)["invoice_file_path"] == r"G:\manual\inv.pdf"
 
 
+def test_vision_fallback_attempt_cap():
+    """A scan the model can't parse consumes attempts and goes quiet after
+    VISION_MAX_ATTEMPTS — no token burn every tick forever."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vision_ocr_attempts")
+        conn.execute("DELETE FROM email_extractions")
+    calls = []
+    original = claim_forms.email_pdf_attachments
+    claim_forms.email_pdf_attachments = lambda email_id: calls.append(email_id) or []
+    try:
+        for _ in range(invoice_matching.VISION_MAX_ATTEMPTS + 2):
+            assert invoice_matching._vision_invoices("em-scan-1") is None
+    finally:
+        claim_forms.email_pdf_attachments = original
+    assert len(calls) == invoice_matching.VISION_MAX_ATTEMPTS, calls
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT attempts FROM vision_ocr_attempts WHERE message_id = 'em-scan-1'"
+        ).fetchone()
+    assert row["attempts"] == invoice_matching.VISION_MAX_ATTEMPTS
+
+
+def test_pet_id_by_name_exact_known_pet_only():
+    db.init_db()
+    with db.get_connection() as conn:
+        pet = conn.execute("SELECT id, name FROM pets LIMIT 1").fetchone()
+    assert pet is not None, "live schema seeds pets"
+    assert invoice_matching._pet_id_by_name(pet["name"].lower()) == pet["id"]
+    assert invoice_matching._pet_id_by_name("Rex The Unknown") is None
+    assert invoice_matching._pet_id_by_name(None) is None
+
+
+def test_ensure_invoice_file_slices_scan_page_and_assigns_pet():
+    """Vision-extracted invoices carry source_pdf/page — the claim's page is
+    sliced without a text layer, and the extracted patient assigns the pet."""
+    import io
+    import json as _json
+    import tempfile
+
+    from pypdf import PdfWriter
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        pet = conn.execute("SELECT id, name FROM pets LIMIT 1").fetchone()
+        cid = _insert_matched_claim(conn, "KINGS VET TEST", -45.0, "2025-07-28", email_id="em-scan-2")
+        conn.execute(
+            "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
+            (_json.dumps({"amount": 45.0, "date": "2025-07-28", "patient": pet["name"],
+                          "source_pdf": "scans.pdf", "page": 1}), cid),
+        )
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_blank_page(width=200, height=200)
+    buf = io.BytesIO()
+    writer.write(buf)
+
+    original_att = claim_forms.email_pdf_attachments
+    original_dir = claim_forms.config.INVOICE_OUTPUT_DIR
+    claim_forms.email_pdf_attachments = lambda email_id: [("scans.pdf", buf.getvalue())]
+    claim_forms.config.INVOICE_OUTPUT_DIR = tempfile.mkdtemp()
+    try:
+        claim_forms.ensure_invoice_file(_matched_row(cid))
+    finally:
+        claim_forms.email_pdf_attachments = original_att
+        claim_forms.config.INVOICE_OUTPUT_DIR = original_dir
+    row = _matched_row(cid)
+    assert row["invoice_file_path"] and row["invoice_file_path"].endswith(f"claim-{cid}-2025-07-28.pdf")
+    from pypdf import PdfReader
+
+    assert len(PdfReader(row["invoice_file_path"]).pages) == 1
+    assert row["pet_id"] == pet["id"], "patient field must assign the pet"
+
+
 def test_draft_step_batches_ready_claims_by_four_per_pet():
     """6 ready same-pet claims → one 4-claim batch + one 2-claim batch (the
     Petcover form holds 4 rows); a not-ready claim still routes through

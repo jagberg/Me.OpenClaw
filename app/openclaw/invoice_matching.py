@@ -179,6 +179,93 @@ def _invoices_for_email(message_id: str, text: str) -> list | None:
     return invoices
 
 
+# --- Vision-OCR fallback for scanned (image-only) invoice PDFs -----------------
+# Kings Vet emails photo scans: no text layer, so the text pipeline can't read
+# them. Verified live: Gemini flash reads the scans accurately (invoice number,
+# visit date, patient, itemised amounts). Hard attempt cap so a scan it can't
+# parse doesn't burn tokens every tick forever.
+
+VISION_MAX_ATTEMPTS = 3
+VISION_PAGE_PROMPT = """This is one scanned page of a vet invoice PDF. Extract exactly this JSON:
+{"invoice_number": "...", "date": "YYYY-MM-DD", "patient": "...", "amount": <invoice total as number>, \
+"items": [{"description": "...", "amount": <number>}, ...]}
+The date must be the visit/service date this invoice bills for — NOT the email, statement, issue or print date.
+If the page is not an invoice (cover letter, statement, blank), return {"not_invoice": true}.
+JSON only, no prose."""
+
+
+def _vision_attempts_left(message_id: str) -> bool:
+    """True while this email still has vision budget; consumes one attempt."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT attempts FROM vision_ocr_attempts WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        if row and row["attempts"] >= VISION_MAX_ATTEMPTS:
+            return False
+        conn.execute(
+            "INSERT INTO vision_ocr_attempts (message_id, attempts, last_attempt_at) VALUES (?, 1, ?) "
+            "ON CONFLICT(message_id) DO UPDATE SET attempts = attempts + 1, last_attempt_at = excluded.last_attempt_at",
+            (message_id, now),
+        )
+    return True
+
+
+def _page_jpeg(image_bytes: bytes) -> bytes:
+    """Scan pages embed one large photo each — downscale for the vision model."""
+    import io
+
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(image_bytes))
+    if max(im.size) > 1600:
+        im.thumbnail((1600, 1600))
+    buf = io.BytesIO()
+    im.convert("RGB").save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def _vision_invoices(message_id: str) -> list | None:
+    """Reads a scanned invoice bundle page-by-page with the vision model.
+    Returns invoice dicts carrying source_pdf/page (so the claim's invoice
+    pages can be sliced without a text layer), or None. Consumes one of the
+    email's VISION_MAX_ATTEMPTS regardless of outcome; a success is cached in
+    email_extractions so vision never re-runs for that email."""
+    if not _vision_attempts_left(message_id):
+        return None
+
+    from io import BytesIO
+
+    from pypdf import PdfReader
+
+    from . import claim_forms
+
+    invoices = []
+    for filename, data in claim_forms.email_pdf_attachments(message_id):
+        try:
+            reader = PdfReader(BytesIO(data))
+        except Exception:
+            continue
+        for page_no, page in enumerate(reader.pages):
+            images = page.images
+            if not images:
+                continue
+            raw = llm.extract_vision(VISION_PAGE_PROMPT, _page_jpeg(images[0].data))
+            parsed = _parse_invoices(raw)
+            if not parsed:
+                continue  # not_invoice pages / unparseable replies carry no data
+            for inv in parsed:
+                if inv.get("amount") is None:
+                    continue
+                inv["source_pdf"] = filename
+                inv["page"] = page_no
+                invoices.append(inv)
+    if invoices:
+        _store_extraction(message_id, invoices)
+        return invoices
+    return None
+
+
 # NetBank descriptors append a trailing city/state (e.g. "...CARINGBAH NSW"),
 # which never appears verbatim in a real invoice email — quoting the full
 # descriptor as an exact phrase was confirmed live to suppress real matches.
@@ -260,6 +347,15 @@ def _single_pet_in_text(text: str) -> int | None:
         pets = conn.execute("SELECT id, name FROM pets").fetchall()
     named = [p for p in pets if re.search(rf"\b{re.escape(p['name'])}\b", text, re.IGNORECASE)]
     return named[0]["id"] if len(named) == 1 else None
+
+
+def _pet_id_by_name(patient: str | None) -> int | None:
+    """Pet id when the extracted patient field IS a known pet's name."""
+    if not patient:
+        return None
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT id FROM pets WHERE name = ? COLLATE NOCASE", (patient.strip(),)).fetchone()
+    return row["id"] if row else None
 
 
 def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None = None,
@@ -362,15 +458,19 @@ def match_claim(claim) -> bool:
             invoices = _invoices_for_email(item["id"], text)
             if not invoices:
                 # A vet-addressed candidate whose PDF gave us nothing readable
-                # (scanned/image PDF, no OCR) — surface it instead of silently
-                # skipping; Justin asks the vet for a text copy.
+                # (scanned/image PDF, no text layer) — try the vision-OCR
+                # fallback; if the model can't read it either (attempt-capped),
+                # surface it so Justin asks the vet for a text copy.
                 if (
                     not needs_vet_confirmation
                     and _has_pdf_attachment(message)
                     and not _AMOUNT_RE.search(text)
                 ):
-                    headers = {h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])}
-                    unreadable_subject = headers.get("Subject", "(no subject)")
+                    invoices = _vision_invoices(item["id"])
+                    if not invoices:
+                        headers = {h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])}
+                        unreadable_subject = headers.get("Subject", "(no subject)")
+            if not invoices:
                 continue
 
             invoice = _pick_invoice(invoices, claim["txn_amount"], txn_date)
@@ -387,7 +487,11 @@ def match_claim(claim) -> bool:
             invoice["claimable_amount"] = claimable_amount(invoice)
             remainder = _unexplained_remainder(total, claim["txn_amount"])
             flag = f"possible additional invoice — unexplained ${remainder:.2f}" if remainder else None
-            pet_id = _single_pet_in_text(text) if claim["pet_id"] is None else None
+            pet_id = None
+            if claim["pet_id"] is None:
+                # scanned invoices have no email text — the vision extraction's
+                # patient field is the printed fact instead
+                pet_id = _pet_id_by_name(invoice.get("patient")) or _single_pet_in_text(text)
             _mark_matched(claim["id"], item["id"], invoice, flag, pet_id=pet_id)
             return True
 

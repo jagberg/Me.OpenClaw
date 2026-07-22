@@ -118,6 +118,15 @@ CREATE TABLE IF NOT EXISTS email_extractions (
     extracted_at TEXT NOT NULL
 );
 
+-- Vision-OCR fallback budget for scanned (image-only) invoice PDFs: hard cap
+-- on extraction attempts per email so a scan the model can't read doesn't
+-- burn tokens every tick forever (successes cache in email_extractions).
+CREATE TABLE IF NOT EXISTS vision_ocr_attempts (
+    message_id TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT NOT NULL
+);
+
 -- One vet invoice paid over several card charges (confirmed live: $2,521.46
 -- invoice = $551.06 + $1,970.40 charges, same day). Which claim carries the
 -- invoice is Justin's call — the proposal holds the invoice + candidate claim

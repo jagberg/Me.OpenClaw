@@ -336,6 +336,23 @@ def invoice_segment_pdf(email_id: str, amount: float) -> tuple[str, bytes] | Non
     return None
 
 
+def _write_invoice_file(claim, writer: PdfWriter, invoice: dict) -> None:
+    """Writes the claim's invoice pages to INVOICE_OUTPUT_DIR and records the
+    path, clearing the awaiting-invoice flag."""
+    date_part = (invoice.get("date") or "undated")[:10]
+    output_path = str(Path(config.INVOICE_OUTPUT_DIR) / f"claim-{claim['id']}-{date_part}.pdf")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        writer.write(f)
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE vet_claims SET invoice_file_path = ?, updated_at = ?, "
+            "flag = CASE WHEN flag = ? THEN NULL ELSE flag END WHERE id = ?",
+            (output_path, now, _AWAITING_INVOICE_FLAG, claim["id"]),
+        )
+
+
 def ensure_invoice_file(claim) -> None:
     """Extracts THIS claim's per-visit invoice pages from its matched email's
     PDF bundle into their own file and sets invoice_file_path — the step that
@@ -353,6 +370,26 @@ def ensure_invoice_file(claim) -> None:
     pet_name = next((n for n, pid in all_pets.items() if pid == claim["pet_id"]), None)
     other_pets = tuple(n for n in all_pets if n != pet_name)
 
+    # Scanned bundles have no text layer to segment — but the vision extraction
+    # recorded exactly which page of which attachment this invoice is.
+    if invoice.get("page") is not None:
+        for filename, data in email_pdf_attachments(claim["matched_email_id"]):
+            if filename != invoice.get("source_pdf"):
+                continue
+            try:
+                reader = PdfReader(BytesIO(data))
+                page = reader.pages[invoice["page"]]
+            except Exception:
+                break  # attachment changed/corrupt — fall through to the flag
+            writer = PdfWriter()
+            writer.add_page(page)
+            _write_invoice_file(claim, writer, invoice)
+            if claim["pet_id"] is None:
+                pet_id = all_pets.get((invoice.get("patient") or "").strip().title())
+                if pet_id:
+                    assign_pet(claim["id"], pet_id)
+            return
+
     for reader, page_texts in _email_pdf_documents(claim["matched_email_id"]):
         segment = find_invoice_segment(page_texts, float(invoice["amount"]), pet_name, other_pets)
         if segment is None:
@@ -361,18 +398,7 @@ def ensure_invoice_file(claim) -> None:
         writer = PdfWriter()
         for i in range(start, end + 1):
             writer.add_page(reader.pages[i])
-        date_part = (invoice.get("date") or "undated")[:10]
-        output_path = str(Path(config.INVOICE_OUTPUT_DIR) / f"claim-{claim['id']}-{date_part}.pdf")
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "wb") as f:
-            writer.write(f)
-        now = datetime.now(timezone.utc).isoformat()
-        with db.get_connection() as conn:
-            conn.execute(
-                "UPDATE vet_claims SET invoice_file_path = ?, updated_at = ?, "
-                "flag = CASE WHEN flag = ? THEN NULL ELSE flag END WHERE id = ?",
-                (output_path, now, _AWAITING_INVOICE_FLAG, claim["id"]),
-            )
+        _write_invoice_file(claim, writer, invoice)
         # The invoice states its patient — reading a printed fact, not guessing.
         # Only assign when exactly ONE known pet is named in the segment.
         if claim["pet_id"] is None:

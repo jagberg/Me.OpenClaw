@@ -115,6 +115,18 @@ def chat(messages: list, tools: list | None = None, tool_impls: dict | None = No
     return {"text": final.content or ""}
 
 
+def extract_vision(prompt: str, image_jpeg: bytes, purpose: str = "vision_extraction") -> str:
+    """Prompt + one JPEG image -> model text. Gemini-only regardless of
+    LLM_PROVIDER: it's the sole configured backend with vision (verified —
+    this Groq account exposes zero vision models)."""
+    from . import gemini
+
+    try:
+        return gemini.extract_image(prompt, image_jpeg, purpose)
+    except gemini.GeminiUnavailableError as exc:
+        raise LLMUnavailableError(str(exc)) from exc
+
+
 def extract(prompt: str, purpose: str = "extraction") -> str:
     """Single-message completion — the drop-in for the old gemini.extract().
     Delegates to the legacy Gemini backend when LLM_PROVIDER=gemini."""

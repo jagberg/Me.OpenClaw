@@ -58,6 +58,19 @@ def _is_rate_limited(exc: Exception) -> bool:
 
 def extract(prompt: str, purpose: str = "extraction") -> str:
     """Send a prompt to Gemini 2.5 Flash. Raises GeminiUnavailableError on unrecoverable failure."""
+    return _generate(prompt, purpose)
+
+
+def extract_image(prompt: str, image_jpeg: bytes, purpose: str = "vision_extraction") -> str:
+    """Prompt + one JPEG page image — the OCR fallback for scanned invoice PDFs
+    (Groq has no vision models on this account, so this stays Gemini-only)."""
+    from google.genai import types
+
+    part = types.Part.from_bytes(data=image_jpeg, mime_type="image/jpeg")
+    return _generate([part, prompt], purpose)
+
+
+def _generate(contents, purpose: str) -> str:
     if _client is None:
         raise GeminiUnavailableError("GEMINI_API_KEY is not configured")
 
@@ -68,7 +81,7 @@ def extract(prompt: str, purpose: str = "extraction") -> str:
         try:
             response = _client.models.generate_content(
                 model=config.GEMINI_MODEL,
-                contents=prompt,
+                contents=contents,
             )
             latency_ms = int((time.monotonic() - start) * 1000)
             _log_call(purpose, True, latency_ms, None)
