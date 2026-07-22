@@ -33,6 +33,24 @@ def _is_authorized(username: str | None) -> bool:
     return authorized
 
 
+async def _ack(message) -> None:
+    """React 👍 to the user's message so slow handlers (LLM chat) don't feel dead.
+    An ack failure must never break the real handler — log and continue."""
+    try:
+        await message.set_reaction("👍")
+    except Exception as exc:
+        logger.warning("could not add 👍 reaction ack: %s", exc)
+
+
+async def _ack_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group -1 handler: acks every user-authored message (text, commands,
+    uploads) before the real handlers run. Callback taps carry no update.message
+    so they're excluded — they already get feedback via _append_result."""
+    username = update.effective_user.username if update.effective_user else None
+    if update.message and _is_authorized(username):
+        await _ack(update.message)
+
+
 def get_registered_chat_id() -> int | None:
     with db.get_connection() as conn:
         row = conn.execute(
@@ -521,6 +539,8 @@ async def _handle_chat(update: Update) -> None:
 
 def build_application() -> Application:
     application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    # Group -1 runs before all group-0 handlers: instant 👍 receipt ack.
+    application.add_handler(MessageHandler(filters.ALL, _ack_user_message), group=-1)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mark", mark_command))

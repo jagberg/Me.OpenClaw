@@ -580,6 +580,31 @@ def test_append_result_falls_back_to_caption_on_document_message():
     assert q_txt.edited[0] == "text" and "plain message" in q_txt.edited[1], q_txt.edited
 
 
+def test_ack_reacts_thumbs_up_and_swallows_failures():
+    """Every incoming user message gets an instant 👍 reaction receipt; a
+    reaction failure must never break the real handler."""
+    import asyncio
+    from openclaw import telegram_bot
+
+    class FakeMessage:
+        def __init__(self, fail=False):
+            self.fail = fail
+            self.reaction = None
+
+        async def set_reaction(self, reaction):
+            if self.fail:
+                raise RuntimeError("reactions not allowed in this chat")
+            self.reaction = reaction
+
+    msg = FakeMessage()
+    asyncio.run(telegram_bot._ack(msg))
+    assert msg.reaction == "👍", msg.reaction
+
+    broken = FakeMessage(fail=True)
+    asyncio.run(telegram_bot._ack(broken))  # must not raise
+    assert broken.reaction is None
+
+
 def test_reject_split_proposal_flags_and_never_reproposes():
     db.init_db()
     with db.get_connection() as conn:
