@@ -532,7 +532,11 @@ def process_claim(claim_id: int, continuation: bool | None = None) -> None:
         ).fetchone()
 
     if pet is None:
-        return  # awaiting pet attribution (vet-payment-detection) — not a failure, just not ready
+        # awaiting pet attribution — flag it so the claim is visible (Telegram
+        # sends the pet keyboard for matched claims with no pet) instead of
+        # sitting silent until someone checks the dashboard
+        _flag(claim_id, "pet not identified — tap a pet to assign")
+        return
 
     if not pet["claim_process_defined"]:
         _flag(claim_id, f"{pet['insurer']} claim process not yet defined")
