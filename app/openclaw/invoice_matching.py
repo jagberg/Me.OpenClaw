@@ -241,25 +241,36 @@ def _vision_invoices(message_id: str) -> list | None:
     from . import claim_forms
 
     invoices = []
-    for filename, data in claim_forms.email_pdf_attachments(message_id):
-        try:
-            reader = PdfReader(BytesIO(data))
-        except Exception:
-            continue
-        for page_no, page in enumerate(reader.pages):
-            images = page.images
-            if not images:
+    try:
+        attachments = claim_forms.email_pdf_attachments(message_id)
+        for filename, data in attachments:
+            try:
+                reader = PdfReader(BytesIO(data))
+            except Exception:
                 continue
-            raw = llm.extract_vision(VISION_PAGE_PROMPT, _page_jpeg(images[0].data))
-            parsed = _parse_invoices(raw)
-            if not parsed:
-                continue  # not_invoice pages / unparseable replies carry no data
-            for inv in parsed:
-                if inv.get("amount") is None:
+            for page_no, page in enumerate(reader.pages):
+                images = page.images
+                if not images:
                     continue
-                inv["source_pdf"] = filename
-                inv["page"] = page_no
-                invoices.append(inv)
+                raw = llm.extract_vision(VISION_PAGE_PROMPT, _page_jpeg(images[0].data))
+                parsed = _parse_invoices(raw)
+                if not parsed:
+                    continue  # not_invoice pages / unparseable replies carry no data
+                for inv in parsed:
+                    if inv.get("amount") is None:
+                        continue
+                    inv["source_pdf"] = filename
+                    inv["page"] = page_no
+                    invoices.append(inv)
+    except llm.LLMUnavailableError:
+        # provider outage, not an unreadable scan — refund the attempt so
+        # 503 spikes can't exhaust the email's vision budget
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE vision_ocr_attempts SET attempts = attempts - 1 WHERE message_id = ? AND attempts > 0",
+                (message_id,),
+            )
+        raise
     if invoices:
         _store_extraction(message_id, invoices)
         return invoices

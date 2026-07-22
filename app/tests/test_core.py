@@ -954,6 +954,32 @@ def test_vision_fallback_attempt_cap():
     assert row["attempts"] == invoice_matching.VISION_MAX_ATTEMPTS
 
 
+def test_vision_provider_outage_refunds_attempt():
+    """A Gemini 503 is not an unreadable scan — the attempt is refunded so
+    outages can't exhaust an email's vision budget."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vision_ocr_attempts")
+    original = claim_forms.email_pdf_attachments
+    claim_forms.email_pdf_attachments = lambda email_id: (_ for _ in ()).throw(
+        llm.LLMUnavailableError("503 UNAVAILABLE")
+    )
+    try:
+        for _ in range(5):  # would exceed the cap if outages counted
+            try:
+                invoice_matching._vision_invoices("em-outage-1")
+                assert False, "must re-raise LLMUnavailableError"
+            except llm.LLMUnavailableError:
+                pass
+    finally:
+        claim_forms.email_pdf_attachments = original
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT attempts FROM vision_ocr_attempts WHERE message_id = 'em-outage-1'"
+        ).fetchone()
+    assert row["attempts"] == 0, row["attempts"]
+
+
 def test_pet_id_by_name_exact_known_pet_only():
     db.init_db()
     with db.get_connection() as conn:
