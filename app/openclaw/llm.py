@@ -1,10 +1,12 @@
 """Provider-agnostic LLM access. Every LLM caller uses chat()/extract() here;
 no other module imports a provider SDK directly (ADR supersedes 0001).
 
-Cerebras, Groq and OpenAI all speak the OpenAI /chat/completions shape, so one
-client with a configurable base_url covers them — swap by env var. Gemini stays
+Groq and OpenAI both speak the OpenAI /chat/completions shape, so one client
+with a configurable base_url covers them — swap by env var. Gemini stays
 selectable (LLM_PROVIDER=gemini) via its own SDK behind the same interface,
-extract() only, as a rollback path.
+extract() only, as a rollback path — and serves extract_vision() regardless of
+provider (sole vision-capable backend, ADR-0010). Cerebras was removed
+2026-07-23: its free inference tier is sold out for this account (ADR-0009).
 """
 import json
 import time
@@ -17,7 +19,6 @@ BASE_BACKOFF_SECONDS = 2
 
 # provider -> (base_url, default_model, api_key)
 _PROVIDERS = {
-    "cerebras": ("https://api.cerebras.ai/v1", "gpt-oss-120b", config.CEREBRAS_API_KEY),
     "groq": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", config.GROQ_API_KEY),
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini", config.OPENAI_API_KEY),
 }

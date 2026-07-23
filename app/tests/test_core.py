@@ -16,7 +16,6 @@ os.environ["DATABASE_PATH"] = os.path.join(_tmpdir, "test.db")
 # a key that happens to be in .env or the container env. Vision tests stub
 # llm.extract_vision on top of this — tokens are limited, tests never spend them.
 os.environ["GEMINI_API_KEY"] = ""
-os.environ["CEREBRAS_API_KEY"] = ""
 os.environ["GROQ_API_KEY"] = ""
 os.environ["OPENAI_API_KEY"] = ""
 

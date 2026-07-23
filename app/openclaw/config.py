@@ -18,13 +18,11 @@ GEMINI_RATE_LIMIT_PER_MIN = _int_env("GEMINI_RATE_LIMIT_PER_MIN", 15)
 # provider works by pointing base_url + model + key at it; llm.py holds the
 # per-provider base_url/default-model table. Default is Groq's free tier
 # (llama-3.3-70b, 100k tokens/day, no context cap). Blank LLM_MODEL = provider
-# default. Cerebras (gpt-oss-120b) is selectable but its free tier is sold-out
-# for this account (402 on every model, 2026-07). LLM_PROVIDER=gemini keeps the
-# legacy backend (extract only) for rollback.
+# default. LLM_PROVIDER=gemini keeps the legacy backend (extract only) for
+# rollback; Gemini also serves the vision-OCR fallback regardless of provider.
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").lower()
 LLM_MODEL = os.environ.get("LLM_MODEL", "")
 LLM_RATE_LIMIT_PER_MIN = _int_env("LLM_RATE_LIMIT_PER_MIN", 5)
-CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
