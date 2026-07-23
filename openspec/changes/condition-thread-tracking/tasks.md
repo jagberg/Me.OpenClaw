@@ -7,7 +7,7 @@ open until run against the real DB in the deploy worktree container.
 
 - [x] 1.1 `petcover_sr INTEGER` on `vet_claims`, `policy_anniversary TEXT` on `pets` (both mirrored in `db.py` schema + additive migration `_migrate_added_columns`); `ops_alerts` table added. **LIVE DONE**: `init_db()` (which now runs the additive migration) applied against `app/data/openclaw.db` — columns + `ops_alerts` present. DB backed up first (`openclaw.db.bak-preconditionthread`).
 - [x] 1.2 **LIVE DONE** Backfilled `petcover_sr` on the DC1-27-5628 arthritis thread oldest-txn-first: #21 (2025-08-08)=Sr2, #19 (2025-09-11)=Sr3, #18 (2025-09-26)=Sr4 (Sr1 = the pre-system Feb-2026 settlement, confirmed in Gmail 2026-02-03).
-- [ ] 1.3 **LIVE — BLOCKED on Justin** No renewal / policy-schedule / certificate email exists in Gmail (searched Petcover senders + subject variants), so the anniversary can't be mined. `pets.policy_anniversary` left NULL → settlement validation runs in its degraded (thread-lifetime, cap-unbounded, "anniversary unknown" wording) mode. Needs Justin to supply Aari's policy anniversary (MM-DD).
+- [x] 1.3 **LIVE DONE** No renewal / policy-schedule email exists in Gmail (searched), so mining failed → asked Justin: Aari's anniversary is **23 Sep**. Set `pets.policy_anniversary = '09-23'` on the live DB; settlement validation now runs year-bounded (not degraded).
 
 ## 2. Event routing (claim_status.py)
 
