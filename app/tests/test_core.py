@@ -1009,6 +1009,143 @@ def test_vision_provider_outage_refunds_attempt():
     assert row["attempts"] == 0, row["attempts"]
 
 
+def _scan_pdf_bytes(pages: int) -> bytes:
+    """An image-only PDF exactly like a vet's photo scan: each page is one
+    embedded image, no text layer (pillow's PDF writer produces this shape)."""
+    import io
+
+    from PIL import Image
+
+    images = [Image.new("RGB", (120, 160), (240, 240, 240)) for _ in range(pages)]
+    buf = io.BytesIO()
+    images[0].save(buf, format="PDF", save_all=True, append_images=images[1:])
+    return buf.getvalue()
+
+
+def test_vision_invoices_reads_pages_skips_junk_and_caches():
+    """Per-page behaviors in one bundle: a valid invoice is kept with its
+    source_pdf/page recorded; a not_invoice page, an unparseable reply and a
+    missing-amount reply are all skipped; the result caches in
+    email_extractions so vision never re-runs for the email."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vision_ocr_attempts")
+        conn.execute("DELETE FROM email_extractions")
+    replies = iter([
+        '{"invoice_number": "184556", "date": "2025-07-28", "patient": "Aari", "amount": 45.0, "items": []}',
+        '{"not_invoice": true}',
+        "the model rambled and returned no JSON at all",
+        '{"invoice_number": "9", "date": "2025-08-01", "patient": "Aari", "items": []}',  # no amount
+    ])
+    vision_calls = []
+    original_att = claim_forms.email_pdf_attachments
+    original_vision = llm.extract_vision
+    claim_forms.email_pdf_attachments = lambda email_id: [("scans.pdf", _scan_pdf_bytes(4))]
+    llm.extract_vision = lambda prompt, jpeg, purpose="vision_extraction": vision_calls.append(1) or next(replies)
+    try:
+        invoices = invoice_matching._vision_invoices("em-scan-mix")
+    finally:
+        claim_forms.email_pdf_attachments = original_att
+        llm.extract_vision = original_vision
+    assert len(vision_calls) == 4, "one vision call per page"
+    assert len(invoices) == 1, invoices
+    assert invoices[0]["invoice_number"] == "184556"
+    assert invoices[0]["source_pdf"] == "scans.pdf" and invoices[0]["page"] == 0
+    # cached: the text-extraction entry point returns it without any LLM call
+    assert invoice_matching._cached_extraction("em-scan-mix") == invoices
+    assert invoice_matching._invoices_for_email("em-scan-mix", "") == invoices
+
+
+def test_vision_all_pages_unreadable_returns_none_and_not_cached():
+    """A bundle where no page yields an invoice: None (flag stands), nothing
+    cached — the remaining attempts may retry next tick."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vision_ocr_attempts")
+        conn.execute("DELETE FROM email_extractions")
+    original_att = claim_forms.email_pdf_attachments
+    original_vision = llm.extract_vision
+    claim_forms.email_pdf_attachments = lambda email_id: [("scans.pdf", _scan_pdf_bytes(2))]
+    llm.extract_vision = lambda prompt, jpeg, purpose="vision_extraction": "illegible blur"
+    try:
+        assert invoice_matching._vision_invoices("em-scan-blur") is None
+    finally:
+        claim_forms.email_pdf_attachments = original_att
+        llm.extract_vision = original_vision
+    assert invoice_matching._cached_extraction("em-scan-blur") is None
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT attempts FROM vision_ocr_attempts WHERE message_id = 'em-scan-blur'"
+        ).fetchone()
+    assert row["attempts"] == 1
+
+
+def test_already_claimed_identity_rules():
+    """invoice_number wins when both sides have one (different numbers with the
+    same amount+date are DIFFERENT invoices); number on one side only falls
+    back to amount+date."""
+    import json as _json
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        other = _insert_matched_claim(conn, "KINGS VET TEST", -45.0, "2025-07-28")
+        conn.execute(
+            "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
+            (_json.dumps({"invoice_number": "184556", "amount": 45.0, "date": "2025-07-28"}), other),
+        )
+    same_number = {"invoice_number": "184556", "amount": 45.0, "date": "2025-07-28"}
+    different_number = {"invoice_number": "188313", "amount": 45.0, "date": "2025-07-28"}
+    no_number_same_facts = {"amount": 45.0, "date": "2025-07-28"}
+    no_number_other_facts = {"amount": 152.5, "date": "2025-08-11"}
+    assert invoice_matching._already_claimed(same_number, claim_id=999999)
+    assert not invoice_matching._already_claimed(different_number, claim_id=999999)
+    assert invoice_matching._already_claimed(no_number_same_facts, claim_id=999999)
+    assert not invoice_matching._already_claimed(no_number_other_facts, claim_id=999999)
+    # a claim never blocks itself (re-matching after unmatch)
+    assert not invoice_matching._already_claimed(same_number, claim_id=other)
+
+
+def test_pick_invoice_unparseable_date_loses_to_dated_candidate():
+    from datetime import date as _date
+
+    invoices = [
+        {"invoice_number": "A", "amount": 100.0, "date": "sometime in winter"},
+        {"invoice_number": "B", "amount": 100.0, "date": "2026-05-18"},
+    ]
+    picked = invoice_matching._pick_invoice(invoices, -100.0, _date(2026, 5, 18))
+    assert picked["invoice_number"] == "B", picked
+
+
+def test_ensure_invoice_file_scan_page_out_of_range_flags():
+    """A stale page index (attachment re-sent/changed) must not crash — it
+    falls through to the inadequate-attachment flag."""
+    import json as _json
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        cid = _insert_matched_claim(conn, "KINGS VET TEST", -45.0, "2025-07-28", email_id="em-scan-3")
+        conn.execute(
+            "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
+            (_json.dumps({"amount": 45.0, "date": "2025-07-28", "source_pdf": "scans.pdf", "page": 99}), cid),
+        )
+    original_att = claim_forms.email_pdf_attachments
+    original_docs = claim_forms._email_pdf_documents
+    claim_forms.email_pdf_attachments = lambda email_id: [("scans.pdf", _scan_pdf_bytes(1))]
+    claim_forms._email_pdf_documents = lambda email_id: []  # scan: no text docs either
+    try:
+        claim_forms.ensure_invoice_file(_matched_row(cid))
+    finally:
+        claim_forms.email_pdf_attachments = original_att
+        claim_forms._email_pdf_documents = original_docs
+    row = _matched_row(cid)
+    assert row["invoice_file_path"] is None
+    assert row["flag"] and "isn't a per-visit itemised invoice" in row["flag"]
+
+
 def test_pet_id_by_name_exact_known_pet_only():
     db.init_db()
     with db.get_connection() as conn:
@@ -1111,6 +1248,33 @@ def test_notify_pushes_flagged_pending_claims_grouped_once():
     assert "unreadable" in sent[0] and "$351.50" in sent[0] and "$132.50" in sent[0]
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     assert len(sent) == 1, "already-notified flags must not re-send"
+
+
+def test_notify_messages_carry_claim_ids():
+    """Every pushed message names the claim #id — Justin acts on ids (/mark,
+    /pet) so a message without one is unanswerable (his report: alerts lacked
+    the #, only the tap-results showed it)."""
+    from openclaw import pipeline
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        pet = conn.execute("SELECT id FROM pets LIMIT 1").fetchone()["id"]
+        needs_cond = _insert_matched_claim(conn, "IDCHECK VET", -45.0, "2026-05-18", pet_id=pet)
+        conn.execute(
+            "UPDATE vet_claims SET flag = 'condition text missing — enter manually on dashboard' WHERE id = ?",
+            (needs_cond,),
+        )
+        pending = _insert_pending_claim(conn, "IDCHECK PENDING VET", -70.0, "2026-05-20")
+        conn.execute(
+            "UPDATE vet_claims SET flag = 'manual review needed' WHERE id = ?", (pending,)
+        )
+    sent = []
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
+    cond_msg = next(t for t in sent if "IDCHECK VET" in t)
+    pending_msg = next(t for t in sent if "IDCHECK PENDING" in t)
+    assert f"#{needs_cond}" in cond_msg, cond_msg
+    assert f"#{pending}" in pending_msg, pending_msg
 
 
 if __name__ == "__main__":

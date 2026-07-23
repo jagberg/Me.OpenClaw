@@ -44,12 +44,13 @@ def _batch_key(claim) -> str:
 
 def _submission_label(group) -> str:
     """A submission's identifier for Justin. Once Petcover assigns a claim
-    reference (learned from their reply), that IS the shared id across every
-    claim in the batch — it's what their emails cite. Before that, label by
-    pet. Internal claim ids are never shown — meaningless to Justin."""
+    reference (learned from their reply), that leads — it's what their emails
+    cite. Claim #ids are always included: Justin acts on them (/mark, /pet,
+    replies quote them back)."""
     pet = group[0]["pet_name"] or "your pet"
+    ids = ", ".join(f"#{c['id']}" for c in group)
     ref = group[0]["petcover_reference"]
-    return f"{ref} ({pet})" if ref else pet
+    return f"{ref} ({pet} {ids})" if ref else f"{pet} ({ids})"
 
 
 def _summarize_drafted(group) -> str:
@@ -66,9 +67,9 @@ def _summarize_drafted(group) -> str:
         date = invoice.get("date") or c["txn_date"]
         if amount is not None:
             total += float(amount)
-            lines.append(f"  • {date} — {service} — ${float(amount):.2f}")
+            lines.append(f"  • #{c['id']} {date} — {service} — ${float(amount):.2f}")
         else:
-            lines.append(f"  • {date} — {service}")
+            lines.append(f"  • #{c['id']} {date} — {service}")
     count = len(group)
     header = f"{pet}'s vet claim — ready to send ({count} item{'s' if count > 1 else ''}, ${total:.2f})"
     return "\n".join(
@@ -100,7 +101,7 @@ def _invoice_lines(claim) -> list[str]:
 
 def _summarize_needs_condition(claim) -> str:
     pet = claim["pet_name"] or "your pet"
-    header = f"{pet} — {claim['txn_date']}, {claim['txn_merchant']}. What condition?"
+    header = f"#{claim['id']} {pet} — {claim['txn_date']}, {claim['txn_merchant']}. What condition?"
     return "\n".join([header, *_invoice_lines(claim)])
 
 
@@ -108,7 +109,7 @@ def _summarize_matched_flag(claim, label: str) -> str:
     """Explain, in plain terms, why a matched claim is still blocked — so Justin
     can act from the message instead of decoding a raw flag string."""
     flag = claim["flag"] or ""
-    who = label if claim["pet_name"] else "Unassigned claim"
+    who = label if claim["pet_name"] else f"Unassigned claim #{claim['id']}"
     lines = [f"⚠ {who} — {claim['txn_date']}, {claim['txn_merchant']}", *_invoice_lines(claim)]
     if "possible additional invoice" in flag:
         gap = flag.split("unexplained")[-1].strip() or "some amount"
@@ -129,7 +130,7 @@ def _summarize_group(group) -> str | None:
     if status == "pending_match":  # flagged-but-unmatched: surface the flag verbatim
         c = group[0]
         lines = [f"⚠ {c['txn_merchant']} — {c['flag']}", "Affected charges:"]
-        lines += [f" • ${abs(m['txn_amount']):.2f} ({m['txn_date']})" for m in group]
+        lines += [f" • #{m['id']} ${abs(m['txn_amount']):.2f} ({m['txn_date']})" for m in group]
         return "\n".join(lines)
     if status == "matched":  # matched claims aren't batched (no draft yet) — group is one claim
         if _needs_condition(group[0]):
