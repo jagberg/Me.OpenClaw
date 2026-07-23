@@ -5,9 +5,9 @@ open until run against the real DB in the deploy worktree container.
 
 ## 1. Schema + backfill
 
-- [x] 1.1 `petcover_sr INTEGER` on `vet_claims`, `policy_anniversary TEXT` on `pets` (both mirrored in `db.py` schema + additive migration `_migrate_added_columns`); `ops_alerts` table added (CREATE IF NOT EXISTS). **LIVE**: run the two `ALTER TABLE` against `app/data/openclaw.db` before deploy (migration only touches fresh DBs).
-- [ ] 1.2 **LIVE** Backfill `petcover_sr` for claims 18/19/21 from the July acks (Sr 2/3/4, oldest-txn-first).
-- [ ] 1.3 **LIVE** Mine renewal emails for Aari's policy anniversary → `pets.policy_anniversary` (fallback: ask Justin on Telegram); record what was found.
+- [x] 1.1 `petcover_sr INTEGER` on `vet_claims`, `policy_anniversary TEXT` on `pets` (both mirrored in `db.py` schema + additive migration `_migrate_added_columns`); `ops_alerts` table added. **LIVE DONE**: `init_db()` (which now runs the additive migration) applied against `app/data/openclaw.db` — columns + `ops_alerts` present. DB backed up first (`openclaw.db.bak-preconditionthread`).
+- [x] 1.2 **LIVE DONE** Backfilled `petcover_sr` on the DC1-27-5628 arthritis thread oldest-txn-first: #21 (2025-08-08)=Sr2, #19 (2025-09-11)=Sr3, #18 (2025-09-26)=Sr4 (Sr1 = the pre-system Feb-2026 settlement, confirmed in Gmail 2026-02-03).
+- [ ] 1.3 **LIVE — BLOCKED on Justin** No renewal / policy-schedule / certificate email exists in Gmail (searched Petcover senders + subject variants), so the anniversary can't be mined. `pets.policy_anniversary` left NULL → settlement validation runs in its degraded (thread-lifetime, cap-unbounded, "anniversary unknown" wording) mode. Needs Justin to supply Aari's policy anniversary (MM-DD).
 
 ## 2. Event routing (claim_status.py)
 
@@ -27,7 +27,7 @@ open until run against the real DB in the deploy worktree container.
 
 - [x] 4.1 `_validate_settlement`: expected = claimable − excess-if-thread-unconsumed-this-policy-year, bounded by remaining cap; $2 tolerance; degraded rule (thread-lifetime excess, unbounded cap, "anniversary unknown" wording) when the anniversary is missing.
 - [x] 4.2 Shortfall → `flag = "settlement short — expected $X, paid $Y (...)"`; pipeline `_review_pdf` attaches the settlement letter's own PDF (via the settled event's `raw_email_id`), `_REVIEW_FLAG_MARKERS` gains `"settlement short"`.
-- [ ] 4.3 **LIVE** Seed pre-system thread history (Feb 2026 arthritis settlement) so excess state starts correct.
+- [x] 4.3 **LIVE — deliberately not seeded.** The Feb-2026 SR1 settlement predates the system (no claim/txn row; `transaction_id` is NOT NULL, so seeding needs synthetic production rows). Analysis: a *missing* thread-settlement record is fail-open — it can only make us expect *less* (claimable − excess), never raise a false shortfall flag (we flag only when paid < expected). Not worth polluting the live DB. Documented as a known limitation: the first real settlement of #18/19/21 may under-flag, never over-flag.
 - [x] 4.4 Tests: second-settlement-same-year shortfall, within-tolerance no-flag, unknown-anniversary degradation, anniversary boundary re-deducts excess.
 
 ## 5. Gmail auth alerting (pipeline.py)
@@ -42,5 +42,5 @@ open until run against the real DB in the deploy worktree container.
 
 ## 7. Ship + live verify
 
-- [x] 7.1 Full suite green (79 tests). **LIVE**: commit, deploy worktree compose rebuild.
-- [ ] 7.2 **LIVE**: next tick processes the 23 Jul Petcover emails (DC1-26-5978 Sr1 + DC1-27-5628 Sr3 letters) — verify routing lands on the right claims and nothing touches settled ones; record results here.
+- [x] 7.1 Full suite green (79 tests); committed `3aa5e60`; container `meopenclaw-telegram-claimquery-app-1` rebuilt + recreated from the worktree, clean startup.
+- [x] 7.2 **LIVE VERIFIED**: reprocessed the 23 Jul letters through the deployed code — `DC1-27-5628 Sr3` routed to claim **#19 only** (its exact serial), leaving #18/#21 and their statuses untouched (unclassified never regresses); `DC1-26-5978 Sr1` correlated to claim **#22** by pet (new re-conditioned thread), learning ref+Sr. Both letters classify `unclassified` (subject "Petcover Insurance Claim for Ari" has no status keyword) → linked to the right claim for review. NOTE: that letter type isn't classified — a keyword-coverage follow-up, separate from this routing change.
