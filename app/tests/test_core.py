@@ -11,11 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _tmpdir = tempfile.mkdtemp()
 os.environ["DATABASE_PATH"] = os.path.join(_tmpdir, "test.db")
-os.environ.setdefault("GEMINI_API_KEY", "")
 # Keep the suite hermetic: force every LLM backend unconfigured so extraction
 # fails visibly (the intended assertion) instead of making a real API call from
-# a key that happens to be in .env. load_dotenv(override=False) won't overwrite
-# these explicit empties.
+# a key that happens to be in .env or the container env. Vision tests stub
+# llm.extract_vision on top of this — tokens are limited, tests never spend them.
+os.environ["GEMINI_API_KEY"] = ""
 os.environ["CEREBRAS_API_KEY"] = ""
 os.environ["GROQ_API_KEY"] = ""
 os.environ["OPENAI_API_KEY"] = ""
