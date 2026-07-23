@@ -12,3 +12,5 @@
 | [0008](0008-append-only-claim-status-event-log.md) | Append-only event log for claim status, with explicit confirm-to-resolve | accepted | 2026-07-18 |
 | [0009](0009-provider-agnostic-llm-backend.md) | Provider-agnostic LLM backend (Groq default), superseding 0001 | accepted | 2026-07-19 |
 | [0010](0010-vision-ocr-fallback-scanned-invoices.md) | Vision-OCR fallback for scanned invoice PDFs, hard-capped attempts | accepted | 2026-07-23 |
+| [0011](0011-condition-thread-correlation.md) | Petcover correlation is per Condition Thread, not per Submission | accepted (design) | 2026-07-23 |
+| [0012](0012-continuation-defaults-true.md) | The claim form's continuation box defaults to ticked | accepted | 2026-07-23 |
