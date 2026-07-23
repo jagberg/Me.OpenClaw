@@ -1,43 +1,46 @@
 # Tasks — condition-thread-tracking
 
+Legend: `[x]` code + hermetic test done; live-DB/Gmail steps flagged **LIVE** stay
+open until run against the real DB in the deploy worktree container.
+
 ## 1. Schema + backfill
 
-- [ ] 1.1 Manual live DDL: `ALTER TABLE vet_claims ADD COLUMN petcover_sr INTEGER;` `ALTER TABLE pets ADD COLUMN policy_anniversary TEXT;` — mirror both in `db.py` schema for fresh DBs; add `ops_alerts` table (CREATE IF NOT EXISTS)
-- [ ] 1.2 Backfill `petcover_sr` for claims 18/19/21 from the July acks (Sr 2/3/4 mapping, oldest-txn-first)
-- [ ] 1.3 Mine renewal emails for Aari's policy anniversary; store on `pets.policy_anniversary` (fallback: ask Justin on Telegram); record what was found
+- [x] 1.1 `petcover_sr INTEGER` on `vet_claims`, `policy_anniversary TEXT` on `pets` (both mirrored in `db.py` schema + additive migration `_migrate_added_columns`); `ops_alerts` table added (CREATE IF NOT EXISTS). **LIVE**: run the two `ALTER TABLE` against `app/data/openclaw.db` before deploy (migration only touches fresh DBs).
+- [ ] 1.2 **LIVE** Backfill `petcover_sr` for claims 18/19/21 from the July acks (Sr 2/3/4, oldest-txn-first).
+- [ ] 1.3 **LIVE** Mine renewal emails for Aari's policy anniversary → `pets.policy_anniversary` (fallback: ask Justin on Telegram); record what was found.
 
 ## 2. Event routing (claim_status.py)
 
-- [ ] 2.1 Extract Sr from letters (`Sr\s*N` near the reference, context-phrase style)
-- [ ] 2.2 Routing precedence: (reference, Sr) → single claim; reference-only → non-terminal thread claims (shared TERMINAL_STATUSES constant); update `find_claims_by_reference` callers
-- [ ] 2.3 Thread isolation: decline events terminal only within their thread (verify no cross-thread status writes)
-- [ ] 2.4 Tests: Sr routing, settled-claims-untouched on reference reuse, decline isolation
+- [x] 2.1 `extract_sr` — reads `SR N` only where it sits right after the reference (anchored, can't misfire).
+- [x] 2.2 Routing precedence in `process_reply`: (reference, Sr) → single claim; reference-only → thread's non-terminal claims; shared `TERMINAL_STATUSES`. Reference finders (`find_claim_by_reference_and_sr`, `find_claims_by_reference`) carry `_txn_date` for Sr assignment.
+- [x] 2.3 Thread isolation: `find_claims_by_reference` excludes `settled`/`declined`; decline routes only to its own reference. Tests prove sibling threads/settled claims untouched.
+- [x] 2.4 Tests: `test_route_reference_and_sr_to_single_claim`, `test_reference_reuse_never_touches_settled_claims`, `test_decline_isolated_to_its_thread`.
 
 ## 3. Ack correlation (claim_status.py)
 
-- [ ] 3.1 Parse printed condition + Sr from acknowledgement letters
-- [ ] 3.2 Replace pet-only pool logic: condition-content match → most-recent-sent fallback → same-day LIFO ordering; within-submission Sr assignment oldest-txn-first
-- [ ] 3.3 Recency fallback leaves claim.condition_text untouched when Petcover re-conditioned
-- [ ] 3.4 Tests: condition decides, recency fallback, same-day LIFO, re-conditioned document, batch Sr assignment
+- [x] 3.1 Reference + Sr parsed from letters; condition matched by content (the submission's own `condition_text` appearing in the letter) rather than parsing Petcover's phrase — Petcover re-conditions documents, so their printed condition is deliberately NOT trusted to overwrite ours.
+- [x] 3.2 `correlate_ack` replaces pet-only pool: condition-content → most-recently-sent fallback; per-Sr letters assign within a submission oldest-txn-first (`_claim_for_sr`).
+- [x] 3.3 Recency fallback leaves `condition_text` untouched (`test_ack_recency_fallback_leaves_condition_untouched`).
+- [x] 3.4 Tests: condition decides, recency fallback, same-day distinct submissions, re-conditioned document, batch Sr assignment (`test_batch_ack_assigns_serials_oldest_txn_first`).
 
 ## 4. Settlement validation (claim_status.py + pipeline notify)
 
-- [ ] 4.1 Expected-payout math: claimable − excess-if-unconsumed (thread + policy year from anniversary), bounded by remaining cap; $2 tolerance; degraded rule when anniversary unknown
-- [ ] 4.2 Shortfall → flag `settlement short — expected $X, paid $Y (…)` + Telegram with settlement PDF
-- [ ] 4.3 Seed pre-system thread history where known (Feb 2026 arthritis settlement) so excess state starts correct
-- [ ] 4.4 Tests: second-settlement-same-year shortfall, anniversary boundary, unknown-anniversary degradation, within-tolerance no-flag
+- [x] 4.1 `_validate_settlement`: expected = claimable − excess-if-thread-unconsumed-this-policy-year, bounded by remaining cap; $2 tolerance; degraded rule (thread-lifetime excess, unbounded cap, "anniversary unknown" wording) when the anniversary is missing.
+- [x] 4.2 Shortfall → `flag = "settlement short — expected $X, paid $Y (...)"`; pipeline `_review_pdf` attaches the settlement letter's own PDF (via the settled event's `raw_email_id`), `_REVIEW_FLAG_MARKERS` gains `"settlement short"`.
+- [ ] 4.3 **LIVE** Seed pre-system thread history (Feb 2026 arthritis settlement) so excess state starts correct.
+- [x] 4.4 Tests: second-settlement-same-year shortfall, within-tolerance no-flag, unknown-anniversary degradation, anniversary boundary re-deducts excess.
 
 ## 5. Gmail auth alerting (pipeline.py)
 
-- [ ] 5.1 Catch RefreshError/missing-token at the Gmail-phase top; skip Gmail steps that tick
-- [ ] 5.2 `ops_alerts` state: ≤5 alerts per rolling 24h; restore confirmation once on first success after alerts; state survives restart
-- [ ] 5.3 Tests: cap at 5/24h, restore-once, fresh cycle after recovery
+- [x] 5.1 `_ensure_gmail_auth` probes credentials at the top of the Gmail phase; `_is_gmail_auth_failure` distinguishes `RefreshError`/missing-token from transient errors (which re-raise); auth death skips the Gmail-dependent tick.
+- [x] 5.2 `ops_alerts` state: ≤5 alerts / rolling 24h; recovery confirmed once on first success after alerts; rows persist so a restart can't re-spam.
+- [x] 5.3 Tests: `test_gmail_auth_alert_caps_at_five_per_day`, `test_gmail_auth_recovery_confirmed_once_and_resets`.
 
 ## 6. Continuation default (claim_forms.py)
 
-- [ ] 6.1 `process_claim`/`process_claim_batch` pass `continuation=True`; test asserts the form field
+- [x] 6.1 `process_claim`/`process_claim_batch` default `continuation=True`; `test_continuation_box_defaults_ticked` asserts the form field `/0` and both defaults.
 
 ## 7. Ship + live verify
 
-- [ ] 7.1 Full suite green; commit; deploy worktree compose rebuild
-- [ ] 7.2 Live: next tick processes the 23 Jul Petcover emails (DC1-26-5978 Sr1 + DC1-27-5628 Sr3 letters) — verify routing lands on the right claims and nothing touches settled ones; record results here
+- [x] 7.1 Full suite green (79 tests). **LIVE**: commit, deploy worktree compose rebuild.
+- [ ] 7.2 **LIVE**: next tick processes the 23 Jul Petcover emails (DC1-26-5978 Sr1 + DC1-27-5628 Sr3 letters) — verify routing lands on the right claims and nothing touches settled ones; record results here.

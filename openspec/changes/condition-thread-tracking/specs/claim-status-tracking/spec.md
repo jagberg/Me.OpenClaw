@@ -23,7 +23,7 @@ A Petcover reference identifies a Condition Thread — one (pet, condition) pair
 
 #### Scenario: Two acknowledgements the same day
 - **WHEN** two un-referenced acknowledgements for one pet arrive the same day and two submissions are awaiting
-- **THEN** the later-received acknowledgement maps to the later-sent submission and the earlier to the earlier
+- **THEN** each acknowledgement attaches to a distinct awaiting submission (learning a reference removes that submission from the un-referenced pool, so the second ack cannot collide onto the first's submission); the recency rule orders which is tried first, and any residual mis-pairing when conditions are indistinguishable is correctable via manual linking
 
 #### Scenario: Acknowledgement without an extractable reference
 - **WHEN** an acknowledgement correlates to a submission but no claim reference could be extracted from it

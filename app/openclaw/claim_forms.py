@@ -415,7 +415,7 @@ def ensure_invoice_file(claim) -> None:
         _flag(claim["id"], flag)
 
 
-def process_claim_batch(claim_ids: list[int], continuation: bool | None = None) -> None:
+def process_claim_batch(claim_ids: list[int], continuation: bool | None = True) -> None:
     """Bundles up to 4 matched claims for the SAME pet into one filled claim
     document and one Gmail draft (never sends) — mirrors real submissions,
     which list up to 4 invoice line items on a single Petcover form."""
@@ -575,10 +575,12 @@ def process_and_report(claim_id: int) -> dict:
     }
 
 
-def process_claim(claim_id: int, continuation: bool | None = None) -> None:
+def process_claim(claim_id: int, continuation: bool | None = True) -> None:
     """Advances a claim from 'matched' to 'drafted' if pet/process/condition/invoice
     fields are all present; otherwise flags what's missing and stays at 'matched'
-    (spec: never guess a required field, never auto-advance without it)."""
+    (spec: never guess a required field, never auto-advance without it). The
+    continuation box defaults to ticked (ADR-0012) — Justin unticks it during
+    draft review for a genuinely new condition."""
     with db.get_connection() as conn:
         claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
         if claim is None or claim["status"] != "matched":

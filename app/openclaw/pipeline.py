@@ -3,10 +3,73 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 
+from google.auth.exceptions import RefreshError
+
 from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, llm, telegram_bot, vet_detection
 from .scheduler import scheduler
 
 logger = logging.getLogger(__name__)
+
+# Gmail auth-death alerting (ADR-0011 ops-alerting). When the OAuth token dies
+# every Gmail step fails silently in logs while Telegram still works — so make
+# it loud there, but bounded: ≤5 alerts per rolling 24h, one recovery
+# confirmation. State lives in ops_alerts so a container restart can't re-spam.
+_GMAIL_AUTH_ALERT = "gmail_auth"
+_MAX_AUTH_ALERTS_24H = 5
+_GMAIL_AUTH_RECOVERY_MSG = "✅ Gmail access restored — the pipeline is reading mail again."
+
+
+def _is_gmail_auth_failure(exc: Exception) -> bool:
+    """A dead/absent OAuth token, distinct from a transient Gmail API error."""
+    return isinstance(exc, RefreshError) or (
+        isinstance(exc, RuntimeError) and "Gmail token" in str(exc)
+    )
+
+
+def _ensure_gmail_auth(send_fn=None) -> bool:
+    """Probe Gmail credentials once per tick (refreshes the token as a side
+    effect). On auth death: send a rate-limited Telegram alert naming the
+    recovery command and return False so the tick skips Gmail-dependent work.
+    On success after any alert: send one 'restored' confirmation and clear the
+    alert state. Returns True when Gmail is usable."""
+    send = send_fn or telegram_bot.send_message_sync
+    try:
+        gmail_client.build_service()
+    except Exception as exc:  # noqa: BLE001 — non-auth errors re-raise below
+        if not _is_gmail_auth_failure(exc):
+            raise
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(hours=24)).isoformat()
+        with db.get_connection() as conn:
+            recent = conn.execute(
+                "SELECT COUNT(*) FROM ops_alerts WHERE kind = ? AND sent_at >= ?",
+                (_GMAIL_AUTH_ALERT, cutoff),
+            ).fetchone()[0]
+            if recent < _MAX_AUTH_ALERTS_24H:
+                conn.execute(
+                    "INSERT INTO ops_alerts (kind, sent_at) VALUES (?, ?)",
+                    (_GMAIL_AUTH_ALERT, now.isoformat()),
+                )
+        if recent < _MAX_AUTH_ALERTS_24H:
+            send(
+                "⚠ Gmail access has stopped working — the OAuth token needs re-authorizing.\n"
+                "Run: python scripts/gmail_auth.py (opens a browser; click Allow).\n"
+                "Claims processing is paused until then."
+            )
+        else:
+            logger.warning("Gmail auth still failing; alert cap (%s/24h) reached, staying quiet", _MAX_AUTH_ALERTS_24H)
+        return False
+
+    # Success — confirm recovery exactly once if we had been alerting.
+    with db.get_connection() as conn:
+        had_alerts = conn.execute(
+            "SELECT COUNT(*) FROM ops_alerts WHERE kind = ?", (_GMAIL_AUTH_ALERT,)
+        ).fetchone()[0]
+        if had_alerts:
+            conn.execute("DELETE FROM ops_alerts WHERE kind = ?", (_GMAIL_AUTH_ALERT,))
+    if had_alerts:
+        send(_GMAIL_AUTH_RECOVERY_MSG)
+    return True
 
 # marketing.au@ deliberately excluded — not claims-relevant (design.md).
 PETCOVER_STATUS_SENDERS = ["claims.au@petcovergroup.com", "requiredinfo.au@petcovergroup.com", "accounts.au@petcovergroup.com"]
@@ -220,15 +283,29 @@ def notify_split_proposals(send_fn=None) -> None:
 
 # Flags whose alert should carry the offending PDF so Justin can review it
 # from the message itself.
-_REVIEW_FLAG_MARKERS = ("isn't a per-visit itemised invoice", "invoice attachment unreadable")
+_REVIEW_FLAG_MARKERS = ("isn't a per-visit itemised invoice", "invoice attachment unreadable", "settlement short")
+
+
+def _latest_settled_email_id(claim_id: int) -> str | None:
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT raw_email_id FROM claim_status_events WHERE claim_id = ? AND event_type = 'settled' "
+            "AND raw_email_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+            (claim_id,),
+        ).fetchone()
+    return row["raw_email_id"] if row else None
 
 
 def _review_pdf(group) -> tuple[str, bytes] | None:
-    """The vet document behind a needs-review flag. Matched claims know their
-    email; unreadable-flagged pending claims only carry the subject in the flag
-    — recovered via a Gmail subject search, best-effort."""
+    """The vet/Petcover document behind a needs-review flag. A short settlement
+    carries its settlement letter's PDF (the breakdown Justin will dispute from);
+    matched claims know their invoice email; unreadable-flagged pending claims
+    only carry the subject in the flag — recovered via a Gmail subject search,
+    best-effort."""
     lead = group[0]
     email_id = lead["matched_email_id"]
+    if lead["flag"] and "settlement short" in lead["flag"]:
+        email_id = _latest_settled_email_id(lead["id"]) or email_id
     if not email_id and lead["flag"] and "unreadable — " in lead["flag"]:
         subject = lead["flag"].split("unreadable — ", 1)[1]
         service = gmail_client.build_service()
@@ -482,6 +559,12 @@ def _draft_matched_claims() -> None:
 
 def run_once() -> None:
     vet_detection.classify_unflagged()
+
+    # Every remaining step reads or writes Gmail — if the token is dead, alert
+    # (loudly, on Telegram) and skip them rather than fail silently in logs.
+    if not _ensure_gmail_auth():
+        return
+
     _reconcile_sent_invoice_requests()
 
     # One claim's failure must never starve the rest of the tick (confirmed

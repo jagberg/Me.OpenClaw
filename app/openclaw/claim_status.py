@@ -46,12 +46,22 @@ REFERENCE_CONTEXT_PATTERNS = [
 # least once (real: "Ari" for Aari) — checked in addition to the exact name.
 PET_NICKNAMES = {"Aari": ["Ari"]}
 
-# Statuses meaning "submitted to Petcover, reply expected" — fallback
-# correlation only considers these. Deliberately NOT date-windowed: a claim's
-# transaction can be a year older than the submission (real case: Aug 2025
-# invoices submitted Jul 2026), so txn-date proximity would reject genuine
-# matches.
-CORRELATABLE_STATUSES = ("sent", "acknowledged", "info_requested", "suspended", "settled", "declined")
+# A Condition Thread's claim is done at these statuses: a later letter reusing
+# the thread's reference (Petcover reuses it for years) must NEVER reopen them.
+# Shared with pipeline notify so "terminal" means one thing everywhere.
+TERMINAL_STATUSES = ("settled", "declined")
+
+# Statuses meaning "submitted to Petcover, still awaiting the first correlating
+# reply" — the pool ack-correlation draws from. Deliberately NOT date-windowed:
+# a claim's transaction can be a year older than its submission (real: Aug 2025
+# invoices submitted Jul 2026), so txn-date proximity would reject real matches.
+AWAITING_REPLY_STATUSES = ("sent", "acknowledged", "info_requested", "suspended")
+
+# Policy math (ADR-0011). Per-condition-thread excess and per-pet annual cap,
+# both reset on the pet's policy anniversary. $2 tolerance absorbs rounding.
+POLICY_EXCESS = 150.00
+ANNUAL_CAP = 10000.00
+SETTLEMENT_TOLERANCE = 2.00
 
 
 def _match_keywords(text: str) -> str | None:
@@ -76,6 +86,16 @@ def extract_reference(text: str) -> str | None:
     return None
 
 
+def extract_sr(text: str, reference: str | None) -> int | None:
+    """Petcover's per-document serial ("DC1-27-5628 SR1", "... Sr 3"). Read only
+    where it sits right after the reference — a bare 'Sr N' elsewhere in a
+    letter carries no thread meaning and must not misfire."""
+    if not reference:
+        return None
+    match = re.search(re.escape(reference) + r"\s*SR\s*0*(\d+)", text, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
 def extract_settlement_amounts(text: str) -> dict:
     """Settlement $ breakdown lives only in the PDF attachment, not the email
     body (confirmed via dry-run) — call with the PDF-extracted text."""
@@ -94,36 +114,86 @@ def _mentions_pet(text: str, pet_name: str) -> bool:
     return any(re.search(rf"\b{re.escape(c)}\b", text, re.IGNORECASE) for c in candidates)
 
 
-def find_claims_by_reference(reference: str) -> list:
-    """A batch submission (up to 4 invoices, one claim document) is several
-    vet_claims rows sharing one Petcover reference — events apply to all."""
+# Every correlation query carries the claim's transaction date as _txn_date so
+# per-Sr assignment (oldest-txn-first) works on any returned row uniformly.
+_CLAIM_SELECT = (
+    "SELECT vc.*, bt.date AS _txn_date FROM vet_claims vc "
+    "JOIN bank_transactions bt ON bt.id = vc.transaction_id"
+)
+
+
+def find_claim_by_reference_and_sr(reference: str, sr: int) -> list:
+    """The single claim a (reference, Sr) letter cites — Petcover's serial pins
+    one document within a Condition Thread."""
     with db.get_connection() as conn:
         return conn.execute(
-            "SELECT * FROM vet_claims WHERE petcover_reference = ?", (reference,)
+            f"{_CLAIM_SELECT} WHERE vc.petcover_reference = ? AND vc.petcover_sr = ?",
+            (reference, sr),
         ).fetchall()
 
 
-def find_claims_by_pet(body: str) -> tuple[list, bool]:
-    """Fallback correlation for the first event on a claim, before a reference
-    is known. Returns (claims, ambiguous). Several matches sharing one
-    draft_id are ONE submission (a claim batch), not an ambiguity; matches
-    spanning different submissions are ambiguous and nothing is picked —
-    caller must not guess."""
+def find_claims_by_reference(reference: str, include_terminal: bool = False) -> list:
+    """Claims sharing a Petcover reference are one Condition Thread (the ref is
+    reused for the life of the condition). A reference-only event touches the
+    thread's non-terminal claims only — settled/declined claims are finished and
+    a later reference-reuse letter must never reopen them."""
+    with db.get_connection() as conn:
+        rows = conn.execute(f"{_CLAIM_SELECT} WHERE vc.petcover_reference = ?", (reference,)).fetchall()
+    return rows if include_terminal else [r for r in rows if r["status"] not in TERMINAL_STATUSES]
+
+
+def _submission_key(claim) -> str:
+    return claim["draft_id"] or f"claim-{claim['id']}"
+
+
+def correlate_ack(text: str) -> list:
+    """Fallback correlation when no stored reference matches (an ack teaching the
+    reference, or an early reply). Candidates are un-referenced, still-awaiting
+    claims for the pet the letter names (nickname-tolerant), grouped into
+    submissions by draft_id. Justin's rule: if the letter's text carries a
+    submission's own condition text, that decides it; otherwise attribute it to
+    the most-recently-sent awaiting submission (Petcover re-conditions documents,
+    so their printed condition is NOT matched against — the recency rule wins and
+    the claim's condition_text is left untouched). Returns one submission's claims
+    (possibly several sharing a draft), or [] when no pet matches."""
     with db.get_connection() as conn:
         candidates = conn.execute(
-            "SELECT vet_claims.*, pets.name AS pet_name "
-            "FROM vet_claims JOIN pets ON pets.id = vet_claims.pet_id "
-            "WHERE vet_claims.petcover_reference IS NULL "
-            f"AND vet_claims.status IN ({','.join('?' * len(CORRELATABLE_STATUSES))})",
-            CORRELATABLE_STATUSES,
+            "SELECT vc.*, p.name AS pet_name, bt.date AS _txn_date "
+            "FROM vet_claims vc JOIN pets p ON p.id = vc.pet_id "
+            "JOIN bank_transactions bt ON bt.id = vc.transaction_id "
+            "WHERE vc.petcover_reference IS NULL "
+            f"AND vc.status IN ({','.join('?' * len(AWAITING_REPLY_STATUSES))})",
+            AWAITING_REPLY_STATUSES,
         ).fetchall()
-    matches = [c for c in candidates if _mentions_pet(body, c["pet_name"])]
-    if not matches:
-        return [], False
-    draft_ids = {c["draft_id"] for c in matches}
-    if len(matches) == 1 or (len(draft_ids) == 1 and None not in draft_ids):
-        return matches, False
-    return [], True
+    candidates = [c for c in candidates if _mentions_pet(text, c["pet_name"])]
+    if not candidates:
+        return []
+
+    submissions: dict[str, list] = {}
+    for c in candidates:
+        submissions.setdefault(_submission_key(c), []).append(c)
+
+    lowered = text.lower()
+    by_condition = [
+        claims
+        for claims in submissions.values()
+        if any(c["condition_text"] and c["condition_text"].lower() in lowered for c in claims)
+    ]
+    if len(by_condition) == 1:
+        return by_condition[0]
+    # recency fallback: the submission whose most recent claim update is latest
+    # (proxy for most-recently-sent). Attaching learns the reference, so the
+    # submission leaves the pool — two same-day acks land on distinct submissions.
+    return max(submissions.values(), key=lambda claims: max(c["updated_at"] for c in claims))
+
+
+def _claim_for_sr(submission_claims: list) -> object:
+    """Within a multi-claim submission, a per-Sr letter attaches to the oldest-
+    transaction claim not yet serialized — Petcover's serials run oldest-first,
+    and acks arrive in serial order (poll processes oldest-first)."""
+    unserialized = [c for c in submission_claims if c["petcover_sr"] is None]
+    pool = unserialized or submission_claims
+    return min(pool, key=lambda c: (c["_txn_date"] or "", c["id"]))
 
 
 def _record_event(claim_id: int | None, event_type: str, email_id: str | None, detail: dict) -> int:
@@ -137,33 +207,54 @@ def _record_event(claim_id: int | None, event_type: str, email_id: str | None, d
 
 
 def process_reply(email_id: str, subject: str, body: str) -> None:
-    """Classifies one Petcover reply, correlates it to the claim(s) of one
-    submission, and records the event per claim. Never guesses a claim to
-    attach an ambiguous reply to."""
+    """Classifies one Petcover reply and routes it to the claim(s) it concerns.
+    Routing precedence: (reference, Sr) → the one cited claim; reference-only →
+    the thread's non-terminal claims; no stored reference → ack correlation by
+    pet + condition + recency. Never guesses across Condition Threads, and never
+    reopens a settled/declined claim."""
     event_type = classify(subject, body)
     if event_type == "ignore":
         return
 
+    text = f"{subject}\n{body}"
     reference = extract_reference(subject) or extract_reference(body)
-    claims = find_claims_by_reference(reference) if reference else []
-    ambiguous = False
-    if not claims:
-        # Reference may be present in the text but not yet learned on any
-        # claim row (first event on a claim) — fall back regardless of
-        # whether a reference string was extracted, not only when absent.
-        claims, ambiguous = find_claims_by_pet(body)
+    sr = extract_sr(text, reference)
+
+    claims: list = []
+    learn_sr = False
+    if reference and sr is not None:
+        exact = find_claim_by_reference_and_sr(reference, sr)
+        if exact:
+            claims = exact  # the serial is already recorded — direct hit
+        else:
+            # This serial isn't recorded yet. Its claim is an un-serialized
+            # sibling (still un-referenced), so find the submission by pet +
+            # condition first; only fall back to the known thread if that finds
+            # nothing (e.g. a serial we never captured on an already-referenced
+            # claim). Assign to the oldest-transaction un-serialized claim.
+            pool = correlate_ack(text) or find_claims_by_reference(reference)
+            if pool:
+                claims = [_claim_for_sr(pool)]
+                learn_sr = True
+    elif reference:
+        # Reference only: the thread's non-terminal claims, or — if none yet
+        # hold the reference — the submission the ack is teaching it to.
+        claims = find_claims_by_reference(reference) or correlate_ack(text)
+    else:
+        # No reference at all — pure ack/early-reply correlation.
+        claims = correlate_ack(text)
 
     detail = {"subject": subject}
     if event_type == "settled":
         detail.update(extract_settlement_amounts(body))
 
     if not claims:
-        flag = "needs manual link — ambiguous pet match" if ambiguous else "needs manual link — no claim matched"
-        _record_event(None, event_type, email_id, {**detail, "flag": flag})
+        _record_event(None, event_type, email_id, {**detail, "flag": "needs manual link — no claim matched"})
         return
 
     now = datetime.now(timezone.utc).isoformat()
     for claim in claims:
+        settlement_flag = _validate_settlement(claim, detail.get("paid_amount")) if event_type == "settled" else None
         _record_event(claim["id"], event_type, email_id, detail)
         with db.get_connection() as conn:
             # "unclassified" is a review queue entry, not a lifecycle stage —
@@ -173,11 +264,90 @@ def process_reply(email_id: str, subject: str, body: str) -> None:
             if reference and not claim["petcover_reference"]:
                 updates.append("petcover_reference = ?")
                 params.append(reference)
-            if event_type == "acknowledged" and not reference and not claim["petcover_reference"]:
+            if learn_sr and sr is not None and claim["petcover_sr"] is None:
+                updates.append("petcover_sr = ?")
+                params.append(sr)
+            if settlement_flag:
+                updates.append("flag = ?")
+                params.append(settlement_flag)
+            elif event_type == "acknowledged" and not reference and not claim["petcover_reference"]:
                 # spec: never guess or discard — flag visibly instead
                 updates.append("flag = ?")
                 params.append("unclassified — reference format not recognized")
             conn.execute(f"UPDATE vet_claims SET {', '.join(updates)} WHERE id = ?", (*params, claim["id"]))
+
+
+def _policy_year_start(anniversary_mmdd: str, on: "datetime") -> "datetime":
+    """Start of the policy year (anniversary→anniversary) containing `on`."""
+    from datetime import date
+
+    mm, dd = (int(x) for x in anniversary_mmdd.split("-"))
+    this_year = date(on.year, mm, dd)
+    on_date = on.date() if hasattr(on, "date") else on
+    return this_year if on_date >= this_year else date(on.year - 1, mm, dd)
+
+
+def _validate_settlement(claim, paid_amount: float | None) -> str | None:
+    """Deterministic settlement check (ADR-0011): expected = claimable − excess
+    (only when this thread has no earlier settled claim in the current policy
+    year) bounded by the pet's remaining annual cap. Paid short of expected by
+    more than the tolerance returns a human flag; else None. Never auto-disputes
+    — the flag is a prompt for Justin. Degrades when the anniversary is unknown."""
+    if paid_amount is None:
+        return None
+    invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
+    claimable = invoice.get("claimable_amount")
+    if claimable is None:
+        claimable = invoice.get("amount")
+    if claimable is None:
+        return None  # nothing to compare against — don't fabricate an expectation
+    claimable = float(claimable)
+
+    now = datetime.now(timezone.utc)
+    reference = claim["petcover_reference"]
+    with db.get_connection() as conn:
+        pet = conn.execute("SELECT policy_anniversary FROM pets WHERE id = ?", (claim["pet_id"],)).fetchone()
+        thread_settlements = conn.execute(
+            "SELECT e.created_at FROM claim_status_events e JOIN vet_claims v ON v.id = e.claim_id "
+            "WHERE v.petcover_reference IS ? AND e.event_type = 'settled' AND e.claim_id != ?",
+            (reference, claim["id"]),
+        ).fetchall() if reference else []
+        pet_settlements = conn.execute(
+            "SELECT e.created_at, e.detail FROM claim_status_events e JOIN vet_claims v ON v.id = e.claim_id "
+            "WHERE v.pet_id IS ? AND e.event_type = 'settled' AND e.claim_id != ?",
+            (claim["pet_id"], claim["id"]),
+        ).fetchall()
+
+    anniversary = pet["policy_anniversary"] if pet else None
+    if anniversary:
+        year_start = _policy_year_start(anniversary, now)
+        year_end = year_start.replace(year=year_start.year + 1)
+
+        def _in_year(iso: str) -> bool:
+            d = datetime.fromisoformat(iso).date()
+            return year_start <= d < year_end
+
+        note = ""
+    else:
+        # No anniversary on record: use thread-lifetime excess only, whole-history
+        # cap. Any flag says the anniversary is unknown so Justin can weigh it.
+        _in_year = lambda iso: True  # noqa: E731
+        note = "; policy anniversary unknown, excess/cap not year-bounded"
+
+    excess_consumed = any(_in_year(r["created_at"]) for r in thread_settlements)
+    paid_this_year = sum(
+        (json.loads(r["detail"] or "{}").get("paid_amount") or 0.0)
+        for r in pet_settlements
+        if _in_year(r["created_at"])
+    )
+    remaining_cap = max(0.0, ANNUAL_CAP - paid_this_year)
+
+    expected = claimable - (0.0 if excess_consumed else POLICY_EXCESS)
+    expected = max(0.0, min(expected, remaining_cap))
+    if paid_amount < expected - SETTLEMENT_TOLERANCE:
+        reason = "excess already deducted this policy year" if excess_consumed else "less excess"
+        return f"settlement short — expected ${expected:.2f}, paid ${paid_amount:.2f} ({reason}{note})"
+    return None
 
 
 def link_event(event_id: int, claim_id: int) -> bool:

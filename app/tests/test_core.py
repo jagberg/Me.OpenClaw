@@ -247,28 +247,25 @@ def test_batch_claims_correlate_and_learn_reference_together():
     assert settled_events == 3
 
 
-def test_ambiguous_match_never_guessed_then_manually_linked():
-    """Two separate submissions for the same pet: a reply naming only the pet
-    must be stored unlinked (never guessed), then manual linking attaches it
-    and applies the status."""
+def test_uncorrelated_reply_unlinked_then_manually_linked():
+    """A reply naming no known pet correlates to nothing — stored unlinked
+    (never guessed), then manual linking attaches it WITHOUT rewriting the
+    claim's status (a late-linked old email must not regress a settled claim)."""
     db.init_db()
     with db.get_connection() as conn:
         aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
         claim_a = _insert_sent_claim(conn, aari, "2026-01-05", "draft-a")
-        _insert_sent_claim(conn, aari, "2026-02-05", "draft-b")
 
     claim_status.process_reply(
-        "msg-ambig-1", "GABR-0306- First request for consult note",
-        "We recently received a claim for treatment provided to Ari. Please provide consult notes.",
+        "msg-uncorr-1", "First request for consult note",
+        "We recently received a claim for treatment provided to Rex. Please provide consult notes.",
     )
     with db.get_connection() as conn:
-        event = conn.execute(
-            "SELECT * FROM claim_status_events WHERE raw_email_id = 'msg-ambig-1'"
-        ).fetchone()
+        event = conn.execute("SELECT * FROM claim_status_events WHERE raw_email_id = 'msg-uncorr-1'").fetchone()
         status_a = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
-    assert event["claim_id"] is None, "ambiguous reply must not be attached to any claim"
+    assert event["claim_id"] is None, "unknown-pet reply must not be attached to any claim"
     assert event["event_type"] == "info_requested"
-    assert status_a == "sent", "ambiguous reply must not change any claim's status"
+    assert status_a == "sent", "uncorrelated reply must not change any claim's status"
 
     assert claim_status.link_event(event["id"], 999999) is False, "linking to a nonexistent claim must refuse"
     assert claim_status.link_event(event["id"], claim_a) is True
@@ -739,8 +736,9 @@ def test_run_once_isolates_one_claims_failure():
 
     originals = (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
                  pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
-                 pipeline.poll_petcover_status, pipeline.notify_claim_states)
+                 pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth)
     pipeline.vet_detection.classify_unflagged = lambda: stages.append("classify")
+    pipeline._ensure_gmail_auth = lambda: True
     pipeline._reconcile_sent_invoice_requests = lambda: stages.append("reconcile")
     pipeline.invoice_matching.match_claim = fake_match
     pipeline._maybe_draft_invoice_request = lambda claim: stages.append(f"draft:{claim['id']}")
@@ -751,7 +749,7 @@ def test_run_once_isolates_one_claims_failure():
     finally:
         (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
          pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
-         pipeline.poll_petcover_status, pipeline.notify_claim_states) = originals
+         pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth) = originals
 
     assert attempted == [claim_a, claim_b], "claim B must still be attempted after claim A crashes"
     assert "poll" in stages and "notify" in stages, "downstream stages must run despite the failure"
@@ -780,8 +778,9 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
 
     originals = (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
                  pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
-                 pipeline.poll_petcover_status, pipeline.notify_claim_states)
+                 pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth)
     pipeline.vet_detection.classify_unflagged = lambda: None
+    pipeline._ensure_gmail_auth = lambda: True
     pipeline._reconcile_sent_invoice_requests = lambda: None
     pipeline.invoice_matching.match_claim = unavailable_match
     pipeline._maybe_draft_invoice_request = lambda claim: None
@@ -807,7 +806,7 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
     finally:
         (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
          pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
-         pipeline.poll_petcover_status, pipeline.notify_claim_states) = originals
+         pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth) = originals
 
 
 # Real-shape page texts (from MediPaws' actual PDFs): a per-visit invoice page
@@ -1274,6 +1273,294 @@ def test_notify_messages_carry_claim_ids():
     pending_msg = next(t for t in sent if "IDCHECK PENDING" in t)
     assert f"#{needs_cond}" in cond_msg, cond_msg
     assert f"#{pending}" in pending_msg, pending_msg
+
+
+# ---------------------------------------------------------------------------
+# Condition Thread tracking, ack correlation, settlement validation, ops alerts
+# ---------------------------------------------------------------------------
+
+def _fresh_db():
+    """Clean slate: the smoke suite shares one DB file across tests, so thread /
+    settlement tests must start from empty claim + event tables (and no stray
+    policy anniversary) to stay deterministic."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM claim_status_events")
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM ops_alerts")
+        conn.execute("UPDATE pets SET policy_anniversary = NULL")
+
+
+def _insert_claim(conn, pet_id, txn_date, status="sent", draft_id=None, reference=None,
+                  sr=None, condition=None, invoice_data=None, amount=-50.0, merchant="THREAD VET"):
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO bank_transactions (date, amount, merchant, created_at) VALUES (?, ?, ?, ?)",
+        (txn_date, amount, merchant, now),
+    )
+    txn_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        "INSERT INTO vet_claims (transaction_id, pet_id, status, draft_id, petcover_reference, "
+        "petcover_sr, condition_text, invoice_data, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (txn_id, pet_id, status, draft_id, reference, sr, condition, invoice_data, now, now),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def _insert_settled_event(conn, claim_id, created_at, paid):
+    import json as _json
+    conn.execute(
+        "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
+        "VALUES (?, 'settled', NULL, ?, ?)",
+        (claim_id, _json.dumps({"paid_amount": paid}), created_at),
+    )
+
+
+def _aari(conn):
+    return conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+
+
+def _claim_row(claim_id):
+    with db.get_connection() as conn:
+        return conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+
+
+def test_route_reference_and_sr_to_single_claim():
+    """A letter citing (reference, Sr) attaches to that one claim alone — not
+    to its thread siblings sharing the reference."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        c1 = _insert_claim(conn, aari, "2026-05-01", status="acknowledged", reference="DC1-27-5628", sr=1)
+        c2 = _insert_claim(conn, aari, "2026-05-02", status="acknowledged", reference="DC1-27-5628", sr=2)
+    claim_status.process_reply("m-sr", "Petcover Claim DC1-27-5628 SR1 - Claim suspended", "")
+    assert _claim_row(c1)["status"] == "suspended"
+    assert _claim_row(c2)["status"] == "acknowledged", "the other serial must be untouched"
+
+
+def test_reference_reuse_never_touches_settled_claims():
+    """Reference-only event on a thread that holds settled + open claims: only
+    the open ones move; settled claims are done (the ref is reused for years)."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        done1 = _insert_claim(conn, aari, "2026-02-01", status="settled", reference="DC1-27-5628", sr=1)
+        done2 = _insert_claim(conn, aari, "2026-02-02", status="declined", reference="DC1-27-5628", sr=2)
+        open1 = _insert_claim(conn, aari, "2026-07-01", status="acknowledged", reference="DC1-27-5628", sr=3)
+        open2 = _insert_claim(conn, aari, "2026-07-02", status="acknowledged", reference="DC1-27-5628", sr=4)
+    claim_status.process_reply(
+        "m-ref", "Petcover Claim DC1-27-5628 - Request for information", "please send consult notes"
+    )
+    assert _claim_row(done1)["status"] == "settled"
+    assert _claim_row(done2)["status"] == "declined"
+    assert _claim_row(open1)["status"] == "info_requested"
+    assert _claim_row(open2)["status"] == "info_requested"
+
+
+def test_decline_isolated_to_its_thread():
+    """One submission filed by Petcover into two threads: a decline on one
+    thread must not touch the other thread's claims."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        # one submission (shared draft), two conditions → two threads
+        t1 = _insert_claim(conn, aari, "2026-06-01", status="acknowledged", draft_id="d1",
+                           reference="DC1-30-1", sr=1)
+        t2 = _insert_claim(conn, aari, "2026-06-02", status="acknowledged", draft_id="d1",
+                           reference="DC1-31-9", sr=1)
+    claim_status.process_reply("m-dec", "Petcover Claim DC1-30-1 - Declined - Invoices over 12 months", "")
+    assert _claim_row(t1)["status"] == "declined"
+    assert _claim_row(t2)["status"] == "acknowledged", "sibling thread must be unaffected"
+
+
+def test_ack_condition_content_decides_submission():
+    """Two awaiting submissions differ by condition; the ack's text naming one
+    condition attaches it there and learns the reference — the other is left."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        arth = _insert_claim(conn, aari, "2026-05-01", draft_id="d-arth", condition="Arthritis")
+        ear = _insert_claim(conn, aari, "2026-05-02", draft_id="d-ear", condition="Ear infection")
+    claim_status.process_reply(
+        "m-cond", "PetCover - Acknowledgement Letter",
+        "Pet Name: Aari Condition: Arthritis Claim Number DC1-40-1 Thank you",
+    )
+    assert _claim_row(arth)["status"] == "acknowledged" and _claim_row(arth)["petcover_reference"] == "DC1-40-1"
+    assert _claim_row(ear)["status"] == "sent", "the non-matching submission must be left alone"
+
+
+def test_ack_recency_fallback_leaves_condition_untouched():
+    """When the ack's printed condition matches no awaiting claim (Petcover
+    re-conditioned the document), correlation falls back to the most-recently-
+    sent submission and does NOT rewrite the claim's own condition text."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        older = _insert_claim(conn, aari, "2026-05-01", draft_id="d-old", condition="Arthritis")
+        newer = _insert_claim(conn, aari, "2026-05-02", draft_id="d-new", condition="Dermatitis")
+        conn.execute("UPDATE vet_claims SET updated_at = '2026-07-01T00:00:00+00:00' WHERE id = ?", (older,))
+        conn.execute("UPDATE vet_claims SET updated_at = '2026-07-10T00:00:00+00:00' WHERE id = ?", (newer,))
+    claim_status.process_reply(
+        "m-recon", "PetCover - Acknowledgement Letter",
+        "Pet Name: Aari Condition: Lick Granuloma Claim Number DC1-41-2 Thank you",
+    )
+    assert _claim_row(newer)["status"] == "acknowledged", "recency picks the most-recently-sent submission"
+    assert _claim_row(newer)["condition_text"] == "Dermatitis", "our condition_text must not be overwritten"
+    assert _claim_row(older)["status"] == "sent"
+
+
+def test_two_same_day_acks_land_on_distinct_submissions():
+    """Two acks for one pet the same day, two submissions awaiting: each ack
+    lands on a distinct submission (learning the ref removes it from the pool),
+    never both on the same one."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        sub_old = _insert_claim(conn, aari, "2026-05-01", draft_id="d-old")
+        sub_new = _insert_claim(conn, aari, "2026-05-02", draft_id="d-new")
+        conn.execute("UPDATE vet_claims SET updated_at = '2026-07-01T00:00:00+00:00' WHERE id = ?", (sub_old,))
+        conn.execute("UPDATE vet_claims SET updated_at = '2026-07-10T00:00:00+00:00' WHERE id = ?", (sub_new,))
+    claim_status.process_reply("m-a", "PetCover - Acknowledgement Letter",
+                               "Pet Name: Aari Claim Number DC1-50-1 Thank you")
+    claim_status.process_reply("m-b", "PetCover - Acknowledgement Letter",
+                               "Pet Name: Aari Claim Number DC1-51-2 Thank you")
+    refs = {_claim_row(sub_old)["petcover_reference"], _claim_row(sub_new)["petcover_reference"]}
+    assert refs == {"DC1-50-1", "DC1-51-2"}, f"each ack must learn a distinct reference: {refs}"
+
+
+def test_batch_ack_assigns_serials_oldest_txn_first():
+    """One 3-claim submission; three acks (Sr 2/3/4 of one reference) attach to
+    the claims oldest-transaction-first, each learning its own serial."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        ids = [_insert_claim(conn, aari, f"2025-08-{10 + i:02d}", draft_id="d-batch") for i in range(3)]
+    for serial in (2, 3, 4):
+        claim_status.process_reply(
+            f"m-ack-{serial}", "PetCover - Acknowledgement Letter",
+            f"Pet Name: Aari Claim Number DC1-77-0001 SR{serial} Thank you",
+        )
+    rows = [_claim_row(cid) for cid in ids]
+    assert [r["petcover_sr"] for r in rows] == [2, 3, 4], "oldest txn → lowest serial"
+    assert all(r["petcover_reference"] == "DC1-77-0001" for r in rows)
+    assert all(r["status"] == "acknowledged" for r in rows)
+
+
+def test_settlement_short_second_same_year_flags():
+    """A thread that already had its excess deducted (Feb settlement) then pays
+    claimable − $150 again in the same policy year → flagged short."""
+    _fresh_db()
+    import json as _json
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        conn.execute("UPDATE pets SET policy_anniversary = '01-01' WHERE id = ?", (aari,))
+        first = _insert_claim(conn, aari, "2026-02-01", status="settled", reference="DC1-SS-1")
+        _insert_settled_event(conn, first, "2026-02-10T00:00:00+00:00", 400.0)
+        second = _insert_claim(conn, aari, "2026-07-01", status="acknowledged", reference="DC1-SS-1",
+                               invoice_data=_json.dumps({"claimable_amount": 500.0, "amount": 500.0}))
+    flag = claim_status._validate_settlement(_claim_row(second), 350.0)
+    assert flag and "settlement short" in flag and "$500.00" in flag and "$350.00" in flag
+    assert "already deducted" in flag, flag
+
+
+def test_settlement_within_tolerance_no_flag():
+    _fresh_db()
+    import json as _json
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        conn.execute("UPDATE pets SET policy_anniversary = '01-01' WHERE id = ?", (aari,))
+        cid = _insert_claim(conn, aari, "2026-07-01", status="acknowledged", reference="DC1-T-1",
+                            invoice_data=_json.dumps({"claimable_amount": 500.0}))
+    # expected = 500 - 150 excess = 350; paid within $2 → no flag
+    assert claim_status._validate_settlement(_claim_row(cid), 349.0) is None
+    # paid short beyond tolerance → flag, first settlement so "less excess"
+    flag = claim_status._validate_settlement(_claim_row(cid), 300.0)
+    assert flag and "less excess" in flag
+
+
+def test_settlement_unknown_anniversary_degrades():
+    _fresh_db()
+    import json as _json
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        conn.execute("UPDATE pets SET policy_anniversary = NULL WHERE id = ?", (aari,))
+        cid = _insert_claim(conn, aari, "2026-07-01", status="acknowledged", reference="DC1-U-1",
+                            invoice_data=_json.dumps({"claimable_amount": 500.0}))
+    flag = claim_status._validate_settlement(_claim_row(cid), 200.0)
+    assert flag and "anniversary unknown" in flag
+
+
+def test_settlement_anniversary_boundary_rededucts_excess():
+    """Thread settled in the previous policy year; a settlement after the
+    anniversary deducts the excess again (new year)."""
+    _fresh_db()
+    import json as _json
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        conn.execute("UPDATE pets SET policy_anniversary = '07-01' WHERE id = ?", (aari,))
+        first = _insert_claim(conn, aari, "2026-01-01", status="settled", reference="DC1-BD-1")
+        _insert_settled_event(conn, first, "2026-02-10T00:00:00+00:00", 400.0)  # previous policy year
+        second = _insert_claim(conn, aari, "2026-07-05", status="acknowledged", reference="DC1-BD-1",
+                               invoice_data=_json.dumps({"claimable_amount": 500.0}))
+    flag = claim_status._validate_settlement(_claim_row(second), 300.0)
+    assert flag and "less excess" in flag, "excess must be deducted again in the new policy year"
+
+
+def test_gmail_auth_alert_caps_at_five_per_day():
+    from openclaw import pipeline
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM ops_alerts")
+    sent = []
+    original = pipeline.gmail_client.build_service
+    pipeline.gmail_client.build_service = lambda: (_ for _ in ()).throw(RuntimeError("No Gmail token at x"))
+    try:
+        results = [pipeline._ensure_gmail_auth(send_fn=lambda t, markup=None: sent.append(t)) for _ in range(7)]
+    finally:
+        pipeline.gmail_client.build_service = original
+    assert results == [False] * 7
+    assert len(sent) == 5, f"cap is 5/24h, got {len(sent)}"
+    assert all("gmail_auth.py" in s for s in sent)
+    with db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ops_alerts WHERE kind='gmail_auth'").fetchone()[0] == 5
+
+
+def test_gmail_auth_recovery_confirmed_once_and_resets():
+    from openclaw import pipeline
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM ops_alerts")
+    sent = []
+    spy = lambda t, markup=None: sent.append(t)  # noqa: E731
+    fail = lambda: (_ for _ in ()).throw(RuntimeError("No Gmail token"))  # noqa: E731
+    ok = lambda: object()  # noqa: E731
+    original = pipeline.gmail_client.build_service
+    try:
+        pipeline.gmail_client.build_service = fail
+        assert pipeline._ensure_gmail_auth(send_fn=spy) is False  # one alert
+        pipeline.gmail_client.build_service = ok
+        assert pipeline._ensure_gmail_auth(send_fn=spy) is True   # recovery
+        assert pipeline._ensure_gmail_auth(send_fn=spy) is True   # nothing more
+        assert len([s for s in sent if "restored" in s]) == 1, sent
+        # a later failure starts a fresh alert cycle
+        sent.clear()
+        pipeline.gmail_client.build_service = fail
+        pipeline._ensure_gmail_auth(send_fn=spy)
+        assert len(sent) == 1 and "gmail_auth.py" in sent[0]
+    finally:
+        pipeline.gmail_client.build_service = original
+
+
+def test_continuation_box_defaults_ticked():
+    import inspect
+    db.init_db()
+    with db.get_connection() as conn:
+        pet = conn.execute("SELECT * FROM pets WHERE name='Aari'").fetchone()
+    assert claim_forms._shared_fields(pet, True)["claim_continuation_state"] == "/0", "ticked = Yes = /0"
+    assert inspect.signature(claim_forms.process_claim).parameters["continuation"].default is True
+    assert inspect.signature(claim_forms.process_claim_batch).parameters["continuation"].default is True
 
 
 if __name__ == "__main__":

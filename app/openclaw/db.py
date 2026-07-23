@@ -50,7 +50,10 @@ CREATE TABLE IF NOT EXISTS pets (
     claim_process_defined INTEGER NOT NULL DEFAULT 0,
     policy_number TEXT,
     dob TEXT,
-    insured_elsewhere INTEGER NOT NULL DEFAULT 0
+    insured_elsewhere INTEGER NOT NULL DEFAULT 0,
+    -- Policy anniversary "MM-DD": excess ($150/condition) and the $10k annual
+    -- cap reset here, NOT at calendar year (settlement validation, ADR-0011).
+    policy_anniversary TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bank_transactions (
@@ -146,6 +149,16 @@ CREATE TABLE IF NOT EXISTS telegram_registrations (
     chat_id INTEGER NOT NULL,
     registered_at TEXT NOT NULL
 );
+
+-- Operational alerts sent to Telegram (currently only Gmail auth death).
+-- One row per alert actually sent; used to rate-limit (≤5/24h) and to know a
+-- failure is outstanding so recovery is confirmed exactly once. Survives
+-- container restarts, so a restart can't re-spam (ADR-0011 ops-alerting).
+CREATE TABLE IF NOT EXISTS ops_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    sent_at TEXT NOT NULL
+);
 """
 
 # vet_claims columns added after the table's initial release — CREATE TABLE IF
@@ -158,6 +171,13 @@ _VET_CLAIMS_ADDED_COLUMNS = {
     "petcover_reference": "TEXT",
     "rejected_email_ids": "TEXT",  # JSON list of invoice emails Justin unmatched — never re-match these
     "item_conditions": "TEXT",  # JSON [{description, amount, condition}] when one invoice spans >1 condition
+    "petcover_sr": "INTEGER",  # Petcover's per-document serial within a Condition Thread ("DC1-27-5628 Sr 3")
+}
+
+# pets columns added after the table's initial release — same migration reason
+# as _VET_CLAIMS_ADDED_COLUMNS.
+_PETS_ADDED_COLUMNS = {
+    "policy_anniversary": "TEXT",
 }
 
 # Echo's claim_email stays NULL until Justin supplies Bow Wow Insurance's process
@@ -169,11 +189,11 @@ VALUES ('Aari', 'Petcover', 'claims.au@petcovergroup.com', 1),
 """
 
 
-def _migrate_vet_claims_columns(conn: sqlite3.Connection) -> None:
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(vet_claims)")}
-    for column, col_type in _VET_CLAIMS_ADDED_COLUMNS.items():
+def _migrate_added_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for column, col_type in columns.items():
         if column not in existing:
-            conn.execute(f"ALTER TABLE vet_claims ADD COLUMN {column} {col_type}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
 
 def init_db(path: str | None = None) -> None:
@@ -181,7 +201,8 @@ def init_db(path: str | None = None) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA)
-        _migrate_vet_claims_columns(conn)
+        _migrate_added_columns(conn, "vet_claims", _VET_CLAIMS_ADDED_COLUMNS)
+        _migrate_added_columns(conn, "pets", _PETS_ADDED_COLUMNS)
         conn.executescript(SEED_PETS)
 
 
