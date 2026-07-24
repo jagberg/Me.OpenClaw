@@ -463,16 +463,18 @@ def confirm_resolved(claim_id: int) -> None:
     _record_event(claim_id, "confirmed_resolved", None, {})
 
 
-def _policy_year(txn_date: str) -> str:
-    """Policy-year key for excess/cap grouping. Calendar year of the charge —
-    an approximation: Petcover's real policy-year start isn't recorded, so a
-    claim near a year boundary could be grouped a year off. Refine to the true
-    renewal date if/when it's stored on the pet."""
-    # ponytail: calendar year, switch to renewal-anchored year if excess disputes arise
-    return (txn_date or "")[:4]
+def _policy_year_key(txn_date: str, anniversary: str | None) -> str:
+    """Policy-year key for excess/cap grouping. Anniversary-anchored (ADR-0011)
+    when the pet's renewal date is on file; calendar year otherwise — an
+    approximation that can group a claim a year off near the real boundary."""
+    if not txn_date:
+        return ""
+    if anniversary:
+        return _policy_year_start(anniversary, date.fromisoformat(txn_date[:10])).isoformat()
+    return txn_date[:4]
 
 
-def _apply_excess_and_cap(rows: list, excess, cap) -> None:
+def _apply_excess_and_cap(rows: list, excess, cap, anniversary: str | None = None) -> None:
     """Fills each row's `expected` in place. Excess is drained greedily across
     a (pet, condition, year) group in charge-date order — earliest charges
     absorb it first — then the running per-year total is bounded by the cap.
@@ -495,7 +497,7 @@ def _apply_excess_and_cap(rows: list, excess, cap) -> None:
 
     by_condition: dict[tuple, list] = {}
     for r in priced:
-        key = (r["condition_text"] or "", _policy_year(r["txn_date"]))
+        key = (r["condition_text"] or "", _policy_year_key(r["txn_date"], anniversary))
         by_condition.setdefault(key, []).append(r)
 
     year_totals: dict[str, float] = {}
@@ -534,6 +536,7 @@ def visit_ledger() -> list:
         ).fetchall()
         claim_rows = conn.execute(
             "SELECT vet_claims.*, pets.name AS pet_name, pets.annual_excess, pets.annual_cap, "
+            "pets.policy_anniversary, "
             "bank_transactions.date AS txn_date, bank_transactions.amount AS txn_amount, "
             "bank_transactions.merchant AS txn_merchant "
             "FROM vet_claims JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
@@ -574,6 +577,7 @@ def visit_ledger() -> list:
                 "txn_date": c["txn_date"],
                 "annual_excess": c["annual_excess"],
                 "annual_cap": c["annual_cap"],
+                "policy_anniversary": c["policy_anniversary"],
                 "last_event": last_event.get(c["id"]),
                 "settled_paid": settled_paid.get(c["id"]),
             }
@@ -587,7 +591,7 @@ def visit_ledger() -> list:
             by_pet.setdefault(cl["pet_id"], []).append(cl)
     for pet_claims in by_pet.values():
         first = pet_claims[0]
-        _apply_excess_and_cap(pet_claims, first["annual_excess"], first["annual_cap"])
+        _apply_excess_and_cap(pet_claims, first["annual_excess"], first["annual_cap"], first["policy_anniversary"])
     # Settled claims override the estimate with what Petcover actually paid.
     for pet_claims in by_pet.values():
         for cl in pet_claims:

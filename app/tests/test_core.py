@@ -1835,6 +1835,34 @@ def test_visit_ledger_expected_after_excess_and_settled_actual():
     assert claim["expected"]["estimate"] is False
 
 
+def test_visit_ledger_uses_anniversary_year_not_calendar_year():
+    """Real bug: excess/cap grouping used to bucket by calendar year, but
+    Aari's policy year runs anniversary-to-anniversary (09-23), not Jan-Dec.
+    Two arthritis charges either side of Dec 31 but inside the SAME real
+    policy year must share one $150 excess — calendar-year bucketing would
+    wrongly give each charge its own fresh excess."""
+    db.init_db()
+    with db.get_connection() as conn:
+        # earlier visit_ledger tests leave Aari/Arthritis rows behind (no
+        # cleanup) and this test's group math is sensitive to exactly that.
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM claim_status_events")
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        conn.execute("UPDATE pets SET policy_anniversary = '09-23' WHERE id = ?", (aari,))
+        # both after the 2025-09-23 anniversary, before the next one -> one policy year
+        t1 = _insert_txn(conn, "2025-11-01", -100.00)
+        t2 = _insert_txn(conn, "2026-02-01", -100.00)
+        _insert_ledger_claim(conn, t1, aari, "drafted", "Arthritis", 100.00)
+        _insert_ledger_claim(conn, t2, aari, "drafted", "Arthritis", 100.00)
+
+    ledger = claim_status.visit_ledger()
+    by_txn = {e["txn"]["id"]: e["claims"][0] for e in ledger if e["txn"]["id"] in (t1, t2)}
+    # combined $200 > $150 excess: earliest charge absorbs it fully ($0), the
+    # later one only clears the remaining $50 of excess -> $50 expected
+    assert by_txn[t1]["expected"]["value"] == 0.0
+    assert by_txn[t2]["expected"]["value"] == 50.0
+
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
