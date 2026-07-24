@@ -2,7 +2,7 @@ import json
 import re
 from datetime import date, datetime, timezone
 
-from . import db
+from . import claim_forms, db
 
 # "Automatic reply: ..." fires instantly on submission, before the real
 # Acknowledgement Letter (1-2 business days later per its own boilerplate) —
@@ -474,13 +474,35 @@ def _policy_year_key(txn_date: str, anniversary: str | None) -> str:
     return txn_date[:4]
 
 
+def _split_conditions(row) -> dict[str, float] | None:
+    """Recovers a split claim's real per-condition subtotals from its stored
+    item_conditions JSON (same grouping claim_forms._group_by_condition did
+    when the claim was split into e.g. "Arthritis; Dermatitis"). None when
+    there's nothing to split (no item_conditions, or it doesn't parse) — the
+    row's single joined condition_text bucket applies unchanged, same as
+    today, rather than guessing a breakdown."""
+    raw = row.get("item_conditions")
+    if not raw:
+        return None
+    try:
+        groups = claim_forms._group_by_condition(json.loads(raw))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return groups or None
+
+
 def _apply_excess_and_cap(rows: list, excess, cap, anniversary: str | None = None) -> None:
     """Fills each row's `expected` in place. Excess is drained greedily across
-    a (pet, condition, year) group in charge-date order — earliest charges
-    absorb it first — then the running per-year total is bounded by the cap.
-    All figures are estimates (est.), never booked reimbursements: they don't
-    net off what Petcover has already paid this year. Missing excess/cap →
-    unavailable, never guessed."""
+    a (condition, year) group in charge-date order — earliest charges absorb
+    it first — then the running per-year total is bounded by the cap. A claim
+    spanning >1 condition (item_conditions on file) is split back into its
+    real per-condition subtotals for this grouping — Petcover's $150 excess
+    applies per condition, so a joined "Arthritis; Dermatitis" claim must
+    drain two buckets, not share one; the claim still ends up with a single
+    `expected.value` (the sum of its condition-portions). All figures are
+    estimates (est.), never booked reimbursements: they don't net off what
+    Petcover has already paid this year. Missing excess/cap → unavailable,
+    never guessed."""
     if excess is None or cap is None:
         for r in rows:
             r["expected"] = {"available": False, "value": None, "note": "no policy excess/cap on file"}
@@ -495,20 +517,34 @@ def _apply_excess_and_cap(rows: list, excess, cap, anniversary: str | None = Non
         else:
             priced.append(r)
 
-    by_condition: dict[tuple, list] = {}
+    # Each row contributes one "part" per condition it actually covers — one
+    # part for the common single-condition case, one per condition for a
+    # split claim (a single row can land in >1 bucket below).
+    parts = []
     for r in priced:
-        key = (r["condition_text"] or "", _policy_year_key(r["txn_date"], anniversary))
-        by_condition.setdefault(key, []).append(r)
+        split = _split_conditions(r)
+        if split:
+            for condition, amount in split.items():
+                parts.append({"row": r, "condition": condition, "amount": amount})
+        else:
+            parts.append({"row": r, "condition": r["condition_text"] or "", "amount": r["claimable"] or 0})
+
+    by_condition: dict[tuple, list] = {}
+    for p in parts:
+        key = (p["condition"], _policy_year_key(p["row"]["txn_date"], anniversary))
+        by_condition.setdefault(key, []).append(p)
 
     year_totals: dict[str, float] = {}
+    row_values: dict[int, float] = {}
+    row_notes: dict[int, list] = {}
     for (condition, year), group in by_condition.items():
         remaining_excess = excess
-        group_claimable = sum((g["claimable"] or 0) for g in group)
-        for r in sorted(group, key=lambda g: g["txn_date"] or ""):
-            claimable = r["claimable"] or 0
-            absorbed = min(remaining_excess, claimable)
+        group_claimable = sum(g["amount"] for g in group)
+        for p in sorted(group, key=lambda g: g["row"]["txn_date"] or ""):
+            amount = p["amount"]
+            absorbed = min(remaining_excess, amount)
             remaining_excess -= absorbed
-            after_excess = claimable - absorbed
+            after_excess = amount - absorbed
             # bound the running per-year total by the annual cap
             used = year_totals.get(year, 0.0)
             allowed = max(0.0, cap - used)
@@ -518,7 +554,18 @@ def _apply_excess_and_cap(rows: list, excess, cap, anniversary: str | None = Non
                 note = f"{condition or 'condition'} YTD ${group_claimable:.2f} < ${excess:.0f} excess"
             else:
                 note = f"est. after ${excess:.0f} excess"
-            r["expected"] = {"available": True, "value": value, "note": note, "estimate": True}
+            row_id = id(p["row"])
+            row_values[row_id] = row_values.get(row_id, 0.0) + value
+            row_notes.setdefault(row_id, []).append(note)
+
+    for r in priced:
+        row_id = id(r)
+        r["expected"] = {
+            "available": True,
+            "value": round(row_values.get(row_id, 0.0), 2),
+            "note": "; ".join(row_notes.get(row_id, [])),
+            "estimate": True,
+        }
 
 
 def visit_ledger() -> list:
@@ -569,6 +616,7 @@ def visit_ledger() -> list:
                 "pet_name": c["pet_name"],
                 "pet_id": c["pet_id"],
                 "condition_text": c["condition_text"],
+                "item_conditions": c["item_conditions"],
                 "status": c["status"],
                 "reference": c["petcover_reference"],
                 "draft_id": c["draft_id"],

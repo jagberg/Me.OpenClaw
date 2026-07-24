@@ -1755,14 +1755,15 @@ def _insert_txn(conn, date, amount, merchant="KINGS VET CLINIC"):
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
-def _insert_ledger_claim(conn, txn_id, pet_id, status, condition=None, claimable=None):
+def _insert_ledger_claim(conn, txn_id, pet_id, status, condition=None, claimable=None, item_conditions=None):
     import json as _json
     now = datetime.now(timezone.utc).isoformat()
     invoice = _json.dumps({"claimable_amount": claimable}) if claimable is not None else None
+    ic = _json.dumps(item_conditions) if item_conditions is not None else None
     conn.execute(
-        "INSERT INTO vet_claims (transaction_id, pet_id, condition_text, invoice_data, status, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (txn_id, pet_id, condition, invoice, status, now, now),
+        "INSERT INTO vet_claims (transaction_id, pet_id, condition_text, invoice_data, item_conditions, status, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (txn_id, pet_id, condition, invoice, ic, status, now, now),
     )
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -1862,6 +1863,40 @@ def test_visit_ledger_uses_anniversary_year_not_calendar_year():
     # later one only clears the remaining $50 of excess -> $50 expected
     assert by_txn[t1]["expected"]["value"] == 0.0
     assert by_txn[t2]["expected"]["value"] == 50.0
+
+
+def test_visit_ledger_splits_condition_excess_per_condition():
+    """Real bug: a claim whose invoice spans two conditions gets condition_text
+    = "Arthritis; Dermatitis" — a joined string, but Petcover applies the $150
+    excess PER CONDITION, so the two must drain separate excess buckets, not
+    share one under the combined string. $200 Arthritis + $200 Dermatitis on
+    one split invoice: correct = ($200-150) + ($200-150) = $100. The old
+    combined-bucket bug would drain a single $150 excess across the $400
+    combined once -> $250."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM claim_status_events")
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        conn.execute("UPDATE pets SET policy_anniversary = '09-23' WHERE id = ?", (aari,))
+        t1 = _insert_txn(conn, "2025-11-01", -400.00)
+        _insert_ledger_claim(
+            conn,
+            t1,
+            aari,
+            "drafted",
+            condition="Arthritis; Dermatitis",
+            claimable=400.00,
+            item_conditions=[
+                {"description": "Arthritis visit", "amount": 200.00, "condition": "Arthritis"},
+                {"description": "Dermatitis visit", "amount": 200.00, "condition": "Dermatitis"},
+            ],
+        )
+
+    ledger = claim_status.visit_ledger()
+    claim = next(c for e in ledger for c in e["claims"] if e["txn"]["id"] == t1)
+    assert claim["expected"]["value"] == 100.0, claim["expected"]
 
 
 if __name__ == "__main__":
