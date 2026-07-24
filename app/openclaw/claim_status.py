@@ -656,12 +656,17 @@ def visit_ledger() -> list:
 def history_rows(days: int = 365) -> list[dict]:
     """Flat, one-row-per-claim view of visit_ledger() for Telegram's /history.
     A split charge's claims already appear as separate entries in the nested
-    ledger — this just flattens them and windows by transaction date, keeping
-    visit_ledger's newest-first order (a charge with no claim yet contributes
-    no rows, same as it contributes nothing to render in the web ledger)."""
+    ledger — this just flattens them and windows by transaction date (a charge
+    with no claim yet contributes no rows, same as it contributes nothing to
+    render in the web ledger).
+
+    OLDEST first, deliberately inverting visit_ledger's newest-first order: a
+    visit stops being claimable once it's a year old, so the rows nearest the
+    `days` cutoff are the ones about to expire — they belong at the top of
+    page 1, not buried on the last page."""
     cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
     rows = []
-    for entry in visit_ledger():
+    for entry in reversed(visit_ledger()):
         txn = entry["txn"]
         if txn["date"] < cutoff:
             continue
