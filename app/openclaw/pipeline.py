@@ -3,10 +3,74 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 
-from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, telegram_bot, vet_detection
+from google.auth.exceptions import RefreshError
+from googleapiclient.errors import HttpError
+
+from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, llm, telegram_bot, vet_detection
 from .scheduler import scheduler
 
 logger = logging.getLogger(__name__)
+
+# Gmail auth-death alerting (ADR-0011 ops-alerting). When the OAuth token dies
+# every Gmail step fails silently in logs while Telegram still works — so make
+# it loud there, but bounded: ≤5 alerts per rolling 24h, one recovery
+# confirmation. State lives in ops_alerts so a container restart can't re-spam.
+_GMAIL_AUTH_ALERT = "gmail_auth"
+_MAX_AUTH_ALERTS_24H = 5
+_GMAIL_AUTH_RECOVERY_MSG = "✅ Gmail access restored — the pipeline is reading mail again."
+
+
+def _is_gmail_auth_failure(exc: Exception) -> bool:
+    """A dead/absent OAuth token, distinct from a transient Gmail API error."""
+    return isinstance(exc, RefreshError) or (
+        isinstance(exc, RuntimeError) and "Gmail token" in str(exc)
+    )
+
+
+def _ensure_gmail_auth(send_fn=None) -> bool:
+    """Probe Gmail credentials once per tick (refreshes the token as a side
+    effect). On auth death: send a rate-limited Telegram alert naming the
+    recovery command and return False so the tick skips Gmail-dependent work.
+    On success after any alert: send one 'restored' confirmation and clear the
+    alert state. Returns True when Gmail is usable."""
+    send = send_fn or telegram_bot.send_message_sync
+    try:
+        gmail_client.build_service()
+    except Exception as exc:  # noqa: BLE001 — non-auth errors re-raise below
+        if not _is_gmail_auth_failure(exc):
+            raise
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(hours=24)).isoformat()
+        with db.get_connection() as conn:
+            recent = conn.execute(
+                "SELECT COUNT(*) FROM ops_alerts WHERE kind = ? AND sent_at >= ?",
+                (_GMAIL_AUTH_ALERT, cutoff),
+            ).fetchone()[0]
+            if recent < _MAX_AUTH_ALERTS_24H:
+                conn.execute(
+                    "INSERT INTO ops_alerts (kind, sent_at) VALUES (?, ?)",
+                    (_GMAIL_AUTH_ALERT, now.isoformat()),
+                )
+        if recent < _MAX_AUTH_ALERTS_24H:
+            send(
+                "⚠ Gmail access has stopped working — the OAuth token needs re-authorizing.\n"
+                "Run: python scripts/gmail_auth.py (opens a browser; click Allow).\n"
+                "Claims processing is paused until then."
+            )
+        else:
+            logger.warning("Gmail auth still failing; alert cap (%s/24h) reached, staying quiet", _MAX_AUTH_ALERTS_24H)
+        return False
+
+    # Success — confirm recovery exactly once if we had been alerting.
+    with db.get_connection() as conn:
+        had_alerts = conn.execute(
+            "SELECT COUNT(*) FROM ops_alerts WHERE kind = ?", (_GMAIL_AUTH_ALERT,)
+        ).fetchone()[0]
+        if had_alerts:
+            conn.execute("DELETE FROM ops_alerts WHERE kind = ?", (_GMAIL_AUTH_ALERT,))
+    if had_alerts:
+        send(_GMAIL_AUTH_RECOVERY_MSG)
+    return True
 
 # marketing.au@ deliberately excluded — not claims-relevant (design.md).
 PETCOVER_STATUS_SENDERS = ["claims.au@petcovergroup.com", "requiredinfo.au@petcovergroup.com", "accounts.au@petcovergroup.com"]
@@ -19,33 +83,50 @@ DRAFT_SEARCH_LINK = "https://mail.google.com/mail/u/0/#search/in%3Adrafts+subjec
 
 # Statuses worth pushing to Justin's phone. Urgent = he has to act (blocked
 # claim, insurer waiting on him); the rest are informational lifecycle updates.
-NOTIFY_STATUSES = ("matched", "drafted", "info_requested", "suspended", "acknowledged", "settled", "declined")
+NOTIFY_STATUSES = (
+    "matched", "drafted", "info_requested", "suspended", "acknowledged",
+    "approved", "below_excess", "settled", "declined",
+)
 
 
 def _latest_settlement_detail(claim_id: int) -> dict:
+    """The dollar breakdown for a claim's settlement. Lives on the 'approved'
+    event now (the newer letter template) or on 'settled' itself (the older
+    PDF-attachment style) — the later dollar-less 'payment processed' settled
+    email carries neither, so check both event types and take whichever has
+    figures, most recent first."""
     with db.get_connection() as conn:
-        row = conn.execute(
-            "SELECT detail FROM claim_status_events WHERE claim_id = ? AND event_type = 'settled' "
-            "ORDER BY created_at DESC LIMIT 1",
+        rows = conn.execute(
+            "SELECT detail FROM claim_status_events WHERE claim_id = ? "
+            "AND event_type IN ('approved', 'settled') ORDER BY created_at DESC",
             (claim_id,),
-        ).fetchone()
-    return json.loads(row["detail"] or "{}") if row else {}
+        ).fetchall()
+    for row in rows:
+        detail = json.loads(row["detail"] or "{}")
+        if detail.get("paid_amount") is not None:
+            return detail
+    return json.loads(rows[0]["detail"] or "{}") if rows else {}
 
 
 def _batch_key(claim) -> str:
     """Claims sharing one draft are one submission (one Gmail draft, sent as a
-    unit) — notify about them together, not once per claim."""
+    unit) — notify about them together, not once per claim. Flagged pending
+    claims group by (merchant, flag) instead: six claims blocked on the same
+    unreadable vet attachment are one problem, one message."""
+    if claim["status"] == "pending_match":
+        return f"pending:{claim['txn_merchant']}:{claim['flag']}"
     return claim["draft_id"] or f"claim-{claim['id']}"
 
 
 def _submission_label(group) -> str:
     """A submission's identifier for Justin. Once Petcover assigns a claim
-    reference (learned from their reply), that IS the shared id across every
-    claim in the batch — it's what their emails cite. Before that, label by
-    pet. Internal claim ids are never shown — meaningless to Justin."""
+    reference (learned from their reply), that leads — it's what their emails
+    cite. Claim #ids are always included: Justin acts on them (/mark, /pet,
+    replies quote them back)."""
     pet = group[0]["pet_name"] or "your pet"
+    ids = ", ".join(f"#{c['id']}" for c in group)
     ref = group[0]["petcover_reference"]
-    return f"{ref} ({pet})" if ref else pet
+    return f"{ref} ({pet} {ids})" if ref else f"{pet} ({ids})"
 
 
 def _summarize_drafted(group) -> str:
@@ -62,9 +143,9 @@ def _summarize_drafted(group) -> str:
         date = invoice.get("date") or c["txn_date"]
         if amount is not None:
             total += float(amount)
-            lines.append(f"  • {date} — {service} — ${float(amount):.2f}")
+            lines.append(f"  • #{c['id']} {date} — {service} — ${float(amount):.2f}")
         else:
-            lines.append(f"  • {date} — {service}")
+            lines.append(f"  • #{c['id']} {date} — {service}")
     count = len(group)
     header = f"{pet}'s vet claim — ready to send ({count} item{'s' if count > 1 else ''}, ${total:.2f})"
     return "\n".join(
@@ -96,7 +177,7 @@ def _invoice_lines(claim) -> list[str]:
 
 def _summarize_needs_condition(claim) -> str:
     pet = claim["pet_name"] or "your pet"
-    header = f"{pet} — {claim['txn_date']}, {claim['txn_merchant']}. What condition?"
+    header = f"#{claim['id']} {pet} — {claim['txn_date']}, {claim['txn_merchant']}. What condition?"
     return "\n".join([header, *_invoice_lines(claim)])
 
 
@@ -104,7 +185,7 @@ def _summarize_matched_flag(claim, label: str) -> str:
     """Explain, in plain terms, why a matched claim is still blocked — so Justin
     can act from the message instead of decoding a raw flag string."""
     flag = claim["flag"] or ""
-    who = label if claim["pet_name"] else "Unassigned claim"
+    who = label if claim["pet_name"] else f"Unassigned claim #{claim['id']}"
     lines = [f"⚠ {who} — {claim['txn_date']}, {claim['txn_merchant']}", *_invoice_lines(claim)]
     if "possible additional invoice" in flag:
         gap = flag.split("unexplained")[-1].strip() or "some amount"
@@ -122,6 +203,11 @@ def _summarize_matched_flag(claim, label: str) -> str:
 def _summarize_group(group) -> str | None:
     status = group[0]["status"]
     label = _submission_label(group)
+    if status == "pending_match":  # flagged-but-unmatched: surface the flag verbatim
+        c = group[0]
+        lines = [f"⚠ {c['txn_merchant']} — {c['flag']}", "Affected charges:"]
+        lines += [f" • #{m['id']} ${abs(m['txn_amount']):.2f} ({m['txn_date']})" for m in group]
+        return "\n".join(lines)
     if status == "matched":  # matched claims aren't batched (no draft yet) — group is one claim
         if _needs_condition(group[0]):
             return _summarize_needs_condition(group[0])
@@ -134,6 +220,15 @@ def _summarize_group(group) -> str | None:
         return f"⚠ {label}: suspended by Petcover — action needed."
     if status == "acknowledged":
         return f"{label}: acknowledged by Petcover."
+    if status == "below_excess":
+        return f"{label}: under the fixed excess — not yet payable, invoice kept on file."
+    if status == "approved":
+        detail = _latest_settlement_detail(group[0]["id"])
+        claimed, paid = detail.get("claimed_amount"), detail.get("paid_amount")
+        base = f"{label}: approved by Petcover"
+        base += f" — claimed ${claimed:.2f}, paid ${paid:.2f}." if claimed is not None and paid is not None else "."
+        flag = group[0]["flag"]
+        return f"⚠ {base}\n{flag}" if flag and "mismatch" in flag else base
     if status == "declined":
         return f"{label}: declined by Petcover."
     if status == "settled":
@@ -143,6 +238,112 @@ def _summarize_group(group) -> str | None:
             return f"{label}: settled — claimed ${claimed:.2f}, paid ${paid:.2f}."
         return f"{label}: settled."
     return None
+
+
+def notify_split_proposals(send_fn=None) -> None:
+    """Pushes the one invoice / several charges picker: shows the invoice and
+    each covered charge, with a button per claim — Justin picks which claim
+    carries the invoice (see invoice_matching.resolve_split_proposal). Sent
+    once per proposal (notified_at)."""
+    send = send_fn or telegram_bot.send_message_sync
+    with db.get_connection() as conn:
+        proposals = conn.execute(
+            "SELECT * FROM split_proposals WHERE status = 'open' AND notified_at IS NULL"
+        ).fetchall()
+    for proposal in proposals:
+        claim_ids = json.loads(proposal["claim_ids"])
+        invoice = json.loads(proposal["invoice_json"])
+        with db.get_connection() as conn:
+            claims = [
+                dict(r)
+                for r in conn.execute(
+                    f"SELECT vet_claims.id, bank_transactions.amount, bank_transactions.date, "
+                    f"bank_transactions.merchant FROM vet_claims "
+                    f"JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+                    f"WHERE vet_claims.id IN ({','.join('?' * len(claim_ids))}) ORDER BY vet_claims.id",
+                    claim_ids,
+                )
+            ]
+        if len(claims) != len(claim_ids):
+            continue
+        total = float(invoice["amount"])
+        combined = sum(abs(c["amount"]) for c in claims)
+        primary = max(claims, key=lambda c: (abs(c["amount"]), -c["id"]))
+        others = [c for c in claims if c["id"] != primary["id"]]
+        lines = [
+            f"🔀 One invoice paid over {len(claims)} charges — {claims[0]['merchant']}",
+            f"Invoice {invoice.get('date') or '(no date)'} for ${total:.2f}:",
+            *[f" • #{c['id']} — ${abs(c['amount']):.2f} ({c['date']})" for c in claims],
+            f"Charges together: ${combined:.2f}.",
+        ]
+        if invoice.get("payments_confirmed"):
+            lines.append("The invoice's own payment records list both charge amounts.")
+        lines.append(
+            f"Merge? #{primary['id']} will carry the invoice; "
+            f"#{', #'.join(str(c['id']) for c in others)} closes as its other payment. "
+            "(Petcover sees the invoice, not the bank charges — no split needed.)"
+        )
+        text = "\n".join(lines)
+        markup = telegram_bot.merge_bill_keyboard(proposal["id"])
+        # attach the invoice pages themselves so the merge can be reviewed in place
+        document = None
+        if send_fn is None:
+            try:
+                document = claim_forms.invoice_segment_pdf(proposal["email_id"], total)
+            except Exception as exc:
+                logger.warning("merge-proposal pdf fetch failed (proposal %s): %s", proposal["id"], exc)
+        if document:
+            telegram_bot.send_document_sync(text, document[1], document[0], markup)
+        else:
+            send(text, markup)
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE split_proposals SET notified_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), proposal["id"]),
+            )
+
+
+# Flags whose alert should carry the offending PDF so Justin can review it
+# from the message itself.
+_REVIEW_FLAG_MARKERS = ("isn't a per-visit itemised invoice", "invoice attachment unreadable", "settlement mismatch")
+
+
+def _latest_settled_email_id(claim_id: int) -> str | None:
+    """The email carrying the settlement figures — 'approved' for the newer
+    letter template, 'settled' for the older PDF-attachment style."""
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT raw_email_id FROM claim_status_events WHERE claim_id = ? "
+            "AND event_type IN ('approved', 'settled') AND raw_email_id IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 1",
+            (claim_id,),
+        ).fetchone()
+    return row["raw_email_id"] if row else None
+
+
+def _review_pdf(group) -> tuple[str, bytes] | None:
+    """The vet/Petcover document behind a needs-review flag. A settlement
+    mismatch carries its approval/settlement email (the breakdown Justin will
+    review from — a PDF for the older style, plain text for the newer, in
+    which case the fallback below simply finds nothing and sends plain text);
+    matched claims know their invoice email; unreadable-flagged pending claims
+    only carry the subject in the flag — recovered via a Gmail subject search,
+    best-effort."""
+    lead = group[0]
+    email_id = lead["matched_email_id"]
+    if lead["flag"] and "settlement mismatch" in lead["flag"]:
+        email_id = _latest_settled_email_id(lead["id"]) or email_id
+    if not email_id and lead["flag"] and "unreadable — " in lead["flag"]:
+        subject = lead["flag"].split("unreadable — ", 1)[1]
+        service = gmail_client.build_service()
+        messages = service.users().messages().list(
+            userId="me", q=f'subject:"{subject}" has:attachment', maxResults=1
+        ).execute().get("messages", [])
+        email_id = messages[0]["id"] if messages else None
+    if not email_id:
+        return None
+    attachments = claim_forms.email_pdf_attachments(email_id)
+    return attachments[0] if attachments else None
 
 
 def notify_claim_states(send_fn=None) -> None:
@@ -159,7 +360,14 @@ def notify_claim_states(send_fn=None) -> None:
             "FROM vet_claims vc "
             "LEFT JOIN pets p ON p.id = vc.pet_id "
             "JOIN bank_transactions bt ON bt.id = vc.transaction_id "
-            f"WHERE vc.status IN ({','.join('?' * len(NOTIFY_STATUSES))})",
+            f"WHERE vc.status IN ({','.join('?' * len(NOTIFY_STATUSES))}) "
+            # pending claims with an actionable flag (unreadable attachment,
+            # manual-match, merge pending) push too — transient LLM-outage and
+            # drafted-request flags are noise, not actions
+            "OR (vc.status = 'pending_match' AND vc.flag IS NOT NULL "
+            "AND vc.flag != 'invoice_request_drafted' "
+            "AND vc.flag NOT LIKE 'invoice extraction unavailable%' "
+            "AND vc.flag NOT LIKE 'invoice matching error%')",
             NOTIFY_STATUSES,
         ).fetchall()
 
@@ -193,7 +401,18 @@ def notify_claim_states(send_fn=None) -> None:
             markup = telegram_bot.condition_keyboard(lead["id"], lead["pet_id"], multi_item=multi)
         else:
             markup = None
-        send(text, markup)
+        # Review alerts carry the offending PDF itself. Only when using the
+        # real sender — a test send_fn spy stays a plain text call.
+        document = None
+        if send_fn is None and lead["flag"] and any(m in lead["flag"] for m in _REVIEW_FLAG_MARKERS):
+            try:
+                document = _review_pdf(group)
+            except Exception as exc:
+                logger.warning("review-pdf fetch failed for claim %s: %s", lead["id"], exc)
+        if document:
+            telegram_bot.send_document_sync(text, document[1], document[0], markup)
+        else:
+            send(text, markup)
         with db.get_connection() as conn:
             for c in group:
                 conn.execute(
@@ -217,17 +436,18 @@ def _reconcile_sent_invoice_requests() -> None:
     """Justin sends invoice-request drafts himself (CLAUDE.md: never auto-send)
     and is expected to click 'mark invoice-request sent' on the dashboard
     afterward — but real usage shows that click gets missed. Missing it keeps
-    invoice_request_sent_at NULL, which keeps the Gmail search window pinned to
-    the original narrow +/-INVOICE_MATCH_WINDOW_DAYS range (see
-    invoice_matching._date_range_clause), so a reply arriving weeks later never
-    gets searched at all — confirmed live: two real vet replies sat unmatched
-    for this exact reason. Detected here via Gmail's own SENT/DRAFT labels on
+    invoice_request_sent_at NULL. The search window no longer depends on it
+    (wide arrival window is unconditional now), but the dashboard's
+    request-sent state and the drafted-flag hygiene still do. Detected here
+    via Gmail's own SENT/DRAFT labels on
     the stored message id — unambiguous, no Sent-folder text-matching needed.
     Runs every pipeline tick (every VET_CLAIM_PIPELINE_INTERVAL_MINUTES), so
     the daily-check ask is covered many times over."""
     with db.get_connection() as conn:
+        # keyed on draft_id, not the flag — error/unreadable flags can overwrite
+        # 'invoice_request_drafted' without meaning the draft went away
         rows = conn.execute(
-            "SELECT id, draft_id FROM vet_claims WHERE flag = 'invoice_request_drafted' "
+            "SELECT id, draft_id FROM vet_claims WHERE status = 'pending_match' "
             "AND invoice_request_sent_at IS NULL AND draft_id IS NOT NULL"
         ).fetchall()
     if not rows:
@@ -238,6 +458,23 @@ def _reconcile_sent_invoice_requests() -> None:
     for row in rows:
         try:
             message = service.users().messages().get(userId="me", id=row["draft_id"], format="minimal").execute()
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                # The draft was deleted from Gmail — retrying forever just spams
+                # the log every tick (confirmed live: claim 17, 10+/day). Distinct
+                # from a transient failure: this can never resolve itself, so
+                # clear it and tell Justin to send a fresh invoice request.
+                with db.get_connection() as conn:
+                    conn.execute(
+                        "UPDATE vet_claims SET draft_id = NULL, "
+                        "flag = 'invoice-request draft was deleted from Gmail — send a fresh one', "
+                        "updated_at = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+                logger.warning("reconcile: draft %s for claim %s no longer exists — cleared", row["draft_id"], row["id"])
+            else:
+                logger.warning("reconcile: couldn't fetch draft %s for claim %s: %s", row["draft_id"], row["id"], exc)
+            continue
         except Exception as exc:
             # Can't confirm either way this cycle — retry next tick. Not silent:
             # a persistent failure (auth expiry, bad id) stays visible in logs.
@@ -246,14 +483,18 @@ def _reconcile_sent_invoice_requests() -> None:
         labels = message.get("labelIds", [])
         if "SENT" in labels and "DRAFT" not in labels:
             with db.get_connection() as conn:
+                # only clear the drafted marker — flag may hold other state
+                # (e.g. unreadable-attachment) that must survive reconciling
                 conn.execute(
-                    "UPDATE vet_claims SET invoice_request_sent_at = ?, flag = NULL, updated_at = ? WHERE id = ?",
+                    "UPDATE vet_claims SET invoice_request_sent_at = ?, "
+                    "flag = CASE WHEN flag = 'invoice_request_drafted' THEN NULL ELSE flag END, "
+                    "updated_at = ? WHERE id = ?",
                     (now, now, row["id"]),
                 )
 
 
 def _maybe_draft_invoice_request(claim) -> None:
-    if claim["invoice_request_sent_at"] or claim["flag"] == "invoice_request_drafted":
+    if claim["invoice_request_sent_at"] or claim["draft_id"]:
         return  # already sent (rolling recheck handles it), or already drafted awaiting Justin
     txn_date = datetime.fromisoformat(claim["txn_date"]).replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) - txn_date < timedelta(days=config.INVOICE_MATCH_WINDOW_DAYS):
@@ -308,23 +549,95 @@ def poll_petcover_status() -> None:
         gmail_ingest._mark_processed(message["id"], None)
 
 
+# flags run_once writes on match failure — cleared before the next attempt so
+# a recovered claim doesn't carry a stale error
+_TRANSIENT_MATCH_FLAGS = ("invoice extraction unavailable", "invoice matching error")
+
+
+def _matched_claims():
+    with db.get_connection() as conn:
+        return conn.execute(
+            "SELECT vet_claims.*, bank_transactions.merchant AS txn_merchant, "
+            "bank_transactions.date AS txn_date, bank_transactions.amount AS txn_amount, "
+            "pets.claim_process_defined AS pet_process_defined "
+            "FROM vet_claims "
+            "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            "LEFT JOIN pets ON pets.id = vet_claims.pet_id "
+            "WHERE vet_claims.status = 'matched'"
+        ).fetchall()
+
+
+def _draft_matched_claims() -> None:
+    """matched → drafted. First auto-extract each claim's per-visit invoice
+    pages from its matched email (claim_forms.ensure_invoice_file — the step
+    that used to be manual), then draft: fully-ready claims are bundled per
+    pet into batches of ≤4 (the Petcover form's row limit) sharing one form +
+    one Gmail draft; anything not ready goes through process_claim so its
+    per-field flagging (pet/condition/invoice) still runs."""
+    for claim in _matched_claims():
+        try:
+            claim_forms.ensure_invoice_file(claim)
+        except Exception as exc:  # Gmail hiccup — retry next tick, keep the tick alive
+            logger.warning("ensure_invoice_file: claim %s: %s", claim["id"], exc)
+
+    ready_by_pet: dict[int, list] = {}
+    not_ready = []
+    for claim in _matched_claims():  # re-read: paths/pets may have just been set
+        if (
+            claim["pet_id"]
+            and claim["pet_process_defined"]
+            and claim["condition_text"]
+            and claim["invoice_file_path"]
+        ):
+            ready_by_pet.setdefault(claim["pet_id"], []).append(claim)
+        else:
+            not_ready.append(claim)
+
+    for claims in ready_by_pet.values():
+        claims.sort(key=lambda c: (c["txn_date"], c["id"]))
+        for i in range(0, len(claims), 4):
+            claim_forms.process_claim_batch([c["id"] for c in claims[i : i + 4]])
+    for claim in not_ready:
+        claim_forms.process_claim(claim["id"])
+
+
 def run_once() -> None:
     vet_detection.classify_unflagged()
+
+    # Every remaining step reads or writes Gmail — if the token is dead, alert
+    # (loudly, on Telegram) and skip them rather than fail silently in logs.
+    if not _ensure_gmail_auth():
+        return
+
     _reconcile_sent_invoice_requests()
 
+    # One claim's failure must never starve the rest of the tick (confirmed
+    # live: an extraction 429 on the first pending claim blocked Petcover
+    # status polling for days). LLM outage is global, so stop *matching* only;
+    # everything downstream still runs.
     for claim in _pending_claims():
-        if not invoice_matching.match_claim(claim):
+        if (claim["flag"] or "").startswith(_TRANSIENT_MATCH_FLAGS):
+            invoice_matching._flag_claim(claim["id"], None)
+        try:
+            matched = invoice_matching.match_claim(claim)
+        except llm.LLMUnavailableError as exc:
+            logger.warning("matching: LLM unavailable, skipping remaining matching this tick: %s", exc)
+            invoice_matching._flag_claim(claim["id"], f"invoice extraction unavailable — {str(exc)[:120]}")
+            break
+        except Exception as exc:
+            logger.exception("matching: claim %s failed", claim["id"])
+            invoice_matching._flag_claim(claim["id"], f"invoice matching error — {str(exc)[:120]}")
+            continue
+        if not matched:
             _maybe_draft_invoice_request(claim)
 
-    with db.get_connection() as conn:
-        matched_ids = [r["id"] for r in conn.execute("SELECT id FROM vet_claims WHERE status = 'matched'")]
-    for claim_id in matched_ids:
-        claim_forms.process_claim(claim_id)
+    _draft_matched_claims()
 
     # Poll before notifying so status changes from fresh Petcover replies
     # push to Telegram in the same tick, not the next one.
     poll_petcover_status()
     notify_claim_states()
+    notify_split_proposals()
 
 
 def start() -> None:

@@ -33,6 +33,24 @@ def _is_authorized(username: str | None) -> bool:
     return authorized
 
 
+async def _ack(message) -> None:
+    """React 👍 to the user's message so slow handlers (LLM chat) don't feel dead.
+    An ack failure must never break the real handler — log and continue."""
+    try:
+        await message.set_reaction("👍")
+    except Exception as exc:
+        logger.warning("could not add 👍 reaction ack: %s", exc)
+
+
+async def _ack_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group -1 handler: acks every user-authored message (text, commands,
+    uploads) before the real handlers run. Callback taps carry no update.message
+    so they're excluded — they already get feedback via _append_result."""
+    username = update.effective_user.username if update.effective_user else None
+    if update.message and _is_authorized(username):
+        await _ack(update.message)
+
+
 def get_registered_chat_id() -> int | None:
     with db.get_connection() as conn:
         row = conn.execute(
@@ -329,6 +347,18 @@ def wrong_invoice_button(claim_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Wrong invoice", callback_data=f"unmatch:{claim_id}")]])
 
 
+def merge_bill_keyboard(proposal_id: int) -> InlineKeyboardMarkup:
+    """Confirm/reject for a one-invoice-several-charges merge. No per-claim
+    pick: which claim carries the invoice is bookkeeping (Petcover sees the
+    invoice, never the bank charges) — the larger charge carries it."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Merge — one invoice, one claim", callback_data=f"mergebill:{proposal_id}")],
+            [InlineKeyboardButton("❌ Not the same invoice", callback_data=f"rejectbill:{proposal_id}")],
+        ]
+    )
+
+
 def pet_keyboard(claim_id: int) -> InlineKeyboardMarkup:
     """One button per known pet, to assign an unattributed claim in a tap."""
     with db.get_connection() as conn:
@@ -370,6 +400,17 @@ def _execute_action(proposal: dict) -> str:
     return f"Unknown action: {action}"
 
 
+async def _append_result(query, suffix: str) -> None:
+    """Append a result line to the tapped message. Keyboard messages may be
+    plain text OR a document with caption (merge/review alerts carry the PDF) —
+    edit_message_text crashes on the latter, so fall back to the caption."""
+    msg = query.message
+    if msg.text is not None:
+        await query.edit_message_text(text=f"{msg.text}\n\n{suffix}")
+    else:
+        await query.edit_message_caption(caption=f"{msg.caption or ''}\n\n{suffix}"[:1024])
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -379,7 +420,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data or ""
     if data.startswith("sent:"):
         result = claim_status.mark_sent(int(data.split(":", 1)[1]))
-        await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+        await _append_result(query, f"✅ {result['message']}")
     elif data.startswith("cond:"):
         _, cid, idx = data.split(":")
         cid, idx = int(cid), int(idx)
@@ -388,7 +429,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         conds = prior_conditions(claim["pet_id"]) if claim else []
         if 0 <= idx < len(conds):
             result = claim_forms.set_condition_text(cid, conds[idx])
-            await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+            await _append_result(query, f"✅ {result['message']}")
     elif data.startswith("condother:"):
         _pending_condition[query.message.chat_id] = int(data.split(":", 1)[1])
         await context.bot.send_message(
@@ -399,10 +440,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif data.startswith("setpet:"):
         _, cid, pet_id = data.split(":")
         result = claim_forms.assign_pet(int(cid), int(pet_id))
-        await query.edit_message_text(text=f"{query.message.text}\n\n✅ {result['message']}")
+        await _append_result(query, f"✅ {result['message']}")
     elif data.startswith("unmatch:"):
         result = invoice_matching.unmatch(int(data.split(":", 1)[1]))
-        await query.edit_message_text(text=f"{query.message.text}\n\n❌ {result['message']}")
+        await _append_result(query, f"❌ {result['message']}")
+    elif data.startswith("usebill:"):
+        # legacy pick buttons from already-sent messages — still honored
+        _, proposal_id, claim_id = data.split(":")
+        result = invoice_matching.resolve_split_proposal(int(proposal_id), int(claim_id))
+        icon = "✅" if result["ok"] else "⚠️"
+        await _append_result(query, f"{icon} {result['message']}")
+    elif data.startswith("mergebill:"):
+        result = invoice_matching.merge_split_proposal(int(data.split(":", 1)[1]))
+        icon = "✅" if result["ok"] else "⚠️"
+        await _append_result(query, f"{icon} {result['message']}")
+    elif data.startswith("rejectbill:"):
+        result = invoice_matching.reject_split_proposal(int(data.split(":", 1)[1]))
+        icon = "❌" if result["ok"] else "⚠️"
+        await _append_result(query, f"{icon} {result['message']}")
     elif data.startswith("split:"):
         cid = int(data.split(":", 1)[1])
         with db.get_connection() as conn:
@@ -433,10 +488,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif data.startswith("act:"):
         proposal = _pending_actions.pop(data.split(":", 1)[1], None)
         if proposal is None:
-            await query.edit_message_text(text=f"{query.message.text}\n\n⚠️ Action expired — ask again.")
+            await _append_result(query, "⚠️ Action expired — ask again.")
             return
         message = _execute_action(proposal)
-        await query.edit_message_text(text=f"{query.message.text}\n\n✅ {message}")
+        await _append_result(query, f"✅ {message}")
 
 
 async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -484,6 +539,8 @@ async def _handle_chat(update: Update) -> None:
 
 def build_application() -> Application:
     application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    # Group -1 runs before all group-0 handlers: instant 👍 receipt ack.
+    application.add_handler(MessageHandler(filters.ALL, _ack_user_message), group=-1)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mark", mark_command))
@@ -517,6 +574,25 @@ async def stop_polling() -> None:
     await _application.stop()
     await _application.shutdown()
     _application = None
+
+
+def send_document_sync(caption: str, document: bytes, filename: str, reply_markup=None) -> None:
+    """Outbound document push (e.g. the PDF invoice a review alert is about),
+    same synchronous-caller pattern as send_message_sync. Telegram caps
+    captions at 1024 chars — truncated, the document is the point."""
+    chat_id = get_registered_chat_id()
+    if chat_id is None or not config.TELEGRAM_BOT_TOKEN:
+        logger.warning("Telegram document skipped — no chat id or token.")
+        return
+
+    async def _send() -> None:
+        bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
+        await bot.send_document(
+            chat_id=chat_id, document=document, filename=filename,
+            caption=caption[:1024], reply_markup=reply_markup,
+        )
+
+    asyncio.run(_send())
 
 
 def send_message_sync(text: str, reply_markup=None) -> None:

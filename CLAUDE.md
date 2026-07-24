@@ -4,11 +4,13 @@ Personal assistant for Justin: task/reminder capture from Gmail, plus a vet-insu
 
 ## Layout
 
-- `app/openclaw/` — the FastAPI app. Claims service modules: `vet_detection`, `invoice_matching`, `claim_forms`, `claim_status`, orchestrated by `pipeline` (see ADR-0006 — logical boundary, never a separate deployable). Assistant side: `tasks`, `reminders`, `gmail_ingest`.
-- `app/tests/test_core.py` — assert-based smoke suite, run with `./.venv/Scripts/python.exe tests/test_core.py` from `app/`. No pytest.
+- `app/openclaw/` — the FastAPI app; module map in `app/openclaw/CLAUDE.md`. Claims service: `vet_detection`, `invoice_matching`, `claim_forms`, `claim_status`, orchestrated by `pipeline` (see ADR-0006 — logical boundary, never a separate deployable). Assistant side: `tasks`, `reminders`, `gmail_ingest`. Interfaces: `telegram_bot`, dashboard (`main`/templates).
+- `app/tests/test_core.py` — assert-based smoke suite, run with `./.venv/Scripts/python.exe tests/test_core.py` from `app/`. No pytest. Hermetic: all LLM keys force-blanked; vision tests stub `llm.extract_vision` (tokens are never spent by tests).
 - `openspec/changes/` — spec-driven change workflow (proposal → design → specs → tasks; `/opsx:propose`, `/opsx:apply`).
-- `docs/adr/` — architecture decisions; read 0006–0008 before touching the claims service.
+- `docs/adr/` — architecture decisions; read 0006–0010 before touching the claims service (0007 ceiling matching, 0008 status events, 0009 LLM backends, 0010 vision OCR).
+- `README.md` — goal, end-to-end process, matching algorithm, every third-party call. Keep it current when behavior changes.
 - `app/data/` and `app/.env` — real SQLite DB, Gmail credentials/token, secrets. Gitignored; never commit, never print contents.
+- Deploy = Docker from the worktree `C:\Code\Me.OpenClaw-telegram-claimquery` (compose binds `C:/code/Me.OpenClaw/app/data:/data`): `docker compose up -d --build --force-recreate`.
 
 ## Hard rules (non-negotiable)
 
@@ -28,7 +30,7 @@ Personal assistant for Justin: task/reminder capture from Gmail, plus a vet-insu
 
 ## Operational constraints
 
-- LLM backend is provider-agnostic (`llm.py`, `chat()`/`extract()`); default is Groq free tier (`llama-3.3-70b-versatile`), swappable to Cerebras/OpenAI/Gemini by env var — ADR-0009 (supersedes 0001). Cerebras' free tier is sold-out for this account (402 on every model), hence Groq. Chat + extraction are the only LLM users. Don't add LLM calls where regex/keywords work (classification, references are keyword/regex on purpose).
+- LLM backend is provider-agnostic (`llm.py`, `chat()`/`extract()`/`extract_vision()`); default is Groq free tier (`llama-3.3-70b-versatile`), swappable to OpenAI/Gemini by env var — ADR-0009 (supersedes 0001; Cerebras removed 2026-07-23, free tier sold-out for this account). `extract_vision` always uses Gemini (only vision-capable backend; hard-capped 3 attempts/email — ADR-0010). Chat, extraction and vision OCR are the only LLM users. Don't add LLM calls where regex/keywords work (classification, references are keyword/regex on purpose).
 - Gmail OAuth token expires periodically (testing-app 7-day limit) — recovery: `python scripts/gmail_auth.py` (opens browser, Justin must click Allow).
 - Live DB schema changes need a manual `ALTER TABLE` against `app/data/openclaw.db` — `CREATE TABLE IF NOT EXISTS` in `db.py` won't touch existing tables.
 

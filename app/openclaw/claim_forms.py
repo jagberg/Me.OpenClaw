@@ -1,9 +1,11 @@
 import base64
 import json
+import re
 from datetime import datetime, timezone
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from io import BytesIO
 from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
@@ -237,7 +239,183 @@ def apply_item_conditions(claim_id: int, item_conditions: list[dict]) -> dict:
     return {"ok": True, "message": f"Claim #{claim_id}: {', '.join(f'{k} (${v:.2f})' for k, v in groups.items())}."}
 
 
-def process_claim_batch(claim_ids: list[int], continuation: bool | None = None) -> None:
+# A page starting a proper per-visit invoice: "INVOICE #411193" (MediPaws) or
+# "Tax Invoice ..." (SAH). Account statements carry amounts but no such header
+# and no "Patient name:" — verified against MediPaws' real Financial Statement
+# vs its Individual Invoices bundle (0 header/patient hits vs 11 each).
+_INVOICE_HEADER_RE = re.compile(r"INVOICE\s*#\s*\d{4,}|Tax Invoice", re.IGNORECASE)
+# Colon optional — real formats: "Patient name:\nAari" (MediPaws), "Patient : Aari"
+# and "Patient Echo" (SAH, confirmed live — the colon-required version missed it).
+# Captured words are only ever acted on after matching a KNOWN pet name, so the
+# loose pattern can't misfire on e.g. "Patient care".
+_PATIENT_RE = re.compile(r"Patient\s*(?:name)?\s*:?\s*\n?\s*([A-Za-z]+)", re.IGNORECASE)
+
+
+def _patient_candidates(text: str) -> set[str]:
+    return {m.group(1).lower() for m in _PATIENT_RE.finditer(text)}
+
+
+def _amount_variants(amount: float) -> list[str]:
+    plain = f"{amount:.2f}"
+    grouped = f"{amount:,.2f}"
+    return [plain] if plain == grouped else [plain, grouped]
+
+
+def find_invoice_segment(
+    page_texts: list[str], amount: float, pet_name: str | None, other_pets: tuple[str, ...] = ()
+) -> tuple[int, int] | None:
+    """Locates THIS claim's invoice inside a multi-invoice PDF bundle: pages are
+    segmented at invoice headers (each segment = one per-visit invoice, running
+    to the next header), and a segment matches when it contains the claim's
+    invoice total and doesn't name a DIFFERENT known pet as the patient (loose
+    patient-word captures that aren't a known pet name carry no signal either
+    way). Returns (start, end) page indexes, or None — which doubles as the
+    adequacy validation: an account statement has no invoice headers, so
+    nothing can match."""
+    headers = [i for i, t in enumerate(page_texts) if _INVOICE_HEADER_RE.search(t or "")]
+    if not headers:
+        return None
+    variants = _amount_variants(float(amount))
+    others_lower = {p.lower() for p in other_pets}
+    for k, start in enumerate(headers):
+        end = (headers[k + 1] if k + 1 < len(headers) else len(page_texts)) - 1
+        text = "\n".join(page_texts[start : end + 1])
+        if not any(v in text for v in variants):
+            continue
+        if pet_name:
+            candidates = _patient_candidates(text)
+            if pet_name.lower() not in candidates and candidates & others_lower:
+                continue  # another pet's invoice happens to carry the same total
+        return (start, end)
+    return None
+
+
+def email_pdf_attachments(email_id: str) -> list[tuple[str, bytes]]:
+    """Every PDF attachment of the email as (filename, raw bytes) — used both
+    for segmentation and for attaching the document to a review alert."""
+    service = gmail_client.build_service()
+    message = service.users().messages().get(userId="me", id=email_id, format="full").execute()
+    attachments = []
+    for part in gmail_client._iter_attachment_parts(message.get("payload", {})):
+        if part.get("mimeType") != "application/pdf":
+            continue
+        attachment = service.users().messages().attachments().get(
+            userId="me", messageId=email_id, id=part["body"]["attachmentId"]
+        ).execute()
+        attachments.append((part.get("filename") or "attachment.pdf", base64.urlsafe_b64decode(attachment["data"] + "==")))
+    return attachments
+
+
+def _email_pdf_documents(email_id: str) -> list[tuple[PdfReader, list[str]]]:
+    """Every PDF attachment of the email, as (reader, per-page texts). Unreadable
+    PDFs (image scans) yield empty texts and simply won't segment."""
+    documents = []
+    for _filename, data in email_pdf_attachments(email_id):
+        try:
+            reader = PdfReader(BytesIO(data))
+            documents.append((reader, [page.extract_text() or "" for page in reader.pages]))
+        except Exception:
+            continue  # corrupt attachment — treated like any other non-matching PDF
+    return documents
+
+
+def invoice_segment_pdf(email_id: str, amount: float) -> tuple[str, bytes] | None:
+    """The claim-relevant invoice pages of an email's PDF bundle as their own
+    small PDF — attached to review/merge alerts so Justin sees the actual
+    document on his phone."""
+    for reader, page_texts in _email_pdf_documents(email_id):
+        segment = find_invoice_segment(page_texts, float(amount), None)
+        if segment is None:
+            continue
+        writer = PdfWriter()
+        for i in range(segment[0], segment[1] + 1):
+            writer.add_page(reader.pages[i])
+        buffer = BytesIO()
+        writer.write(buffer)
+        return (f"invoice-{amount:.2f}.pdf", buffer.getvalue())
+    return None
+
+
+def _write_invoice_file(claim, writer: PdfWriter, invoice: dict) -> None:
+    """Writes the claim's invoice pages to INVOICE_OUTPUT_DIR and records the
+    path, clearing the awaiting-invoice flag."""
+    date_part = (invoice.get("date") or "undated")[:10]
+    output_path = str(Path(config.INVOICE_OUTPUT_DIR) / f"claim-{claim['id']}-{date_part}.pdf")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        writer.write(f)
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE vet_claims SET invoice_file_path = ?, updated_at = ?, "
+            "flag = CASE WHEN flag = ? THEN NULL ELSE flag END WHERE id = ?",
+            (output_path, now, _AWAITING_INVOICE_FLAG, claim["id"]),
+        )
+
+
+def ensure_invoice_file(claim) -> None:
+    """Extracts THIS claim's per-visit invoice pages from its matched email's
+    PDF bundle into their own file and sets invoice_file_path — the step that
+    used to be manual (nothing wrote invoice_file_path before). When no
+    adequate per-visit invoice exists in any attachment (account statement,
+    image-only scan), the claim is flagged so Telegram/dashboard surface it.
+    `claim` needs txn_merchant joined in; never overwrites an existing path."""
+    if claim["invoice_file_path"] or not claim["matched_email_id"]:
+        return
+    invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
+    if invoice.get("amount") is None:
+        return
+    with db.get_connection() as conn:
+        all_pets = {p["name"]: p["id"] for p in conn.execute("SELECT id, name FROM pets")}
+    pet_name = next((n for n, pid in all_pets.items() if pid == claim["pet_id"]), None)
+    other_pets = tuple(n for n in all_pets if n != pet_name)
+
+    # Scanned bundles have no text layer to segment — but the vision extraction
+    # recorded exactly which page of which attachment this invoice is.
+    if invoice.get("page") is not None:
+        for filename, data in email_pdf_attachments(claim["matched_email_id"]):
+            if filename != invoice.get("source_pdf"):
+                continue
+            try:
+                reader = PdfReader(BytesIO(data))
+                page = reader.pages[invoice["page"]]
+            except Exception:
+                break  # attachment changed/corrupt — fall through to the flag
+            writer = PdfWriter()
+            writer.add_page(page)
+            _write_invoice_file(claim, writer, invoice)
+            if claim["pet_id"] is None:
+                pet_id = all_pets.get((invoice.get("patient") or "").strip().title())
+                if pet_id:
+                    assign_pet(claim["id"], pet_id)
+            return
+
+    for reader, page_texts in _email_pdf_documents(claim["matched_email_id"]):
+        segment = find_invoice_segment(page_texts, float(invoice["amount"]), pet_name, other_pets)
+        if segment is None:
+            continue
+        start, end = segment
+        writer = PdfWriter()
+        for i in range(start, end + 1):
+            writer.add_page(reader.pages[i])
+        _write_invoice_file(claim, writer, invoice)
+        # The invoice states its patient — reading a printed fact, not guessing.
+        # Only assign when exactly ONE known pet is named in the segment.
+        if claim["pet_id"] is None:
+            named = {n for n in all_pets if n.lower() in _patient_candidates("\n".join(page_texts[start : end + 1]))}
+            if len(named) == 1:
+                assign_pet(claim["id"], all_pets[named.pop()])
+        return
+
+    flag = (
+        "vet attachment isn't a per-visit itemised invoice (statement/running-total or unreadable) — "
+        f"ask {claim['txn_merchant']} for individual invoices"
+    )
+    if claim["flag"] != flag:
+        _flag(claim["id"], flag)
+
+
+def process_claim_batch(claim_ids: list[int], continuation: bool | None = True) -> None:
     """Bundles up to 4 matched claims for the SAME pet into one filled claim
     document and one Gmail draft (never sends) — mirrors real submissions,
     which list up to 4 invoice line items on a single Petcover form."""
@@ -397,10 +575,12 @@ def process_and_report(claim_id: int) -> dict:
     }
 
 
-def process_claim(claim_id: int, continuation: bool | None = None) -> None:
+def process_claim(claim_id: int, continuation: bool | None = True) -> None:
     """Advances a claim from 'matched' to 'drafted' if pet/process/condition/invoice
     fields are all present; otherwise flags what's missing and stays at 'matched'
-    (spec: never guess a required field, never auto-advance without it)."""
+    (spec: never guess a required field, never auto-advance without it). The
+    continuation box defaults to ticked (ADR-0012) — Justin unticks it during
+    draft review for a genuinely new condition."""
     with db.get_connection() as conn:
         claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
         if claim is None or claim["status"] != "matched":
@@ -415,7 +595,11 @@ def process_claim(claim_id: int, continuation: bool | None = None) -> None:
         ).fetchone()
 
     if pet is None:
-        return  # awaiting pet attribution (vet-payment-detection) — not a failure, just not ready
+        # awaiting pet attribution — flag it so the claim is visible (Telegram
+        # sends the pet keyboard for matched claims with no pet) instead of
+        # sitting silent until someone checks the dashboard
+        _flag(claim_id, "pet not identified — tap a pet to assign")
+        return
 
     if not pet["claim_process_defined"]:
         _flag(claim_id, f"{pet['insurer']} claim process not yet defined")

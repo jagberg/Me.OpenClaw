@@ -18,13 +18,11 @@ GEMINI_RATE_LIMIT_PER_MIN = _int_env("GEMINI_RATE_LIMIT_PER_MIN", 15)
 # provider works by pointing base_url + model + key at it; llm.py holds the
 # per-provider base_url/default-model table. Default is Groq's free tier
 # (llama-3.3-70b, 100k tokens/day, no context cap). Blank LLM_MODEL = provider
-# default. Cerebras (gpt-oss-120b) is selectable but its free tier is sold-out
-# for this account (402 on every model, 2026-07). LLM_PROVIDER=gemini keeps the
-# legacy backend (extract only) for rollback.
+# default. LLM_PROVIDER=gemini keeps the legacy backend (extract only) for
+# rollback; Gemini also serves the vision-OCR fallback regardless of provider.
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").lower()
 LLM_MODEL = os.environ.get("LLM_MODEL", "")
 LLM_RATE_LIMIT_PER_MIN = _int_env("LLM_RATE_LIMIT_PER_MIN", 5)
-CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
@@ -41,6 +39,10 @@ PETCOVER_TEMPLATE_PATH = os.environ.get("PETCOVER_TEMPLATE_PATH", "./data/petcov
 # them onto currently open ones. Default = the date this feature shipped.
 PETCOVER_STATUS_SINCE = os.environ.get("PETCOVER_STATUS_SINCE", "2026/07/18")
 CLAIM_OUTPUT_DIR = os.environ.get("CLAIM_OUTPUT_DIR", "./data/claims")
+# Per-visit invoice PDFs auto-extracted from vet reply emails (claim_forms.
+# ensure_invoice_file). Inside app/data on purpose: it's the only host dir the
+# container can see (compose binds app/data -> /data; Google Drive is not visible).
+INVOICE_OUTPUT_DIR = os.environ.get("INVOICE_OUTPUT_DIR", "./data/invoices")
 VET_CLAIM_PIPELINE_INTERVAL_MINUTES = _int_env("VET_CLAIM_PIPELINE_INTERVAL_MINUTES", 15)
 INVOICE_MATCH_WINDOW_DAYS = _int_env("INVOICE_MATCH_WINDOW_DAYS", 3)
 

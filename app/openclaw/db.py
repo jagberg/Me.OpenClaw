@@ -56,7 +56,10 @@ CREATE TABLE IF NOT EXISTS pets (
     -- and the dashboard flags reimbursement unavailable rather than guessing.
     -- Excess is per-condition, per policy year; cap is per policy year.
     annual_excess REAL,
-    annual_cap REAL
+    annual_cap REAL,
+    -- Policy anniversary "MM-DD": excess ($150/condition) and the $10k annual
+    -- cap reset here, NOT at calendar year (settlement validation, ADR-0011).
+    policy_anniversary TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bank_transactions (
@@ -115,16 +118,58 @@ CREATE TABLE IF NOT EXISTS claim_status_events (
     created_at TEXT NOT NULL
 );
 
+-- One LLM extraction per email, ever: invoice candidates are re-tested against
+-- claims every pipeline tick and across claims; caching the parsed invoices
+-- makes re-tests free (deterministic gates only) and stops quota burn.
+CREATE TABLE IF NOT EXISTS email_extractions (
+    message_id TEXT PRIMARY KEY,
+    extracted_json TEXT NOT NULL,
+    extracted_at TEXT NOT NULL
+);
+
+-- Vision-OCR fallback budget for scanned (image-only) invoice PDFs: hard cap
+-- on extraction attempts per email so a scan the model can't read doesn't
+-- burn tokens every tick forever (successes cache in email_extractions).
+CREATE TABLE IF NOT EXISTS vision_ocr_attempts (
+    message_id TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT NOT NULL
+);
+
+-- One vet invoice paid over several card charges (confirmed live: $2,521.46
+-- invoice = $551.06 + $1,970.40 charges, same day). Which claim carries the
+-- invoice is Justin's call — the proposal holds the invoice + candidate claim
+-- ids until he picks one on Telegram. status: open | resolved
+CREATE TABLE IF NOT EXISTS split_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email_id TEXT NOT NULL,
+    invoice_json TEXT NOT NULL,
+    claim_ids TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    notified_at TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS telegram_registrations (
     username TEXT PRIMARY KEY,
     chat_id INTEGER NOT NULL,
     registered_at TEXT NOT NULL
 );
+
+-- Operational alerts sent to Telegram (currently only Gmail auth death).
+-- One row per alert actually sent; used to rate-limit (≤5/24h) and to know a
+-- failure is outstanding so recovery is confirmed exactly once. Survives
+-- container restarts, so a restart can't re-spam (ADR-0011 ops-alerting).
+CREATE TABLE IF NOT EXISTS ops_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    sent_at TEXT NOT NULL
+);
 """
 
 # vet_claims columns added after the table's initial release — CREATE TABLE IF
 # NOT EXISTS won't add these to an already-created DB, so they're migrated in
-# explicitly (see _migrate_vet_claims_columns).
+# explicitly (see _migrate_added_columns).
 _VET_CLAIMS_ADDED_COLUMNS = {
     "telegram_notified_status": "TEXT",
     "telegram_notified_flag": "TEXT",
@@ -132,6 +177,13 @@ _VET_CLAIMS_ADDED_COLUMNS = {
     "petcover_reference": "TEXT",
     "rejected_email_ids": "TEXT",  # JSON list of invoice emails Justin unmatched — never re-match these
     "item_conditions": "TEXT",  # JSON [{description, amount, condition}] when one invoice spans >1 condition
+    "petcover_sr": "INTEGER",  # Petcover's per-document serial within a Condition Thread ("DC1-27-5628 Sr 3")
+}
+
+# pets columns added after the table's initial release — same migration reason
+# as _VET_CLAIMS_ADDED_COLUMNS.
+_PETS_ADDED_COLUMNS = {
+    "policy_anniversary": "TEXT",
 }
 
 # Echo's claim_email stays NULL until Justin supplies Bow Wow Insurance's process
@@ -143,26 +195,20 @@ VALUES ('Aari', 'Petcover', 'claims.au@petcovergroup.com', 1, 150, 10000),
 """
 
 
-def _migrate_vet_claims_columns(conn: sqlite3.Connection) -> None:
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(vet_claims)")}
-    for column, col_type in _VET_CLAIMS_ADDED_COLUMNS.items():
+def _migrate_added_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for column, col_type in columns.items():
         if column not in existing:
-            conn.execute(f"ALTER TABLE vet_claims ADD COLUMN {column} {col_type}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
 
 # pets columns added after the table's initial release — same reasoning as
-# _migrate_vet_claims_columns above.
+# _VET_CLAIMS_ADDED_COLUMNS above.
 _PETS_ADDED_COLUMNS = {
     "annual_excess": "REAL",
     "annual_cap": "REAL",
+    "policy_anniversary": "TEXT",
 }
-
-
-def _migrate_pets_columns(conn: sqlite3.Connection) -> None:
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(pets)")}
-    for column, col_type in _PETS_ADDED_COLUMNS.items():
-        if column not in existing:
-            conn.execute(f"ALTER TABLE pets ADD COLUMN {column} {col_type}")
 
 
 def init_db(path: str | None = None) -> None:
@@ -170,8 +216,8 @@ def init_db(path: str | None = None) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA)
-        _migrate_vet_claims_columns(conn)
-        _migrate_pets_columns(conn)
+        _migrate_added_columns(conn, "vet_claims", _VET_CLAIMS_ADDED_COLUMNS)
+        _migrate_added_columns(conn, "pets", _PETS_ADDED_COLUMNS)
         conn.executescript(SEED_PETS)
 
 

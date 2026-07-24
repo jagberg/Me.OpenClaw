@@ -17,11 +17,15 @@ Petcover assigns its own claim reference (e.g. `DC1-27-5628`, `GABR-0305`, `ELD-
 - **THEN** the claim is flagged `unclassified — reference format not recognized` rather than guessing or discarding the email
 
 ### Requirement: Classify Petcover reply emails into lifecycle events
-The system SHALL poll `claims.au@petcovergroup.com`, `requiredinfo.au@petcovergroup.com`, and `accounts.au@petcovergroup.com` on the existing pipeline cycle (paginating past Gmail's page size so no reply is dropped, oldest-first so statuses never regress) and classify each new email into one of: `acknowledged`, `info_requested`, `suspended`, `settled`, `declined`, `ignore` (recognized noise, e.g. "Automatic reply:" instant receipts — dropped without review), or `unclassified` (a real reply we couldn't classify — queued for manual review, and never written to the claim's status). Emails from `marketing.au@petcovergroup.com` SHALL be excluded at the query level, not classified; emails older than the configured `PETCOVER_STATUS_SINCE` date SHALL be excluded at the query level (first-run backfill guard — historical replies about long-settled claims must not be ingested or mis-correlated).
+The system SHALL poll `claims.au@petcovergroup.com`, `requiredinfo.au@petcovergroup.com`, and `accounts.au@petcovergroup.com` on the existing pipeline cycle (paginating past Gmail's page size so no reply is dropped, oldest-first so statuses never regress) and classify each new email into one of: `acknowledged`, `approved` (Petcover has assessed and approved the claim — carries the only dollar breakdown in the lifecycle; a dollar-less "payment processed" confirmation follows as `settled`), `info_requested`, `suspended`, `settled`, `declined`, `below_excess` (the condition is covered but the amount claimed is under the fixed excess — non-terminal, invoice retained), `ignore` (recognized noise, e.g. "Automatic reply:" instant receipts — dropped without review), or `unclassified` (a real reply we couldn't classify — queued for manual review, and never written to the claim's status). `approved` and `below_excess` are recognized from body text (confirmed live phrases: "Your claim has been approved", "Claim assessment outcome: Under excess") since their real subject is a generic template, not a distinct keyword. Emails from `marketing.au@petcovergroup.com` SHALL be excluded at the query level, not classified; emails older than the configured `PETCOVER_STATUS_SINCE` date SHALL be excluded at the query level (first-run backfill guard — historical replies about long-settled claims must not be ingested or mis-correlated).
 
 #### Scenario: Subject matches a known pattern
 - **WHEN** a reply's subject contains a recognized keyword (e.g. "Acknowledgement Letter", "suspended", "Request for information", "Settlement EFT", "Declined")
 - **THEN** it is classified accordingly without needing to read the body
+
+#### Scenario: Generic-subject letter classified from body content
+- **WHEN** a reply's subject is a generic template (e.g. "Petcover Insurance Claim for Ari") but its body states the claim has been approved, or that it is under the fixed excess
+- **THEN** it is classified `approved` or `below_excess` respectively, not left `unclassified`
 
 #### Scenario: Subject is ambiguous or generic
 - **WHEN** a reply's subject doesn't match any known keyword (e.g. templated subjects reused across claim types)
@@ -31,20 +35,32 @@ The system SHALL poll `claims.au@petcovergroup.com`, `requiredinfo.au@petcovergr
 - **WHEN** an email from `marketing.au@petcovergroup.com` is polled
 - **THEN** it is excluded from classification entirely and never appears as a claim status event
 
+#### Scenario: below_excess is non-terminal
+- **WHEN** a `below_excess` event correlates to a claim
+- **THEN** the claim's status becomes `below_excess`, its invoice/`invoice_data` is retained, and it is never treated as `declined` (terminal)
+
 ### Requirement: Correlate a reply to the originating claim submission
-A batch submission (up to 4 invoices on one claim document, one draft) is several `vet_claims` rows sharing one `draft_id` and, once acknowledged, one Petcover reference — replies apply to the whole group. The system SHALL correlate each classified reply using, in order of confidence: (1) an exact claim-reference match (all rows carrying that reference), (2) pet-name match against claims in a submitted-and-awaiting-reply status (`sent` or later) with no reference learned yet. Transaction-date proximity SHALL NOT be required: a claim's transaction can be a year older than its submission (confirmed real case), so date windows reject genuine matches.
+A Petcover reference identifies a Condition Thread — one (pet, condition) pairing whose reference is reused for the life of the condition — not a Submission. The system SHALL correlate each classified reply using, in order of confidence: (1) an exact (reference, Sr) match — the event attaches to that single claim; (2) a reference-only match — the event attaches to the thread's non-terminal claims only (never `settled`/`declined`); (3) for replies with no stored reference (acknowledgements learning it): candidates are un-referenced claims in a submitted-and-awaiting-reply status for the printed pet (nickname-tolerant), narrowed by the reply's printed condition matching the claim's condition text (case-insensitive) — Petcover's printed condition is authoritative in their letters; if condition matching does not decide it, the reply SHALL be assumed to belong to the most recently sent matching submission, and multiple same-day replies SHALL map newest-reply→newest-sent working backwards. Transaction-date proximity SHALL NOT be required: a claim's transaction can be a year older than its submission (confirmed real case), so date windows reject genuine matches.
 
-#### Scenario: Reference present and known
-- **WHEN** a reply contains a claim reference already stored on one or more `vet_claims` rows
-- **THEN** the event is attached to every row of that submission
+#### Scenario: Letter cites reference and serial
+- **WHEN** a reply contains a stored reference and an Sr held by one claim
+- **THEN** the event is attached to that claim only
 
-#### Scenario: No reference known yet, single plausible submission by pet name
-- **WHEN** a reply names a pet matching exactly one submission awaiting a reply (one claim, or several sharing one draft_id)
-- **THEN** the event is attached to every claim of that submission, and a reference in the reply is learned onto all of them
+#### Scenario: Reference present and known, no serial
+- **WHEN** a reply contains a claim reference already stored on `vet_claims` rows and cites no Sr
+- **THEN** the event is attached to that thread's non-terminal claims only; settled and declined claims are untouched
 
-#### Scenario: Ambiguous match across submissions
-- **WHEN** a reply's pet name matches claims spanning more than one submission
-- **THEN** the event is stored unlinked and flagged on the dashboard as "needs manual link" — never guessed
+#### Scenario: Acknowledgement resolved by condition content
+- **WHEN** an un-referenced acknowledgement prints pet "Ari" and condition "Arthritis", and exactly one awaiting submission holds claims with condition text "Arthritis"
+- **THEN** the reference and Sr are learned onto the matching submission's claims
+
+#### Scenario: Condition decides nothing — recency fallback
+- **WHEN** an acknowledgement's printed condition matches no awaiting claim's condition text (Petcover re-conditioned the document)
+- **THEN** the reply is attributed to the most recently sent awaiting submission for that pet, and the claim's own condition text is left unchanged
+
+#### Scenario: Two acknowledgements the same day
+- **WHEN** two un-referenced acknowledgements for one pet arrive the same day and two submissions are awaiting
+- **THEN** each acknowledgement attaches to a distinct awaiting submission (learning a reference removes that submission from the un-referenced pool, so the second ack cannot collide onto the first's submission); the recency rule orders which is tried first, and any residual mis-pairing when conditions are indistinguishable is correctable via manual linking
 
 #### Scenario: Acknowledgement without an extractable reference
 - **WHEN** an acknowledgement correlates to a submission but no claim reference could be extracted from it
