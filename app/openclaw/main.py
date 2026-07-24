@@ -16,6 +16,10 @@ logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# httpx logs the full request URL at INFO, and the Telegram API embeds the bot
+# token in the path — that would write the token into every container log line.
+# Secrets never go to logs (root CLAUDE.md), so this stays at WARNING.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
