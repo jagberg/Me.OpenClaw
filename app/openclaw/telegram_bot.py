@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 from datetime import datetime, timezone
@@ -26,7 +27,8 @@ HELP_TEXT = (
     "/resolved <claim_id> — confirm you've dealt with an info request/suspension\n"
     "/vetemail <merchant name> <email> — set a vet's contact address for invoice requests\n"
     "/notvet <merchant text> — mark a merchant as not-a-vet so its charges never become claims\n"
-    "/history — browse the past year of vet claims, paged"
+    "/history — browse the past year of vet claims, paged\n"
+    "/actions — everything waiting on you, with tap-to-resolve cards"
 )
 
 _application: Application | None = None
@@ -56,6 +58,10 @@ async def _ack_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     so they're excluded — they already get feedback via _append_result."""
     username = update.effective_user.username if update.effective_user else None
     if update.message and _is_authorized(username):
+        # Diagnostic trail, not an archive: enough to reconstruct what was asked
+        # when a session goes wrong. Nothing persisted this before, so a whole
+        # morning's conversation was unrecoverable.
+        logger.info("telegram in: %r", (update.message.text or "<non-text>")[:200])
         await _ack(update.message)
 
 
@@ -302,6 +308,103 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_photo(photo=png, caption=caption, reply_markup=_history_keyboard(page, total_pages))
 
 
+ACTION_CARD_CAP = 10
+
+
+def _esc(s: str) -> str:
+    """HTML-escape for message bodies. quote=False because none of this goes
+    into an attribute — escaping apostrophes would render "hasn&#x27;t"."""
+    return html.escape(s or "", quote=False)
+
+_ACTION_EMOJI = {
+    "split_proposal": "🔀",
+    "unmatch": "❌",
+    "confirm_resolved": "✅",
+    "mark_sent": "📤",
+    "invoice_request_sent": "📧",
+    "assign_pet": "🐾",
+    "set_condition": "⚠️",
+    "dismiss_mismatch": "🔍",
+}
+
+
+def _action_card_text(action: dict) -> str:
+    """One action as a short HTML card. Always carries the claim #id — Justin
+    acts by id (/mark, /pet), and an alert without one is unusable."""
+    lines = [
+        f"{_ACTION_EMOJI.get(action['kind'], '•')} <b>{_esc(action["title"].upper())}</b>",
+        f"Claim #{action['claim_id']} · {_esc(claim_card._vet_name(action["merchant"]))}"
+        f" · ${abs(action['amount']):,.2f}",
+    ]
+    who = " · ".join(filter(None, [action["pet_name"], action["condition_text"]]))
+    lines.append(f"{_esc(who) + ' · ' if who else ''}{action['date']} ({action['age_days']}d ago)")
+    lines.append(f"<i>Blocks: {_esc(action["blocks"])}</i>")
+    return "\n".join(lines)
+
+
+def _action_keyboard(action: dict) -> InlineKeyboardMarkup | None:
+    """Reuses the existing per-action keyboards rather than inventing new ones,
+    so a tap from an action card behaves identically to a tap from the alert
+    the pipeline already pushes. None = nothing to tap (blocked items)."""
+    kind, claim_id = action["kind"], action["claim_id"]
+    if kind == "mark_sent":
+        return mark_sent_button(claim_id)
+    if kind == "assign_pet":
+        return pet_keyboard(claim_id)
+    if kind == "set_condition":
+        return condition_keyboard(claim_id, action["pet_id"], multi_item=len(_invoice_items(claim_id)) > 1)
+    if kind == "unmatch":
+        return wrong_invoice_button(claim_id)
+    if kind == "invoice_request_sent":
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📧 I've sent it", callback_data=f"invreq:{claim_id}")]]
+        )
+    if kind == "dismiss_mismatch":
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("👍 Reviewed", callback_data=f"dismiss:{claim_id}")]]
+        )
+    if kind == "confirm_resolved":
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Resolved", callback_data=f"resolved:{claim_id}")]]
+        )
+    return None
+
+
+async def actions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    username = update.effective_user.username if update.effective_user else None
+    if not _is_authorized(username):
+        return
+    actions = claim_status.pending_actions()
+    if not actions:
+        await update.message.reply_text("Nothing waiting on you — every claim is with Petcover or closed.")
+        return
+
+    tappable = [a for a in actions if a["actionable"]]
+    shown = tappable[:ACTION_CARD_CAP]
+    await update.message.reply_photo(
+        photo=claim_card.render_actions_summary(actions, shown=len(shown)),
+        caption=f"{len(tappable)} to action, {len(actions) - len(tappable)} blocked",
+    )
+    for action in shown:
+        await update.message.reply_text(
+            _action_card_text(action), parse_mode="HTML", reply_markup=_action_keyboard(action)
+        )
+    # Never truncate silently: say what was held back and why.
+    if len(tappable) > len(shown):
+        await update.message.reply_text(
+            f"+{len(tappable) - len(shown)} more — run /actions again once these are cleared."
+        )
+    blocked = [a for a in actions if not a["actionable"]]
+    if blocked:
+        total = sum(abs(a["amount"]) for a in blocked)
+        await update.message.reply_text(
+            f"🚫 <b>{len(blocked)} claims blocked</b> · ${total:,.2f}\n"
+            f"{_esc(blocked[0]["flag"] or "blocked")}\n"
+            "<i>No button can fix this — it needs the insurer's claim process on file.</i>",
+            parse_mode="HTML",
+        )
+
+
 def mark_sent_button(claim_id: int) -> InlineKeyboardMarkup:
     """Inline '✅ Mark sent' button for a drafted-batch notification. One tap
     marks the whole submission sent (any claim id in the batch resolves to the
@@ -541,6 +644,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         message = _execute_action(proposal)
         await _append_result(query, f"✅ {message}")
+    elif data.startswith("invreq:"):
+        result = claim_status.mark_invoice_request_sent(int(data.split(":", 1)[1]))
+        await _append_result(query, f"{'📧' if result['ok'] else '⚠️'} {result['message']}")
+    elif data.startswith("dismiss:"):
+        result = claim_status.dismiss_mismatch(int(data.split(":", 1)[1]))
+        await _append_result(query, f"{'👍' if result['ok'] else '⚠️'} {result['message']}")
+    elif data.startswith("resolved:"):
+        claim_id = int(data.split(":", 1)[1])
+        claim_status.confirm_resolved(claim_id)
+        await _append_result(query, f"✅ Claim #{claim_id} confirmed resolved.")
     elif data.startswith("hist:"):
         result = _history_page(int(data.split(":", 1)[1]))
         if result is None:
@@ -579,7 +692,9 @@ async def _handle_chat(update: Update) -> None:
     """Free-form message → conversational agent. A proposed mutation comes back
     as a Confirm button; the write happens only on the tap (see on_callback)."""
     try:
-        reply, proposal = await asyncio.to_thread(agent.handle_message, update.message.text)
+        reply, proposal = await asyncio.to_thread(
+            agent.handle_message, update.message.text, update.effective_chat.id
+        )
     except llm.LLMUnavailableError as exc:
         await update.message.reply_text(f"⚠️ LLM unavailable: {exc}")
         return
@@ -609,6 +724,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("vetemail", vetemail_command))
     application.add_handler(CommandHandler("notvet", notvet_command))
     application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("actions", actions_command))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_reply))
     return application
@@ -650,6 +766,21 @@ def send_document_sync(caption: str, document: bytes, filename: str, reply_marku
             chat_id=chat_id, document=document, filename=filename,
             caption=caption[:1024], reply_markup=reply_markup,
         )
+
+    asyncio.run(_send())
+
+
+def send_photo_sync(caption: str, photo: bytes, reply_markup=None) -> None:
+    """Push a rendered card image from a synchronous caller (the scheduler's
+    nudge job). Same throwaway-loop pattern as send_message_sync."""
+    chat_id = get_registered_chat_id()
+    if chat_id is None or not config.TELEGRAM_BOT_TOKEN:
+        logger.warning("Telegram photo skipped — no chat id or token.")
+        return
+
+    async def _send() -> None:
+        bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
+        await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption[:1024], reply_markup=reply_markup)
 
     asyncio.run(_send())
 

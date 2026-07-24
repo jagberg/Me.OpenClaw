@@ -78,3 +78,14 @@ DRIVE_BACKUP_LOG_SUBFOLDER = os.environ.get("DRIVE_BACKUP_LOG_SUBFOLDER", "logs"
 # Durable local record: written even if Drive itself is unreachable, so a
 # backup failure is never silent (CLAUDE.md: failures must be visible).
 DB_BACKUP_LOCAL_LOG = os.environ.get("DB_BACKUP_LOCAL_LOG", "./data/backup.log")
+
+# Root log level. Default INFO because it was effectively WARNING (no
+# basicConfig anywhere), which discarded every logger.info and left a morning's
+# bot activity impossible to reconstruct.
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+
+# An outstanding action older than this gets one daily nudge. notify_claim_states
+# dedupes on (status, flag) so it goes quiet on claims that never change — two
+# drafted claims sat unsent for three days without a reminder.
+ACTION_NUDGE_DAYS = int(os.environ.get("ACTION_NUDGE_DAYS", "3"))
+ACTION_NUDGE_HOUR = int(os.environ.get("ACTION_NUDGE_HOUR", "9"))

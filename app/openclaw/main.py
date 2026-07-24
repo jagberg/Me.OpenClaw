@@ -1,6 +1,5 @@
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -8,8 +7,15 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from . import claim_forms, claim_status, db, gmail_ingest, netbank_csv, pipeline, tasks, telegram_bot
+from . import claim_forms, claim_status, config, db, gmail_ingest, netbank_csv, pipeline, tasks, telegram_bot
 from .scheduler import scheduler
+
+# Without this the root level is WARNING and every logger.info in the app is
+# discarded — a whole morning of bot activity left no trace anywhere.
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +66,6 @@ def dashboard(request: Request, upload_error: str | None = None):
     )
 
 
-# Statuses with nothing left for Justin to do — settled/declined are already
-# terminal thread-wide (claim_status.TERMINAL_STATUSES); below_excess/absorbed
-# are equally closed but don't end a Condition Thread, so they aren't in that
-# set. A closed claim must never show up looking like it still needs action.
-_CLOSED_STATUSES = claim_status.TERMINAL_STATUSES + ("below_excess", "absorbed")
-
-
 @app.get("/basic")
 def basic_status(request: Request):
     """Stripped-down, phone-first view: outstanding visits + recently closed, as
@@ -76,7 +75,7 @@ def basic_status(request: Request):
     for entry in ledger:
         for claim in entry["claims"]:
             row = {"txn": entry["txn"], "claim": claim}
-            if claim["status"] in _CLOSED_STATUSES:
+            if claim["status"] in claim_status.CLOSED_STATUSES:
                 closed.append(row)
             else:
                 outstanding.append(row)
@@ -144,10 +143,5 @@ def link_event(event_id: int, claim_id: int = Form(...)):
 
 @app.post("/claims/{claim_id}/invoice-request-sent")
 def mark_invoice_request_sent(claim_id: int):
-    now = datetime.now(timezone.utc).isoformat()
-    with db.get_connection() as conn:
-        conn.execute(
-            "UPDATE vet_claims SET invoice_request_sent_at = ?, flag = NULL, updated_at = ? WHERE id = ?",
-            (now, now, claim_id),
-        )
+    claim_status.mark_invoice_request_sent(claim_id)
     return RedirectResponse("/", status_code=303)

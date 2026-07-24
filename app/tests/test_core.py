@@ -747,12 +747,12 @@ def test_run_once_isolates_one_claims_failure():
             raise RuntimeError("boom")
         return False
 
-    originals = (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
+    originals = (pipeline.vet_detection.classify_unflagged, pipeline.reconcile_sent_invoice_requests,
                  pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
                  pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth)
     pipeline.vet_detection.classify_unflagged = lambda: stages.append("classify")
     pipeline._ensure_gmail_auth = lambda: True
-    pipeline._reconcile_sent_invoice_requests = lambda: stages.append("reconcile")
+    pipeline.reconcile_sent_invoice_requests = lambda: stages.append("reconcile")
     pipeline.invoice_matching.match_claim = fake_match
     pipeline._maybe_draft_invoice_request = lambda claim: stages.append(f"draft:{claim['id']}")
     pipeline.poll_petcover_status = lambda: stages.append("poll")
@@ -760,7 +760,7 @@ def test_run_once_isolates_one_claims_failure():
     try:
         pipeline.run_once()
     finally:
-        (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
+        (pipeline.vet_detection.classify_unflagged, pipeline.reconcile_sent_invoice_requests,
          pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
          pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth) = originals
 
@@ -789,12 +789,12 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
         attempted.append(claim["id"])
         raise llm.LLMUnavailableError("429 quota")
 
-    originals = (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
+    originals = (pipeline.vet_detection.classify_unflagged, pipeline.reconcile_sent_invoice_requests,
                  pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
                  pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth)
     pipeline.vet_detection.classify_unflagged = lambda: None
     pipeline._ensure_gmail_auth = lambda: True
-    pipeline._reconcile_sent_invoice_requests = lambda: None
+    pipeline.reconcile_sent_invoice_requests = lambda: None
     pipeline.invoice_matching.match_claim = unavailable_match
     pipeline._maybe_draft_invoice_request = lambda claim: None
     pipeline.poll_petcover_status = lambda: stages.append("poll")
@@ -817,7 +817,7 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
             flag_a = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
         assert flag_a is None, "recovered claim must not carry a stale outage flag"
     finally:
-        (pipeline.vet_detection.classify_unflagged, pipeline._reconcile_sent_invoice_requests,
+        (pipeline.vet_detection.classify_unflagged, pipeline.reconcile_sent_invoice_requests,
          pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
          pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth) = originals
 
@@ -1682,7 +1682,7 @@ def test_reconcile_clears_stale_draft_on_404():
     original = pipeline.gmail_client.build_service
     pipeline.gmail_client.build_service = lambda: FakeService()
     try:
-        pipeline._reconcile_sent_invoice_requests()
+        pipeline.reconcile_sent_invoice_requests()
     finally:
         pipeline.gmail_client.build_service = original
 
@@ -1970,6 +1970,109 @@ def test_claim_card_renders_png_for_every_status():
     ]
     png = claim_card.render(rows, page=1, total_rows=len(rows))
     assert png.startswith(b"\x89PNG"), "must be a real PNG"
+
+
+def test_pending_actions_one_per_claim_priority_and_blocked_split():
+    """Real-data shapes that broke the first cut: a claim missing BOTH pet and
+    condition must yield one action (pet first, matching the order process_claim
+    blocks in), a closed/absorbed claim must yield none, and an insurer-blocked
+    claim must be marked unactionable rather than looking tappable."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM claim_status_events")
+        conn.execute("DELETE FROM split_proposals")
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        echo = conn.execute("SELECT id FROM pets WHERE name='Echo'").fetchone()[0]
+        t_both = _insert_txn(conn, "2026-01-05", -400.0)
+        both = _insert_ledger_claim(conn, t_both, None, "matched", None, 400.0)
+        t_absorbed = _insert_txn(conn, "2026-02-05", -100.0)
+        absorbed = _insert_ledger_claim(conn, t_absorbed, aari, "absorbed", "Arthritis", 100.0)
+        t_waiting = _insert_txn(conn, "2026-03-05", -200.0)
+        _insert_ledger_claim(conn, t_waiting, aari, "sent", "Arthritis", 200.0)
+        t_blocked = _insert_txn(conn, "2026-04-05", -300.0)
+        blocked = _insert_ledger_claim(conn, t_blocked, echo, "matched", None, 300.0)
+        conn.execute(
+            "UPDATE vet_claims SET flag = 'Bow Wow Insurance claim process not yet defined' WHERE id = ?",
+            (blocked,),
+        )
+        t_draft = _insert_txn(conn, "2026-05-05", -500.0)
+        drafted = _insert_ledger_claim(conn, t_draft, aari, "drafted", "Arthritis", 500.0)
+
+    actions = claim_status.pending_actions()
+    by_claim = {a["claim_id"]: a for a in actions}
+    assert len(actions) == len(by_claim), "one action per claim, never two"
+    assert by_claim[both]["kind"] == "assign_pet", "pet is checked before condition"
+    assert by_claim[blocked]["kind"] == "blocked_insurer"
+    assert by_claim[blocked]["actionable"] is False, "no button can clear an undefined insurer process"
+    assert by_claim[drafted]["kind"] == "mark_sent"
+    assert absorbed not in by_claim, "an absorbed claim is finished, not an action"
+    # a claim sitting with Petcover is not Justin's move
+    assert all(a["status"] != "sent" for a in actions)
+    # oldest first — the near-expiry end is the urgent end
+    assert [a["date"] for a in actions] == sorted(a["date"] for a in actions)
+
+
+def test_dismiss_mismatch_clears_flag_and_records_why():
+    """A settlement discrepancy must never just vanish — clearing the flag has
+    to leave an append-only trace (ADR-0008), or the review is invisible."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM claim_status_events")
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        txn = _insert_txn(conn, "2026-06-05", -44.75)
+        claim_id = _insert_ledger_claim(conn, txn, aari, "settled", "Arthritis", 44.75)
+        conn.execute(
+            "UPDATE vet_claims SET flag = 'settlement mismatch — we expected $44.75, Petcover paid $22.75 — review' "
+            "WHERE id = ?",
+            (claim_id,),
+        )
+
+    import json as _json
+
+    assert claim_status.dismiss_mismatch(claim_id)["ok"] is True
+    with db.get_connection() as conn:
+        flag = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()[0]
+        event = conn.execute(
+            "SELECT detail FROM claim_status_events WHERE claim_id = ? AND event_type = 'mismatch_dismissed'",
+            (claim_id,),
+        ).fetchone()
+    assert flag is None
+    assert "settlement mismatch" in _json.loads(event["detail"])["dismissed_flag"], "keeps what was dismissed"
+    # idempotent: a second tap can't fabricate another dismissal
+    assert claim_status.dismiss_mismatch(claim_id)["ok"] is False
+
+
+def test_agent_summary_carries_claim_id_and_never_invents_a_pet():
+    """Both were live failures: an outstanding-actions answer with no claim ids
+    (unusable — Justin acts by id) and the model inventing 'Whiskers'/'Fluffy'."""
+    from openclaw import agent
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        txn = _insert_txn(conn, "2026-06-19", -585.39)
+        claim_id = _insert_ledger_claim(conn, txn, aari, "drafted", "Arthritis", 585.39)
+
+    rows = agent._find_claims(pet="Aari")
+    assert f"#{claim_id}" in agent._summary_line(rows[0]), "every claim reference carries its id"
+
+    # the real pet list is injected, so the model never has to guess one
+    prompt = agent.system_prompt()
+    assert "Aari" in prompt and "Echo" in prompt
+    assert "cannot read" in prompt.lower(), "must state the Gmail limit rather than imply access"
+
+    impls = agent._build_impls([])
+    rejection = impls["propose_assign_pet"]("Whiskers")
+    assert "No pet named" in rejection, "a made-up pet must be refused, not assigned"
+    assert "Aari" in rejection and "Echo" in rejection, "and the real pets offered, so it can't guess again"
+    # the actions answer must reach the drafted claim that was silently omitted
+    assert f"#{claim_id}" in impls["pending_actions"]()
 
 
 if __name__ == "__main__":

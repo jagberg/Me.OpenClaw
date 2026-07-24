@@ -432,7 +432,7 @@ def _pending_claims():
         ).fetchall()
 
 
-def _reconcile_sent_invoice_requests() -> None:
+def reconcile_sent_invoice_requests() -> dict:
     """Justin sends invoice-request drafts himself (CLAUDE.md: never auto-send)
     and is expected to click 'mark invoice-request sent' on the dashboard
     afterward — but real usage shows that click gets missed. Missing it keeps
@@ -442,7 +442,13 @@ def _reconcile_sent_invoice_requests() -> None:
     via Gmail's own SENT/DRAFT labels on
     the stored message id — unambiguous, no Sent-folder text-matching needed.
     Runs every pipeline tick (every VET_CLAIM_PIPELINE_INTERVAL_MINUTES), so
-    the daily-check ask is covered many times over."""
+    the daily-check ask is covered many times over.
+
+    Returns {checked, confirmed_sent, stale_drafts} so the Telegram agent can
+    report what actually changed — "go through my sent emails and update the
+    status" is a real request this answers, and it needs an answer, not a
+    silent sweep."""
+    result = {"checked": 0, "confirmed_sent": [], "stale_drafts": []}
     with db.get_connection() as conn:
         # keyed on draft_id, not the flag — error/unreadable flags can overwrite
         # 'invoice_request_drafted' without meaning the draft went away
@@ -451,7 +457,8 @@ def _reconcile_sent_invoice_requests() -> None:
             "AND invoice_request_sent_at IS NULL AND draft_id IS NOT NULL"
         ).fetchall()
     if not rows:
-        return
+        return result
+    result["checked"] = len(rows)
 
     service = gmail_client.build_service()
     now = datetime.now(timezone.utc).isoformat()
@@ -472,6 +479,7 @@ def _reconcile_sent_invoice_requests() -> None:
                         (now, row["id"]),
                     )
                 logger.warning("reconcile: draft %s for claim %s no longer exists — cleared", row["draft_id"], row["id"])
+                result["stale_drafts"].append(row["id"])
             else:
                 logger.warning("reconcile: couldn't fetch draft %s for claim %s: %s", row["draft_id"], row["id"], exc)
             continue
@@ -491,6 +499,32 @@ def _reconcile_sent_invoice_requests() -> None:
                     "updated_at = ? WHERE id = ?",
                     (now, now, row["id"]),
                 )
+            result["confirmed_sent"].append(row["id"])
+    return result
+
+
+def nudge_stale_actions() -> dict:
+    """Once-daily reminder of actions that have gone stale.
+
+    notify_claim_states is a change-feed — it dedupes on (status, flag), so a
+    claim that stays outstanding is announced once and never again. That's how
+    two drafted claims sat unsent for three days in silence. This is the
+    state-based counterpart: one message covering everything old, rather than
+    re-notifying per claim."""
+    from . import claim_card, claim_status, telegram_bot
+
+    actions = claim_status.pending_actions()
+    stale = [a for a in actions if a["actionable"] and a["age_days"] >= config.ACTION_NUDGE_DAYS]
+    if not stale:
+        return {"sent": False, "stale": 0}
+    oldest = stale[0]
+    caption = (
+        f"{len(stale)} action(s) still waiting — oldest is #{oldest['claim_id']} "
+        f"({oldest['age_days']}d). Send /actions for the cards."
+    )
+    telegram_bot.send_photo_sync(caption, claim_card.render_actions_summary(actions, shown=len(stale)))
+    logger.info("nudge: reminded about %s stale actions", len(stale))
+    return {"sent": True, "stale": len(stale)}
 
 
 def _maybe_draft_invoice_request(claim) -> None:
@@ -609,7 +643,7 @@ def run_once() -> None:
     if not _ensure_gmail_auth():
         return
 
-    _reconcile_sent_invoice_requests()
+    reconcile_sent_invoice_requests()
 
     # One claim's failure must never starve the rest of the tick (confirmed
     # live: an extraction 429 on the first pending claim blocked Petcover
@@ -646,5 +680,12 @@ def start() -> None:
         "interval",
         minutes=config.VET_CLAIM_PIPELINE_INTERVAL_MINUTES,
         id="vet-claim-pipeline",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        nudge_stale_actions,
+        "cron",
+        hour=config.ACTION_NUDGE_HOUR,
+        id="stale-action-nudge",
         replace_existing=True,
     )

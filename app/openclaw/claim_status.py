@@ -688,6 +688,161 @@ def history_rows(days: int = 365) -> list[dict]:
     return rows
 
 
+# Action kinds in resolution priority, most-blocking first. A claim yields ONE
+# action (its first match here) — several predicates overlap in real data, e.g.
+# an awaiting-invoice claim usually has no pet yet either, and two cards for one
+# claim would just be noise.
+ACTION_PRIORITY = (
+    "split_proposal",
+    "unmatch",
+    "confirm_resolved",
+    "mark_sent",
+    "invoice_request_sent",
+    # pet before condition, matching the order process_claim actually blocks in
+    # (claim_forms flags "pet not identified" before it looks at the condition)
+    "assign_pet",
+    "set_condition",
+    "dismiss_mismatch",
+    "blocked_insurer",
+)
+
+# Nothing left for Justin to do. settled/declined end a Condition Thread;
+# below_excess (nothing payable) and absorbed (merged into a sibling claim) are
+# equally finished but don't, so they aren't in TERMINAL_STATUSES.
+CLOSED_STATUSES = TERMINAL_STATUSES + ("below_excess", "absorbed")
+
+# What each kind means to Justin, and what stalls until he acts.
+_ACTION_META = {
+    "split_proposal": ("Confirm invoice split", "one invoice paid over several charges"),
+    "unmatch": ("Check invoice match", "a possible wrong/extra invoice is attached"),
+    "confirm_resolved": ("Confirm resolved", "Petcover is waiting on you"),
+    "mark_sent": ("Send Gmail draft", "Petcover reply tracking hasn't started"),
+    "invoice_request_sent": ("Invoice request sent?", "no invoice means no claim"),
+    "set_condition": ("Set condition", "the claim can't be drafted"),
+    "assign_pet": ("Assign pet", "the claim can't be filled"),
+    "dismiss_mismatch": ("Review settlement", "a paid-vs-expected difference is unreviewed"),
+    "blocked_insurer": ("Define claim process", "every claim for this pet is stuck"),
+}
+
+_INSURER_UNDEFINED = "claim process not yet defined"
+
+
+def _action_kind(claim: dict, open_split_claim_ids: set, unresolved_event_claim_ids: set) -> str | None:
+    """The single action a claim needs, or None when it's waiting on someone
+    else (sent/acknowledged/approved = Petcover's turn) or finished."""
+    flag = claim["flag"] or ""
+    if claim["id"] in open_split_claim_ids:
+        return "split_proposal"
+    if flag.startswith("possible additional invoice"):
+        return "unmatch"
+    if claim["id"] in unresolved_event_claim_ids:
+        return "confirm_resolved"
+    if claim["status"] == "drafted":
+        return "mark_sent"
+    # flag, NOT invoice_request_sent_at + draft_id: draft_id is overloaded
+    # (claim drafts AND invoice-request drafts), so that pair matches almost
+    # every claim and is useless as a predicate.
+    if flag == "invoice_request_drafted":
+        return "invoice_request_sent"
+    if flag.endswith(_INSURER_UNDEFINED):
+        return "blocked_insurer"
+    if flag.startswith("settlement mismatch"):
+        return "dismiss_mismatch"
+    if claim["status"] in CLOSED_STATUSES:
+        return None  # finished — an absorbed/below-excess claim needs nothing
+    if claim["pet_id"] is None:
+        return "assign_pet"
+    if claim["status"] == "matched" and not claim["condition_text"]:
+        return "set_condition"
+    return None
+
+
+def pending_actions() -> list[dict]:
+    """Everything waiting on Justin, one entry per claim, oldest charge first.
+
+    Oldest-first for the same reason /history is: a visit stops being claimable
+    once it's a year old, so the ones nearest expiry are the urgent ones.
+
+    Nothing else in the codebase answers this. dashboard_lists covers only the
+    event-driven slice (one of nine kinds here), and pipeline.notify_claim_states
+    is a change-feed — it dedupes on (status, flag) and so goes silent on a
+    claim that stays outstanding, which is how two drafted claims sat unsent for
+    three days without a single reminder."""
+    with db.get_connection() as conn:
+        open_splits = conn.execute("SELECT claim_ids FROM split_proposals WHERE status = 'open'").fetchall()
+    open_split_claim_ids = {cid for row in open_splits for cid in json.loads(row["claim_ids"] or "[]")}
+    unresolved_event_claim_ids = {entry["claim"]["id"] for entry in dashboard_lists()["needs_action"]}
+
+    today = datetime.now(timezone.utc).date()
+    actions = []
+    for entry in visit_ledger():
+        txn = entry["txn"]
+        for claim in entry["claims"]:
+            kind = _action_kind(claim, open_split_claim_ids, unresolved_event_claim_ids)
+            if kind is None:
+                continue
+            title, blocks = _ACTION_META[kind]
+            actions.append(
+                {
+                    "kind": kind,
+                    "title": title,
+                    "blocks": blocks,
+                    "claim_id": claim["id"],
+                    "pet_name": claim["pet_name"],
+                    "pet_id": claim["pet_id"],
+                    "merchant": txn["merchant"],
+                    "amount": txn["amount"],
+                    "date": txn["date"],
+                    "status": claim["status"],
+                    "condition_text": claim["condition_text"],
+                    "flag": claim["flag"],
+                    "detail": claim["flag"] or "",
+                    "age_days": (today - date.fromisoformat(txn["date"][:10])).days,
+                    # blocked_insurer needs a decision from Justin, not a tap —
+                    # there is no UI that can clear it.
+                    "actionable": kind != "blocked_insurer",
+                }
+            )
+    actions.sort(key=lambda a: (a["date"], ACTION_PRIORITY.index(a["kind"])))
+    return actions
+
+
+def dismiss_mismatch(claim_id: int) -> dict:
+    """Clears a settlement-mismatch flag once Justin has looked at it. Records a
+    `mismatch_dismissed` event rather than just wiping the flag — the append-only
+    log (ADR-0008) is the audit trail, and a silently-erased discrepancy is
+    exactly the invisible failure the hard rules forbid."""
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim is None:
+            return {"ok": False, "message": f"No claim #{claim_id} found."}
+        if not (claim["flag"] or "").startswith("settlement mismatch"):
+            return {"ok": False, "message": f"Claim #{claim_id} has no settlement mismatch to review."}
+        dismissed = claim["flag"]
+        conn.execute(
+            "UPDATE vet_claims SET flag = NULL, updated_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), claim_id),
+        )
+    _record_event(claim_id, "mismatch_dismissed", None, {"dismissed_flag": dismissed})
+    return {"ok": True, "message": f"Claim #{claim_id}: settlement difference marked reviewed."}
+
+
+def mark_invoice_request_sent(claim_id: int) -> dict:
+    """Justin sent the invoice-request draft himself (the app never sends —
+    hard rule), which opens the reply search window. Shared by the dashboard
+    route and the Telegram button so both can't drift."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT 1 FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim is None:
+            return {"ok": False, "message": f"No claim #{claim_id} found."}
+        conn.execute(
+            "UPDATE vet_claims SET invoice_request_sent_at = ?, flag = NULL, updated_at = ? WHERE id = ?",
+            (now, now, claim_id),
+        )
+    return {"ok": True, "message": f"Claim #{claim_id}: invoice request marked sent — watching for the reply."}
+
+
 def dashboard_lists() -> dict:
     """Event-domain rollups for the dashboard: needs_action (info_requested/
     suspended not yet confirmed resolved — later events, even settled, don't

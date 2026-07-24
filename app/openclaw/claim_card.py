@@ -88,6 +88,22 @@ HEADER_H = 30 + 26 + 18
 FOOTER_H = 32
 
 
+def _rrect(d: ImageDraw.ImageDraw, box, radius: float, fill) -> None:
+    """All geometry is written in final pixels and scaled to the supersampled
+    canvas here, so layout code never carries S around."""
+    d.rounded_rectangle([c * S for c in box], radius=radius * S, fill=fill)
+
+
+def _text(d: ImageDraw.ImageDraw, xy, s: str, font, fill, anchor: str = "la", spacing: float = 0) -> None:
+    if not spacing:
+        d.text((xy[0] * S, xy[1] * S), s, font=font, fill=fill, anchor=anchor)
+        return
+    x, y = xy[0] * S, xy[1] * S
+    for ch in s:  # per-char draw: PIL has no letter-spacing option
+        d.text((x, y), ch, font=font, fill=fill, anchor=anchor)
+        x += d.textlength(ch, font=font) + spacing * S
+
+
 def _status_label(status: str) -> str:
     return _STATUS_LABELS.get(status, status.replace("_", " ").capitalize())
 
@@ -167,16 +183,10 @@ def render(
     d = ImageDraw.Draw(img)
 
     def rrect(box, radius, fill):
-        d.rounded_rectangle([c * S for c in box], radius=radius * S, fill=fill)
+        _rrect(d, box, radius, fill)
 
     def text(xy, s, font, fill, anchor="la", spacing=0):
-        if not spacing:
-            d.text((xy[0] * S, xy[1] * S), s, font=font, fill=fill, anchor=anchor)
-            return
-        x, y = xy[0] * S, xy[1] * S
-        for ch in s:
-            d.text((x, y), ch, font=font, fill=fill, anchor=anchor)
-            x += d.textlength(ch, font=font) + spacing * S
+        _text(d, xy, s, font, fill, anchor, spacing)
 
     f_title = _font("sans_bold", 19)
     f_sub = _font("sans", 11)
@@ -236,6 +246,110 @@ def render(
     footer_y = height - MARGIN - PAD - 10
     d.line([x0 * S, (footer_y - 14) * S, x1 * S, (footer_y - 14) * S], fill=LINE, width=S)
     text((x0, footer_y), "Amounts are bank charges. Estimates exclude age contribution.", f_foot, FAINT)
+
+    out = io.BytesIO()
+    img.resize((W, height), Image.LANCZOS).save(out, format="PNG")
+    return out.getvalue()
+
+
+# One accent per action kind, reusing the status palette so a "send draft" row
+# reads the same colour as a Drafted chip on the history card.
+_ACTION_COLOURS = {
+    "split_proposal": ((94, 214, 195), (20, 48, 46)),
+    "unmatch": ((224, 108, 96), (48, 23, 21)),
+    "confirm_resolved": ((228, 168, 78), (46, 36, 20)),
+    "mark_sent": ((122, 168, 255), (26, 38, 62)),
+    "invoice_request_sent": ((177, 148, 255), (40, 34, 64)),
+    "assign_pet": ((255, 176, 66), (58, 42, 20)),
+    "set_condition": ((255, 176, 66), (58, 42, 20)),
+    "dismiss_mismatch": ((150, 158, 175), (44, 48, 58)),
+    "blocked_insurer": ((224, 108, 96), (48, 23, 21)),
+}
+
+SUMMARY_ROW_H = 34
+SUMMARY_SECTION_H = 26
+
+
+def _summarise(actions: list[dict]) -> list[tuple]:
+    """[(kind, title, count, total charge)] in first-seen order, so the caller's
+    urgency ordering carries through to the card."""
+    order, by_kind = [], {}
+    for action in actions:
+        kind = action["kind"]
+        if kind not in by_kind:
+            order.append(kind)
+            by_kind[kind] = {"title": action["title"], "count": 0, "total": 0.0}
+        by_kind[kind]["count"] += 1
+        by_kind[kind]["total"] += abs(action["amount"])
+    return [(k, by_kind[k]["title"], by_kind[k]["count"], by_kind[k]["total"]) for k in order]
+
+
+def render_actions_summary(actions: list[dict], shown: int | None = None) -> bytes:
+    """PNG overview of everything waiting on Justin, grouped by action kind.
+
+    Blocked items get their own section: they're real money stuck (Echo's whole
+    backlog sits behind one undefined insurer process) but no button can clear
+    them, so mixing them into the tappable list would misrepresent both."""
+    actionable = [a for a in actions if a["actionable"]]
+    blocked = [a for a in actions if not a["actionable"]]
+    live_groups = _summarise(actionable)
+    blocked_groups = _summarise(blocked)
+
+    height = MARGIN + PAD + HEADER_H
+    height += SUMMARY_ROW_H * len(live_groups)
+    if blocked_groups:
+        height += SUMMARY_SECTION_H + SUMMARY_ROW_H * len(blocked_groups)
+    height += FOOTER_H + PAD + MARGIN
+
+    img = Image.new("RGB", (W * S, height * S), BG)
+    d = ImageDraw.Draw(img)
+    f_title = _font("sans_bold", 19)
+    f_sub = _font("sans", 11)
+    f_section = _font("sans_bold", 10)
+    f_row = _font("sans", 13)
+    f_amt = _font("mono_bold", 14)
+    f_count = _font("mono_bold", 12)
+    f_foot = _font("sans", 10)
+
+    _rrect(d, (MARGIN, MARGIN, W - MARGIN, height - MARGIN), 18, CARD)
+    x0, x1 = MARGIN + PAD, W - MARGIN - PAD
+    y = MARGIN + PAD
+
+    waiting = sum(abs(a["amount"]) for a in actions)
+    _text(d, (x0, y), "Actions needed", f_title, TXT)
+    _text(d, (x1, y + 5), _money(waiting), f_amt, TXT, anchor="ra")
+    y += 30
+    subtitle = f"{len(actionable)} you can action"
+    if blocked:
+        subtitle += f" · {len(blocked)} blocked"
+    if shown is not None and shown < len(actionable):
+        subtitle += f" · showing {shown}"
+    _text(d, (x0, y), subtitle, f_sub, DIM)
+    _text(d, (x1, y), "total charged", f_sub, FAINT, anchor="ra")
+    y += 26
+    d.line([x0 * S, y * S, x1 * S, y * S], fill=LINE, width=S)
+    y += 18
+
+    def rows(groups):
+        nonlocal y
+        for kind, title, count, total in groups:
+            fg, chip_bg = _ACTION_COLOURS.get(kind, (DIM, LINE))
+            _rrect(d, (x0, y + 3, x0 + 22, y + 21), 6, chip_bg)
+            _text(d, (x0 + 11, y + 7), str(count), f_count, fg, anchor="ma")
+            _text(d, (x0 + 34, y + 4), title, f_row, TXT)
+            _text(d, (x1, y + 3), _money(total), f_amt, TXT, anchor="ra")
+            y += SUMMARY_ROW_H
+
+    rows(live_groups)
+    if blocked_groups:
+        y += 4
+        _text(d, (x0, y), "BLOCKED — NEEDS A DECISION, NOT A TAP", f_section, FAINT, spacing=1.1)
+        y += SUMMARY_SECTION_H - 4
+        rows(blocked_groups)
+
+    footer_y = height - MARGIN - PAD - 10
+    d.line([x0 * S, (footer_y - 14) * S, x1 * S, (footer_y - 14) * S], fill=LINE, width=S)
+    _text(d, (x0, footer_y), "Oldest first — a visit is unclaimable once a year old.", f_foot, FAINT)
 
     out = io.BytesIO()
     img.resize((W, height), Image.LANCZOS).save(out, format="PNG")

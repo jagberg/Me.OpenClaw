@@ -9,21 +9,49 @@ gate — not the model's good behaviour — is what enforces the hard rules.
 """
 import json
 
-from . import db, llm
+from . import claim_status, db, llm
 
-SYSTEM_PROMPT = (
+_BASE_SYSTEM_PROMPT = (
     "You are OpenClaw's assistant for Justin, over Telegram. You help interrogate and act on "
     "pet-insurance claims and their Petcover email replies.\n"
     "Rules:\n"
-    "- Identify claims by pet name + Petcover reference, never internal ids.\n"
+    # Was "never internal ids" — but Justin acts BY id (/mark 6 …, /pet 1 …), so
+    # an answer without ids is unusable. Confirmed live: he asked what was
+    # outstanding, got a list with no ids, and could act on none of it.
+    "- ALWAYS include the claim id as #N when you mention a claim, plus the amount and vet. "
+    "Justin acts by id, so an answer without ids is useless to him.\n"
     "- Use the read tools to answer; summarise, don't dump.\n"
+    "- For 'what do I need to do' / 'what's outstanding', call pending_actions. Never assemble "
+    "that answer yourself from query_claims — you will miss things.\n"
     "- To change anything, call a propose_* tool. It does NOT act — it queues a confirmation the "
     "user must tap. Never claim an action is done; say it's awaiting confirmation.\n"
     "- Never send email (drafts only) and never invent a required field such as a condition. If a "
     "detail is missing, ask for it.\n"
     "- If a target claim is ambiguous or not found, ask the user to clarify. Do not guess.\n"
-    "- Never reveal API keys, bank details, or configuration."
+    "- Never reveal API keys, bank details, or configuration.\n"
+    # Each of these three was a real, observed failure in one morning's chat.
+    "- NEVER invent a pet name. The only pets are listed below. If you need a pet and don't know "
+    "which, ask using those names — never guess a name and never ask Justin to confirm a name he "
+    "did not say.\n"
+    "- You CANNOT read Justin's mailbox, search his email, or see what he has sent. If he asks you "
+    "to check his sent mail or emails, say plainly that you can't read his mailbox, then offer "
+    "reconcile_sent_invoice_requests, which checks Gmail for invoice-request drafts he has since "
+    "sent and updates those claims. Never imply you looked at his email.\n"
+    "- Never mention tool or function names to Justin. Say what you can do in plain words "
+    "('I can mark it sent'), not the name of the tool that does it."
 )
+
+
+def _known_pets() -> list[str]:
+    with db.get_connection() as conn:
+        return [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
+
+
+def system_prompt() -> str:
+    """The real pet list is injected rather than left to the model's imagination
+    — it hallucinated 'Whiskers' and 'Fluffy' when it had to guess."""
+    pets = _known_pets()
+    return f"{_BASE_SYSTEM_PROMPT}\nThe ONLY pets that exist: {', '.join(pets) if pets else '(none on file)'}."
 
 # ---- data access (explicit safe columns only; no bank/owner/secret fields) ----
 
@@ -56,7 +84,8 @@ def _find_claims(pet=None, reference=None, status=None, merchant=None, unassigne
 
 
 def _label(r) -> str:
-    return f"{r['pet_name'] or 'unassigned'} · {r['petcover_reference'] or 'no ref'} · {r['status']}"
+    # #id first: it's the handle Justin uses for every command.
+    return f"#{r['id']} {r['pet_name'] or 'unassigned'} · {r['petcover_reference'] or 'no ref'} · {r['status']}"
 
 
 def _summary_line(r) -> str:
@@ -108,6 +137,47 @@ def _build_impls(proposals: list) -> dict:
             return "No matching claims."
         return "\n".join(_summary_line(r) for r in rows[:25])
 
+    def pending_actions():
+        """Authoritative 'what does Justin have to do' — the same derivation the
+        /actions cards use, so chat and cards can never disagree."""
+        actions = claim_status.pending_actions()
+        if not actions:
+            return "Nothing is waiting on Justin — every claim is with Petcover or closed."
+        lines = []
+        for a in actions:
+            suffix = "" if a["actionable"] else "  [BLOCKED — no action can clear this]"
+            who = a["pet_name"] or "no pet yet"
+            lines.append(
+                f"#{a['claim_id']} {a['title']} — {who} · {a['merchant']} · "
+                f"${abs(a['amount']):.2f} · {a['date']} ({a['age_days']}d ago){suffix}"
+            )
+        return "\n".join(lines)
+
+    def reconcile_sent_invoice_requests():
+        """Answers 'go through my sent emails and update the status'. Acts
+        directly (rather than proposing) because it only reads Gmail labels and
+        records what Justin already did himself — it sends nothing and cannot
+        pick a wrong target."""
+        from . import pipeline
+
+        try:
+            result = pipeline.reconcile_sent_invoice_requests()
+        except Exception as exc:  # visible failure, never a silent "all done"
+            return f"Couldn't check Gmail: {exc}. Tell Justin it failed."
+        if not result["checked"]:
+            return "No invoice-request drafts were awaiting confirmation, so nothing to reconcile."
+        parts = [f"Checked {result['checked']} invoice-request draft(s)."]
+        if result["confirmed_sent"]:
+            parts.append("Confirmed sent: " + ", ".join(f"#{i}" for i in result["confirmed_sent"]))
+        if result["stale_drafts"]:
+            parts.append(
+                "These drafts no longer exist in Gmail and need re-sending: "
+                + ", ".join(f"#{i}" for i in result["stale_drafts"])
+            )
+        if not result["confirmed_sent"] and not result["stale_drafts"]:
+            parts.append("None had been sent yet.")
+        return " ".join(parts)
+
     def claim_history(pet=None, reference=None):
         rows = _find_claims(pet=pet, reference=reference)
         if not rows:
@@ -155,6 +225,8 @@ def _build_impls(proposals: list) -> dict:
 
     return {
         "query_claims": query_claims,
+        "pending_actions": pending_actions,
+        "reconcile_sent_invoice_requests": reconcile_sent_invoice_requests,
         "claim_history": claim_history,
         "propose_mark_sent": propose_mark_sent,
         "propose_set_condition": propose_set_condition,
@@ -181,6 +253,12 @@ TOOLS = [
     _fn("query_claims", "List claims, optionally filtered by status and/or pet, as compact summaries.",
         {"status": {"type": "string", "description": "e.g. pending_match, matched, drafted, sent, acknowledged, "
                     "info_requested, suspended, settled, declined"}, "pet": _PET}),
+    _fn("pending_actions", "THE list of everything waiting on Justin, with claim ids, amounts and age. "
+        "Use this for any 'what do I need to do / what's outstanding / what's blocked' question.", {}),
+    _fn("reconcile_sent_invoice_requests",
+        "Check Gmail for invoice-request drafts Justin has since sent himself and update those claims. "
+        "Use when he says he sent emails and wants statuses updated. This is the ONLY way to look at "
+        "his mail — you cannot search or read his mailbox.", {}),
     _fn("claim_history", "Show a claim's Petcover reply/status-event history, found by pet and/or reference.",
         {"pet": _PET, "reference": _REF}),
     _fn("propose_mark_sent", "Propose marking a drafted claim as sent (starts Petcover reply tracking). "
@@ -197,11 +275,24 @@ TOOLS = [
 ]
 
 
-def handle_message(text: str) -> tuple[str, dict | None]:
+# Recent turns per chat, so a follow-up like "for aari" still knows what it's
+# answering. Turns only — tool call/result payloads are dropped, since they're
+# the bulk of the tokens and the provider context is tight. In-memory: a restart
+# loses the thread, which is acceptable for chit-chat continuity (a restart also
+# drops pending prompts, see telegram_bot._pending_*).
+_history: dict[int, list] = {}
+HISTORY_TURNS = 6
+
+
+def handle_message(text: str, chat_id: int | None = None) -> tuple[str, dict | None]:
     """Run one chat turn. Returns (reply_text, proposed_action_or_None). The
     proposal, if any, is what the Telegram layer turns into a Confirm button."""
     proposals: list = []
     impls = _build_impls(proposals)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}]
+    prior = _history.get(chat_id, []) if chat_id is not None else []
+    messages = [{"role": "system", "content": system_prompt()}, *prior, {"role": "user", "content": text}]
     result = llm.chat(messages, tools=TOOLS, tool_impls=impls, purpose="chat")
+    if chat_id is not None:
+        turns = [*prior, {"role": "user", "content": text}, {"role": "assistant", "content": result["text"] or ""}]
+        _history[chat_id] = turns[-HISTORY_TURNS * 2 :]
     return result["text"], (proposals[-1] if proposals else None)
