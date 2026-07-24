@@ -8,7 +8,7 @@ See ADR-0011 for the email-mining evidence (reference reuse, per-Sr routing, ack
 ## Requirements
 
 ### Requirement: A claim belongs to a Condition Thread with a per-document serial
-A Petcover reference identifies a Condition Thread — one (pet, condition) pairing reused for the life of the condition (proven: settled and reused months apart). The system SHALL store, per claim, the thread's reference (`petcover_reference`) and Petcover's document serial (`petcover_sr`) learned from their letters ("DC1-27-5628 Sr 3").
+A Petcover reference identifies a Condition Thread — one (pet, condition) pairing reused for the life of the condition (proven: settled and reused months apart). The system SHALL store, per claim, the thread's reference (`petcover_reference`) and Petcover's document serial (`petcover_sr`) learned from their letters, in either of two confirmed formats: adjacent to the reference ("DC1-27-5628 Sr 3") or its own distinctly-labeled field ("Treatment number: 3" — no reference adjacency, discovered live 2026-07-24 after being missed initially and briefly mis-routing an event to a whole thread instead of one claim, see ADR-0011's amendment).
 
 #### Scenario: Acknowledgement carries reference and serial
 - **WHEN** an acknowledgement correlates to a claim and contains reference `DC1-27-5628` and `Sr 3`

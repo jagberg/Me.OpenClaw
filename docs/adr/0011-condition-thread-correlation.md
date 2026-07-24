@@ -40,3 +40,9 @@ Without a fix, the next arthritis submission stamps events onto the already-sett
 - Schema change on the live DB (`petcover_sr`, thread bookkeeping) — manual DDL per the live-schema rule.
 - Petcover may re-condition a document (our condition_text is input only); the mapping rule tolerates this by preferring their printed condition over ours.
 - The LIFO same-day assumption is a heuristic; if it ever misroutes, the correction path is the existing unmatch/manual tooling.
+
+## Amendment (2026-07-24) — Sr isn't always spelled "Sr"
+
+This ADR's Context section asserted "Suspension/request letters cite 'DC1-27-5628 SR1'" as if that were the only serial format — live-verifying the settlement-validation hotfix (ADR-0013) proved that assumption incomplete: Petcover's "Claim Approval" letter carries no "Sr"/"SR" text anywhere, only its own labeled field, "Treatment number: 2". Because `extract_sr` only recognized the `<reference> SR <n>` shape, this silently returned no serial for that letter, and the event fell through to reference-only routing — hitting **all 3 claims** of the DC1-27-5628 thread instead of the one it was actually about (caught live, before being called done, then fixed and re-verified correct).
+
+`extract_sr` now also recognizes "Treatment number: N" as an equivalent serial — a distinctly-labeled field, so no reference-adjacency is required the way the classic "Sr N" pattern needs (to avoid a bare "Sr" elsewhere in a letter misfiring). Not a reversed decision — the (reference, Sr) routing model this ADR established stands; only the surface forms Sr is recognized in were incomplete.
