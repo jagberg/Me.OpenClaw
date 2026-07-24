@@ -1448,21 +1448,38 @@ def test_batch_ack_assigns_serials_oldest_txn_first():
     assert all(r["status"] == "acknowledged" for r in rows)
 
 
-def test_settlement_short_second_same_year_flags():
-    """A thread that already had its excess deducted (Feb settlement) then pays
-    claimable − $150 again in the same policy year → flagged short."""
+def _relative_date(days_ago: int) -> str:
+    from datetime import timedelta
+    return (datetime.now(timezone.utc).date() - timedelta(days=days_ago)).isoformat()
+
+
+def _anniversary_days_ago(days_ago: int) -> str:
+    from datetime import timedelta
+    d = datetime.now(timezone.utc).date() - timedelta(days=days_ago)
+    return f"{d.month:02d}-{d.day:02d}"
+
+
+def test_settlement_current_year_excess_already_used_flags_mismatch():
+    """Excess is once per condition thread per (open) policy year, bucketed by
+    each claim's OWN transaction date. A sibling claim already used the thread's
+    excess this policy year (its txn falls in the current year); a later-txn
+    sibling should be expected in FULL (no further deduction) — if Petcover
+    still pays short of that, it's a mismatch to flag."""
     _fresh_db()
     import json as _json
     with db.get_connection() as conn:
         aari = _aari(conn)
-        conn.execute("UPDATE pets SET policy_anniversary = '01-01' WHERE id = ?", (aari,))
-        first = _insert_claim(conn, aari, "2026-02-01", status="settled", reference="DC1-SS-1")
-        _insert_settled_event(conn, first, "2026-02-10T00:00:00+00:00", 400.0)
-        second = _insert_claim(conn, aari, "2026-07-01", status="acknowledged", reference="DC1-SS-1",
+        anniversary = _anniversary_days_ago(300)  # current policy year opened 300 days ago
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+        first_txn = _relative_date(250)
+        second_txn = _relative_date(100)
+        first = _insert_claim(conn, aari, first_txn, status="settled", reference="DC1-SS-1")
+        _insert_settled_event(conn, first, datetime.now(timezone.utc).isoformat(), 400.0)
+        second = _insert_claim(conn, aari, second_txn, status="acknowledged", reference="DC1-SS-1",
                                invoice_data=_json.dumps({"claimable_amount": 500.0, "amount": 500.0}))
-    flag = claim_status._validate_settlement(_claim_row(second), 350.0)
-    assert flag and "settlement short" in flag and "$500.00" in flag and "$350.00" in flag
-    assert "already deducted" in flag, flag
+    flag = claim_status._validate_settlement(_claim_row(second), 350.0, second_txn)
+    assert flag and "settlement mismatch" in flag and "$500.00" in flag and "$350.00" in flag
+    assert "excess already used" in flag, flag
 
 
 def test_settlement_within_tolerance_no_flag():
@@ -1470,14 +1487,16 @@ def test_settlement_within_tolerance_no_flag():
     import json as _json
     with db.get_connection() as conn:
         aari = _aari(conn)
-        conn.execute("UPDATE pets SET policy_anniversary = '01-01' WHERE id = ?", (aari,))
-        cid = _insert_claim(conn, aari, "2026-07-01", status="acknowledged", reference="DC1-T-1",
+        anniversary = _anniversary_days_ago(300)
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+        txn = _relative_date(100)
+        cid = _insert_claim(conn, aari, txn, status="acknowledged", reference="DC1-T-1",
                             invoice_data=_json.dumps({"claimable_amount": 500.0}))
     # expected = 500 - 150 excess = 350; paid within $2 → no flag
-    assert claim_status._validate_settlement(_claim_row(cid), 349.0) is None
-    # paid short beyond tolerance → flag, first settlement so "less excess"
-    flag = claim_status._validate_settlement(_claim_row(cid), 300.0)
-    assert flag and "less excess" in flag
+    assert claim_status._validate_settlement(_claim_row(cid), 349.0, txn) is None
+    # paid short beyond tolerance → flag, no prior sibling this year so "fresh excess"
+    flag = claim_status._validate_settlement(_claim_row(cid), 300.0, txn)
+    assert flag and "fresh $150 excess" in flag
 
 
 def test_settlement_unknown_anniversary_degrades():
@@ -1486,26 +1505,177 @@ def test_settlement_unknown_anniversary_degrades():
     with db.get_connection() as conn:
         aari = _aari(conn)
         conn.execute("UPDATE pets SET policy_anniversary = NULL WHERE id = ?", (aari,))
-        cid = _insert_claim(conn, aari, "2026-07-01", status="acknowledged", reference="DC1-U-1",
+        txn = _relative_date(30)
+        cid = _insert_claim(conn, aari, txn, status="acknowledged", reference="DC1-U-1",
                             invoice_data=_json.dumps({"claimable_amount": 500.0}))
-    flag = claim_status._validate_settlement(_claim_row(cid), 200.0)
+    flag = claim_status._validate_settlement(_claim_row(cid), 200.0, txn)
     assert flag and "anniversary unknown" in flag
 
 
-def test_settlement_anniversary_boundary_rededucts_excess():
-    """Thread settled in the previous policy year; a settlement after the
-    anniversary deducts the excess again (new year)."""
+def test_settlement_closed_policy_year_assumes_full_claimable():
+    """Justin's rule: our history for an already-closed policy year is
+    presumed incomplete, so a claim whose OWN transaction falls in a prior,
+    closed year is expected in full (no excess deducted) — regardless of what
+    other claims exist. Real case: Sr2's txn predates the anniversary that
+    closed its policy year weeks before Sr4's txn (a different, current year)."""
     _fresh_db()
     import json as _json
     with db.get_connection() as conn:
         aari = _aari(conn)
-        conn.execute("UPDATE pets SET policy_anniversary = '07-01' WHERE id = ?", (aari,))
-        first = _insert_claim(conn, aari, "2026-01-01", status="settled", reference="DC1-BD-1")
-        _insert_settled_event(conn, first, "2026-02-10T00:00:00+00:00", 400.0)  # previous policy year
-        second = _insert_claim(conn, aari, "2026-07-05", status="acknowledged", reference="DC1-BD-1",
+        anniversary = _anniversary_days_ago(10)  # current year opened only 10 days ago
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+        closed_year_txn = _relative_date(40)  # before the anniversary -> prior, closed year
+        cid = _insert_claim(conn, aari, closed_year_txn, status="acknowledged", reference="DC1-CY-1",
+                            invoice_data=_json.dumps({"claimable_amount": 55.74}))
+    # expected = full claimable (no excess) since the year is closed; paid short of that -> flag
+    assert claim_status._validate_settlement(_claim_row(cid), 55.74, closed_year_txn) is None
+    flag = claim_status._validate_settlement(_claim_row(cid), 22.75, closed_year_txn)
+    assert flag and "expected $55.74" in flag
+
+
+def test_settlement_anniversary_boundary_fresh_excess_in_new_year():
+    """A thread's prior claim settled in the now-CLOSED policy year (its own
+    txn predates the anniversary) does not count toward the current year's
+    excess-consumed check — a new-year sibling still gets a fresh $150 excess."""
+    _fresh_db()
+    import json as _json
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        anniversary = _anniversary_days_ago(20)  # current year opened 20 days ago
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+        prior_txn = _relative_date(60)   # before the anniversary -> prior, closed year
+        current_txn = _relative_date(5)  # after the anniversary -> current year
+        first = _insert_claim(conn, aari, prior_txn, status="settled", reference="DC1-BD-1")
+        _insert_settled_event(conn, first, datetime.now(timezone.utc).isoformat(), 400.0)
+        second = _insert_claim(conn, aari, current_txn, status="acknowledged", reference="DC1-BD-1",
                                invoice_data=_json.dumps({"claimable_amount": 500.0}))
-    flag = claim_status._validate_settlement(_claim_row(second), 300.0)
-    assert flag and "less excess" in flag, "excess must be deducted again in the new policy year"
+    flag = claim_status._validate_settlement(_claim_row(second), 300.0, current_txn)
+    assert flag and "fresh $150 excess" in flag, "prior claim's closed-year txn must not count toward this year's excess"
+
+
+def test_classify_approved_and_below_excess():
+    """Real letters (Jul 2026) both use the generic subject 'Petcover Insurance
+    Claim for Ari' — classification must come from the body phrase."""
+    assert claim_status.classify(
+        "Petcover Insurance Claim for Ari", "Your claim has been approved\nWe have assessed the recent claim"
+    ) == "approved"
+    assert claim_status.classify(
+        "Petcover Insurance Claim for Ari",
+        "Claim assessment outcome: Under excess\nWhile it is a claimable condition, the amount you have claimed is under your fixed excess.",
+    ) == "below_excess"
+
+
+def test_extract_approval_amounts_real_letter_shapes():
+    """Real (redacted) text shapes: the 'approved' letter is the only place
+    these numbers appear at all."""
+    sr2_text = (
+        "Total amount claimed: $35.00\nPaid by you:\nFixed excess $0.00\n"
+        "Non‐claimable amount $0.00\nAge Contribution: $12.25 [35%]\n"
+        "Percentage Excess: $0.00 [0%]\nPaid by us: $22.75"
+    )
+    amounts = claim_status.extract_approval_amounts(sr2_text)
+    assert amounts["claimed_amount"] == 35.00
+    assert amounts["paid_amount"] == 22.75
+    assert amounts["fixed_excess_stated"] == 0.00
+    assert amounts["age_contribution_stated"] == 12.25
+
+    sr4_text = "Amount claimed: $55.74\nLess Fixed excess: $105.00\nOther deductibles: $0.00\nOutstanding excess: $-49.26"
+    amounts4 = claim_status.extract_approval_amounts(sr4_text)
+    assert amounts4["fixed_excess_stated"] == 105.00
+    assert "paid_amount" not in amounts4, "this letter states no payout yet — must not fabricate one"
+
+
+def test_settlement_mismatch_flags_paid_more_than_expected_too():
+    """The check is a plain two-way mismatch, not a one-directional shortfall
+    — Petcover paying MORE than our simple expectation is just as worth a
+    look (we don't try to explain it, just surface it)."""
+    _fresh_db()
+    import json as _json
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        anniversary = _anniversary_days_ago(300)
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+        txn = _relative_date(100)
+        cid = _insert_claim(conn, aari, txn, status="acknowledged", reference="DC1-OVER-1",
+                            invoice_data=_json.dumps({"claimable_amount": 200.0}))
+    # expected = 200 - 150 = 50; paid way more than expected -> still flagged
+    flag = claim_status._validate_settlement(_claim_row(cid), 190.0, txn)
+    assert flag and "settlement mismatch" in flag and "$50.00" in flag and "$190.00" in flag
+
+
+def test_process_reply_approved_validates_and_flags_from_real_shape():
+    """End-to-end through process_reply: an 'approved' email (generic subject,
+    real body shape) is classified, correlates by reference+sr, records the
+    approval event, and — since the claim's own txn predates the pet's
+    anniversary (closed prior year) — expects full claimable, flagging a
+    mismatch against what was actually paid."""
+    _fresh_db()
+    import json as _json
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        anniversary = _anniversary_days_ago(10)  # current year just opened
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+        closed_year_txn = _relative_date(40)
+        cid = _insert_claim(conn, aari, closed_year_txn, status="acknowledged", reference="DC1-APR-1", sr=2,
+                            invoice_data=_json.dumps({"claimable_amount": 55.74}))
+    claim_status.process_reply(
+        "m-approved-1", "Petcover Insurance Claim for Ari",
+        "Claim Reference:DC1-APR-1 Sr 2\nYour claim has been approved\n"
+        "Total amount claimed: $55.74\nPaid by us: $22.75",
+    )
+    row = _claim_row(cid)
+    assert row["status"] == "approved"
+    assert row["flag"] and "settlement mismatch" in row["flag"] and "$55.74" in row["flag"]
+    with db.get_connection() as conn:
+        event = conn.execute(
+            "SELECT event_type, detail FROM claim_status_events WHERE raw_email_id='m-approved-1'"
+        ).fetchone()
+    detail = _json.loads(event["detail"])
+    assert event["event_type"] == "approved"
+    assert detail["paid_amount"] == 22.75
+
+
+def test_reconcile_clears_stale_draft_on_404():
+    """Real failure: a deleted Gmail draft 404s every 15-minute tick forever
+    (confirmed live, claim #17, 10+/day in logs). A 404 specifically means the
+    draft is gone for good — clear it and flag for a fresh invoice request,
+    distinct from a transient fetch failure (which still retries next tick)."""
+    from openclaw import pipeline
+    from googleapiclient.errors import HttpError
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        cid = _insert_pending_claim(conn, "STALE DRAFT VET", -50.0, "2026-07-01")
+        conn.execute("UPDATE vet_claims SET draft_id = 'gone-draft-1' WHERE id = ?", (cid,))
+
+    class FakeResp:
+        status = 404
+        reason = "Not Found"
+
+    class FakeMessages:
+        def get(self, userId, id, format):
+            raise HttpError(FakeResp(), b'{"error": {"message": "not found"}}')
+
+    class FakeUsers:
+        def messages(self):
+            return FakeMessages()
+
+    class FakeService:
+        def users(self):
+            return FakeUsers()
+
+    original = pipeline.gmail_client.build_service
+    pipeline.gmail_client.build_service = lambda: FakeService()
+    try:
+        pipeline._reconcile_sent_invoice_requests()
+    finally:
+        pipeline.gmail_client.build_service = original
+
+    row = _matched_row(cid)
+    assert row["draft_id"] is None
+    assert row["flag"] == "invoice-request draft was deleted from Gmail — send a fresh one"
 
 
 def test_gmail_auth_alert_caps_at_five_per_day():

@@ -2,24 +2,35 @@
 
 ## ADDED Requirements
 
-### Requirement: Do not submit a condition until its claimable exceeds the annual excess
-The system SHALL NOT draft or submit a claim for a condition until the total claimable subtotal accrued for that `(pet, condition, policy year)` **exceeds** the fixed excess ($150). Accrual sums the claimable of every non-settled, non-terminal claim for that key (`matched` held, `below_excess`, and in-flight submitted). If the condition's thread already has a settled claim within the current policy year (the excess is consumed), the gate is disabled and claims submit normally. The policy year runs anniversary-to-anniversary; when the pet's anniversary is unknown the gate degrades to lifetime accrual.
+### Requirement: Do not submit a current-policy-year condition until its claimable exceeds the annual excess
+The system SHALL NOT draft or submit a claim for a condition until the total claimable subtotal accrued for that `(pet, condition, current policy year)` **exceeds** the fixed excess ($150). The policy year a claim belongs to is judged by **its own transaction date**, never by when it happens to be processed. Accrual sums the claimable of every non-terminal claim in that key whose own transaction date falls in the CURRENT, open policy year (`matched` held, `below_excess`, and in-flight submitted/approved). If the condition's thread already has an approved/settled claim whose own transaction is also in the current policy year (the excess is already used this year), the gate is disabled and claims submit normally.
 
 #### Scenario: Single small invoice under the excess
-- **WHEN** a matched arthritis claim has claimable $44.75 and no other arthritis claimable is accrued this policy year
+- **WHEN** a matched arthritis claim has claimable $44.75, its transaction is in the current policy year, and no other current-year arthritis claimable is accrued
 - **THEN** the claim stays `matched`, is not drafted, and carries a holding flag naming the accrued amount against the $150 excess
 
 #### Scenario: Accrued claimable exceeds the excess
-- **WHEN** further matched arthritis invoices bring the condition's accrued claimable to more than $150 in the policy year
+- **WHEN** further matched arthritis invoices (current policy year) bring the condition's accrued claimable to more than $150
 - **THEN** the gate opens and the condition's held claims become eligible to draft
 
-#### Scenario: Excess already consumed this policy year
-- **WHEN** the condition's thread already has a claim settled in the current policy year
-- **THEN** the gate is disabled and a new matched claim for that condition drafts without waiting to re-accrue $150
+#### Scenario: Excess already used this policy year
+- **WHEN** the condition's thread already has a claim (approved or settled) whose own transaction date is in the current policy year
+- **THEN** the gate is disabled and a new current-year matched claim for that condition drafts without waiting to re-accrue $150
 
 #### Scenario: Accrued exactly at the excess
-- **WHEN** a condition's accrued claimable equals $150 exactly
+- **WHEN** a condition's current-year accrued claimable equals $150 exactly
 - **THEN** it stays held (submitting would net $0), until accrual strictly exceeds $150
+
+### Requirement: A claim in an already-closed policy year submits immediately
+The system SHALL NOT hold a claim whose own transaction date falls in a policy year that has already ended — our claim history for a closed year is presumed incomplete, so such a claim is assumed to have already passed the excess threshold and drafts without waiting to accrue. The same bypass applies when the pet's policy anniversary is unknown (no year boundary can be determined at all).
+
+#### Scenario: Claim's transaction predates the current policy year
+- **WHEN** a matched claim's own transaction date falls before the pet's most recent policy anniversary
+- **THEN** it is treated as already past the excess threshold and is eligible to draft immediately, regardless of any other claim's accrual
+
+#### Scenario: Policy anniversary unknown
+- **WHEN** the pet has no stored policy anniversary
+- **THEN** claims for that pet bypass the accrual gate entirely and draft as soon as they are otherwise ready
 
 ### Requirement: On release, held and below-excess claims of a condition draft together
 When the gate opens for a condition, the system SHALL draft that condition's held `matched` claims together with its previously `below_excess`-declined claims for the same policy year, batched at most 4 per Petcover form (sharing one draft), for Justin to send himself. Re-drafting a `below_excess` claim SHALL reuse its already-attached invoice and move it back into the `drafted` lifecycle.

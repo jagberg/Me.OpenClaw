@@ -1,6 +1,6 @@
 import json
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from . import db
 
@@ -15,6 +15,14 @@ IGNORE_KEYWORDS = ["automatic reply"]
 # patterns from the 201-email survey + one full dry-run lifecycle).
 SUBJECT_KEYWORDS = [
     ("acknowledged", ["acknowledgement letter"]),
+    # "Claim Approval" precedes "payment processed"/settled and is the ONLY
+    # place the dollar breakdown appears (confirmed live, Jul 2026) — the
+    # later settled email carries no figures at all.
+    ("approved", ["your claim has been approved", "claim has been approved"]),
+    # Real subject is the generic "Petcover Insurance Claim for Ari" — this
+    # phrase is body-only, confirmed live ("Claim assessment outcome: Under
+    # excess ... Less Fixed excess: $105.00").
+    ("below_excess", ["claim assessment outcome: under excess", "under your fixed excess"]),
     ("suspended", ["suspended"]),
     (
         "info_requested",
@@ -97,8 +105,9 @@ def extract_sr(text: str, reference: str | None) -> int | None:
 
 
 def extract_settlement_amounts(text: str) -> dict:
-    """Settlement $ breakdown lives only in the PDF attachment, not the email
-    body (confirmed via dry-run) — call with the PDF-extracted text."""
+    """Older PDF-attachment settlement style ($ breakdown in the PDF, not the
+    email body — confirmed via dry-run). Newer 'Claim Approval' emails use a
+    different template entirely; see extract_approval_amounts."""
     result = {}
     claimed = re.search(r"Amount Claimed\s*\$?([\d,]+\.\d{2})", text)
     payable = re.search(r"Total Payable\s*:?\s*\$?([\d,]+\.\d{2})", text)
@@ -106,6 +115,29 @@ def extract_settlement_amounts(text: str) -> dict:
         result["claimed_amount"] = float(claimed.group(1).replace(",", ""))
     if payable:
         result["paid_amount"] = float(payable.group(1).replace(",", ""))
+    return result
+
+
+# 'Claim Approval' email fields (confirmed live, Jul 2026): "Total amount
+# claimed: $35.00", "Paid by us: $22.75", "Fixed excess $0.00" / "Less Fixed
+# excess: $105.00", "Age Contribution: $12.25 [35%]". This is the ONLY email
+# in the lifecycle that states these numbers — captured for display/
+# comparison against our own expectation, never folded into it: Petcover's
+# own math (Age Contribution etc.) is theirs to get right, not ours to model.
+_APPROVAL_PATTERNS = {
+    "claimed_amount": r"Total amount claimed:?\s*\$?([\d,]+\.\d{2})",
+    "paid_amount": r"Paid by us:?\s*\$?([\d,]+\.\d{2})",
+    "fixed_excess_stated": r"(?:Less\s+)?Fixed excess:?\s*\$?(-?[\d,]+\.\d{2})",
+    "age_contribution_stated": r"Age Contribution:?\s*\$?([\d,]+\.\d{2})",
+}
+
+
+def extract_approval_amounts(text: str) -> dict:
+    result = {}
+    for key, pattern in _APPROVAL_PATTERNS.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            result[key] = float(match.group(1).replace(",", ""))
     return result
 
 
@@ -247,6 +279,10 @@ def process_reply(email_id: str, subject: str, body: str) -> None:
     detail = {"subject": subject}
     if event_type == "settled":
         detail.update(extract_settlement_amounts(body))
+    elif event_type == "approved":
+        # The approval email carries the only dollar breakdown in the whole
+        # lifecycle — validate here, not at the later dollar-less 'settled' event.
+        detail.update(extract_approval_amounts(body))
 
     if not claims:
         _record_event(None, event_type, email_id, {**detail, "flag": "needs manual link — no claim matched"})
@@ -254,7 +290,12 @@ def process_reply(email_id: str, subject: str, body: str) -> None:
 
     now = datetime.now(timezone.utc).isoformat()
     for claim in claims:
-        settlement_flag = _validate_settlement(claim, detail.get("paid_amount")) if event_type == "settled" else None
+        # Validate whenever a paid amount is actually stated — the newer
+        # 'approved' email carries it; the older settled-with-PDF style
+        # carries it directly in the settled email itself. Either way, the
+        # dollar-less 'payment processed' settled email that FOLLOWS an
+        # approval has nothing to validate and correctly no-ops here.
+        settlement_flag = _validate_settlement(claim, detail.get("paid_amount"), claim["_txn_date"])
         _record_event(claim["id"], event_type, email_id, detail)
         with db.get_connection() as conn:
             # "unclassified" is a review queue entry, not a lifecycle stage —
@@ -277,22 +318,31 @@ def process_reply(email_id: str, subject: str, body: str) -> None:
             conn.execute(f"UPDATE vet_claims SET {', '.join(updates)} WHERE id = ?", (*params, claim["id"]))
 
 
-def _policy_year_start(anniversary_mmdd: str, on: "datetime") -> "datetime":
-    """Start of the policy year (anniversary→anniversary) containing `on`."""
-    from datetime import date
-
+def _policy_year_start(anniversary_mmdd: str, on: date) -> date:
+    """Start of the policy year (anniversary→anniversary) containing date `on`."""
     mm, dd = (int(x) for x in anniversary_mmdd.split("-"))
     this_year = date(on.year, mm, dd)
-    on_date = on.date() if hasattr(on, "date") else on
-    return this_year if on_date >= this_year else date(on.year - 1, mm, dd)
+    return this_year if on >= this_year else date(on.year - 1, mm, dd)
 
 
-def _validate_settlement(claim, paid_amount: float | None) -> str | None:
-    """Deterministic settlement check (ADR-0011): expected = claimable − excess
-    (only when this thread has no earlier settled claim in the current policy
-    year) bounded by the pet's remaining annual cap. Paid short of expected by
-    more than the tolerance returns a human flag; else None. Never auto-disputes
-    — the flag is a prompt for Justin. Degrades when the anniversary is unknown."""
+def _validate_settlement(claim, paid_amount: float | None, txn_date_iso: str) -> str | None:
+    """Deterministic settlement check (ADR-0011, simplified per Justin): expected
+    = claimable − $150 excess, once per condition thread per policy year — the
+    policy year a CLAIM belongs to is judged by its own transaction date, never
+    by when the reply happened to arrive (two claims processed the same week
+    can be a year apart by transaction date, straddling the anniversary).
+
+    Closed-year default: our claim history for any policy year that has already
+    ended is presumed incomplete (some vet spend never hits the tracked card,
+    and bank-CSV coverage doesn't reach arbitrarily far back) — so excess/cap
+    math only runs for the CURRENT, still-open policy year. A claim whose own
+    transaction falls in an already-closed year is assumed to have already
+    passed the threshold: expected = full claimable, no excess deducted.
+
+    The flag is deliberately a plain mismatch check in EITHER direction — we
+    don't try to replicate Petcover's own internal math (e.g. their Age
+    Contribution co-pay), we just compare our simple expectation to what they
+    actually reported and surface any difference as a warning for Justin."""
     if paid_amount is None:
         return None
     invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
@@ -303,50 +353,60 @@ def _validate_settlement(claim, paid_amount: float | None) -> str | None:
         return None  # nothing to compare against — don't fabricate an expectation
     claimable = float(claimable)
 
-    now = datetime.now(timezone.utc)
-    reference = claim["petcover_reference"]
     with db.get_connection() as conn:
         pet = conn.execute("SELECT policy_anniversary FROM pets WHERE id = ?", (claim["pet_id"],)).fetchone()
-        thread_settlements = conn.execute(
-            "SELECT e.created_at FROM claim_status_events e JOIN vet_claims v ON v.id = e.claim_id "
-            "WHERE v.petcover_reference IS ? AND e.event_type = 'settled' AND e.claim_id != ?",
-            (reference, claim["id"]),
-        ).fetchall() if reference else []
-        pet_settlements = conn.execute(
-            "SELECT e.created_at, e.detail FROM claim_status_events e JOIN vet_claims v ON v.id = e.claim_id "
-            "WHERE v.pet_id IS ? AND e.event_type = 'settled' AND e.claim_id != ?",
-            (claim["pet_id"], claim["id"]),
-        ).fetchall()
-
     anniversary = pet["policy_anniversary"] if pet else None
-    if anniversary:
-        year_start = _policy_year_start(anniversary, now)
-        year_end = year_start.replace(year=year_start.year + 1)
+    txn_date = date.fromisoformat(txn_date_iso[:10])
 
-        def _in_year(iso: str) -> bool:
-            d = datetime.fromisoformat(iso).date()
-            return year_start <= d < year_end
-
-        note = ""
+    reason = ""
+    if not anniversary:
+        # No anniversary on record: can't tell current vs closed year at all —
+        # don't guess a boundary, just expect full claimable.
+        expected = claimable
+        note = "; policy anniversary unknown, expected full claimable"
     else:
-        # No anniversary on record: use thread-lifetime excess only, whole-history
-        # cap. Any flag says the anniversary is unknown so Justin can weigh it.
-        _in_year = lambda iso: True  # noqa: E731
-        note = "; policy anniversary unknown, excess/cap not year-bounded"
+        claim_year_start = _policy_year_start(anniversary, txn_date)
+        current_year_start = _policy_year_start(anniversary, datetime.now(timezone.utc).date())
+        if claim_year_start != current_year_start:
+            expected = claimable
+            note = ""
+        else:
+            year_end = claim_year_start.replace(year=claim_year_start.year + 1)
+            reference = claim["petcover_reference"]
+            with db.get_connection() as conn:
+                thread_prior = conn.execute(
+                    "SELECT bt.date AS txn_date FROM claim_status_events e "
+                    "JOIN vet_claims v ON v.id = e.claim_id "
+                    "JOIN bank_transactions bt ON bt.id = v.transaction_id "
+                    "WHERE v.petcover_reference IS ? AND e.event_type IN ('approved', 'settled') "
+                    "AND e.claim_id != ?",
+                    (reference, claim["id"]),
+                ).fetchall() if reference else []
+                pet_paid = conn.execute(
+                    "SELECT bt.date AS txn_date, e.detail FROM claim_status_events e "
+                    "JOIN vet_claims v ON v.id = e.claim_id "
+                    "JOIN bank_transactions bt ON bt.id = v.transaction_id "
+                    "WHERE v.pet_id IS ? AND e.event_type = 'approved' AND e.claim_id != ?",
+                    (claim["pet_id"], claim["id"]),
+                ).fetchall()
 
-    excess_consumed = any(_in_year(r["created_at"]) for r in thread_settlements)
-    paid_this_year = sum(
-        (json.loads(r["detail"] or "{}").get("paid_amount") or 0.0)
-        for r in pet_settlements
-        if _in_year(r["created_at"])
-    )
-    remaining_cap = max(0.0, ANNUAL_CAP - paid_this_year)
+            def _in_year(iso: str) -> bool:
+                return claim_year_start <= date.fromisoformat(iso) < year_end
 
-    expected = claimable - (0.0 if excess_consumed else POLICY_EXCESS)
-    expected = max(0.0, min(expected, remaining_cap))
-    if paid_amount < expected - SETTLEMENT_TOLERANCE:
-        reason = "excess already deducted this policy year" if excess_consumed else "less excess"
-        return f"settlement short — expected ${expected:.2f}, paid ${paid_amount:.2f} ({reason}{note})"
+            excess_consumed = any(_in_year(r["txn_date"]) for r in thread_prior)
+            paid_this_year = sum(
+                (json.loads(r["detail"] or "{}").get("paid_amount") or 0.0)
+                for r in pet_paid
+                if _in_year(r["txn_date"])
+            )
+            remaining_cap = max(0.0, ANNUAL_CAP - paid_this_year)
+            expected = claimable - (0.0 if excess_consumed else POLICY_EXCESS)
+            expected = max(0.0, min(expected, remaining_cap))
+            note = ""
+            reason = " (excess already used this policy year)" if excess_consumed else " (fresh $150 excess this policy year)"
+
+    if abs(paid_amount - expected) > SETTLEMENT_TOLERANCE:
+        return f"settlement mismatch — we expected ${expected:.2f}, Petcover paid ${paid_amount:.2f}{reason}{note} — review"
     return None
 
 

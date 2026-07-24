@@ -4,6 +4,7 @@ import json
 import logging
 
 from google.auth.exceptions import RefreshError
+from googleapiclient.errors import HttpError
 
 from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, llm, telegram_bot, vet_detection
 from .scheduler import scheduler
@@ -82,17 +83,29 @@ DRAFT_SEARCH_LINK = "https://mail.google.com/mail/u/0/#search/in%3Adrafts+subjec
 
 # Statuses worth pushing to Justin's phone. Urgent = he has to act (blocked
 # claim, insurer waiting on him); the rest are informational lifecycle updates.
-NOTIFY_STATUSES = ("matched", "drafted", "info_requested", "suspended", "acknowledged", "settled", "declined")
+NOTIFY_STATUSES = (
+    "matched", "drafted", "info_requested", "suspended", "acknowledged",
+    "approved", "below_excess", "settled", "declined",
+)
 
 
 def _latest_settlement_detail(claim_id: int) -> dict:
+    """The dollar breakdown for a claim's settlement. Lives on the 'approved'
+    event now (the newer letter template) or on 'settled' itself (the older
+    PDF-attachment style) — the later dollar-less 'payment processed' settled
+    email carries neither, so check both event types and take whichever has
+    figures, most recent first."""
     with db.get_connection() as conn:
-        row = conn.execute(
-            "SELECT detail FROM claim_status_events WHERE claim_id = ? AND event_type = 'settled' "
-            "ORDER BY created_at DESC LIMIT 1",
+        rows = conn.execute(
+            "SELECT detail FROM claim_status_events WHERE claim_id = ? "
+            "AND event_type IN ('approved', 'settled') ORDER BY created_at DESC",
             (claim_id,),
-        ).fetchone()
-    return json.loads(row["detail"] or "{}") if row else {}
+        ).fetchall()
+    for row in rows:
+        detail = json.loads(row["detail"] or "{}")
+        if detail.get("paid_amount") is not None:
+            return detail
+    return json.loads(rows[0]["detail"] or "{}") if rows else {}
 
 
 def _batch_key(claim) -> str:
@@ -207,6 +220,15 @@ def _summarize_group(group) -> str | None:
         return f"⚠ {label}: suspended by Petcover — action needed."
     if status == "acknowledged":
         return f"{label}: acknowledged by Petcover."
+    if status == "below_excess":
+        return f"{label}: under the fixed excess — not yet payable, invoice kept on file."
+    if status == "approved":
+        detail = _latest_settlement_detail(group[0]["id"])
+        claimed, paid = detail.get("claimed_amount"), detail.get("paid_amount")
+        base = f"{label}: approved by Petcover"
+        base += f" — claimed ${claimed:.2f}, paid ${paid:.2f}." if claimed is not None and paid is not None else "."
+        flag = group[0]["flag"]
+        return f"⚠ {base}\n{flag}" if flag and "mismatch" in flag else base
     if status == "declined":
         return f"{label}: declined by Petcover."
     if status == "settled":
@@ -283,28 +305,33 @@ def notify_split_proposals(send_fn=None) -> None:
 
 # Flags whose alert should carry the offending PDF so Justin can review it
 # from the message itself.
-_REVIEW_FLAG_MARKERS = ("isn't a per-visit itemised invoice", "invoice attachment unreadable", "settlement short")
+_REVIEW_FLAG_MARKERS = ("isn't a per-visit itemised invoice", "invoice attachment unreadable", "settlement mismatch")
 
 
 def _latest_settled_email_id(claim_id: int) -> str | None:
+    """The email carrying the settlement figures — 'approved' for the newer
+    letter template, 'settled' for the older PDF-attachment style."""
     with db.get_connection() as conn:
         row = conn.execute(
-            "SELECT raw_email_id FROM claim_status_events WHERE claim_id = ? AND event_type = 'settled' "
-            "AND raw_email_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+            "SELECT raw_email_id FROM claim_status_events WHERE claim_id = ? "
+            "AND event_type IN ('approved', 'settled') AND raw_email_id IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 1",
             (claim_id,),
         ).fetchone()
     return row["raw_email_id"] if row else None
 
 
 def _review_pdf(group) -> tuple[str, bytes] | None:
-    """The vet/Petcover document behind a needs-review flag. A short settlement
-    carries its settlement letter's PDF (the breakdown Justin will dispute from);
+    """The vet/Petcover document behind a needs-review flag. A settlement
+    mismatch carries its approval/settlement email (the breakdown Justin will
+    review from — a PDF for the older style, plain text for the newer, in
+    which case the fallback below simply finds nothing and sends plain text);
     matched claims know their invoice email; unreadable-flagged pending claims
     only carry the subject in the flag — recovered via a Gmail subject search,
     best-effort."""
     lead = group[0]
     email_id = lead["matched_email_id"]
-    if lead["flag"] and "settlement short" in lead["flag"]:
+    if lead["flag"] and "settlement mismatch" in lead["flag"]:
         email_id = _latest_settled_email_id(lead["id"]) or email_id
     if not email_id and lead["flag"] and "unreadable — " in lead["flag"]:
         subject = lead["flag"].split("unreadable — ", 1)[1]
@@ -431,6 +458,23 @@ def _reconcile_sent_invoice_requests() -> None:
     for row in rows:
         try:
             message = service.users().messages().get(userId="me", id=row["draft_id"], format="minimal").execute()
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                # The draft was deleted from Gmail — retrying forever just spams
+                # the log every tick (confirmed live: claim 17, 10+/day). Distinct
+                # from a transient failure: this can never resolve itself, so
+                # clear it and tell Justin to send a fresh invoice request.
+                with db.get_connection() as conn:
+                    conn.execute(
+                        "UPDATE vet_claims SET draft_id = NULL, "
+                        "flag = 'invoice-request draft was deleted from Gmail — send a fresh one', "
+                        "updated_at = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+                logger.warning("reconcile: draft %s for claim %s no longer exists — cleared", row["draft_id"], row["id"])
+            else:
+                logger.warning("reconcile: couldn't fetch draft %s for claim %s: %s", row["draft_id"], row["id"], exc)
+            continue
         except Exception as exc:
             # Can't confirm either way this cycle — retry next tick. Not silent:
             # a persistent failure (auth expiry, bad id) stays visible in logs.

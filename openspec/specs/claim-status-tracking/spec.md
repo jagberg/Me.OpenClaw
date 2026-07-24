@@ -17,11 +17,15 @@ Petcover assigns its own claim reference (e.g. `DC1-27-5628`, `GABR-0305`, `ELD-
 - **THEN** the claim is flagged `unclassified — reference format not recognized` rather than guessing or discarding the email
 
 ### Requirement: Classify Petcover reply emails into lifecycle events
-The system SHALL poll `claims.au@petcovergroup.com`, `requiredinfo.au@petcovergroup.com`, and `accounts.au@petcovergroup.com` on the existing pipeline cycle (paginating past Gmail's page size so no reply is dropped, oldest-first so statuses never regress) and classify each new email into one of: `acknowledged`, `info_requested`, `suspended`, `settled`, `declined`, `ignore` (recognized noise, e.g. "Automatic reply:" instant receipts — dropped without review), or `unclassified` (a real reply we couldn't classify — queued for manual review, and never written to the claim's status). Emails from `marketing.au@petcovergroup.com` SHALL be excluded at the query level, not classified; emails older than the configured `PETCOVER_STATUS_SINCE` date SHALL be excluded at the query level (first-run backfill guard — historical replies about long-settled claims must not be ingested or mis-correlated).
+The system SHALL poll `claims.au@petcovergroup.com`, `requiredinfo.au@petcovergroup.com`, and `accounts.au@petcovergroup.com` on the existing pipeline cycle (paginating past Gmail's page size so no reply is dropped, oldest-first so statuses never regress) and classify each new email into one of: `acknowledged`, `approved` (Petcover has assessed and approved the claim — carries the only dollar breakdown in the lifecycle; a dollar-less "payment processed" confirmation follows as `settled`), `info_requested`, `suspended`, `settled`, `declined`, `below_excess` (the condition is covered but the amount claimed is under the fixed excess — non-terminal, invoice retained), `ignore` (recognized noise, e.g. "Automatic reply:" instant receipts — dropped without review), or `unclassified` (a real reply we couldn't classify — queued for manual review, and never written to the claim's status). `approved` and `below_excess` are recognized from body text (confirmed live phrases: "Your claim has been approved", "Claim assessment outcome: Under excess") since their real subject is a generic template, not a distinct keyword. Emails from `marketing.au@petcovergroup.com` SHALL be excluded at the query level, not classified; emails older than the configured `PETCOVER_STATUS_SINCE` date SHALL be excluded at the query level (first-run backfill guard — historical replies about long-settled claims must not be ingested or mis-correlated).
 
 #### Scenario: Subject matches a known pattern
 - **WHEN** a reply's subject contains a recognized keyword (e.g. "Acknowledgement Letter", "suspended", "Request for information", "Settlement EFT", "Declined")
 - **THEN** it is classified accordingly without needing to read the body
+
+#### Scenario: Generic-subject letter classified from body content
+- **WHEN** a reply's subject is a generic template (e.g. "Petcover Insurance Claim for Ari") but its body states the claim has been approved, or that it is under the fixed excess
+- **THEN** it is classified `approved` or `below_excess` respectively, not left `unclassified`
 
 #### Scenario: Subject is ambiguous or generic
 - **WHEN** a reply's subject doesn't match any known keyword (e.g. templated subjects reused across claim types)
@@ -30,6 +34,10 @@ The system SHALL poll `claims.au@petcovergroup.com`, `requiredinfo.au@petcovergr
 #### Scenario: Marketing email arrives
 - **WHEN** an email from `marketing.au@petcovergroup.com` is polled
 - **THEN** it is excluded from classification entirely and never appears as a claim status event
+
+#### Scenario: below_excess is non-terminal
+- **WHEN** a `below_excess` event correlates to a claim
+- **THEN** the claim's status becomes `below_excess`, its invoice/`invoice_data` is retained, and it is never treated as `declined` (terminal)
 
 ### Requirement: Correlate a reply to the originating claim submission
 A Petcover reference identifies a Condition Thread — one (pet, condition) pairing whose reference is reused for the life of the condition — not a Submission. The system SHALL correlate each classified reply using, in order of confidence: (1) an exact (reference, Sr) match — the event attaches to that single claim; (2) a reference-only match — the event attaches to the thread's non-terminal claims only (never `settled`/`declined`); (3) for replies with no stored reference (acknowledgements learning it): candidates are un-referenced claims in a submitted-and-awaiting-reply status for the printed pet (nickname-tolerant), narrowed by the reply's printed condition matching the claim's condition text (case-insensitive) — Petcover's printed condition is authoritative in their letters; if condition matching does not decide it, the reply SHALL be assumed to belong to the most recently sent matching submission, and multiple same-day replies SHALL map newest-reply→newest-sent working backwards. Transaction-date proximity SHALL NOT be required: a claim's transaction can be a year older than its submission (confirmed real case), so date windows reject genuine matches.
