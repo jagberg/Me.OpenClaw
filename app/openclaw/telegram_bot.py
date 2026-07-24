@@ -1,13 +1,19 @@
 import asyncio
-import html
 import json
 import logging
 from datetime import datetime, timezone
 
-from telegram import Bot, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    Bot,
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from . import agent, claim_forms, claim_status, config, db, invoice_matching, llm
+from . import agent, claim_card, claim_forms, claim_status, config, db, invoice_matching, llm
 
 logger = logging.getLogger(__name__)
 
@@ -255,60 +261,6 @@ async def notvet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(result["message"])
 
 
-# Kept in sync with templates/index.html's status_chip macro — same labels,
-# different rendering (HTML <pre> table here vs a colored chip there).
-_HISTORY_STATUS_LABELS = {
-    "pending_match": "No invoice",
-    "matched": "Matched",
-    "drafted": "Drafted",
-    "sent": "Sent",
-    "acknowledged": "Acknowledged",
-    "info_requested": "Info requested",
-    "suspended": "Suspended",
-    "settled": "Settled",
-    "declined": "Declined",
-    "approved": "Approved",
-    "below_excess": "Below excess",
-    "absorbed": "Absorbed",
-}
-_HISTORY_PAGE_SIZE = 15
-
-
-def _format_history_page(rows: list[dict], page: int, page_size: int = _HISTORY_PAGE_SIZE) -> tuple[str, int]:
-    """Renders one page as an HTML <pre> table — Telegram's default font is
-    proportional, so alignment only holds inside <pre>/<code>. Rows are
-    grouped by month for scannability; fields are escaped AFTER padding to a
-    fixed width so alignment holds for the near-universal no-special-char
-    case (a literal '&' in a merchant name would widen past its column, but
-    that's rarer than worth precomputing display-width-aware padding for)."""
-    total_pages = max(1, -(-len(rows) // page_size))
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * page_size
-    chunk = rows[start : start + page_size]
-
-    lines = []
-    current_month = None
-    for row in chunk:
-        month_key = row["date"][:7]
-        if month_key != current_month:
-            if current_month is not None:
-                lines.append("")
-            lines.append(datetime.strptime(month_key, "%Y-%m").strftime("%b %Y"))
-            current_month = month_key
-        day = row["date"][5:]
-        vet = html.escape(f"{(row['merchant'] or '')[:10]:<10}")
-        amt = f"${abs(row['amount']):.0f}"
-        status = html.escape(_HISTORY_STATUS_LABELS.get(row["status"], row["status"]))
-        lines.append(f"{day:<5} {vet} {amt:>6} {status}")
-        detail = " · ".join(filter(None, [row["pet_name"], row["condition_text"]]))
-        if detail:
-            lines.append(f"      {html.escape(detail)}")
-
-    body = "\n".join(lines) if lines else "No claims in this window."
-    header = f"\U0001f4cb <b>Vet Claim History</b> — page {page}/{total_pages} · {len(rows)} visits"
-    return f"{header}\n<pre>{body}</pre>", total_pages
-
-
 def _history_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup | None:
     buttons = []
     if page > 1:
@@ -318,13 +270,36 @@ def _history_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup | Non
     return InlineKeyboardMarkup([buttons]) if buttons else None
 
 
+def _history_page(page: int) -> tuple[bytes, str, int, int] | None:
+    """(png, caption, clamped page, total pages), or None when there's nothing
+    to show. Re-reads the DB on every page so a claim that changed since the
+    message was sent renders current — cheap, and there's no session to hold."""
+    rows = claim_status.history_rows()
+    if not rows:
+        return None
+    per_page = claim_card.ROWS_PER_PAGE
+    total_pages = max(1, -(-len(rows) // per_page))
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    png = claim_card.render(
+        rows[start : start + per_page],
+        page=page,
+        total_rows=len(rows),
+        agg=claim_card.totals(rows),  # whole-year header figures, not just this page
+    )
+    return png, f"Claim history — page {page}/{total_pages}", page, total_pages
+
+
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     username = update.effective_user.username if update.effective_user else None
     if not _is_authorized(username):
         return
-    rows = claim_status.history_rows()
-    text, total_pages = _format_history_page(rows, page=1)
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=_history_keyboard(1, total_pages))
+    result = _history_page(1)
+    if result is None:
+        await update.message.reply_text("No vet claims in the last 12 months.")
+        return
+    png, caption, page, total_pages = result
+    await update.message.reply_photo(photo=png, caption=caption, reply_markup=_history_keyboard(page, total_pages))
 
 
 def mark_sent_button(claim_id: int) -> InlineKeyboardMarkup:
@@ -567,10 +542,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         message = _execute_action(proposal)
         await _append_result(query, f"✅ {message}")
     elif data.startswith("hist:"):
-        page = int(data.split(":", 1)[1])
-        rows = claim_status.history_rows()
-        text, total_pages = _format_history_page(rows, page)
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=_history_keyboard(page, total_pages))
+        result = _history_page(int(data.split(":", 1)[1]))
+        if result is None:
+            return
+        png, caption, page, total_pages = result
+        await query.edit_message_media(
+            media=InputMediaPhoto(media=png, caption=caption),
+            reply_markup=_history_keyboard(page, total_pages),
+        )
 
 
 async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

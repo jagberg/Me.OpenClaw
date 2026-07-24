@@ -674,6 +674,10 @@ def history_rows(days: int = 365) -> list[dict]:
                     "status": claim["status"],
                     "pet_name": claim["pet_name"],
                     "condition_text": claim["condition_text"],
+                    # paid = what Petcover actually paid (settled only, a hard
+                    # fact); expected = our excess/cap estimate for the rest.
+                    "paid": claim["settled_paid"],
+                    "expected": claim["expected"],
                 }
             )
     return rows

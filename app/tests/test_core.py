@@ -1927,6 +1927,49 @@ def test_history_rows_windows_by_date_and_flattens_split_charges():
     assert {r["pet_name"] for r in rows if r["date"] == older} == {"Aari", "Echo"}, "shared charge yields one row per claim"
 
 
+def test_claim_card_totals_split_actual_paid_from_estimate():
+    """Card header: reimbursed counts ONLY money Petcover actually paid; the
+    'to come' figure is our own estimate for everything unsettled and must not
+    double-count a settled claim. Petcover's age contribution is deliberately
+    not modelled (no rate is recorded for any pet), so the estimate reads high
+    and is flagged as an estimate rather than quietly presented as fact."""
+    from openclaw import claim_card
+
+    rows = [
+        {"date": "2026-07-06", "merchant": "V", "amount": -100.0, "status": "settled",
+         "pet_name": "Aari", "condition_text": "Arthritis", "paid": 22.75, "expected": None},
+        {"date": "2026-06-06", "merchant": "V", "amount": -200.0, "status": "sent",
+         "pet_name": "Aari", "condition_text": "Arthritis",
+         "paid": None, "expected": {"available": True, "value": 50.0, "estimate": True}},
+        {"date": "2026-05-06", "merchant": "V", "amount": -60.0, "status": "pending_match",
+         "pet_name": "Aari", "condition_text": None,
+         "paid": None, "expected": {"available": False, "value": None}},
+    ]
+    agg = claim_card.totals(rows)
+    assert agg["reimbursed"] == 22.75, "only the settled claim's real payment counts"
+    assert agg["outstanding"] == 50.0, "unavailable estimate contributes nothing, settled isn't re-counted"
+    assert agg["outstanding_is_estimate"] is True
+
+    # Nothing estimable at all → no phantom '~$0' estimate marker.
+    assert claim_card.totals(rows[:1]) == {"reimbursed": 22.75, "outstanding": 0.0, "outstanding_is_estimate": False}
+
+
+def test_claim_card_renders_png_for_every_status():
+    """Rendering must not crash on any real status (an unmapped one falls back
+    to neutral colours) — the card is the whole /history reply, so a render
+    error means Justin gets nothing."""
+    from openclaw import claim_card
+
+    rows = [
+        {"date": f"2026-0{(i % 9) + 1}-1{i % 9}", "merchant": "The Shire Veterinary Hospital",
+         "amount": -(50 + i), "status": status, "pet_name": "Aari", "condition_text": "Arthritis",
+         "paid": None, "expected": {"available": True, "value": 10.0, "estimate": True}}
+        for i, status in enumerate(list(claim_card._STATUS_LABELS) + ["some_new_status"])
+    ]
+    png = claim_card.render(rows, page=1, total_rows=len(rows))
+    assert png.startswith(b"\x89PNG"), "must be a real PNG"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
