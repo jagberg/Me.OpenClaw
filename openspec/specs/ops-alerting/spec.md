@@ -3,6 +3,8 @@
 ## Purpose
 Make operational failures that would otherwise die silently in container logs — currently Gmail OAuth token death — loud on Telegram (which keeps working when Gmail doesn't), rate-limited so a persistent failure can't spam, with a one-time recovery confirmation.
 
+No dedicated ADR — this rationale ("Gmail auth death is invisible on Telegram") lives only in `openspec/changes/archive/2026-07-23-condition-thread-tracking/proposal.md`, which it shipped alongside. Flagged here rather than fabricating an ADR link that doesn't exist.
+
 ## Requirements
 
 ### Requirement: Gmail auth death is detected specifically and alerted on Telegram

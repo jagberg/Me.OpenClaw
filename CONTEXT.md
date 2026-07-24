@@ -20,7 +20,7 @@ _Avoid_: claim reference (the reference is the thread's id, not the thing itself
 Petcover's running number for each claim document inside a Condition Thread ("DC1-27-5628 Sr 3"). Their letters cite reference + Sr; it is how an event targets one claim within a thread.
 
 **Excess**:
-$150 deducted from the first settlement of each Condition Thread in each Policy Year. Consumed once per thread per year — a second same-year settlement in that thread must not deduct it again.
+$150 deducted from the first settlement of each Condition Thread in each Policy Year. Consumed once per thread per year — a second same-year settlement in that thread must not deduct it again. **Pending** (`excess-threshold-accrual`, ADR-0013): a condition's claim is also held from submission until its accrued claimable for the year exceeds this excess — a below-excess reply (`below_excess` status, non-terminal) is real evidence to Justin, not something to submit and eat as a $0 settlement.
 
 **Policy Year**:
 Runs anniversary-to-anniversary of the pet's policy, NOT the calendar year. Excess consumption and the $10k annual cap both reset on the anniversary.

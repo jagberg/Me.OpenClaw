@@ -3,6 +3,8 @@
 ## Purpose
 Model a Petcover claim reference as a **Condition Thread** — one (pet, condition) pairing whose reference is reused for the life of the condition — and route Petcover's reply events to the correct claim within a thread using the reference and Petcover's per-document serial, never disturbing terminal (settled/declined) claims and never letting one declined thread block another.
 
+See ADR-0011 for the email-mining evidence (reference reuse, per-Sr routing, ack correlation rules) behind these requirements.
+
 ## Requirements
 
 ### Requirement: A claim belongs to a Condition Thread with a per-document serial

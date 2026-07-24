@@ -3,6 +3,8 @@
 ## Purpose
 Check every Petcover settlement against the deterministic policy math — claimable subtotal minus the per-condition-thread excess (once per policy year), bounded by the pet's remaining annual cap, with the policy year running anniversary-to-anniversary — and flag (never auto-dispute) shortfalls so Justin can act, degrading gracefully when the pet's anniversary is unknown.
 
+See ADR-0011 for the origin of the excess/policy-year model this validates against; see ADR-0013 for the related (but distinct) decision to gate *submission* on the same excess math.
+
 ## Requirements
 
 ### Requirement: Settlements are validated against expected payout
