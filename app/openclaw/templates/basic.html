@@ -1,3 +1,4 @@
+{%- from "index.html" import status_chip -%}
 <!doctype html>
 <html lang="en">
 <head>
@@ -50,10 +51,11 @@
     .chip{display:inline-flex;align-items:center;gap:6px;font:600 11px/1 system-ui,sans-serif;padding:4px 9px;border-radius:999px;white-space:nowrap;}
     .chip::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;}
     .chip.drafted{background:var(--hold-wash);color:var(--hold);}
-    .chip.sent,.chip.acknowledged{background:var(--accent-wash);color:var(--accent-ink);}
-    .chip.pending_match,.chip.matched{background:var(--line);color:var(--ink-soft);}
+    .chip.sent,.chip.acknowledged,.chip.approved{background:var(--accent-wash);color:var(--accent-ink);}
+    .chip.pending_match,.chip.matched,.chip.below_excess,.chip.absorbed{background:var(--line);color:var(--ink-soft);}
     .chip.info_requested,.chip.suspended{background:var(--warn-wash);color:var(--warn);}
     .chip.settled{background:var(--ok-wash);color:var(--ok);}
+    .chip.declined{background:var(--bad-wash);color:var(--bad);}
     .need{display:block;font-size:11.5px;color:var(--ink-faint);margin-top:3px;}
     .paidline{font-variant-numeric:tabular-nums;font-weight:650;}
     .paidline .of{color:var(--ink-faint);font-weight:500;font-size:12px;}
@@ -65,8 +67,8 @@
 <div class="wrap">
   <header><h1>OpenClaw</h1><a href="/">Full view &rarr;</a></header>
 
-  {% set needs = {'pending_match':'Upload invoice &rarr;','matched':'Set condition &rarr;','drafted':'Send Gmail draft &rarr;','sent':'Awaiting Petcover','acknowledged':'Awaiting Petcover','info_requested':'Petcover needs info &rarr;','suspended':'Claim suspended &rarr;','declined':'Declined'} %}
-  {% set sev = {'pending_match':'bad','info_requested':'bad','suspended':'bad','matched':'bad','drafted':'hold','sent':'hold','acknowledged':'hold','declined':'bad'} %}
+  {% set needs = {'pending_match':'Upload invoice &rarr;','matched':'Set condition &rarr;','drafted':'Send Gmail draft &rarr;','sent':'Awaiting Petcover','acknowledged':'Awaiting Petcover','approved':'Awaiting settlement','info_requested':'Petcover needs info &rarr;','suspended':'Claim suspended &rarr;'} %}
+  {% set sev = {'pending_match':'bad','info_requested':'bad','suspended':'bad','matched':'bad','drafted':'hold','sent':'hold','acknowledged':'hold','approved':'hold'} %}
 
   <h2>Outstanding <span class="count">{{ outstanding|length }}</span></h2>
   <div class="list">
@@ -79,7 +81,7 @@
       </div>
       <div class="right">
         <span class="amt">${{ '%.2f'|format(row.txn.amount|abs) }}</span>
-        <span class="chip {{ row.claim.status }}">{{ row.claim.status.replace('_',' ')|title }}</span>
+        {{ status_chip(row.claim) }}
         <span class="need">{% if row.claim.pet_id is none %}Assign pet &rarr;{% else %}{{ needs.get(row.claim.status, '')|safe }}{% endif %}</span>
       </div>
     </div>
@@ -88,19 +90,25 @@
     {% endfor %}
   </div>
 
-  <h2 class="paid">Recently paid <span class="count">{{ paid|length }}</span></h2>
+  {% set closed_sev = {'settled':'ok','declined':'bad','below_excess':'hold','absorbed':'hold'} %}
+
+  <h2 class="paid">Recently closed <span class="count">{{ closed|length }}</span></h2>
   <div class="list">
-    {% for row in paid %}
-    <div class="card" data-sev="ok">
+    {% for row in closed %}
+    <div class="card" data-sev="{{ closed_sev.get(row.claim.status, 'ok') }}">
       <div class="stripe"></div>
       <div>
         <span class="who"><i></i>{{ row.claim.pet_name or 'no pet' }}</span>
         <div class="meta">{{ row.claim.condition_text or '' }}{% if row.claim.reference %} &middot; {{ row.claim.reference }}{% endif %}</div>
       </div>
       <div class="right">
+        {% if row.claim.status == 'settled' %}
         <span class="paidline">${{ '%.2f'|format(row.claim.settled_paid) if row.claim.settled_paid is not none else '?' }}
           {% if row.claim.claimable is not none %}<span class="of">of ${{ '%.2f'|format(row.claim.claimable) }}</span>{% endif %}</span>
-        <span class="chip settled">Settled</span>
+        {% elif row.claim.claimable is not none %}
+        <span class="amt">${{ '%.2f'|format(row.claim.claimable) }}</span>
+        {% endif %}
+        {{ status_chip(row.claim) }}
       </div>
     </div>
     {% else %}
@@ -108,7 +116,7 @@
     {% endfor %}
   </div>
 
-  <footer>Outstanding = needs you or awaiting Petcover. Amounts are bank charges (claim ceiling).</footer>
+  <footer>Outstanding = needs you or awaiting Petcover. Closed = settled, declined, below excess, or absorbed into another claim. Amounts are bank charges (claim ceiling).</footer>
 </div>
 </body>
 </html>

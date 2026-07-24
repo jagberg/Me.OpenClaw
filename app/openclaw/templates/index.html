@@ -59,11 +59,11 @@
     .chip{display:inline-flex;align-items:center;gap:6px;font:600 11px/1 system-ui,sans-serif;padding:4px 9px;border-radius:999px;white-space:nowrap;}
     .chip::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;}
     .chip.settled{background:var(--ok-wash);color:var(--ok);}
-    .chip.sent,.chip.acknowledged{background:var(--accent-wash);color:var(--accent-ink);}
+    .chip.sent,.chip.acknowledged,.chip.approved{background:var(--accent-wash);color:var(--accent-ink);}
     .chip.drafted{background:var(--hold-wash);color:var(--hold);}
     .chip.suspended,.chip.info_requested{background:var(--warn-wash);color:var(--warn);}
     .chip.declined{background:var(--bad-wash);color:var(--bad);}
-    .chip.matched,.chip.pending_match{background:var(--line);color:var(--ink-soft);}
+    .chip.matched,.chip.pending_match,.chip.below_excess,.chip.absorbed{background:var(--line);color:var(--ink-soft);}
 
     .tablewrap{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow-x:auto;box-shadow:var(--shadow);}
     table{border-collapse:collapse;width:100%;min-width:960px;font-size:12.5px;}
@@ -100,7 +100,7 @@
 
   {# ---- Jinja macros: status chip, expected cell, row action ---- #}
   {% macro status_chip(claim) %}
-    {% set labels = {'pending_match':'No invoice','matched':'Matched','drafted':'Drafted','sent':'Sent','acknowledged':'Acknowledged','info_requested':'Info requested','suspended':'Suspended','settled':'Settled','declined':'Declined'} %}
+    {% set labels = {'pending_match':'No invoice','matched':'Matched','drafted':'Drafted','sent':'Sent','acknowledged':'Acknowledged','info_requested':'Info requested','suspended':'Suspended','settled':'Settled','declined':'Declined','approved':'Approved','below_excess':'Below excess','absorbed':'Absorbed'} %}
     <span class="chip {{ claim.status }}">{{ labels.get(claim.status, claim.status) }}</span>
   {% endmacro %}
 

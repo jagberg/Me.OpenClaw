@@ -60,21 +60,29 @@ def dashboard(request: Request, upload_error: str | None = None):
     )
 
 
+# Statuses with nothing left for Justin to do — settled/declined are already
+# terminal thread-wide (claim_status.TERMINAL_STATUSES); below_excess/absorbed
+# are equally closed but don't end a Condition Thread, so they aren't in that
+# set. A closed claim must never show up looking like it still needs action.
+_CLOSED_STATUSES = claim_status.TERMINAL_STATUSES + ("below_excess", "absorbed")
+
+
 @app.get("/basic")
 def basic_status(request: Request):
-    """Stripped-down, phone-first view: outstanding visits + recently paid, as
+    """Stripped-down, phone-first view: outstanding visits + recently closed, as
     stacked cards (no wide table). Derived from the same visit_ledger()."""
     ledger = claim_status.visit_ledger()
-    outstanding, paid = [], []
+    outstanding, closed = [], []
     for entry in ledger:
         for claim in entry["claims"]:
             row = {"txn": entry["txn"], "claim": claim}
-            if claim["status"] == "settled":
-                paid.append(row)
+            if claim["status"] in _CLOSED_STATUSES:
+                closed.append(row)
             else:
                 outstanding.append(row)
+    closed.sort(key=lambda r: r["claim"]["status"] != "settled")  # settled (has money) first
     return templates.TemplateResponse(
-        "basic.html", {"request": request, "outstanding": outstanding, "paid": paid}
+        "basic.html", {"request": request, "outstanding": outstanding, "closed": closed}
     )
 
 
