@@ -50,7 +50,13 @@ CREATE TABLE IF NOT EXISTS pets (
     claim_process_defined INTEGER NOT NULL DEFAULT 0,
     policy_number TEXT,
     dob TEXT,
-    insured_elsewhere INTEGER NOT NULL DEFAULT 0
+    insured_elsewhere INTEGER NOT NULL DEFAULT 0,
+    -- Policy limits driving expected-reimbursement math. Nullable: a pet whose
+    -- excess/cap we don't know (e.g. Echo, no Petcover policy) leaves these NULL
+    -- and the dashboard flags reimbursement unavailable rather than guessing.
+    -- Excess is per-condition, per policy year; cap is per policy year.
+    annual_excess REAL,
+    annual_cap REAL
 );
 
 CREATE TABLE IF NOT EXISTS bank_transactions (
@@ -131,9 +137,9 @@ _VET_CLAIMS_ADDED_COLUMNS = {
 # Echo's claim_email stays NULL until Justin supplies Bow Wow Insurance's process
 # (tasks.md 6.0) — claim_process_defined=0 blocks fill/draft for Echo's claims.
 SEED_PETS = """
-INSERT OR IGNORE INTO pets (name, insurer, claim_email, claim_process_defined)
-VALUES ('Aari', 'Petcover', 'claims.au@petcovergroup.com', 1),
-       ('Echo', 'Bow Wow Insurance', NULL, 0);
+INSERT OR IGNORE INTO pets (name, insurer, claim_email, claim_process_defined, annual_excess, annual_cap)
+VALUES ('Aari', 'Petcover', 'claims.au@petcovergroup.com', 1, 150, 10000),
+       ('Echo', 'Bow Wow Insurance', NULL, 0, NULL, NULL);
 """
 
 
@@ -144,12 +150,28 @@ def _migrate_vet_claims_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE vet_claims ADD COLUMN {column} {col_type}")
 
 
+# pets columns added after the table's initial release — same reasoning as
+# _migrate_vet_claims_columns above.
+_PETS_ADDED_COLUMNS = {
+    "annual_excess": "REAL",
+    "annual_cap": "REAL",
+}
+
+
+def _migrate_pets_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(pets)")}
+    for column, col_type in _PETS_ADDED_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE pets ADD COLUMN {column} {col_type}")
+
+
 def init_db(path: str | None = None) -> None:
     path = path or config.DATABASE_PATH
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA)
         _migrate_vet_claims_columns(conn)
+        _migrate_pets_columns(conn)
         conn.executescript(SEED_PETS)
 
 

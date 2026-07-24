@@ -225,6 +225,144 @@ def confirm_resolved(claim_id: int) -> None:
     _record_event(claim_id, "confirmed_resolved", None, {})
 
 
+def _policy_year(txn_date: str) -> str:
+    """Policy-year key for excess/cap grouping. Calendar year of the charge —
+    an approximation: Petcover's real policy-year start isn't recorded, so a
+    claim near a year boundary could be grouped a year off. Refine to the true
+    renewal date if/when it's stored on the pet."""
+    # ponytail: calendar year, switch to renewal-anchored year if excess disputes arise
+    return (txn_date or "")[:4]
+
+
+def _apply_excess_and_cap(rows: list, excess, cap) -> None:
+    """Fills each row's `expected` in place. Excess is drained greedily across
+    a (pet, condition, year) group in charge-date order — earliest charges
+    absorb it first — then the running per-year total is bounded by the cap.
+    All figures are estimates (est.), never booked reimbursements: they don't
+    net off what Petcover has already paid this year. Missing excess/cap →
+    unavailable, never guessed."""
+    if excess is None or cap is None:
+        for r in rows:
+            r["expected"] = {"available": False, "value": None, "note": "no policy excess/cap on file"}
+        return
+
+    # A claim with no invoice matched yet has no claimable subtotal — nothing to
+    # estimate against. Flag unavailable and keep it out of the group math.
+    priced = []
+    for r in rows:
+        if r["claimable"] is None:
+            r["expected"] = {"available": False, "value": None, "note": "no invoice yet"}
+        else:
+            priced.append(r)
+
+    by_condition: dict[tuple, list] = {}
+    for r in priced:
+        key = (r["condition_text"] or "", _policy_year(r["txn_date"]))
+        by_condition.setdefault(key, []).append(r)
+
+    year_totals: dict[str, float] = {}
+    for (condition, year), group in by_condition.items():
+        remaining_excess = excess
+        group_claimable = sum((g["claimable"] or 0) for g in group)
+        for r in sorted(group, key=lambda g: g["txn_date"] or ""):
+            claimable = r["claimable"] or 0
+            absorbed = min(remaining_excess, claimable)
+            remaining_excess -= absorbed
+            after_excess = claimable - absorbed
+            # bound the running per-year total by the annual cap
+            used = year_totals.get(year, 0.0)
+            allowed = max(0.0, cap - used)
+            value = round(min(after_excess, allowed), 2)
+            year_totals[year] = used + value
+            if group_claimable < excess:
+                note = f"{condition or 'condition'} YTD ${group_claimable:.2f} < ${excess:.0f} excess"
+            else:
+                note = f"est. after ${excess:.0f} excess"
+            r["expected"] = {"available": True, "value": value, "note": note, "estimate": True}
+
+
+def visit_ledger() -> list:
+    """Transaction-anchored rollup for the unified dashboard: one entry per vet
+    bank charge (the ADR-0007 ceiling), with the claim(s) derived from it
+    nested beneath. A charge with no claim yet (no invoice) is a first-class
+    entry with an empty claim list. Replaces the old parallel per-status lists.
+
+    Each entry: {txn, claims: [...], claim_count}. Each claim carries its
+    claimable subtotal, expected reimbursement (excess/cap-aware estimate, or
+    unavailable), status, reference, and last status event."""
+    with db.get_connection() as conn:
+        txns = conn.execute(
+            "SELECT * FROM bank_transactions WHERE vet_flag = 1 ORDER BY date DESC, id DESC"
+        ).fetchall()
+        claim_rows = conn.execute(
+            "SELECT vet_claims.*, pets.name AS pet_name, pets.annual_excess, pets.annual_cap, "
+            "bank_transactions.date AS txn_date, bank_transactions.amount AS txn_amount, "
+            "bank_transactions.merchant AS txn_merchant "
+            "FROM vet_claims JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
+            "LEFT JOIN pets ON pets.id = vet_claims.pet_id"
+        ).fetchall()
+        events = conn.execute(
+            "SELECT * FROM claim_status_events WHERE claim_id IS NOT NULL ORDER BY created_at"
+        ).fetchall()
+
+    last_event: dict[int, dict] = {}
+    settled_paid: dict[int, float] = {}
+    for e in events:
+        if e["event_type"] == "unclassified":
+            continue
+        last_event[e["claim_id"]] = {"type": e["event_type"], "at": e["created_at"]}
+        if e["event_type"] == "settled":
+            paid = json.loads(e["detail"] or "{}").get("paid_amount")
+            if paid is not None:
+                settled_paid[e["claim_id"]] = paid
+
+    claims_by_txn: dict[int, list] = {}
+    for c in claim_rows:
+        invoice = json.loads(c["invoice_data"] or "{}")
+        claimable = invoice.get("claimable_amount")
+        if claimable is None:
+            claimable = invoice.get("amount")
+        claims_by_txn.setdefault(c["transaction_id"], []).append(
+            {
+                "id": c["id"],
+                "pet_name": c["pet_name"],
+                "pet_id": c["pet_id"],
+                "condition_text": c["condition_text"],
+                "status": c["status"],
+                "reference": c["petcover_reference"],
+                "draft_id": c["draft_id"],
+                "flag": c["flag"],
+                "claimable": claimable,
+                "txn_date": c["txn_date"],
+                "annual_excess": c["annual_excess"],
+                "annual_cap": c["annual_cap"],
+                "last_event": last_event.get(c["id"]),
+                "settled_paid": settled_paid.get(c["id"]),
+            }
+        )
+
+    # Expected reimbursement, grouped per pet so each pet's excess/cap applies
+    # to its own claims only.
+    by_pet: dict[int, list] = {}
+    for claims in claims_by_txn.values():
+        for cl in claims:
+            by_pet.setdefault(cl["pet_id"], []).append(cl)
+    for pet_claims in by_pet.values():
+        first = pet_claims[0]
+        _apply_excess_and_cap(pet_claims, first["annual_excess"], first["annual_cap"])
+    # Settled claims override the estimate with what Petcover actually paid.
+    for pet_claims in by_pet.values():
+        for cl in pet_claims:
+            if cl["settled_paid"] is not None:
+                cl["expected"] = {"available": True, "value": cl["settled_paid"], "note": "actual", "estimate": False}
+
+    ledger = []
+    for txn in txns:
+        claims = claims_by_txn.get(txn["id"], [])
+        ledger.append({"txn": txn, "claims": claims, "claim_count": len(claims)})
+    return ledger
+
+
 def dashboard_lists() -> dict:
     """Event-domain rollups for the dashboard: needs_action (info_requested/
     suspended not yet confirmed resolved — later events, even settled, don't

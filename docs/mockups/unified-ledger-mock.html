@@ -1,0 +1,392 @@
+<title>OpenClaw — Unified Visit Ledger (mock)</title>
+<style>
+  :root {
+    --ink: #16302C; --ink-soft: #4A5F5B; --ink-faint: #7C8D89;
+    --ground: #F6F5F1; --panel: #FFFFFF; --line: #E2E1DA;
+    --accent: #127A6D; --accent-ink: #0C5A50; --accent-wash: #E3F0EE;
+    --ok: #2E7D4F;   --ok-wash: #E4F1E8;
+    --warn: #A8650A; --warn-wash: #F7EDDD;
+    --bad: #B3362B;  --bad-wash: #F8E7E5;
+    --hold: #5B6B9E; --hold-wash: #E8EBF5;
+    --shadow: 0 1px 2px rgba(22,48,44,.06), 0 4px 14px rgba(22,48,44,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #DCE7E4; --ink-soft: #9FB3AE; --ink-faint: #6E827D;
+      --ground: #0E1716; --panel: #15211F; --line: #24322F;
+      --accent: #3AA795; --accent-ink: #6BC4B5; --accent-wash: #16302C;
+      --ok: #58B27E; --ok-wash: #16281D;
+      --warn: #D79A45; --warn-wash: #2C2214;
+      --bad: #E06C60; --bad-wash: #301715;
+      --hold: #8B9CD4; --hold-wash: #1B2133;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.3);
+    }
+  }
+  :root[data-theme="light"] {
+    --ink: #16302C; --ink-soft: #4A5F5B; --ink-faint: #7C8D89;
+    --ground: #F6F5F1; --panel: #FFFFFF; --line: #E2E1DA;
+    --accent: #127A6D; --accent-ink: #0C5A50; --accent-wash: #E3F0EE;
+    --ok: #2E7D4F; --ok-wash: #E4F1E8; --warn: #A8650A; --warn-wash: #F7EDDD;
+    --bad: #B3362B; --bad-wash: #F8E7E5; --hold: #5B6B9E; --hold-wash: #E8EBF5;
+    --shadow: 0 1px 2px rgba(22,48,44,.06), 0 4px 14px rgba(22,48,44,.05);
+  }
+  :root[data-theme="dark"] {
+    --ink: #DCE7E4; --ink-soft: #9FB3AE; --ink-faint: #6E827D;
+    --ground: #0E1716; --panel: #15211F; --line: #24322F;
+    --accent: #3AA795; --accent-ink: #6BC4B5; --accent-wash: #16302C;
+    --ok: #58B27E; --ok-wash: #16281D; --warn: #D79A45; --warn-wash: #2C2214;
+    --bad: #E06C60; --bad-wash: #301715; --hold: #8B9CD4; --hold-wash: #1B2133;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.3);
+  }
+
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--ground); color: var(--ink); font: 13px/1.5 system-ui, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1140px; margin: 0 auto; padding: 28px 24px 80px; }
+
+  header.mast { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+  .mast h1 { font: 600 26px/1.2 Georgia, "Times New Roman", serif; margin: 0; letter-spacing: -.01em; }
+  .mast .sub { color: var(--ink-soft); font-size: 14px; }
+  .mast .mocktag { margin-left: auto; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--warn); border: 1px dashed var(--warn); border-radius: 3px; padding: 2px 8px; }
+  .petfilter { display: flex; gap: 8px; margin: 14px 0 26px; flex-wrap: wrap; }
+  .petfilter button { font: 500 13px/1 system-ui, sans-serif; padding: 7px 14px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); color: var(--ink-soft); cursor: pointer; }
+  .petfilter button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 34px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; box-shadow: var(--shadow); }
+  .tile .k { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 6px; }
+  .tile .v { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+  .tile .d { font-size: 12.5px; color: var(--ink-soft); margin-top: 3px; }
+  .tile.alert { border-left: 4px solid var(--warn); } .tile.alert .v { color: var(--warn); }
+
+  section { margin-bottom: 38px; }
+  section > h2 { font: 600 13px/1 system-ui, sans-serif; letter-spacing: .09em; text-transform: uppercase; color: var(--ink-soft); margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  section > h2 .count { background: var(--warn-wash); color: var(--warn); border-radius: 999px; font-size: 11.5px; padding: 2px 8px; letter-spacing: 0; }
+  section > h2 .hint { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 500; font-size: 12px; color: var(--ink-faint); }
+
+  .queue { display: grid; gap: 10px; }
+  .qcard { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 13px 16px; display: grid; grid-template-columns: 4px 1fr auto; gap: 14px; align-items: center; box-shadow: var(--shadow); }
+  .qcard .stripe { width: 4px; height: 100%; min-height: 40px; border-radius: 2px; }
+  .qcard[data-sev="warn"] .stripe { background: var(--warn); }
+  .qcard[data-sev="bad"]  .stripe { background: var(--bad); }
+  .qcard[data-sev="hold"] .stripe { background: var(--hold); }
+  .qcard .t { font-weight: 600; } .qcard .t .who { color: var(--accent-ink); }
+  .qcard .why { color: var(--ink-soft); font-size: 13.5px; margin-top: 2px; }
+  .qcard .why em { font-style: normal; background: var(--warn-wash); padding: 0 4px; border-radius: 3px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .btn { font: 600 13px/1 system-ui, sans-serif; padding: 8px 13px; border-radius: 6px; cursor: pointer; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.quiet { color: var(--ink-soft); }
+
+  .chip { display: inline-flex; align-items: center; gap: 6px; font: 600 12px/1 system-ui, sans-serif; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }
+  .chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .chip.settled   { background: var(--ok-wash);   color: var(--ok); }
+  .chip.sent, .chip.acknowledged { background: var(--accent-wash); color: var(--accent-ink); }
+  .chip.drafted   { background: var(--hold-wash); color: var(--hold); }
+  .chip.suspended, .chip.inforeq { background: var(--warn-wash); color: var(--warn); }
+  .chip.declined, .chip.blocked  { background: var(--bad-wash);  color: var(--bad); }
+  .chip.matched, .chip.noinvoice { background: var(--line); color: var(--ink-soft); }
+
+  .tablewrap { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; min-width: 960px; font-size: 12.5px; }
+  th { text-align: left; font: 600 10.5px/1 system-ui, sans-serif; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-faint); padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tbody td:first-child { white-space: nowrap; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td .sub { display: block; font-size: 11px; color: var(--ink-faint); margin-top: 1px; white-space: normal; }
+  .pet { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
+  .pet i { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .pet.aari i { background: #127A6D; } .pet.echo i { background: #5B6B9E; } .pet.loki i { background: #9C8449; }
+  .ceil { color: var(--ink-faint); }
+  .ref { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color: var(--ink-soft); }
+  .rowbtn { font: 600 12px/1 system-ui, sans-serif; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--accent-ink); cursor: pointer; white-space: nowrap; }
+
+  /* ---------- ledger: anchor + expandable sub-rows ---------- */
+  tr.anchor > td { border-bottom: 0; }
+  tr.anchor.solo > td { border-bottom: 1px solid var(--line); }
+  tr.group-end > td { border-bottom: 1px solid var(--line); }
+  .twist { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
+  .twist .caret { color: var(--ink-faint); font-size: 11px; }
+  .countbadge { background: var(--accent-wash); color: var(--accent-ink); border-radius: 999px; font-size: 11px; font-weight: 600; padding: 1px 7px; margin-left: 6px; }
+  tr.sub > td { background: color-mix(in srgb, var(--panel) 100%, var(--ground) 55%); border-bottom: 1px dashed var(--line); }
+  tr.sub td.branch { color: var(--ink-faint); padding-left: 30px; position: relative; }
+  tr.sub td.branch::before { content: "└"; position: absolute; left: 14px; color: var(--ink-faint); }
+  .excl { color: var(--ink-faint); font-size: 12.5px; }
+  .na { color: var(--ink-faint); }
+  .est { color: var(--accent-ink); font-weight: 600; }
+  .est.zero { color: var(--warn); }
+  .note-excess { font-size: 12px; color: var(--warn); }
+
+  .recon { display: grid; gap: 14px; }
+  .rcard { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; box-shadow: var(--shadow); }
+  .rcard .rhead { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 9px; }
+  .rcard .rhead .amt { font-variant-numeric: tabular-nums; font-weight: 650; }
+  .bar { height: 14px; border-radius: 4px; background: var(--line); overflow: hidden; display: flex; }
+  .bar .paid { background: var(--ok); }
+  .bar .gap  { background: repeating-linear-gradient(45deg, var(--warn), var(--warn) 4px, var(--warn-wash) 4px, var(--warn-wash) 8px); }
+  .rlegend { display: flex; gap: 18px; font-size: 12.5px; color: var(--ink-soft); margin-top: 8px; flex-wrap: wrap; }
+  .rlegend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+
+  .flow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-soft); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+  .flow .chip { font-size: 11px; } .flow .arr { color: var(--ink-faint); }
+  footer { margin-top: 44px; font-size: 12.5px; color: var(--ink-faint); border-top: 1px solid var(--line); padding-top: 14px; }
+  footer code { font-family: ui-monospace, Consolas, monospace; }
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <h1>OpenClaw</h1>
+    <span class="sub">Visit ledger · Saturday 19 July 2026</span>
+    <span class="mocktag">Design mock — static data</span>
+  </header>
+
+  <nav class="petfilter" aria-label="Filter by pet">
+    <button aria-pressed="true">All pets</button>
+    <button aria-pressed="false">Aari</button>
+    <button aria-pressed="false">Echo</button>
+    <button aria-pressed="false">Loki (archived)</button>
+  </nav>
+
+  <div class="tiles">
+    <div class="tile alert">
+      <div class="k">Needs your action</div>
+      <div class="v">3</div>
+      <div class="d">2 missing invoices · 1 draft to send</div>
+    </div>
+    <div class="tile">
+      <div class="k">Arthritis batch — Aari</div>
+      <div class="v">$124.75</div>
+      <div class="d">claimable, but under $150 excess → $0 back yet</div>
+    </div>
+    <div class="tile">
+      <div class="k">Settled this policy year</div>
+      <div class="v">$324.97</div>
+      <div class="d">of $624.89 claimed (52%)</div>
+    </div>
+    <div class="tile">
+      <div class="k">Visits captured</div>
+      <div class="v">7</div>
+      <div class="d">6 matched · 1 without invoice</div>
+    </div>
+  </div>
+
+  <!-- Needs-action stays its own triage lane -->
+  <section aria-labelledby="h-action">
+    <h2 id="h-action">Needs your action <span class="count">3</span></h2>
+    <div class="queue">
+      <div class="qcard" data-sev="hold">
+        <div class="stripe"></div>
+        <div>
+          <div class="t"><span class="who">Aari</span> — arthritis batch ready to send</div>
+          <div class="why">Draft in Gmail with claim form + 3 invoices attached. Send it, then mark the batch sent here.</div>
+        </div>
+        <div class="actions">
+          <button class="btn primary">Open Gmail draft</button>
+          <button class="btn">Mark sent</button>
+        </div>
+      </div>
+      <div class="qcard" data-sev="bad">
+        <div class="stripe"></div>
+        <div>
+          <div class="t"><span class="who">Echo</span> — Kings Vet visit, $191.50 on 3 Dec 2025</div>
+          <div class="why">No invoice found in Gmail. <em>Ask the clinic for a copy</em>, then upload it to match this charge.</div>
+        </div>
+        <div class="actions">
+          <button class="btn primary">Upload invoice</button>
+          <button class="btn quiet">Dismiss</button>
+        </div>
+      </div>
+      <div class="qcard" data-sev="bad">
+        <div class="stripe"></div>
+        <div>
+          <div class="t"><span class="who">Echo</span> — Vetwest, $679.50 on 22 Dec 2025</div>
+          <div class="why">Bow Wow Insurance claim process undefined. <em>Set the process</em> before this can be drafted.</div>
+        </div>
+        <div class="actions"><button class="btn primary">Set condition / process</button></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- THE MERGE: one transaction-anchored ledger replacing Active-claims + Visits tables -->
+  <section aria-labelledby="h-ledger">
+    <h2 id="h-ledger">Visit ledger
+      <span class="hint">each bank charge once · claims nested beneath · charge = ceiling (ADR-0007)</span>
+    </h2>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Visit</th><th>Pet</th><th>Condition</th>
+            <th class="num">Charge<br>(ceiling)</th><th class="num">Claimable</th>
+            <th class="num">Expected<br>back</th>
+            <th>Status</th><th>Reference</th><th>Last event</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <!-- 1 charge → 1 claim, but BLOCKED: Echo, insurer process undefined -->
+          <tr class="anchor solo">
+            <td>22 Dec 2025<span class="sub">Vetwest</span></td>
+            <td><span class="pet echo"><i></i>Echo</span></td>
+            <td>Needed<span class="sub">condition not set</span></td>
+            <td class="num ceil">$679.50</td>
+            <td class="num na">—</td>
+            <td class="num na">n/a<span class="sub">no Petcover policy</span></td>
+            <td><span class="chip blocked">Blocked</span></td>
+            <td class="ref">—</td>
+            <td>Flagged: insurer process undefined<span class="sub">18 Jul 2026</span></td>
+            <td><button class="rowbtn">Set condition</button></td>
+          </tr>
+
+          <!-- 1 charge → 0 claims: no invoice yet, first-class inline row -->
+          <tr class="anchor solo">
+            <td>3 Dec 2025<span class="sub">Kings Vet Clinic</span></td>
+            <td><span class="pet echo"><i></i>Echo</span></td>
+            <td class="na">—</td>
+            <td class="num ceil">$191.50</td>
+            <td class="num na">—</td>
+            <td class="num na">n/a<span class="sub">no Petcover policy</span></td>
+            <td><span class="chip noinvoice">No invoice</span></td>
+            <td class="ref">—</td>
+            <td>Needs manual retrieval from clinic<span class="sub">18 Jul 2026</span></td>
+            <td><button class="rowbtn">Upload invoice</button></td>
+          </tr>
+
+          <!-- 1 charge → 1 claim, flat: Aari arthritis, 3rd in batch this year -->
+          <tr class="anchor solo">
+            <td>26 Sep 2025<span class="sub">Kings Vet Clinic</span></td>
+            <td><span class="pet aari"><i></i>Aari</span></td>
+            <td>Arthritis<span class="sub">batch 21·19·18</span></td>
+            <td class="num ceil">$45.00</td>
+            <td class="num">$45.00</td>
+            <td class="num est zero">$0.00<span class="sub note-excess">arthritis YTD $124.75 &lt; $150 excess</span></td>
+            <td><span class="chip drafted">Drafted</span></td>
+            <td class="ref">—</td>
+            <td>Draft updated<span class="sub">18 Jul 2026</span></td>
+            <td><button class="rowbtn">Mark sent</button></td>
+          </tr>
+
+          <!-- 1 charge → N claims: split $177.50 across Aari (claimable) + Echo (non-claimable) -->
+          <tr class="anchor">
+            <td>11 Sep 2025<span class="sub">Kings Vet Clinic</span></td>
+            <td><span class="twist"><span class="caret">▾</span>2 pets</span><span class="countbadge">2 claims</span></td>
+            <td class="na">split charge</td>
+            <td class="num ceil">$177.50</td>
+            <td class="num">$35.00<span class="sub">claimable of $177.50</span></td>
+            <td class="num est zero">$0.00</td>
+            <td><span class="chip drafted">Drafted</span></td>
+            <td class="ref">—</td>
+            <td>Draft updated<span class="sub">18 Jul 2026</span></td>
+            <td><button class="rowbtn">Mark sent</button></td>
+          </tr>
+          <tr class="sub">
+            <td class="branch">Aari claim</td>
+            <td><span class="pet aari"><i></i>Aari</span></td>
+            <td>Arthritis</td>
+            <td class="num ceil">—</td>
+            <td class="num">$35.00</td>
+            <td class="num est zero">$0.00<span class="sub note-excess">within $150 excess</span></td>
+            <td><span class="chip drafted">Drafted</span></td>
+            <td class="ref">—</td>
+            <td>in arthritis batch</td>
+            <td></td>
+          </tr>
+          <tr class="sub group-end">
+            <td class="branch">Echo line</td>
+            <td><span class="pet echo"><i></i>Echo</span></td>
+            <td>Vaccination <span class="excl">· not claimable</span></td>
+            <td class="num ceil">—</td>
+            <td class="num na">$142.50 <span class="excl">excluded</span></td>
+            <td class="num na">—</td>
+            <td><span class="chip matched">Matched</span></td>
+            <td class="ref">—</td>
+            <td>excluded by keyword</td>
+            <td></td>
+          </tr>
+
+          <!-- 1 charge → 1 claim, flat: Aari arthritis, first of batch (excess anchor) -->
+          <tr class="anchor solo">
+            <td>8 Aug 2025<span class="sub">Kings Vet Clinic</span></td>
+            <td><span class="pet aari"><i></i>Aari</span></td>
+            <td>Arthritis<span class="sub">1st this year — excess applies</span></td>
+            <td class="num ceil">$44.75</td>
+            <td class="num">$44.75</td>
+            <td class="num est zero">$0.00<span class="sub note-excess">$150 excess not yet met</span></td>
+            <td><span class="chip drafted">Drafted</span></td>
+            <td class="ref">—</td>
+            <td>Draft updated<span class="sub">18 Jul 2026</span></td>
+            <td><button class="rowbtn">Mark sent</button></td>
+          </tr>
+
+          <!-- 1 charge → 0 claims: no invoice, Aari -->
+          <tr class="anchor solo">
+            <td>28 Jul 2025<span class="sub">Kings Vet Clinic</span></td>
+            <td><span class="pet aari"><i></i>Aari</span></td>
+            <td class="na">—</td>
+            <td class="num ceil">$45.00</td>
+            <td class="num na">—</td>
+            <td class="num na">—</td>
+            <td><span class="chip noinvoice">No invoice</span></td>
+            <td class="ref">—</td>
+            <td>Needs manual retrieval from clinic<span class="sub">18 Jul 2026</span></td>
+            <td><button class="rowbtn">Upload invoice</button></td>
+          </tr>
+
+          <!-- settled, prior year, Loki: expected column shows actual paid -->
+          <tr class="anchor solo">
+            <td>12 Mar 2024<span class="sub">Eastside Animal Hospital</span></td>
+            <td><span class="pet loki"><i></i>Loki</span></td>
+            <td>Gastroenteritis</td>
+            <td class="num ceil">$632.10</td>
+            <td class="num">$624.89</td>
+            <td class="num"><span class="est">$324.97</span><span class="sub">actual · after $150 excess</span></td>
+            <td><span class="chip settled">Settled</span></td>
+            <td class="ref">ELD-24-2146</td>
+            <td>Paid $324.97<span class="sub">settlement PDF · 2 May 2024</span></td>
+            <td><button class="rowbtn">History</button></td>
+          </tr>
+
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-recon">
+    <h2 id="h-recon">Settlements — claimed vs paid</h2>
+    <div class="recon">
+      <div class="rcard">
+        <div class="rhead">
+          <div><span class="pet loki"><i></i>Loki</span> · Gastroenteritis · <span class="ref">ELD-24-2146</span></div>
+          <div class="amt">$324.97 paid of $624.89 claimed</div>
+        </div>
+        <div class="bar" role="img" aria-label="52 percent paid">
+          <div class="paid" style="width:52%"></div>
+          <div class="gap" style="width:48%"></div>
+        </div>
+        <div class="rlegend">
+          <span><span class="sw" style="background:var(--ok)"></span>Paid $324.97</span>
+          <span><span class="sw" style="background:repeating-linear-gradient(45deg,var(--warn),var(--warn) 4px,var(--warn-wash) 4px,var(--warn-wash) 8px)"></span>Gap $299.92 — $150 per-condition excess + $149.92 non-claimable items</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-flow">
+    <h2 id="h-flow">Claim lifecycle</h2>
+    <div class="flow">
+      <span class="chip noinvoice">No invoice</span><span class="arr">→</span>
+      <span class="chip matched">Matched</span><span class="arr">→</span>
+      <span class="chip drafted">Drafted</span><span class="arr">→</span>
+      <span class="chip sent">Sent</span><span class="arr">→</span>
+      <span class="chip acknowledged">Acknowledged</span><span class="arr">→</span>
+      <span class="chip inforeq">Info requested</span><span class="arr">→</span>
+      <span class="chip settled">Settled</span> / <span class="chip declined">Declined</span>
+    </div>
+  </section>
+
+  <footer>
+    One row per <code>bank_transaction</code> (vet_flag=1); <code>vet_claims</code> nest beneath via <code>transaction_id</code>.
+    Charge is the ceiling (ADR-0007); expected back = claimable − per-condition annual excess, bounded by remaining $10k/yr cap.
+    Unknown excess/cap renders <span class="na">n/a</span>, never guessed.
+  </footer>
+</div>

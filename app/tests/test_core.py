@@ -334,6 +334,95 @@ def test_unclassified_reply_never_overwrites_status():
     assert status == "acknowledged", "unclassified is a review-queue entry, not a lifecycle stage"
 
 
+def _insert_txn(conn, date, amount, merchant="KINGS VET CLINIC"):
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO bank_transactions (date, amount, merchant, vet_flag, created_at) VALUES (?, ?, ?, 1, ?)",
+        (date, amount, merchant, now),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def _insert_claim(conn, txn_id, pet_id, status, condition=None, claimable=None):
+    import json as _json
+    now = datetime.now(timezone.utc).isoformat()
+    invoice = _json.dumps({"claimable_amount": claimable}) if claimable is not None else None
+    conn.execute(
+        "INSERT INTO vet_claims (transaction_id, pet_id, condition_text, invoice_data, status, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (txn_id, pet_id, condition, invoice, status, now, now),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def test_visit_ledger_four_shapes():
+    """One entry per vet charge; flat vs split vs no-invoice; excess drained
+    across the arthritis batch (all under $150 -> $0 expected); Echo (no
+    Petcover excess) flagged unavailable, never guessed."""
+    db.init_db()
+    with db.get_connection() as conn:
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        echo = conn.execute("SELECT id FROM pets WHERE name='Echo'").fetchone()[0]
+        # flat: Aari arthritis, claimable 44.75
+        t1 = _insert_txn(conn, "2025-08-08", -44.75)
+        _insert_claim(conn, t1, aari, "drafted", "Arthritis", 44.75)
+        # two more arthritis charges same year -> batch totals 124.75 (< 150 excess)
+        t2 = _insert_txn(conn, "2025-09-26", -45.00)
+        _insert_claim(conn, t2, aari, "drafted", "Arthritis", 45.00)
+        # split: one $177.50 charge -> Aari arthritis 35.00 + Echo vaccination excluded
+        t3 = _insert_txn(conn, "2025-09-11", -177.50)
+        _insert_claim(conn, t3, aari, "drafted", "Arthritis", 35.00)
+        _insert_claim(conn, t3, echo, "matched", "Vaccination", 0.0)
+        # no-invoice: Aari charge, pending_match, no invoice_data
+        t4 = _insert_txn(conn, "2025-07-28", -45.00)
+        _insert_claim(conn, t4, aari, "pending_match")
+        # missing-excess: Echo charge with a real claimable but no policy excess/cap
+        t5 = _insert_txn(conn, "2025-12-22", -679.50, "VETWEST")
+        _insert_claim(conn, t5, echo, "matched", "Injury", 600.00)
+
+    ledger = claim_status.visit_ledger()
+
+    # one entry per charge, newest first
+    assert [e["txn"]["id"] for e in ledger] == [t5, t2, t3, t1, t4]
+
+    by_txn = {e["txn"]["id"]: e for e in ledger}
+    assert by_txn[t3]["claim_count"] == 2, "split charge nests both claims under one entry"
+    assert by_txn[t1]["claim_count"] == 1
+
+    # arthritis batch (44.75 + 35 + 45 = 124.75) all under the $150 excess -> $0 each
+    arth = [c for e in ledger for c in e["claims"] if c["condition_text"] == "Arthritis"]
+    assert len(arth) == 3
+    assert all(c["expected"]["available"] and c["expected"]["value"] == 0.0 for c in arth)
+
+    # no-invoice claim -> unavailable, not guessed
+    noinv = by_txn[t4]["claims"][0]
+    assert noinv["status"] == "pending_match"
+    assert noinv["expected"]["available"] is False
+
+    # Echo (no excess/cap on file) -> unavailable even with a real claimable
+    echo_claim = by_txn[t5]["claims"][0]
+    assert echo_claim["claimable"] == 600.00
+    assert echo_claim["expected"]["available"] is False
+
+
+def test_visit_ledger_expected_after_excess_and_settled_actual():
+    """Once the batch exceeds the excess, expected = claimable beyond it; a
+    settled claim shows Petcover's actual paid, overriding the estimate."""
+    db.init_db()
+    with db.get_connection() as conn:
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        # single arthritis claim of 200 in a fresh year -> expected 200 - 150 = 50
+        t1 = _insert_txn(conn, "2024-03-12", -210.00, "EASTSIDE ANIMAL HOSPITAL")
+        c1 = _insert_claim(conn, t1, aari, "settled", "Gastroenteritis", 200.00)
+    claim_status._record_event(c1, "settled", "msg-x", {"paid_amount": 124.97})
+
+    ledger = claim_status.visit_ledger()
+    claim = next(c for e in ledger for c in e["claims"] if c["id"] == c1)
+    # settled actual overrides the estimate
+    assert claim["expected"]["value"] == 124.97
+    assert claim["expected"]["estimate"] is False
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
