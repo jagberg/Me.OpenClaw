@@ -155,6 +155,19 @@ def test_reference_regex_does_not_match_bare_policy_number():
     assert claim_status.extract_reference("Policy Number: GABR-0306-DC1-00000001R") is None
 
 
+def test_extract_sr_recognizes_treatment_number_variant():
+    """Real bug (live-caught): the 'Claim Approval' letter has no 'Sr' text at
+    all — only 'Treatment number: 2', a distinct labeled field, not adjacent
+    to the reference. Missing this silently broadened an event's routing from
+    one claim to the whole thread."""
+    text = "Claim Reference:DC1-27-5628\nTreatment number: 2\nCondition: Illness (Arthritis)"
+    assert claim_status.extract_sr(text, "DC1-27-5628") == 2
+    # classic adjacent style still works
+    assert claim_status.extract_sr("DC1-27-5628 SR1 Request for information", "DC1-27-5628") == 1
+    # no reference at all -> no sr, regardless of what the text contains
+    assert claim_status.extract_sr("Treatment number: 2", None) is None
+
+
 def test_classify_acknowledgement_letter():
     assert claim_status.classify("PetCover - Acknowledgement Letter", "") == "acknowledged"
 

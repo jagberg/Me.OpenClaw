@@ -95,12 +95,20 @@ def extract_reference(text: str) -> str | None:
 
 
 def extract_sr(text: str, reference: str | None) -> int | None:
-    """Petcover's per-document serial ("DC1-27-5628 SR1", "... Sr 3"). Read only
-    where it sits right after the reference — a bare 'Sr N' elsewhere in a
-    letter carries no thread meaning and must not misfire."""
+    """Petcover's per-document serial within a Condition Thread, in either of
+    two confirmed-live formats: "DC1-27-5628 SR1"/"Sr 3" sitting right after
+    the reference (a bare 'Sr N' elsewhere carries no thread meaning and must
+    not misfire), or the newer "Treatment number: N" field — its own labeled
+    line, not adjacent to the reference, but unambiguous on its own (real:
+    the "Claim Approval" letter has no "Sr" text at all, only this field —
+    missing it silently broadened routing to the whole thread instead of one
+    claim, confirmed live)."""
     if not reference:
         return None
     match = re.search(re.escape(reference) + r"\s*SR\s*0*(\d+)", text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"Treatment number:?\s*(\d+)", text, re.IGNORECASE)
     return int(match.group(1)) if match else None
 
 
