@@ -1,6 +1,6 @@
 import json
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from . import claim_forms, db
 
@@ -651,6 +651,32 @@ def visit_ledger() -> list:
         claims = claims_by_txn.get(txn["id"], [])
         ledger.append({"txn": txn, "claims": claims, "claim_count": len(claims)})
     return ledger
+
+
+def history_rows(days: int = 365) -> list[dict]:
+    """Flat, one-row-per-claim view of visit_ledger() for Telegram's /history.
+    A split charge's claims already appear as separate entries in the nested
+    ledger — this just flattens them and windows by transaction date, keeping
+    visit_ledger's newest-first order (a charge with no claim yet contributes
+    no rows, same as it contributes nothing to render in the web ledger)."""
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    rows = []
+    for entry in visit_ledger():
+        txn = entry["txn"]
+        if txn["date"] < cutoff:
+            continue
+        for claim in entry["claims"]:
+            rows.append(
+                {
+                    "date": txn["date"],
+                    "merchant": txn["merchant"],
+                    "amount": txn["amount"],
+                    "status": claim["status"],
+                    "pet_name": claim["pet_name"],
+                    "condition_text": claim["condition_text"],
+                }
+            )
+    return rows
 
 
 def dashboard_lists() -> dict:

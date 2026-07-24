@@ -1899,6 +1899,34 @@ def test_visit_ledger_splits_condition_excess_per_condition():
     assert claim["expected"]["value"] == 100.0, claim["expected"]
 
 
+def test_history_rows_windows_by_date_and_flattens_split_charges():
+    """history_rows() (Telegram /history) windows visit_ledger() to the last
+    `days` and flattens its nested claims to one row per claim, newest first —
+    a charge shared by two claims (different pets) must yield two rows."""
+    db.init_db()
+    today = datetime.now(timezone.utc).date()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM claim_status_events")
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        echo = conn.execute("SELECT id FROM pets WHERE name='Echo'").fetchone()[0]
+        in_window = (today - timedelta(days=30)).isoformat()
+        older = (today - timedelta(days=30 * 2)).isoformat()
+        out_of_window = (today - timedelta(days=400)).isoformat()
+        t_recent = _insert_txn(conn, in_window, -50.0)
+        _insert_ledger_claim(conn, t_recent, aari, "sent", "Arthritis", 50.0)
+        t_shared = _insert_txn(conn, older, -80.0)
+        _insert_ledger_claim(conn, t_shared, aari, "matched", "Arthritis", 35.0)
+        _insert_ledger_claim(conn, t_shared, echo, "matched", "Vaccination", 0.0)
+        t_stale = _insert_txn(conn, out_of_window, -60.0)
+        _insert_ledger_claim(conn, t_stale, aari, "settled", "Injury", 60.0)
+
+    rows = claim_status.history_rows()
+    assert [r["date"] for r in rows] == [in_window, older, older], "stale row excluded, newest-first order kept"
+    assert {r["pet_name"] for r in rows if r["date"] == older} == {"Aari", "Echo"}, "shared charge yields one row per claim"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

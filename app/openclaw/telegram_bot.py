@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 from datetime import datetime, timezone
@@ -18,7 +19,8 @@ HELP_TEXT = (
     "/sent <claim_id> — mark a drafted claim as sent (starts Petcover reply tracking)\n"
     "/resolved <claim_id> — confirm you've dealt with an info request/suspension\n"
     "/vetemail <merchant name> <email> — set a vet's contact address for invoice requests\n"
-    "/notvet <merchant text> — mark a merchant as not-a-vet so its charges never become claims"
+    "/notvet <merchant text> — mark a merchant as not-a-vet so its charges never become claims\n"
+    "/history — browse the past year of vet claims, paged"
 )
 
 _application: Application | None = None
@@ -251,6 +253,78 @@ async def notvet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     result = handle_notvet(username, " ".join(context.args))
     await update.message.reply_text(result["message"])
+
+
+# Kept in sync with templates/index.html's status_chip macro — same labels,
+# different rendering (HTML <pre> table here vs a colored chip there).
+_HISTORY_STATUS_LABELS = {
+    "pending_match": "No invoice",
+    "matched": "Matched",
+    "drafted": "Drafted",
+    "sent": "Sent",
+    "acknowledged": "Acknowledged",
+    "info_requested": "Info requested",
+    "suspended": "Suspended",
+    "settled": "Settled",
+    "declined": "Declined",
+    "approved": "Approved",
+    "below_excess": "Below excess",
+    "absorbed": "Absorbed",
+}
+_HISTORY_PAGE_SIZE = 15
+
+
+def _format_history_page(rows: list[dict], page: int, page_size: int = _HISTORY_PAGE_SIZE) -> tuple[str, int]:
+    """Renders one page as an HTML <pre> table — Telegram's default font is
+    proportional, so alignment only holds inside <pre>/<code>. Rows are
+    grouped by month for scannability; fields are escaped AFTER padding to a
+    fixed width so alignment holds for the near-universal no-special-char
+    case (a literal '&' in a merchant name would widen past its column, but
+    that's rarer than worth precomputing display-width-aware padding for)."""
+    total_pages = max(1, -(-len(rows) // page_size))
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    chunk = rows[start : start + page_size]
+
+    lines = []
+    current_month = None
+    for row in chunk:
+        month_key = row["date"][:7]
+        if month_key != current_month:
+            if current_month is not None:
+                lines.append("")
+            lines.append(datetime.strptime(month_key, "%Y-%m").strftime("%b %Y"))
+            current_month = month_key
+        day = row["date"][5:]
+        vet = html.escape(f"{(row['merchant'] or '')[:10]:<10}")
+        amt = f"${abs(row['amount']):.0f}"
+        status = html.escape(_HISTORY_STATUS_LABELS.get(row["status"], row["status"]))
+        lines.append(f"{day:<5} {vet} {amt:>6} {status}")
+        detail = " · ".join(filter(None, [row["pet_name"], row["condition_text"]]))
+        if detail:
+            lines.append(f"      {html.escape(detail)}")
+
+    body = "\n".join(lines) if lines else "No claims in this window."
+    header = f"\U0001f4cb <b>Vet Claim History</b> — page {page}/{total_pages} · {len(rows)} visits"
+    return f"{header}\n<pre>{body}</pre>", total_pages
+
+
+def _history_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup | None:
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"hist:{page - 1}"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"hist:{page + 1}"))
+    return InlineKeyboardMarkup([buttons]) if buttons else None
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    username = update.effective_user.username if update.effective_user else None
+    if not _is_authorized(username):
+        return
+    rows = claim_status.history_rows()
+    text, total_pages = _format_history_page(rows, page=1)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=_history_keyboard(1, total_pages))
 
 
 def mark_sent_button(claim_id: int) -> InlineKeyboardMarkup:
@@ -492,6 +566,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         message = _execute_action(proposal)
         await _append_result(query, f"✅ {message}")
+    elif data.startswith("hist:"):
+        page = int(data.split(":", 1)[1])
+        rows = claim_status.history_rows()
+        text, total_pages = _format_history_page(rows, page)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=_history_keyboard(page, total_pages))
 
 
 async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -550,6 +629,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("resolved", resolved_command))
     application.add_handler(CommandHandler("vetemail", vetemail_command))
     application.add_handler(CommandHandler("notvet", notvet_command))
+    application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_reply))
     return application
