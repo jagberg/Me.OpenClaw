@@ -36,8 +36,8 @@
 
 ## 5. Budget + loop
 
-- [x] 5.1 `handle_message` passes `max_iterations=6`
-- [x] 5.2 **Measure** the real context/token limit and resolve the `agent.py` "8k cap" vs `config.py` "no context cap" contradiction — record the answer in one place, don't inherit it
+- [x] 5.1 ~~`handle_message` passes `max_iterations=6`~~ — raised, then put BACK to 4: a live 429 exposed a 100k tokens/**day** cap that header-only measurement missed (ADR-0016 amendment). Extra iterations are charged against <40 requests/day.
+- [x] 5.2 Measured: 131,072 context / 32,768 completion / 12,000 tokens-per-min / 1,000 req-per-day / **100,000 tokens-per-DAY**. `agent.py`'s "8k cap" was wrong; `config.py`'s "100k/day" was right. The TPD limit is absent from rate-limit headers and appears only in the 429 body — measuring headers alone first produced a confident, wrong "no daily token limit exists"
 - [x] 5.3 Keep every new tool description to one line
 
 ## 6. Tests (`app/tests/test_core.py`)
@@ -63,9 +63,32 @@
 ## 8. Deploy + live verification
 
 - [x] 8.1 Full suite green (104 before this change)
-- [ ] 8.2 Deploy via `./scripts/deploy.ps1` from the `Me.OpenClaw-telegram-claimquery` worktree — not bare compose (leaves `APP_VERSION` unknown, mistags every `telegram_messages` row)
-- [ ] 8.3 Live: "what actions do I have for July 2025 transactions"
-- [ ] 8.4 Live: "what did I send that's awaiting a reply"
-- [ ] 8.5 Live: scoped "go through the Petcover mail" — confirm the reply states its own scope
+- [x] 8.2 Deploy via `./scripts/deploy.ps1` from the `Me.OpenClaw-telegram-claimquery` worktree — not bare compose (leaves `APP_VERSION` unknown, mistags every `telegram_messages` row)
+- [x] 8.3 Live: "what actions do I have for July 2025 transactions"
+- [x] 8.4 Live: "what did I send that's awaiting a reply"
+- [x] 8.5 Live: scoped "go through the Petcover mail" — confirm the reply states its own scope
 - [ ] 8.6 Live: capture a task from chat, confirm the tap writes it and the untapped case doesn't
 - [ ] 8.7 Record what was *actually verified live* here, not merely what was coded
+
+## 9. Live verification results (2026-07-25, real DB + real Gmail + real Groq)
+
+Deployed `e180b92+feat/telegram-agent-reach` via `deploy.ps1`; `/health` reported
+`polling_alive: true`, queue 0.
+
+**Verified working against real data:**
+- Date scoping — July 2025 correctly reports the range empty; Aug 2025 returns exactly #21 and #20; Dec 2025 returns #16 and #17. The model resolved "July 2025" to the right range unaided.
+- `submissions_awaiting_reply` — 5 real submissions, batches correctly collapsed to one entry each (#8+#22, #6+#7).
+- `claim_detail(21)` — produced the answer that was previously impossible: flag plus `claimed_amount=$35.00 paid_amount=$22.75 fixed_excess_stated=$0.00 age_contribution_stated=$12.25`. Also re-surfaces the known #21 data-quality gap (our $44.75 vs Petcover's stated $35.00 claimed).
+- `rematch_claims(merchant="bankstown")` — real Gmail search, scoped to exactly the 2 pending Bankstown claims, left #17 (a different vet) alone. **Run twice: identical result, no state change** — the idempotency the direct-acting decision rests on, confirmed live and not just in a stub.
+- `poll_petcover_now` — run twice, no new events, and the reply carried its own scope disclaimer rather than implying Petcover had never written.
+
+**Three real bugs the live pass caught that tests had not:**
+1. `"what claim emails were sent that you can verify and check for a response"` routed to the **vet** invoice-request sweep and answered "nothing to verify" while 5 submissions sat awaiting Petcover. Both tool descriptions said "sent"; neither said to whom. Fixed + regression test (`841e3a4`).
+2. `"last reply: unclassified"` read as though Petcover had answered something meaningful, when an unclassified event is a reply we couldn't parse and never sets status (ADR-0008). Fixed (`c915ead`).
+3. `"remember I need to call the vet…"` died with a raw Groq 400 dump — the model emitted `<function=list_tasks,{...}</function>` and `_is_rate_limited` only matched 429, so it never retried. Now retried, with a message that doesn't claim an outage. Also called `list_tasks` for "remember X", so the prompt now maps remember/don't-let-me-forget to `propose_create_task`. Fixed + test (`e180b92`).
+
+Post-fix re-test: all three questions answer correctly (see 8.3–8.5).
+
+**NOT verified live — and why:**
+- [ ] 9.1 Task capture end-to-end (8.6). Blocked partway: live testing consumed the day's Groq budget (429 at 98,676/100,000 TPD). The proposal path leaked no write on either attempt — the `tasks` table stayed at 44 rows — and the confirm-tap write/close path is covered by `test_agent_task_proposals_write_nothing_until_confirmed`. The **model choosing** `propose_create_task` for "remember X" is the specific thing still unproven live; the prompt rule for it was written *after* the budget ran out.
+- [ ] 9.2 The Telegram transport itself. Everything above ran through `agent.handle_message` in the container — real model, real tools, real DB — but not through a Telegram message. Justin sending the three questions from his phone is the last mile.

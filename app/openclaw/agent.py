@@ -3,13 +3,13 @@ domain, driven by llm.chat's bounded tool loop.
 
 Read tools run immediately and return compact summaries (never raw email dumps).
 The reason is NOT a context cap — measured 2026-07-25, llama-3.3-70b-versatile
-has a 131,072-token context window. The real ceiling is Groq's free-tier
-**12,000 tokens per minute** (`x-ratelimit-limit-tokens`; 1,000 requests/day is
-the other limit, and there is no daily *token* limit). One turn is up to 7
-requests (max_iterations=6 plus the forced answer), each re-sending the whole
-tool schema and history — so a turn that dumps raw emails can exhaust a minute's
-budget by itself. llm._completion retries 429s with backoff, so hitting it
-degrades to a slow answer rather than a failed one. Act tools NEVER mutate: they
+has a 131,072-token context window, so agent.py's old "8k cap" claim was wrong.
+The real ceiling is Groq's free-tier **100,000 tokens per DAY** (see config.py).
+Every request re-sends the whole tool schema (~1.5k tokens of the ~2.6k a chat
+request costs), so the day's budget is well under 40 requests and ONE turn can
+spend several. That is why the tool loop stays at the default 4 iterations and
+why summaries are mandatory: a turn that dumps raw emails costs Justin the rest
+of his day. Act tools NEVER mutate: they
 record a *proposed action* that the Telegram layer renders as a Confirm button;
 the write happens only on the tap (telegram_bot._execute_action). That harness
 gate — not the model's good behaviour — is what enforces the hard rules.
@@ -555,9 +555,12 @@ def handle_message(text: str, chat_id: int | None = None) -> tuple[str, dict | N
     impls = _build_impls(proposals)
     prior = _history.get(chat_id, []) if chat_id is not None else []
     messages = [{"role": "system", "content": system_prompt()}, *prior, {"role": "user", "content": text}]
-    # 6, not the default 4: a real request is now sweep -> read -> answer, and
-    # 4 rounds left no headroom for a follow-up read before the forced answer.
-    result = llm.chat(messages, tools=TOOLS, tool_impls=impls, purpose="chat", max_iterations=6)
+    # Left at the default 4. It was briefly raised to 6 for headroom, before a
+    # live 429 revealed a 100k tokens/DAY cap (config.py) that header-only
+    # measurement had missed: at ~2.6k tokens a request, extra iterations are
+    # charged against a budget of under 40 requests a day. 4 rounds still cover
+    # the deepest real path (sweep -> read -> answer) with a spare.
+    result = llm.chat(messages, tools=TOOLS, tool_impls=impls, purpose="chat")
     if chat_id is not None:
         turns = [*prior, {"role": "user", "content": text}, {"role": "assistant", "content": result["text"] or ""}]
         _history[chat_id] = turns[-HISTORY_TURNS * 2 :]

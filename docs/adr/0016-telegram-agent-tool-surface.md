@@ -71,18 +71,36 @@ A specific regression it would cause: OpenClaw holds a direct `googleapiclient` 
 ### Negative / Risks
 - **A prompt rule with a carve-out is weaker than an absolute one.** The model may still over-claim at the margin. Mitigated by the sweeps' reply text carrying their own scope, so the *evidence* in the answer is bounded even if the prose overreaches.
 - **The tool schema is not free.** 8 tools → 15, and the whole schema ships in every request. Measured 5.9 KB; a test caps it at 9 KB so the next addition is deliberate.
-- **`max_iterations` went 4 → 6**, so a turn is now up to 7 requests. Against Groq's measured **12,000 tokens/minute**, a heavy turn can exhaust a minute's budget on its own. `llm._completion` retries 429s with backoff, so this degrades to a slow answer rather than a failure — but it is a real new pressure, not a free change.
+- **`max_iterations` was raised 4 → 6 and then put back to 4** — see the amendment below. The daily token budget, not per-turn depth, is the scarce resource.
 - `submissions_awaiting_reply` measures waiting from `vet_claims.updated_at`, because **no sent-at column exists**. `mark_sent` stamps it and nothing else touches an unanswered submission, so it is correct in the common case; once a reply lands the last event is reported instead. A precise sent-at column would need live DDL and was not worth it for this.
 
 ## Note — a documented limit that was wrong in two places
 
-Resolving this required settling a contradiction rather than inheriting it: `agent.py` claimed turns were kept "under the provider's 8k context cap" while `config.py` said the model had "no context cap" and "100k tokens/day". Both were wrong. Measured from the API on 2026-07-25:
+Resolving this required settling a contradiction rather than inheriting it: `agent.py` claimed turns were kept "under the provider's 8k context cap" while `config.py` said the model had "no context cap" and "100k tokens/day". Measured from the API on 2026-07-25:
 
 | | measured |
 |---|---|
 | context window | 131,072 tokens |
 | max completion tokens | 32,768 |
-| `x-ratelimit-limit-tokens` | **12,000 per minute** |
-| `x-ratelimit-limit-requests` | 1,000 per day |
+| tokens per minute | 12,000 |
+| requests per day | 1,000 |
+| **tokens per day** | **100,000** |
 
-There is no daily token limit. The "keep turns small" discipline was right for the wrong reason — the binding constraint is per-minute throughput, not per-request context. Both comments now carry the measured figures.
+`agent.py`'s "8k context cap" was simply wrong. `config.py`'s "100k tokens/day" was right — see the amendment for how nearly that got "corrected" away.
+
+The "keep turns small" discipline was right, but not for the stated reason: the binding constraint is the daily token budget, not per-request context.
+
+## Amendment (2026-07-25) — the daily cap that headers don't report
+
+The first version of this ADR stated flatly that **"There is no daily token limit."** That was wrong, and wrong in the more dangerous direction: it "corrected" a `config.py` comment that had been right all along.
+
+The error came from *how* it was measured. `x-ratelimit-limit-*` response headers report tokens-per-minute and requests-per-day, and nothing else — so header inspection alone produces a confident, complete-looking picture with the daily token limit missing from it. The limit surfaced the same hour, from the body of a real 429 during live verification:
+
+> Rate limit reached … on tokens per day (TPD): Limit 100000, Used 98676, Requested 2638. Please try again in 18m55s.
+
+Two consequences:
+
+1. **`max_iterations` goes back to 4.** It had been raised to 6 for headroom on the reasoning that only a 12,000/minute limit applied, where extra iterations cost latency at worst. Against 100,000 tokens/**day** at ~2,600 tokens a request — the tool schema ships every time — the day's whole budget is under 40 requests, and one turn can spend several. 4 rounds still cover the deepest real path (sweep → read → answer) with a spare. Not a reversal of the decision, a correction of the arithmetic it rested on.
+2. **The tool-schema size guard matters more than it looked.** At ~1.5k of those 2.6k tokens, the schema is the largest fixed cost of every request, and 8 → 15 tools raised the price of *every* chat turn, not just the ones using the new tools.
+
+Method note worth keeping: this is the second time in this change that measuring the obvious surface gave a wrong-but-plausible answer. Headers are a partial view of a provider's limits; the errors it throws are the complete one.

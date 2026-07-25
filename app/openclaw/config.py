@@ -17,13 +17,19 @@ GEMINI_RATE_LIMIT_PER_MIN = _int_env("GEMINI_RATE_LIMIT_PER_MIN", 15)
 # LLM backend — provider-agnostic (ADR supersedes 0001). Any OpenAI-compatible
 # provider works by pointing base_url + model + key at it; llm.py holds the
 # per-provider base_url/default-model table. Default is Groq's free tier
-# (llama-3.3-70b-versatile). Measured limits 2026-07-25 from the API itself,
-# because the previous note here ("100k tokens/day, no context cap") and
-# agent.py's ("8k context cap") contradicted each other and were both wrong:
-#   context window          131,072 tokens   (not 8k, and not uncapped)
+# (llama-3.3-70b-versatile). Limits measured 2026-07-25, because this note and
+# agent.py's "8k context cap" contradicted each other:
+#   context window          131,072 tokens   (so the "8k cap" was simply wrong)
 #   max completion tokens    32,768
-#   x-ratelimit-limit-tokens 12,000 per MINUTE  <- the real binding constraint
-#   x-ratelimit-limit-requests 1,000 per day    (no daily token limit exists)
+#   tokens per MINUTE        12,000          (x-ratelimit-limit-tokens)
+#   requests per day          1,000          (x-ratelimit-limit-requests)
+#   tokens per DAY          100,000          <- the binding constraint
+# The TPD limit does NOT appear in the rate-limit response headers — only in the
+# body of the 429 it eventually throws. Measuring from headers alone produced a
+# confident "no daily token limit exists", which a live 429 disproved the same
+# hour. The original 100k/day note here was right; don't "correct" it again.
+# At ~2.6k tokens per chat request (the tool schema ships every time), that's
+# well under 40 requests a day — which is why the agent's tool loop stays tight.
 # Blank LLM_MODEL = provider default. LLM_PROVIDER=gemini keeps the legacy backend (extract only) for
 # rollback; Gemini also serves the vision-OCR fallback regardless of provider.
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").lower()
