@@ -186,6 +186,21 @@ def _submission_key(claim) -> str:
     return claim["draft_id"] or f"claim-{claim['id']}"
 
 
+def submission_group_id(claim_ids) -> str:
+    """A submission's short sayable id: 'S' + its claim ids ascending — 'S6+7'.
+
+    Derived, never stored. A stored sequence would buy a fixed-width token at the
+    cost of manual live DDL (root CLAUDE.md), and this one carries the ids Justin
+    already acts on (/mark 6 …) instead of adding a second vocabulary beside them.
+    Sorted, so read order can't change the token.
+
+    ponytail: derived is only stable because nothing re-splits a drafted batch —
+    the only reset (invoice_matching.unmatch) clears the batch entirely. If a redo
+    path ever re-groups drafted claims this has to become a real column.
+    """
+    return "S" + "+".join(str(i) for i in sorted(claim_ids))
+
+
 def correlate_ack(text: str) -> list:
     """Fallback correlation when no stored reference matches (an ack teaching the
     reference, or an early reply). Candidates are un-referenced, still-awaiting
@@ -443,6 +458,19 @@ def mark_sent(claim_id: int) -> dict:
         if claim is None:
             return {"ok": False, "message": f"No claim #{claim_id} found."}
         if claim["status"] != "drafted":
+            # The first tap on a batch advances every member, so any second tap —
+            # a sibling card, an older push, the dashboard's per-claim button —
+            # necessarily lands here. "isn't drafted (status: sent)" read as a
+            # failure when the send had in fact succeeded. Only 'sent' gets this
+            # wording: a claim at acknowledged/settled moved on through Petcover's
+            # replies and must report where it actually is.
+            if claim["status"] == "sent":
+                group = _sent_group_ids(conn, claim_id, claim["draft_id"])
+                return {
+                    "ok": False,
+                    "message": f"Submission {submission_group_id(group)} ({_id_list(group)})"
+                    " was already marked sent — nothing to do.",
+                }
             return {"ok": False, "message": f"Claim #{claim_id} isn't drafted (status: {claim['status']})."}
         if claim["draft_id"]:
             cur = conn.execute(
@@ -455,8 +483,30 @@ def mark_sent(claim_id: int) -> dict:
                 (now, claim_id),
             )
         count = cur.rowcount
-    suffix = f" ({count} claims in this submission)" if count > 1 else ""
-    return {"ok": True, "message": f"Claim #{claim_id} marked sent{suffix} — Petcover replies now tracked."}
+        group = _sent_group_ids(conn, claim_id, claim["draft_id"])
+    # Group id supplements the claim ids, never replaces them — Justin's commands
+    # take ids and a regression test enforces their presence in every message.
+    suffix = f", {count} claims in this submission" if count > 1 else ""
+    return {
+        "ok": True,
+        "message": f"Submission {submission_group_id(group)} ({_id_list(group)}{suffix})"
+        " marked sent — Petcover replies now tracked.",
+    }
+
+
+def _id_list(claim_ids) -> str:
+    return ", ".join(f"#{i}" for i in sorted(claim_ids))
+
+
+def _sent_group_ids(conn, claim_id: int, draft_id: str | None) -> list[int]:
+    """Member ids of the submission this claim's send covers. Restricted to 'sent'
+    so a member Petcover has already answered isn't relabelled as just-sent."""
+    if not draft_id:
+        return [claim_id]
+    rows = conn.execute(
+        "SELECT id FROM vet_claims WHERE draft_id = ? AND status = 'sent'", (draft_id,)
+    ).fetchall()
+    return [r["id"] for r in rows] or [claim_id]
 
 
 def confirm_resolved(claim_id: int) -> dict:
@@ -722,6 +772,17 @@ ACTION_PRIORITY = (
     "blocked_insurer",
 )
 
+# Kinds where the action belongs to the whole submission, not one claim: sending
+# one Gmail draft sends every claim in it, so N cards for one email is N-1 taps
+# too many — and taps 2..N land on an already-sent claim, which read as failures.
+#
+# Stated explicitly rather than inferred from "has a draft_id" so the reasoning
+# stays reviewable: every other kind fires at or before `matched`, where no draft
+# and so no batch exists (pipeline.py:236 says the same), except confirm_resolved
+# and dismiss_mismatch, which hang off per-claim status events — collapsing those
+# would hide one claim's settlement mismatch behind its batch.
+SUBMISSION_LEVEL_ACTIONS = ("mark_sent",)
+
 # Nothing left for Justin to do. settled/declined end a Condition Thread;
 # below_excess (nothing payable) and absorbed (merged into a sibling claim) are
 # equally finished but don't, so they aren't in TERMINAL_STATUSES.
@@ -804,6 +865,9 @@ def pending_actions() -> list[dict]:
                     "title": title,
                     "blocks": blocks,
                     "claim_id": claim["id"],
+                    "claim_ids": [claim["id"]],
+                    "group_id": submission_group_id([claim["id"]]),
+                    "draft_id": claim["draft_id"],
                     "pet_name": claim["pet_name"],
                     "pet_id": claim["pet_id"],
                     "merchant": txn["merchant"],
@@ -819,8 +883,51 @@ def pending_actions() -> list[dict]:
                     "actionable": kind != "blocked_insurer",
                 }
             )
+    actions = _collapse_submissions(actions)
     actions.sort(key=lambda a: (a["date"], ACTION_PRIORITY.index(a["kind"])))
     return actions
+
+
+def _collapse_submissions(actions: list[dict]) -> list[dict]:
+    """Fold SUBMISSION_LEVEL_ACTIONS down to one entry per submission.
+
+    The collapsed entry keeps a single `claim_id` (the lowest member's, the same
+    convention as agent._single_target) so every existing consumer keeps working
+    untouched: the callback token is `sent:{claim_id}` and mark_sent(any member)
+    already advances the whole group via `WHERE draft_id = ?`."""
+    out, groups = [], {}
+    for action in actions:
+        if action["kind"] in SUBMISSION_LEVEL_ACTIONS and action["draft_id"]:
+            groups.setdefault(action["draft_id"], []).append(action)
+        else:
+            out.append(action)
+    for members in groups.values():
+        members.sort(key=lambda a: a["claim_id"])
+        if len(members) == 1:
+            out.append(members[0])
+            continue
+        oldest = min(members, key=lambda a: a["date"])
+        out.append(
+            {
+                **members[0],
+                "claim_ids": [a["claim_id"] for a in members],
+                "group_id": submission_group_id(a["claim_id"] for a in members),
+                # One email covering several charges: the total is what Justin is
+                # confirming. Urgency comes from the OLDEST member — a visit stops
+                # being claimable at a year, so the batch expires with its eldest.
+                "amount": sum(a["amount"] for a in members),
+                "date": oldest["date"],
+                "age_days": oldest["age_days"],
+                # Members differ in date, amount and condition (live: #6 Raised ALT
+                # $351.50, #7 Arthritis $132.50), so one summary line would hide
+                # what's in the email.
+                "members": [
+                    {k: a[k] for k in ("claim_id", "merchant", "amount", "date", "condition_text")}
+                    for a in members
+                ],
+            }
+        )
+    return out
 
 
 # Sent to Petcover (or ready to be) and no final answer yet. Broader than

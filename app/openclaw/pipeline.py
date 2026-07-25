@@ -147,11 +147,13 @@ def _submission_label(group) -> str:
     """A submission's identifier for Justin. Once Petcover assigns a claim
     reference (learned from their reply), that leads — it's what their emails
     cite. Claim #ids are always included: Justin acts on them (/mark, /pet,
-    replies quote them back)."""
+    replies quote them back). Before a reference exists the derived group id
+    leads, so a batch is sayable from `drafted` onwards, not only after Petcover
+    answers."""
     pet = group[0]["pet_name"] or "your pet"
     ids = ", ".join(f"#{c['id']}" for c in group)
-    ref = group[0]["petcover_reference"]
-    return f"{ref} ({pet} {ids})" if ref else f"{pet} ({ids})"
+    ref = group[0]["petcover_reference"] or claim_status.submission_group_id(c["id"] for c in group)
+    return f"{ref} ({pet} {ids})"
 
 
 def _summarize_drafted(group) -> str:
@@ -172,7 +174,8 @@ def _summarize_drafted(group) -> str:
         else:
             lines.append(f"  • #{c['id']} {date} — {service}")
     count = len(group)
-    header = f"{pet}'s vet claim — ready to send ({count} item{'s' if count > 1 else ''}, ${total:.2f})"
+    gid = claim_status.submission_group_id(c["id"] for c in group)
+    header = f"{pet}'s vet claim {gid} — ready to send ({count} item{'s' if count > 1 else ''}, ${total:.2f})"
     return "\n".join(
         [header, *lines, f'Open the Gmail app → Drafts (subject "Vet claim — {pet}"):', DRAFT_SEARCH_LINK]
     )

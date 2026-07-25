@@ -16,7 +16,7 @@ os.environ["DATABASE_PATH"] = os.path.join(_tmpdir, "test_telegram.db")
 os.environ.setdefault("GEMINI_API_KEY", "")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 
-from openclaw import claim_forms, db, invoice_matching, pipeline, telegram_bot  # noqa: E402
+from openclaw import claim_forms, claim_status, db, invoice_matching, pipeline, telegram_bot  # noqa: E402
 
 AUTHORIZED_USER = "jagberg"
 UNAUTHORIZED_USER = "someone_else"
@@ -265,6 +265,59 @@ def test_sent_command_advances_batch():
             ).fetchall()
         ]
     assert statuses == ["sent", "sent"], "one /sent must advance every claim sharing the draft"
+
+
+def test_second_tap_on_a_sent_batch_reads_as_a_no_op():
+    """The first tap advances every member, so any second tap — sibling card, old
+    push, dashboard button — lands on an already-sent claim. It used to answer
+    "isn't drafted (status: sent)", which read as a failure when the send had
+    actually worked."""
+    a = _seed_drafted_claim("NOOP VET A", draft_id="draft-noop-1", pet_name="NoopPet")
+    b = _seed_drafted_claim("NOOP VET B", draft_id="draft-noop-1", pet_name="NoopPet")
+    first = telegram_bot.handle_sent(AUTHORIZED_USER, a)
+    assert first["ok"] is True
+    gid = claim_status.submission_group_id([a, b])
+    assert gid in first["message"] and f"#{a}" in first["message"]
+
+    second = telegram_bot.handle_sent(AUTHORIZED_USER, b)
+    assert second["ok"] is False, "nothing was done — but that isn't a failure"
+    assert "already marked sent" in second["message"]
+    assert gid in second["message"] and f"#{b}" in second["message"]
+    assert "isn't drafted" not in second["message"]
+
+    # a claim that moved PAST sent must report where it really is
+    with db.get_connection() as conn:
+        conn.execute("UPDATE vet_claims SET status = 'acknowledged' WHERE id = ?", (a,))
+    moved_on = telegram_bot.handle_sent(AUTHORIZED_USER, a)
+    assert moved_on["ok"] is False
+    assert "acknowledged" in moved_on["message"] and "already marked sent" not in moved_on["message"]
+
+
+def test_batch_action_card_is_one_card_naming_every_member():
+    """One card, one button, and the members itemised — they differ in amount and
+    condition, so a single summary line would hide what's in the email."""
+    a = _seed_drafted_claim("CARD VET A", draft_id="draft-card-1", pet_name="CardPet")
+    b = _seed_drafted_claim("CARD VET B", draft_id="draft-card-1", pet_name="CardPet")
+    sends = [
+        x
+        for x in claim_status.pending_actions()
+        if x["kind"] == "mark_sent" and set(x["claim_ids"]) == {a, b}
+    ]
+    assert len(sends) == 1, "a 2-claim batch must produce exactly one actionable card"
+    action = sends[0]
+    text = telegram_bot._action_card_text(action)
+    assert claim_status.submission_group_id([a, b]) in text
+    assert f"#{a}" in text and f"#{b}" in text, "group id supplements the claim ids, never replaces them"
+    keyboard = telegram_bot._action_keyboard(action)
+    buttons = [btn for row in keyboard.inline_keyboard for btn in row]
+    assert len(buttons) == 1 and buttons[0].callback_data == f"sent:{min(a, b)}"
+    telegram_bot.handle_sent(AUTHORIZED_USER, int(buttons[0].callback_data.split(":", 1)[1]))
+    with db.get_connection() as conn:
+        statuses = [
+            r["status"]
+            for r in conn.execute("SELECT status FROM vet_claims WHERE id IN (?, ?)", (a, b)).fetchall()
+        ]
+    assert statuses == ["sent", "sent"], "the single tap advances the whole submission"
 
 
 def test_resolved_records_event():

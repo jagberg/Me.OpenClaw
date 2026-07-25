@@ -336,14 +336,33 @@ _ACTION_EMOJI = {
 
 def _action_card_text(action: dict) -> str:
     """One action as a short HTML card. Always carries the claim #id — Justin
-    acts by id (/mark, /pet), and an alert without one is unusable."""
-    lines = [
-        f"{_ACTION_EMOJI.get(action['kind'], '•')} <b>{_esc(action["title"].upper())}</b>",
-        f"Claim #{action['claim_id']} · {_esc(claim_card._vet_name(action["merchant"]))}"
-        f" · ${abs(action['amount']):,.2f}",
-    ]
-    who = " · ".join(filter(None, [action["pet_name"], action["condition_text"]]))
-    lines.append(f"{_esc(who) + ' · ' if who else ''}{action['date']} ({action['age_days']}d ago)")
+    acts by id (/mark, /pet), and an alert without one is unusable.
+
+    A submission-level action covers several claims (one Gmail draft, one email,
+    one tap), so it names the group and itemises the members: they differ in date,
+    amount and condition, and a single summary line would hide what's in the
+    email Justin is confirming he sent."""
+    members = action.get("members")
+    head = f"{_ACTION_EMOJI.get(action['kind'], '•')} <b>{_esc(action["title"].upper())}</b>"
+    if members:
+        lines = [
+            head,
+            f"<b>{action['group_id']}</b> · {len(members)} claims · ${abs(action['amount']):,.2f}",
+        ]
+        lines += [
+            f"  • #{m['claim_id']} {m['date']} · {_esc(claim_card._vet_name(m["merchant"]))}"
+            f" · ${abs(m['amount']):,.2f}{' · ' + _esc(m['condition_text']) if m['condition_text'] else ''}"
+            for m in members
+        ]
+        lines.append(f"{_esc(action['pet_name'] or '')} · oldest {action['date']} ({action['age_days']}d ago)")
+    else:
+        lines = [
+            head,
+            f"Claim #{action['claim_id']} · {_esc(claim_card._vet_name(action["merchant"]))}"
+            f" · ${abs(action['amount']):,.2f}",
+        ]
+        who = " · ".join(filter(None, [action["pet_name"], action["condition_text"]]))
+        lines.append(f"{_esc(who) + ' · ' if who else ''}{action['date']} ({action['age_days']}d ago)")
     lines.append(f"<i>Blocks: {_esc(action["blocks"])}</i>")
     return "\n".join(lines)
 

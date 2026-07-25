@@ -2268,6 +2268,75 @@ def test_pending_actions_one_per_claim_priority_and_blocked_split():
     assert [a["date"] for a in actions] == sorted(a["date"] for a in actions)
 
 
+def test_submission_group_id_is_order_independent():
+    """The token is derived from claim ids, so read order must not change it —
+    otherwise the same batch gets two names in two places."""
+    assert claim_status.submission_group_id([7, 6]) == "S6+7"
+    assert claim_status.submission_group_id([6, 7]) == "S6+7"
+    assert claim_status.submission_group_id([12]) == "S12"
+
+
+def test_batched_mark_sent_is_one_action_per_submission():
+    """One Gmail draft = one email = one tap. Two claims sharing a draft used to
+    yield two 'Send Gmail draft' cards, and the second tap landed on a claim the
+    first had already advanced (live: #6 + #7, 2026-07-25)."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM claim_status_events")
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        # different charges, different dates/amounts/conditions — one draft
+        t_a = _insert_txn(conn, "2026-04-17", -132.50)
+        t_b = _insert_txn(conn, "2026-05-18", -351.50)
+        a = _insert_ledger_claim(conn, t_a, aari, "drafted", "Arthritis", 132.50)
+        b = _insert_ledger_claim(conn, t_b, aari, "drafted", "Raised ALT", 351.50)
+        conn.execute("UPDATE vet_claims SET draft_id = 'one-draft' WHERE id IN (?, ?)", (a, b))
+        # a solo drafted claim must NOT be folded into anything
+        t_solo = _insert_txn(conn, "2026-06-01", -80.0)
+        solo = _insert_ledger_claim(conn, t_solo, aari, "drafted", "Ear infection", 80.0)
+        conn.execute("UPDATE vet_claims SET draft_id = 'solo-draft' WHERE id = ?", (solo,))
+
+    sends = [x for x in claim_status.pending_actions() if x["kind"] == "mark_sent"]
+    assert len(sends) == 2, "the batch collapses to one entry, the solo claim keeps its own"
+    batch = next(x for x in sends if len(x["claim_ids"]) > 1)
+    assert batch["claim_ids"] == sorted([a, b])
+    assert batch["group_id"] == claim_status.submission_group_id([a, b])
+    assert batch["claim_id"] == min(a, b), "representative = lowest id (the tap token takes one)"
+    assert abs(batch["amount"]) == 484.0, "the total is what Justin is confirming he sent"
+    assert batch["date"] == "2026-04-17", "urgency comes from the oldest member — expiry is per visit"
+    assert [m["condition_text"] for m in batch["members"]] == ["Arthritis", "Raised ALT"]
+
+    lone = next(x for x in sends if len(x["claim_ids"]) == 1)
+    assert lone["claim_ids"] == [solo] and lone["group_id"] == f"S{solo}"
+    assert "members" not in lone
+
+
+def test_only_submission_level_actions_collapse():
+    """A per-claim action must stay per-claim even when the claims share a draft:
+    two settlement mismatches in one batch are two figures to check, and folding
+    them would hide one behind the other."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM claim_status_events")
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        ids = []
+        for day, amount in (("2026-03-01", -100.0), ("2026-03-02", -200.0)):
+            txn = _insert_txn(conn, day, amount)
+            ids.append(_insert_ledger_claim(conn, txn, aari, "settled", "Arthritis", abs(amount)))
+        conn.execute(
+            "UPDATE vet_claims SET draft_id = 'shared', flag = 'settlement mismatch: paid less than claimed' "
+            "WHERE id IN (?, ?)",
+            tuple(ids),
+        )
+
+    assert claim_status.SUBMISSION_LEVEL_ACTIONS == ("mark_sent",)
+    mismatches = [a for a in claim_status.pending_actions() if a["kind"] == "dismiss_mismatch"]
+    assert sorted(a["claim_id"] for a in mismatches) == sorted(ids), "one entry per claim, not per draft"
+
+
 def test_dismiss_mismatch_clears_flag_and_records_why():
     """A settlement discrepancy must never just vanish — clearing the flag has
     to leave an append-only trace (ADR-0008), or the review is invisible."""
@@ -2589,6 +2658,30 @@ def test_agent_task_proposals_write_nothing_until_confirmed():
         assert "already closed" in impls["propose_close_task"](task_id, "again")
     finally:
         tasks_module._extract_follow_up = original
+
+
+def test_chat_answer_names_every_claim_in_a_batch():
+    """The collapse gave the agent one representative claim_id to render, which
+    would have printed '#6' and dropped '#7' from the answer describing that very
+    submission. Every referenced claim's id has to appear."""
+    from openclaw import agent
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute("DELETE FROM claim_status_events")
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        ids = []
+        for day, amount in (("2026-04-17", -132.50), ("2026-05-18", -351.50)):
+            txn = _insert_txn(conn, day, amount)
+            ids.append(_insert_ledger_claim(conn, txn, aari, "drafted", "Arthritis", abs(amount)))
+        conn.execute("UPDATE vet_claims SET draft_id = 'chat-draft' WHERE id IN (?, ?)", tuple(ids))
+
+    answer = agent._build_impls([])["pending_actions"]()
+    for claim_id in ids:
+        assert f"#{claim_id}" in answer, f"#{claim_id} missing — a dropped id is an unactionable answer"
+    assert claim_status.submission_group_id(ids) in answer
 
 
 def test_action_tokens_are_not_claim_shaped():

@@ -221,8 +221,13 @@ def _build_impls(proposals: list) -> dict:
         for a in actions:
             suffix = "" if a["actionable"] else "  [BLOCKED — no action can clear this]"
             who = a["pet_name"] or "no pet yet"
+            # A submission-level action covers several claims. Name every one of
+            # them: the representative id alone would hide the rest, and "every
+            # claim reference carries its id" is what makes an answer actionable.
+            ids = " ".join(f"#{i}" for i in a["claim_ids"])
+            group = f"{a['group_id']} ({ids}) " if len(a["claim_ids"]) > 1 else f"{ids} "
             lines.append(
-                f"#{a['claim_id']} {a['title']} — {who} · {a['merchant']} · "
+                f"{group}{a['title']} — {who} · {a['merchant']} · "
                 f"${abs(a['amount']):.2f} · {a['date']} ({a['age_days']}d ago){suffix}"
             )
         return "\n".join(lines)

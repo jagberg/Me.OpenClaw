@@ -40,6 +40,8 @@ Three different operations are all called "redo" and only Justin can say which h
 
 Note the premise was also wrong: #7's draft was never gone (verified live — draft `r-7259758204005672288`, correct recipient, subject and three attachments). See the subject-collision entry below for why it looked missing. Tasks #124 and #125 are open and duplicate; close them when this lands.
 
+**Answering this now also decides something else.** `submission-group-id` ships a submission id *derived* from its claim ids (`S6+7`), which is stable only because nothing can re-split a drafted batch. If the redo semantics chosen here can re-group drafted claims, that token stops being stable and has to become a stored `submission_id` column (manual live `ALTER TABLE` + backfill). Weighed as the rejected alternative in that change's `design.md` — check it before answering.
+
 ### No alert exists for "the DB is unreachable", and none can as built
 *Found 2026-07-25 during the outage in ADR-0018. Capability: `claims-pipeline-resilience`. See the ADR-0015 amendment.*
 
