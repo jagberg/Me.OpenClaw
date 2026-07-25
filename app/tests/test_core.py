@@ -2744,6 +2744,17 @@ def test_fallback_model_is_disclosed_in_the_reply():
         llm.chat = original
 
 
+def test_prompt_forbids_markdown_for_a_plain_text_channel():
+    """_handle_chat sends replies with no parse_mode, so markdown arrives
+    literally. gpt-oss-120b (reachable via the fallback chain) answers with pipe
+    tables by default — unreadable on a phone."""
+    from openclaw import agent
+
+    prompt = agent.system_prompt()
+    assert "NEVER use markdown tables" in prompt
+    assert "Telegram" in prompt
+
+
 def test_assistant_turn_drops_output_only_fields():
     """Live 400 (2026-07-25): `messages[2].reasoning: reasoning is not supported
     with this model`. The tool loop replayed the whole assistant message back

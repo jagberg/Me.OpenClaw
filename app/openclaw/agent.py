@@ -68,7 +68,12 @@ _BASE_SYSTEM_PROMPT = (
     "flag and recorded replies (claim_detail). If asked how the system works internally, say that's "
     "not something you can see rather than guessing at the implementation.\n"
     "- Never mention tool or function names to Justin. Say what you can do in plain words "
-    "('I can mark it sent'), not the name of the tool that does it."
+    "('I can mark it sent'), not the name of the tool that does it.\n"
+    # Telegram sends these replies as plain text (no parse_mode), so markdown
+    # arrives literally. gpt-oss-120b — reachable via the fallback chain —
+    # answers with pipe tables by default, which render as unreadable pipes.
+    "- Reply in short plain-text lines, one claim or task per line. NEVER use markdown tables, and "
+    "don't bother with ** bold ** — this is read in Telegram, where that markup shows up literally."
 )
 
 
