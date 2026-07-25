@@ -58,6 +58,18 @@ def _is_rate_limited(exc: Exception) -> bool:
     return status == 429 or "429" in str(exc)
 
 
+def _is_malformed_tool_call(exc: Exception) -> bool:
+    """Groq 400 `tool_use_failed`: the model emitted a broken pseudo-XML call
+    (seen live: `<function=list_tasks,{"status":"open"}</function>`) instead of
+    proper tool_calls JSON, and the API rejected its own output.
+
+    A model formatting slip, not an outage — and nondeterministic, so the same
+    prompt usually succeeds on the next attempt. Worth retrying precisely
+    because it got MORE likely when the tool surface went 8 -> 15 (ADR-0016):
+    without this a single garbled call surfaced to Justin as a raw 400 dump."""
+    return "tool_use_failed" in str(exc)
+
+
 def _completion(client, model: str, messages: list, tools, purpose: str):
     """One provider round-trip with retry/backoff, rate limiting and call logging.
     Returns the assistant message object. Raises LLMUnavailableError on failure."""
@@ -75,10 +87,20 @@ def _completion(client, model: str, messages: list, tools, purpose: str):
         except Exception as exc:  # network/API errors — logged, not swallowed
             last_error = exc
             _log_call(purpose, False, int((time.monotonic() - start) * 1000), str(exc))
-            if _is_rate_limited(exc) and attempt < MAX_RETRIES:
-                time.sleep(BASE_BACKOFF_SECONDS * attempt)
-                continue
+            if attempt < MAX_RETRIES:
+                if _is_rate_limited(exc):
+                    time.sleep(BASE_BACKOFF_SECONDS * attempt)
+                    continue
+                if _is_malformed_tool_call(exc):
+                    continue  # no backoff: nothing is overloaded, the output was just malformed
             break
+    if _is_malformed_tool_call(last_error):
+        # Distinct message: nothing is down, so "LLM unavailable" would send
+        # Justin looking for an outage that isn't there.
+        raise LLMUnavailableError(
+            f"the model kept producing a malformed tool call after {MAX_RETRIES} attempts — "
+            "try rephrasing the question"
+        ) from last_error
     raise LLMUnavailableError(f"LLM request failed after retries: {last_error}") from last_error
 
 

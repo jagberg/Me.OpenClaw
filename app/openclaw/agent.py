@@ -61,6 +61,9 @@ _BASE_SYSTEM_PROMPT = (
     "arrived — never that Petcover hasn't replied. To see what was already recorded, use claim_detail.\n"
     "- For tasks, ALWAYS include the task id as #N — it's how Justin closes them. Never invent an "
     "outcome when closing one; if he didn't say what happened, ask.\n"
+    # Live: "remember I need to call the vet..." made it call list_tasks.
+    "- 'Remember X' / 'don't let me forget X' / 'add a task' means propose_create_task with X as "
+    "the description. Only use list_tasks when he asks what tasks he HAS.\n"
     "- You cannot read OpenClaw's code, specs or docs. You CAN explain a claim's own state from its "
     "flag and recorded replies (claim_detail). If asked how the system works internally, say that's "
     "not something you can see rather than guessing at the implementation.\n"

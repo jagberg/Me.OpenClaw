@@ -2621,6 +2621,55 @@ def test_agent_prompt_narrows_mailbox_rule_without_dropping_it():
     assert "cannot read openclaw's code" in prompt, "no code/spec reading in the container"
 
 
+def test_malformed_tool_call_retries_then_fails_readably():
+    """Groq rejects its own garbled output with a 400 `tool_use_failed` (seen
+    live: `<function=list_tasks,{...}</function>`). That's a nondeterministic
+    formatting slip, not an outage — and it got likelier when the tool surface
+    went 8 -> 15. Retry it, and don't report an outage that isn't happening."""
+    from openclaw import llm
+
+    class _Boom(Exception):
+        pass
+
+    err = _Boom("Error code: 400 - {'code': 'tool_use_failed', 'failed_generation': '<function=x'}")
+    assert llm._is_malformed_tool_call(err)
+    assert not llm._is_rate_limited(err), "a 400 is not a rate limit"
+
+    attempts = []
+
+    class _Client:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    attempts.append(1)
+                    if len(attempts) < 2:
+                        raise err
+                    class _M:
+                        content = "recovered"
+                        tool_calls = None
+                    class _R:
+                        choices = [type("C", (), {"message": _M()})()]
+                    return _R()
+
+    message = llm._completion(_Client(), "m", [{"role": "user", "content": "hi"}], None, "test")
+    assert message.content == "recovered" and len(attempts) == 2, "one garbled call must not fail the turn"
+
+    class _AlwaysBad:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    raise err
+
+    try:
+        llm._completion(_AlwaysBad(), "m", [{"role": "user", "content": "hi"}], None, "test")
+        raise AssertionError("must still fail visibly when it never recovers")
+    except llm.LLMUnavailableError as exc:
+        assert "malformed tool call" in str(exc), "says what actually went wrong"
+        assert "try rephrasing" in str(exc)
+
+
 def test_petcover_and_vet_mail_tools_are_distinguishable():
     """Live miss (2026-07-25): asked "what claim emails were sent that you can
     verify and check for a response", the model called the VET invoice-request
