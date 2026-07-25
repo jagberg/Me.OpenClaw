@@ -1,12 +1,10 @@
 # OpenClaw
 
-Personal assistant that watches for vet expenses and does the insurance-claim legwork: detect the bank charge, find the matching invoice in Gmail, fill the insurer's PDF claim form, stage a ready-to-send Gmail draft, then track the insurer's replies (acknowledgement → info requests/suspensions → settlement) until the money lands. Also captures tasks/reminders from email onto a local dashboard.
+An agent that turns bank transactions into ready-to-send insurance claims: detect the charge, find the matching invoice in email, fill the insurer's PDF form, stage a draft, then track the insurer's replies until the money lands.
 
-Built for one household (two dogs, two insurers). Three promises it never breaks:
+It's a household-scale project, but the interesting part isn't the domain — it's what an agentic system is allowed to do unsupervised. Three constraints hold no matter what: **it never sends email** (drafts only, a human hits send), **it never stores bank credentials** (manual CSV upload), and **it never guesses a required field** — anything it can't derive from a document is surfaced as a question instead of inferred. Failures are visible by rule: every one writes a human-readable reason to the claim, no silent no-ops.
 
-- **Never sends email.** Gmail drafts only — Justin reviews and hits send himself.
-- **Never stores bank logins.** Transactions arrive via manual NetBank CSV upload.
-- **Never guesses required claim fields.** Anything it can't derive from a document (the claimed condition, an ambiguous pet) is flagged and asked — on Telegram and the dashboard — not inferred.
+The reasoning lives in [`docs/adr/`](docs/adr/), and every change went through a spec first — [`openspec/`](openspec/). Two worth reading if you only read two: **ADR-0007** (why a bank charge is a *ceiling* on a claim, not an equality target — the assumption that broke first against real data) and **ADR-0014/0015** (Telegram actions were being silently dropped; the fix was a durable message log with replay and a watchdog, not a retry).
 
 ## The goal
 
