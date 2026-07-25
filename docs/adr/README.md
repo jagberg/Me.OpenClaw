@@ -1,5 +1,17 @@
 # Architecture Decision Records
 
+## Convention: amend in place, or supersede with a new ADR?
+
+Written down 2026-07-25. It had been practised consistently for weeks but recorded nowhere, so the next person had to infer it — and `template.md` offers only `superseded by ADR-NNNN`, which suggests supersession is the sole mechanism. It isn't.
+
+**Amend in place** — append an `## Amendment (YYYY-MM-DD) — <what>` section — when the **decision still stands** but a premise behind it was wrong or incomplete. The original text stays exactly as written; the amendment says what was wrong, how it was found, and what changed as a result. Precedents: 0011 (the Sr format was more varied than the Context claimed), 0013 (design corrected before build), 0016 (a daily token cap it said didn't exist), 0009 (asserted "no context cap" three times).
+
+**Supersede with a new ADR** — and set the old one's status to `superseded by NNNN` — when the **decision itself changes**. Precedent: 0001 (Gemini-only) → 0009 (provider-agnostic).
+
+The two can combine: 0009 keeps its decision, so it is amended, and its *mitigation* for quota exhaustion is superseded by 0017 — the amendment says so and points there.
+
+Why not always supersede: most corrections are factual, not directional. A new ADR per corrected fact would bury the handful of real reversals in noise, and the original reasoning is the part worth preserving. Never edit the original decision text to match reality — that destroys the trail, which is the whole point.
+
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
 | [0001](0001-gemini-only-llm-backend-for-v1.md) | Use Gemini 2.5 Flash (AI Studio free tier) as sole LLM backend for v1 | superseded by 0009 | 2026-07-08 |

@@ -34,3 +34,11 @@ When a claim's own transaction date falls in a policy year that has already ende
 #### Scenario: Anniversary not on record
 - **WHEN** a settlement arrives for a pet without a stored policy anniversary
 - **THEN** expected payout is the full claimable subtotal and any mismatch flag names the anniversary as unknown
+
+## Known inconsistency — the dashboard disagrees about closed policy years (found 2026-07-25, undecided)
+
+The closed-year default above is **not** applied by the dashboard's own estimate. `claim_status._apply_excess_and_cap` (see `dashboard-visit-ledger`) drains the $150 excess for every `(condition, policy year)` group, closed years included.
+
+So for a claim whose transaction falls in a closed policy year, the dashboard displays an expected reimbursement $150 lower than this capability expects for the same claim.
+
+Which is right is **unrecorded**. The closed-year default was Justin's explicit instruction for settlement validation; whether he intended it to govern the dashboard's estimates was never asked. Recorded in both specs and in `openspec/BACKLOG.md` rather than resolved in one of them — changing either path silently would fabricate a decision.
