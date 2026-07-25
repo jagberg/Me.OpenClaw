@@ -14,3 +14,6 @@
 | [0010](0010-vision-ocr-fallback-scanned-invoices.md) | Vision-OCR fallback for scanned invoice PDFs, hard-capped attempts | accepted | 2026-07-23 |
 | [0011](0011-condition-thread-correlation.md) | Petcover correlation is per Condition Thread, not per Submission | accepted (design) | 2026-07-23 |
 | [0012](0012-continuation-defaults-true.md) | The claim form's continuation box defaults to ticked | accepted | 2026-07-23 |
+| [0013](0013-excess-accrual-gates-submission.md) | Hold a condition's claim until its accrued claimable exceeds the annual excess | accepted (design; implementation pending) | 2026-07-24 |
+| [0014](0014-durable-telegram-message-log.md) | One durable table records every Telegram message, and doubles as the replay queue | accepted | 2026-07-25 |
+| [0015](0015-restart-on-dead-updater-and-alerting-levels.md) | A dead Telegram updater restarts the process; ERROR means Justin must act | accepted | 2026-07-25 |

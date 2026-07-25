@@ -75,7 +75,7 @@ Every LLM call is rate-limited and logged to the `llm_calls` table (provider, pu
 
 ## Storage
 
-- `app/data/openclaw.db` — SQLite: transactions, claims, status events, extraction cache, vision attempt counts, split proposals, tasks/reminders.
+- `app/data/openclaw.db` — SQLite: transactions, claims, status events, extraction cache, vision attempt counts, split proposals, tasks/reminders, and every Telegram message in and out (`telegram_messages` — audit trail, replay queue and training data in one table, ADR-0014). Runs in **WAL** mode with a 5s busy timeout: the host and the container both open this bind-mounted file, and the default rollback journal produced a `disk I/O error` when they overlapped.
 - `/data/claims` (container) = `app/data/claims` — filled claim-form PDFs.
 - `/data/invoices` = `app/data/invoices` — per-visit invoice PDFs sliced out of vet emails.
 - `app/data/` also holds Gmail credentials/token. The whole directory and `app/.env` are gitignored.
@@ -90,13 +90,15 @@ python scripts/gmail_auth.py   # one-time OAuth consent (opens a browser)
 .venv/Scripts/uvicorn openclaw.main:app --port 8000
 ```
 
-Dashboard at `http://localhost:8000` — upload a NetBank CSV there to kick the pipeline. Production runs in Docker (`docker compose up -d --build`) with `app/data` bind-mounted at `/data`.
+Dashboard at `http://localhost:8000` — upload a NetBank CSV there to kick the pipeline. Also: `/basic` (phone-first card view), `/health` (deploy version, whether Telegram polling is actually alive, unprocessed-message count), `/messages.jsonl` (the full Telegram message stream for reinforcement learning, one JSON object per line).
+
+Production runs in Docker via `./scripts/deploy.ps1`, which stamps the image with the git SHA and prints `/health` afterwards; `app/data` is bind-mounted at `/data`. A bare `docker compose up -d --build` works but leaves the deploy version `unknown`, which mistags every logged message (ADR-0015).
 
 Tests: `cd app && .venv/Scripts/python tests/test_core.py` — assert-based, no pytest, fully hermetic (all LLM keys force-blanked, vision calls stubbed; tests never spend API tokens).
 
 ## Docs
 
 - `CLAUDE.md` (root) — hard rules + hard-won domain knowledge for AI-assisted sessions; `app/openclaw/CLAUDE.md` — module map.
-- `docs/adr/` — architecture decisions. Start with 0006 (service boundary), 0007 (ceiling matching), 0008 (status event log), 0009 (LLM backends), 0010 (vision OCR).
+- `docs/adr/` — architecture decisions. Start with 0006 (service boundary), 0007 (ceiling matching), 0008 (status event log), 0009 (LLM backends), 0010 (vision OCR). For the Telegram side: 0014 (durable message log + replay queue) and 0015 (restart on a dead updater; what ERROR means).
 - `docs/prd/` — original product requirements.
 - `openspec/changes/` — spec-driven change history; each change's `tasks.md` records what was verified against real data.

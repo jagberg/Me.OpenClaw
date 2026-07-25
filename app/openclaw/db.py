@@ -159,7 +159,8 @@ CREATE TABLE IF NOT EXISTS telegram_registrations (
 -- Operational alerts sent to Telegram (currently only Gmail auth death).
 -- One row per alert actually sent; used to rate-limit (≤5/24h) and to know a
 -- failure is outstanding so recovery is confirmed exactly once. Survives
--- container restarts, so a restart can't re-spam (ADR-0011 ops-alerting).
+-- container restarts, so a restart can't re-spam (ADR-0015; earlier comments
+-- cited ADR-0011, which is about Petcover correlation, not alerting).
 CREATE TABLE IF NOT EXISTS ops_alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,

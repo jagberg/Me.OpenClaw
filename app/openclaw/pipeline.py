@@ -26,7 +26,9 @@ def _is_transient(exc: Exception) -> bool:
         return exc.resp.status in (429, 500, 502, 503, 504)
     return False
 
-# Gmail auth-death alerting (ADR-0011 ops-alerting). When the OAuth token dies
+# Gmail auth-death alerting (ADR-0015; the mechanism was decided 2026-07-23 and
+# these comments cited ADR-0011 by mistake — that ADR is about Petcover
+# correlation). When the OAuth token dies
 # every Gmail step fails silently in logs while Telegram still works — so make
 # it loud there, but bounded: ≤5 alerts per rolling 24h, one recovery
 # confirmation. State lives in ops_alerts so a container restart can't re-spam.

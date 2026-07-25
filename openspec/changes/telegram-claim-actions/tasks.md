@@ -73,11 +73,53 @@
 - [x] 7b.2 Per-item condition split: assign a condition per line item; group into one form row per condition (summed amounts); guard when items lack amounts
 - [x] 7b.3 One-tap pet-assignment buttons on unassigned matched claims
 - [x] 7b.4 "Wrong invoice" unmatch button: record rejected email (`rejected_email_ids`), reset to `pending_match`, matcher skips rejected
-- [x] 7b.5 Submissions identified by Petcover reference / pet name, never internal claim ids; batched drafted claims notify once with a self-contained summary + ✅ Mark sent button
+- [x] 7b.5 Submissions identified by Petcover reference / pet name, never internal claim ids; batched drafted claims notify once with a self-contained summary + ✅ Mark sent button — **partly superseded 2026-07-25, see 7c.0**
 - [x] 7b.6 Plain-language "why" summary for blocked/suspicious matched claims (date, vet, line items)
 - [x] 7b.7 Invoice-request email uses Justin's template (visit date dd-MMM-yyyy, pet + surname, amount, sign-off)
 - [x] 7b.8 Persistent Docker service (`restart: unless-stopped`); async-SSL `wrap_bio` fix; case-insensitive username auth
 - [x] 7b.9 Tests for all of the above in `tests/test_telegram.py` (22 checks, incl. the split-callback path that caught a missing-json regression)
+
+## 7c. Reliability + observability (2026-07-25, ADR-0014 / ADR-0015)
+
+Triggered by a real failure: taps on `/actions` cards changed nothing and the system could not say whether the callbacks arrived or the handlers failed.
+
+### 7c.0 Change of mind — claim ids in messages (supersedes part of 7b.5)
+
+**Decision:** every Telegram message carries the claim `#id`. Submissions are still *named* by Petcover reference or pet name, but the id is always present.
+
+**Reasoning:** 7b.5's "never internal claim ids" leaked into the chat agent's system prompt as a blanket rule. On 2026-07-25 Justin asked "what actions are outstanding for me" and got prose with no ids and no amounts — unactionable, because he acts *by* id (`/mark 6 …`, `/pet 1 …`). The two recorded decisions were in direct conflict: 7b.5 said never, `app/openclaw/CLAUDE.md` said always. Resolved in favour of always.
+
+**Trade-off accepted:** messages are slightly less human-readable, and internal identifiers are visible to the only user who will ever see them.
+
+**Scope kept from 7b.5:** a *submission* is still identified by reference/pet name, not by id — a batch of claims sharing a `draft_id` is one submission with one reference. Only the blanket "never show ids" is dropped. Enforced by `test_agent_summary_carries_claim_id_and_never_invents_a_pet`.
+
+### 7c.1 Shipped
+
+- [x] 7c.1 Callback taps logged on arrival, unauthorized taps logged, unhandled `callback_data` prefix reports to the user instead of falling off the end of the if/elif chain; PTB `add_error_handler` registered (commit `3955826`)
+- [x] 7c.2 `telegram_messages` — durable in/out log, version-stamped, doubling as the replay queue (ADR-0014); `LoggedApplication` writes the arrival row before handlers run, `LoggedBot` records outbound
+- [x] 7c.3 `message_log.replay_pending` at startup; `expire_queue` drops rows from the queue after 24h without deleting them
+- [x] 7c.4 `confirm_resolved` made idempotent — it wrote a second audit event on a second call and invented an event when nothing was outstanding, which at-least-once replay would have multiplied
+- [x] 7c.5 `_watchdog_telegram_polling`: dead updater → rate-limited alert → SIGTERM → compose restart (ADR-0015)
+- [x] 7c.6 SQLite WAL + `busy_timeout=5000` in `db.get_connection` — host and container share the bind-mounted file, which had already produced a `disk I/O error`
+- [x] 7c.7 APScheduler `coalesce=True` + `misfire_grace_time` on all three interval/cron jobs — the default 1s grace was **skipping** runs missed while the host slept, leaving the pipeline idle
+- [x] 7c.8 Log levels: ERROR = Justin must act; `_is_transient` demotes network blips to WARNING without a traceback; dropped outbound (no chat id / no token) promoted to ERROR
+- [x] 7c.9 `APP_VERSION` baked by `scripts/deploy.ps1`; `unknown` warns at startup. `GET /health`, `GET /messages.jsonl`
+- [x] 7c.10 104 assert checks green in `tests/test_core.py`, incl. the failed-update-stays-queued invariant, replay dedupe, queue expiry keeping the row, and the watchdog's three states
+
+### 7c.11 Verified live (real Telegram, real DB)
+
+- [x] Replay safety checked against a **copy** of the live DB: `mark_sent` and `dismiss_mismatch` were already idempotent; `confirm_resolved` was not, and now is
+- [x] WAL confirmed active on the live DB and persisting; tested on a scratch file inside the bind mount first, since not every virtual filesystem supports WAL
+- [x] Deploy `64d7c08+fix/email-matching-gaps`: `/health` returned the real SHA and `polling_alive: true`; container log grep for `api.telegram.org/bot` returned 0 (the httpx-at-INFO token leak fixed earlier in `17b4de8`)
+- [x] Watchdog drill in the container: alert sent (and itself captured in `telegram_messages`), exit requested
+- [x] **End-to-end**: Justin tapped ✅ Mark sent on claim #2 at 04:15 UTC. `telegram_messages` holds the inbound `sent:2` tap (processed, no error) and the outbound reply; `vet_claims.status` for #2 is `sent`. This is the exact chain that was unprovable that morning.
+
+### 7c.12 Not done / known gaps
+
+- Updates already confirmed by Telegram but sitting in PTB's in-memory queue when the process dies are neither logged nor replayable (ADR-0014, accepted risk)
+- The morning's original lost taps are unrecoverable — nothing recorded them
+- The watchdog only fires on the pipeline tick, so up to one interval of deafness can pass unnoticed
+- No test covers the watchdog's real SIGTERM path (the drill used an injected `exit_fn`); killing the process inside a test would take the suite down
 
 ## 8. Live verification (manual, real Telegram + Gmail)
 
