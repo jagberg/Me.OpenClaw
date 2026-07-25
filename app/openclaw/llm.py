@@ -29,8 +29,9 @@ _PROVIDERS = {
 # Groq's daily token budget is PER MODEL ("Rate limit reached for model
 # llama-3.3-70b-versatile … on tokens per day"), so an exhausted TPD is
 # survivable by moving models — unlike TPM, where waiting is the only cure.
-# ADR-0009 made the provider swappable to absorb single-provider failure; this
-# is the same failure one level down, and it took the whole chat agent out.
+# ADR-0017. ADR-0009 made the provider swappable to absorb single-provider
+# failure, but that swap is manual and this failure wasn't the provider's —
+# Groq was healthy, one model's daily budget was gone, and the agent was dead.
 # Ordered by capability: a weaker answer beats no answer, and the degradation is
 # reported to Justin rather than passed off as normal (see agent.handle_message).
 #
@@ -179,7 +180,7 @@ def _assistant_turn(message) -> dict:
     returns a `reasoning` field, and echoing it produced
     `messages[2].reasoning: reasoning is not supported with this model` — a 400
     that killed the turn. Latent since the tool loop was written; it could only
-    surface once the fallback chain (ADR-0016) could route to such a model.
+    surface once the fallback chain (ADR-0017) could route to such a model.
 
     A whitelist, not a `reasoning` blacklist: the next model to emit some other
     output-only field would otherwise reproduce this exactly. The loop needs

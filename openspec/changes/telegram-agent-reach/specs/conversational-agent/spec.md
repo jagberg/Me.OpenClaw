@@ -77,6 +77,15 @@ Nothing else answers this: `reconcile_sent_invoice_requests` covers invoice-requ
 - **WHEN** several claims share a `draft_id`
 - **THEN** they appear as a single Submission entry, since claims sharing a draft move together
 
+### Requirement: Replies are plain text
+Chat replies SHALL be short plain-text lines, one claim or task per line, with no markdown tables and no bold markers.
+
+`_handle_chat` sends replies with no `parse_mode`, so markdown arrives literally. The fallback models introduced by ADR-0017 answer with pipe tables by default, which would reach Justin's phone as raw pipes.
+
+#### Scenario: A multi-row answer
+- **WHEN** the answer covers several claims
+- **THEN** each appears on its own plain-text line, not as a markdown table
+
 ### Requirement: Full claim detail including recorded figures
 The agent SHALL be able to report one claim in full by id: its transaction, invoice line items, claimable subtotal, current flag, and every status event **with the dollar figures recorded on it** (claimed, paid, stated fixed excess, stated age contribution).
 

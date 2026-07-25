@@ -20,10 +20,21 @@ Separately, the assistant half of OpenClaw (`tasks.py`, `reminders.py`) has **ze
 - **Assistant side onto Telegram**: `list_tasks`, `propose_create_task`, `propose_close_task`. Requires generalizing `telegram_bot._register_action` from its `action:claim_id` token — tasks have no claim id.
 - **Deliberately excluded**: force-reprocessing already-seen Petcover mail, and any code/docs/spec reading inside the container. Both are reasoned about in design.md.
 
+## Scope grew during verification (recorded, not hidden)
+
+Three things shipped under this change that its original scope did not cover. All were caused or exposed by it, and all were found by Justin using the feature rather than by tests:
+
+- **Per-model daily-budget fallback** (`0acad21`, `3cb9b15`) — widening the tool surface raised the cost of every chat request, Justin hit Groq's 100k tokens/day, and the agent was simply dead. Groq's TPD is per model, so `llm.py` now walks a four-model chain and discloses the downgrade. Its own decision record: **ADR-0017**, which supersedes ADR-0009's manual-swap mitigation for quota walls. Delta spec in `specs/llm-backend/`.
+- **Reasoning-field replay** (`199cc20`) — a latent bug in `chat()`'s tool loop, only reachable once the chain could route to a reasoning-capable model. Delta spec in `specs/llm-backend/`.
+- **Markdown in a plain-text channel** (`b304325`) — the fallback models answer with pipe tables, and chat replies carry no `parse_mode`.
+
+These belong to `llm-backend`, not `conversational-agent`, so they are declared as a modified capability below rather than folded into this change's original one.
+
 ## Capabilities
 
 ### Modified Capabilities
-- `conversational-agent`: gains date-scoped queries, two named mailbox sweeps (with the never-imply-mailbox-access requirement narrowed accordingly), submission-reply and claim-detail reads, and task capture/closure under the existing confirm-before-commit gate.
+- `conversational-agent`: gains date-scoped queries, two named mailbox sweeps (with the never-imply-mailbox-access requirement narrowed accordingly), submission-reply and claim-detail reads, and task capture/closure under the existing confirm-before-commit gate. Replies must also be plain text — the channel has no `parse_mode`.
+- `llm-backend`: per-model daily-budget fallback with the downgrade disclosed, and only input-valid fields replayed into the tool loop (see the scope note above; ADR-0017).
 
 ### New Capabilities
 - `task-telegram-surface`: reading and mutating the assistant-side `tasks` table from Telegram, under the same proposal gate claims mutations use.

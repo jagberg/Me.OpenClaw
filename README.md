@@ -65,7 +65,8 @@ For each unmatched vet charge, `invoice_matching`:
 | Service | What for | What's sent | Auth |
 |---|---|---|---|
 | **Gmail API** (Google) | Search/read mail + attachments; create/update **drafts**; never `send()` | Search queries (merchant names, dates), message/attachment reads; drafts containing filled claim PDFs | OAuth token in `app/data/token.json` (testing-app 7-day expiry; re-auth: `python scripts/gmail_auth.py`) |
-| **Groq** (default LLM, `llama-3.3-70b-versatile`, free tier) | Invoice text extraction; Telegram free-chat agent | Email/PDF text of candidate invoice emails; chat prompts | `GROQ_API_KEY` |
+| **Groq** (default LLM, free tier) | Invoice text extraction; Telegram free-chat agent | Email/PDF text of candidate invoice emails; chat prompts | `GROQ_API_KEY` |
+| ↳ four Groq models are called, not one | `llama-3.3-70b-versatile` is the primary. Its free budget is **100k tokens/day, per model**, so on daily exhaustion the chain falls through to `openai/gpt-oss-120b` → `openai/gpt-oss-20b` → `llama-3.1-8b-instant`, each with its own budget, and the reply says which one answered (ADR-0017) | Same as above | Same key |
 | **Gemini** (Google, `gemini-2.5-flash`, free tier) | **Vision OCR** of scanned invoice PDFs (always, regardless of provider); full text-LLM rollback if `LLM_PROVIDER=gemini` | Downscaled JPEG of scan pages | `GEMINI_API_KEY` |
 | **OpenAI** (optional, `gpt-4o-mini`) | Paid fallback provider — only if `LLM_PROVIDER=openai` | Same as Groq | `OPENAI_API_KEY` |
 | **Telegram Bot API** | Notifications, questions with tap-buttons, document (PDF) review messages, 👍 receipt acks, free-chat queries | Claim summaries (amounts, dates, vet names, pet names), invoice PDFs for review | `TELEGRAM_BOT_TOKEN`; single authorized username |

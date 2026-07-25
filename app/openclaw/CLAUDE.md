@@ -16,7 +16,7 @@ Root rules live in the repo-root `CLAUDE.md` (hard rules, domain rules, working 
 
 | Module | Owns |
 |---|---|
-| `llm.py` | THE LLM seam (ADR-0009): `chat()` (tool loop), `extract()`, `extract_vision()` (Gemini-only, ADR-0010). No other module imports a provider SDK — except `gemini.py`, which is the Gemini implementation behind it. |
+| `llm.py` | THE LLM seam (ADR-0009): `chat()` (tool loop), `extract()`, `extract_vision()` (Gemini-only, ADR-0010). No other module imports a provider SDK — except `gemini.py`, which is the Gemini implementation behind it. `_FALLBACK_MODELS` walks four Groq models on daily-budget exhaustion (per-model TPD, ADR-0017); `_is_daily_budget_exhausted` vs `_is_rate_limited` is the split that decides switch-model vs back-off-and-retry. |
 | `gemini.py` | Gemini SDK calls, `_RateLimiter`, `llm_calls` logging (shared by all providers via import). |
 | `gmail_client.py` | OAuth, `full_message_text` (includes PDF text — settlement breakdowns need it), attachment iteration. Read + drafts only; `send()` is forbidden (hard rule). |
 | `db.py` | Schema (`CREATE TABLE IF NOT EXISTS` — live schema CHANGES to existing tables need manual DDL against `app/data/openclaw.db`), connections. |
@@ -42,6 +42,9 @@ Root rules live in the repo-root `CLAUDE.md` (hard rules, domain rules, working 
 - Outbound logging lives in `LoggedBot`, so anything that constructs a plain `telegram.Bot` bypasses the message log. The three `*_sync` senders use `LoggedBot` for exactly this reason.
 - ERROR means *Justin must act*. Transient network failures are WARNING (`pipeline._is_transient`) — a Gmail `IncompleteRead` used to log a full traceback and read like a crisis.
 - The updater task is fire-and-forget: nothing awaits it, so its death is silent. `polling_alive()` + `pipeline._watchdog_telegram_polling` (SIGTERM, compose restarts) is the safety net.
+- Never replay a provider's whole assistant message back into `chat()`'s tool loop — `_assistant_turn` whitelists role/content/tool_calls. `model_dump()` echoed gpt-oss-120b's `reasoning` field and every following request 400'd (`reasoning is not supported with this model`). Whitelist, not a `reasoning` blacklist: the next output-only field would repeat it.
+- Chat replies are sent with **no `parse_mode`**, so markdown arrives literally. The fallback models answer with pipe tables unless the prompt forbids it (`test_prompt_forbids_markdown_for_a_plain_text_channel`).
+- Rate limits are two different failures: per-MINUTE tokens → back off, retry same model; per-DAY tokens → switch model, one attempt each (retrying can't free a daily cap). Only the 429 *body* names which — the headers never mention TPD.
 - `email_extractions` caches successful extraction FOREVER; invalidate the row if you change what extraction must return.
 - Vision attempts are refunded on `LLMUnavailableError` (provider outage ≠ unreadable scan).
 - Invoice identity across claims: `invoice_number` first, else amount+date (`_already_claimed`).

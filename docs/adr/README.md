@@ -18,3 +18,4 @@
 | [0014](0014-durable-telegram-message-log.md) | One durable table records every Telegram message, and doubles as the replay queue | accepted | 2026-07-25 |
 | [0015](0015-restart-on-dead-updater-and-alerting-levels.md) | A dead Telegram updater restarts the process; ERROR means Justin must act | accepted | 2026-07-25 |
 | [0016](0016-telegram-agent-tool-surface.md) | How far the chat agent's tools reach (named mail sweeps, no repo access), and why not MCP | accepted | 2026-07-25 |
+| [0017](0017-per-model-daily-budget-fallback.md) | Fall through to another model's own daily budget, and disclose the downgrade — amends 0009 | accepted | 2026-07-25 |

@@ -30,7 +30,7 @@ Personal assistant for Justin: task/reminder capture from Gmail, plus a vet-insu
 
 ## Operational constraints
 
-- LLM backend is provider-agnostic (`llm.py`, `chat()`/`extract()`/`extract_vision()`); default is Groq free tier (`llama-3.3-70b-versatile`), swappable to OpenAI/Gemini by env var — ADR-0009 (supersedes 0001; Cerebras removed 2026-07-23, free tier sold-out for this account). `extract_vision` always uses Gemini (only vision-capable backend; hard-capped 3 attempts/email — ADR-0010). Chat, extraction and vision OCR are the only LLM users. Don't add LLM calls where regex/keywords work (classification, references are keyword/regex on purpose).
+- LLM backend is provider-agnostic (`llm.py`, `chat()`/`extract()`/`extract_vision()`); default is Groq free tier (`llama-3.3-70b-versatile`), swappable to OpenAI/Gemini by env var — ADR-0009 (supersedes 0001; Cerebras removed 2026-07-23, free tier sold-out for this account). Groq's real ceiling is **100k tokens/day, per model** (not a context cap — that's 131k; ADR-0009's amendment corrects this). On daily exhaustion `llm.py` falls through to the next model's own budget automatically and says which model answered — ADR-0017. `extract_vision` always uses Gemini (only vision-capable backend; hard-capped 3 attempts/email — ADR-0010). Chat, extraction and vision OCR are the only LLM users. Don't add LLM calls where regex/keywords work (classification, references are keyword/regex on purpose).
 - Gmail OAuth token expires periodically (testing-app 7-day limit) — recovery: `python scripts/gmail_auth.py` (opens browser, Justin must click Allow).
 - Live DB schema changes need a manual `ALTER TABLE` against `app/data/openclaw.db` — `CREATE TABLE IF NOT EXISTS` in `db.py` won't touch existing tables.
 

@@ -32,6 +32,18 @@ Introduce `app/openclaw/llm.py` as the single LLM seam — `chat(messages, tools
 - Free-tier providers may train on submitted text — same posture accepted in ADR-0001 for household-admin content.
 - Free-tier keys can hit quota/billing walls (observed live: Cerebras returned `402 payment_required`); the swap path (Groq/OpenAI) is the mitigation.
 
+## Amendment (2026-07-25) — "no context cap" was wrong; the quota mitigation is now automatic
+
+Two claims in this ADR need correcting against measurement. The decision itself stands.
+
+**1. "No context cap" is wrong.** This ADR asserts it three times (Alternatives, Consequences/Positive, and Negative/Risks). Measured from the Groq API on 2026-07-25, `llama-3.3-70b-versatile` has a **131,072-token context window** — large, but a cap. The related "100k tokens/day" figure here was **right**, and is the binding constraint; see ADR-0016's amendment for how nearly that got "corrected" away by measuring rate-limit headers, which never mention the daily token limit at all.
+
+The reasoning built on the wrong claim survives anyway: this ADR's Negative/Risks note says compact summaries "keep quota use low and survive a swap back to a context-capped provider". The first half is the real reason, and it's the daily budget it protects — not a per-minute or per-request ceiling.
+
+**2. The stated quota mitigation is superseded.** This ADR recorded: *"Free-tier keys can hit quota/billing walls … the swap path (Groq/OpenAI) is the mitigation."* That proved insufficient in practice. When `llama-3.3-70b-versatile` exhausted its daily budget, the chat agent was dead — the swap path is manual, requiring an env var and a restart, which is useless to someone holding a phone. And the failure wasn't at provider granularity: Groq was healthy, one *model's* budget was gone.
+
+**Superseded by ADR-0017**, which adds automatic per-model fallback within the provider (Groq's TPD is per model). The manual provider swap remains available and remains correct for an actual provider outage — which is what this ADR was reasoning about. It simply wasn't the failure that occurred.
+
 ## Notes
 
 Classification and Petcover reference extraction remain regex/keyword on purpose (quota discipline) — chat and extraction are the only LLM users.
