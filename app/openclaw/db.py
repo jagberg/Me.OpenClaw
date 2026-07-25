@@ -249,6 +249,14 @@ def get_connection(path: str | None = None):
     # coexist; busy_timeout waits its turn instead of failing instantly. Verified
     # working (and persisting) on the Docker bind mount — not all virtual
     # filesystems support WAL, so re-check if the mount ever changes.
+    #
+    # The sidecars WAL needs (-wal, -shm) are the fragile part, and a *read* is
+    # enough to break them: a host-side read-write open (sqlite3's default) that
+    # closes cleanly checkpoints and deletes them, after which Docker Desktop's
+    # bind-mount cache can hold those names as present-but-absent and this very
+    # PRAGMA fails with "unable to open database file" until the container is
+    # restarted. Total outage, 51 minutes, 2026-07-25. Host queries must use
+    # mode=ro — ADR-0018.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row

@@ -37,4 +37,5 @@ Personal assistant for Justin: task/reminder capture from Gmail, plus a vet-insu
 ## Working style
 
 - Verify against real data before declaring anything correct or broken — this project's history is a string of plausible assumptions broken by real emails/PDFs/CSVs. Test hypotheses on the real DB/Gmail (read-only) first.
+- **Query the live DB from the host read-only, always:** `sqlite3.connect("file:data/openclaw.db?mode=ro", uri=True)`. A plain `connect()` opens read-write, and closing it checkpoints the WAL and deletes `openclaw.db-wal`/`-shm` from the Windows side. Docker Desktop's bind-mount cache then holds those names as present-but-absent, so every `get_connection()` in the container fails `PRAGMA journal_mode=WAL` with `unable to open database file` — a total outage (scheduler *and* Telegram, since `record_inbound` writes before the handler runs). Happened 2026-07-25 10:46, took a container restart to clear. Read-only opens never touch the sidecars.
 - Update the relevant openspec `tasks.md` with what was *actually* verified live, not just what was coded.

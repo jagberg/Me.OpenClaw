@@ -102,3 +102,11 @@ A single chat turn SHALL stay within the configured provider's per-request limit
 #### Scenario: Tool loop is bounded
 - **WHEN** the agent invokes read/act tools to satisfy a turn
 - **THEN** the number of tool iterations is capped, and on reaching the cap the agent replies with its best answer rather than looping indefinitely
+
+## Known limitation — "do X" with no tool for X becomes a saved task (found 2026-07-25, live)
+
+`propose_create_task` accepts any free-text description, so it is the tool that always fits. When Justin asks for an operation the surface does not implement, the agent does not say "I can't do that" — it proposes a task describing the request, and the confirm tap saves it.
+
+Observed live: "The #7 claim needs to be redone" produced task #125 *"Redo claim #7 for Aari"*, and a vaguer earlier attempt produced #124. Both were reasonable records of intent and neither was the action Justin expected; he read the ✅ as the claim having been redone. The requirement above about never claiming mailbox access it lacks has no counterpart for capabilities it lacks.
+
+This is a **caveat, not a decided behaviour** — the alternative (teach the agent to refuse when no tool matches) was never evaluated, and saving the intent is arguably better than dropping it. What is clearly wrong is that the confirmation is indistinguishable from having done the thing. Unresolved; the concrete instance is tracked in `openspec/BACKLOG.md` ("What does 'redo claim #N' mean?"), which also has to be answered before a real redo tool can exist.

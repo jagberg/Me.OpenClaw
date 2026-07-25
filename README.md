@@ -76,7 +76,7 @@ Every LLM call is rate-limited and logged to the `llm_calls` table (provider, pu
 
 ## Storage
 
-- `app/data/openclaw.db` — SQLite: transactions, claims, status events, extraction cache, vision attempt counts, split proposals, tasks/reminders, and every Telegram message in and out (`telegram_messages` — audit trail, replay queue and training data in one table, ADR-0014). Runs in **WAL** mode with a 5s busy timeout: the host and the container both open this bind-mounted file, and the default rollback journal produced a `disk I/O error` when they overlapped.
+- `app/data/openclaw.db` — SQLite: transactions, claims, status events, extraction cache, vision attempt counts, split proposals, tasks/reminders, and every Telegram message in and out (`telegram_messages` — audit trail, replay queue and training data in one table, ADR-0014). Runs in **WAL** mode with a 5s busy timeout: the host and the container both open this bind-mounted file, and the default rollback journal produced a `disk I/O error` when they overlapped. **Query it from the host read-only** — `sqlite3.connect("file:data/openclaw.db?mode=ro", uri=True)`. A read-write open (the default, even for pure `SELECT`s) checkpoints and deletes the WAL sidecars on close, which left the container unable to open the DB at all for 51 minutes on 2026-07-25. ADR-0018.
 - `/data/claims` (container) = `app/data/claims` — filled claim-form PDFs.
 - `/data/invoices` = `app/data/invoices` — per-visit invoice PDFs sliced out of vet emails.
 - `app/data/` also holds Gmail credentials/token. The whole directory and `app/.env` are gitignored.

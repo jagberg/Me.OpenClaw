@@ -70,6 +70,21 @@ Two adjacent problems surfaced in the same investigation:
 - A fault that makes `polling_alive()` return `False` *persistently* becomes a restart loop. Bounded in practice by `restart: unless-stopped` backoff and by the alert cap, which goes quiet after 5 in 24h — but a loop would still be visible only in the container log. Not mitigated further; flagged here.
 - `scripts/deploy.ps1` is the only path that sets `APP_VERSION` correctly. A hand-rolled `docker compose up --build` still works and is only detectable by the startup WARNING.
 
+## Amendment (2026-07-25) — the alerting path depends on the DB, so a DB outage silently disables all alerting
+
+The decision above stands. One premise behind it does not: that having **one** alerting path means every new failure kind inherits working alerts. It inherits the rate limit and the no-re-spam property, but it also inherits a dependency this ADR never named.
+
+Hours after this ADR was accepted, the container lost the SQLite DB entirely (ADR-0018). For 51 minutes every `get_connection()` raised, and the outage was **invisible by exactly the standard this ADR sets**:
+
+- **The ERROR level worked and still reached nobody.** `run_once` and `poll_once` failed every tick with full tracebacks at ERROR — correctly, since `_is_transient` does not match `sqlite3.OperationalError` and a dead DB is emphatically "Justin must act". But those ERRORs went to the container log, which nothing watches. This ADR's ladder defines what ERROR *means*; it does not guarantee ERROR *arrives*. Only two kinds are ever pushed to Telegram (`_ensure_gmail_auth`, `_watchdog_telegram_polling`); everything else in the ERROR list is log-only.
+- **`_alert_rate_limited` cannot report a DB outage.** Its first act is `with db.get_connection()` to read the `ops_alerts` ledger — so during a DB outage it raises before reaching `send(...)`. The generalised alerting mechanism is structurally incapable of announcing the failure of the one dependency every other alert also needs. There is no alert kind for "the DB is unreachable" and, as built, there could not be.
+- **`polling_alive()` reported healthy, and was telling the truth.** The updater was running; `/health` said `polling_alive: true`. But `message_log.record_inbound` (ADR-0014) writes the durable row *before* the handler runs, so every inbound update died at that write — no `telegram tap:` line, no handler, no reply. A live updater whose every update fails is a state this ADR's liveness signal does not distinguish from health. It was designed to answer "is the bot listening?", and it answered correctly; nobody had asked "can the bot do anything?".
+- **Justin found it by pressing a button and getting silence** — the identical symptom ADR-0014 and this ADR were written to eliminate, reached by a different route. `last_inbound_at` had been frozen for 51 minutes and would have shown it, but nothing polls `/health`.
+
+Note the one honest signal: `/health` itself would have failed, because `message_log.stats()` needs the DB. An external poller would have caught this. This ADR's Alternative 3 rejected a Docker healthcheck on the grounds that Docker marks containers unhealthy without restarting them — still true, and still not an argument against *something* polling.
+
+**Not fixed here.** The obvious repair — a DB-reachability check that alerts without touching the DB — needs a decision about where the rate-limit state lives when the ledger is unreachable, and Justin has not been asked. Recorded in `openspec/BACKLOG.md` under "Decisions needed" rather than resolved silently, and stated here so the next reader does not inherit this ADR's "one alerting path" claim as if it were unconditional.
+
 ## Corrections to the record
 
 - `pipeline.py` and `db.py` previously cited "ADR-0011 ops-alerting" for the rate-limited alert mechanism. ADR-0011 does not cover it; those citations now point here. The 2026-07-23 decision itself stands unchanged — only its pointer was wrong.

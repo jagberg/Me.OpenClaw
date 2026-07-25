@@ -27,7 +27,36 @@ So a last-year claim shows an expected reimbursement $150 lower on the dashboard
 
 The closed-year default was Justin's explicit instruction for settlement validation. Whether he meant it to govern the dashboard's estimates too **was never asked**. Not resolved either way, because silently changing either path would fabricate a decision.
 
+### What does "redo claim #N" mean?
+*Found 2026-07-25 in live Telegram use. Capability: `conversational-agent`, `claim-form-automation`.*
+
+Justin asked the agent twice to redo claim #7 ("This claim needs to be redone as it doesn't exist anymore", then "The #7 claim needs to be redone"). No tool matches, so the agent fell through to `propose_create_task` and saved tasks #124 and #125 — an honest non-action that reads like action. Nothing in the codebase can rebuild an already-`drafted` claim; the only reset path is `invoice_matching.unmatch` (→ `pending_match`, clears `invoice_data`), reachable via ❌ Wrong invoice, which is wrong here because #7's invoice is correct.
+
+Three different operations are all called "redo" and only Justin can say which he wants:
+
+1. **Rebuild the draft** — same `invoice_data`, regenerate the form PDF and Gmail draft, delete the old draft. For "the draft is wrong or missing".
+2. **Re-extract the invoice** — discard `invoice_data`, re-read the source PDF. For "the figures are wrong".
+3. **Full reset** — back to `pending_match` and re-hunt the email. For "wrong invoice entirely".
+
+Note the premise was also wrong: #7's draft was never gone (verified live — draft `r-7259758204005672288`, correct recipient, subject and three attachments). See the subject-collision entry below for why it looked missing. Tasks #124 and #125 are open and duplicate; close them when this lands.
+
+### No alert exists for "the DB is unreachable", and none can as built
+*Found 2026-07-25 during the outage in ADR-0018. Capability: `claims-pipeline-resilience`. See the ADR-0015 amendment.*
+
+`pipeline._alert_rate_limited` reads the `ops_alerts` ledger from the DB before sending, so it raises during a DB outage instead of alerting. Every other push alert routes through it. ERROR-level logs were emitted correctly every tick and reached nobody, and `polling_alive()` reported `true` truthfully while every inbound update died at `message_log.record_inbound`'s write. Justin discovered it by pressing a button and getting silence — the symptom ADR-0014/0015 exist to eliminate.
+
+The repair needs a decision first: **where does the rate-limit state live when the ledger is unreachable?** An in-memory counter loses the restart-can't-re-spam property that `ops_alerts` was chosen for. Alternatives include a file-backed counter under `/data`, an unbounded-but-narrow exception for this one kind, or an external `/health` poller (which would have caught it, since `/health` itself fails without the DB — ADR-0015's Alternative 3 rejected a Docker healthcheck for not restarting anything, which is not an argument against polling).
+
 ## Deferred features
+
+### Claim-draft subjects don't name their claims
+*Found 2026-07-25 in live Telegram use. Capability: `claim-form-automation`.*
+
+`claim_forms.py:483` and `:643` both build `subject=f"Vet claim — {pet['name']}"`, so every submission for the same pet is indistinguishable in Gmail, and `pipeline.DRAFT_SEARCH_LINK` searches on exactly that subject. On 2026-07-25 two drafts titled `Vet claim — Aari` coexisted — #7+#6 batched, and #12 — and Justin concluded #7's draft had been deleted. It had not.
+
+Fix is one line in each place: include the claim ids, e.g. `Vet claim — Aari (#7, #6)`. Not built because it lands with the redo decision above.
+
+Checked before deferring: this does **not** affect reply correlation. `claim_status.classify` and `extract_reference` run against *Petcover's* reply subject (their own wording — `claim_status.py:22` records the real one as "Petcover Insurance Claim for Ari"), never against the subject we send. Nothing matches on our draft subject except `pipeline.DRAFT_SEARCH_LINK`, which is the thing being fixed.
 
 ### Dashboard view of open split/merge proposals
 *From `fix-email-matching-gaps` tasks 7.5 and 9.6 — deferred at the time with "at some stage".*
