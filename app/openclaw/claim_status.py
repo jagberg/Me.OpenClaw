@@ -823,6 +823,128 @@ def pending_actions() -> list[dict]:
     return actions
 
 
+# Sent to Petcover (or ready to be) and no final answer yet. Broader than
+# AWAITING_REPLY_STATUSES, which is the ack-correlation pool: this one also
+# carries 'drafted' (Justin hasn't pressed send) and 'approved' (their figures
+# arrived, the payment confirmation hasn't).
+_OPEN_SUBMISSION_STATUSES = ("drafted",) + AWAITING_REPLY_STATUSES + ("approved",)
+
+
+def submissions_awaiting_reply() -> list[dict]:
+    """What has gone to Petcover and whether an answer came back — one entry per
+    Submission (claims sharing a draft_id move together), newest activity last.
+
+    Nothing else answers this. reconcile_sent_invoice_requests covers only
+    invoice-request drafts to vets; dashboard_lists covers only the event slice.
+
+    Caveat worth knowing: there is no sent-at column, so "waiting" is measured
+    from vet_claims.updated_at — which mark_sent stamps and nothing else touches
+    while a submission sits unanswered. Once a reply lands, the last event is
+    reported instead, so the imprecision never applies to a case that matters."""
+    today = datetime.now(timezone.utc).date()
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT vc.id, vc.status, vc.draft_id, vc.petcover_reference, vc.updated_at, "
+            "       p.name AS pet_name, bt.merchant, bt.amount AS txn_amount, bt.date AS txn_date "
+            "FROM vet_claims vc "
+            "LEFT JOIN pets p ON p.id = vc.pet_id "
+            "LEFT JOIN bank_transactions bt ON bt.id = vc.transaction_id "
+            f"WHERE vc.status IN ({','.join('?' * len(_OPEN_SUBMISSION_STATUSES))}) "
+            "ORDER BY vc.id",
+            _OPEN_SUBMISSION_STATUSES,
+        ).fetchall()
+        events = conn.execute(
+            "SELECT claim_id, event_type, created_at FROM claim_status_events "
+            "WHERE claim_id IS NOT NULL ORDER BY id"
+        ).fetchall()
+
+    latest_event = {e["claim_id"]: e for e in events}  # ordered by id, so last wins
+
+    groups: dict[str, list] = {}
+    for row in rows:
+        # A claim with no draft_id is its own submission — grouping them all
+        # under one None key would merge unrelated claims into one entry.
+        groups.setdefault(row["draft_id"] or f"claim-{row['id']}", []).append(row)
+
+    out = []
+    for key, claims in groups.items():
+        newest = max((latest_event[c["id"]] for c in claims if c["id"] in latest_event),
+                     key=lambda e: e["created_at"], default=None)
+        activity = newest["created_at"] if newest else max(c["updated_at"] for c in claims)
+        out.append(
+            {
+                "claim_ids": [c["id"] for c in claims],
+                "draft_id": key if not key.startswith("claim-") else None,
+                "status": claims[0]["status"],
+                "pet_name": claims[0]["pet_name"],
+                "reference": claims[0]["petcover_reference"],
+                "merchants": sorted({c["merchant"] for c in claims if c["merchant"]}),
+                "total_amount": sum(abs(c["txn_amount"] or 0) for c in claims),
+                "last_event": newest["event_type"] if newest else None,
+                "last_activity": activity,
+                "days_waiting": (today - date.fromisoformat(activity[:10])).days,
+            }
+        )
+    out.sort(key=lambda s: s["last_activity"])
+    return out
+
+
+def claim_detail(claim_id: int) -> dict | None:
+    """Everything about one claim, for answering "why is #21 like this?" — the
+    transaction, invoice line items, claimable subtotal, current flag, and every
+    status event WITH the dollar figures recorded on it.
+
+    claim_history gives event types and subjects only and is keyed by
+    pet/reference, so it cannot answer a question about a specific claim id."""
+    with db.get_connection() as conn:
+        claim = conn.execute(
+            "SELECT vc.*, p.name AS pet_name, p.policy_anniversary, "
+            "       bt.date AS txn_date, bt.amount AS txn_amount, bt.merchant "
+            "FROM vet_claims vc "
+            "LEFT JOIN pets p ON p.id = vc.pet_id "
+            "LEFT JOIN bank_transactions bt ON bt.id = vc.transaction_id "
+            "WHERE vc.id = ?",
+            (claim_id,),
+        ).fetchone()
+        if claim is None:
+            return None
+        events = conn.execute(
+            "SELECT event_type, created_at, detail FROM claim_status_events "
+            "WHERE claim_id = ? ORDER BY id",
+            (claim_id,),
+        ).fetchall()
+
+    invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
+    # Only the figures — the raw detail also holds subjects and bodies, which
+    # would blow the chat turn's token budget for no answering power.
+    figure_keys = ("claimed_amount", "paid_amount", "fixed_excess_stated",
+                   "age_contribution_stated", "subject")
+    return {
+        "claim_id": claim["id"],
+        "status": claim["status"],
+        "flag": claim["flag"],
+        "pet_name": claim["pet_name"],
+        "condition_text": claim["condition_text"],
+        "reference": claim["petcover_reference"],
+        "petcover_sr": claim["petcover_sr"],
+        "txn_date": claim["txn_date"],
+        "txn_amount": claim["txn_amount"],
+        "merchant": claim["merchant"],
+        "invoice_number": invoice.get("invoice_number"),
+        "invoice_amount": invoice.get("amount"),
+        "claimable_amount": invoice.get("claimable_amount", invoice.get("amount")),
+        "items": invoice.get("items") or [],
+        "events": [
+            {
+                "event_type": e["event_type"],
+                "at": e["created_at"],
+                **{k: v for k, v in (json.loads(e["detail"] or "{}")).items() if k in figure_keys},
+            }
+            for e in events
+        ],
+    }
+
+
 def dismiss_mismatch(claim_id: int) -> dict:
     """Clears a settlement-mismatch flag once Justin has looked at it. Records a
     `mismatch_dismissed` event rather than just wiping the flag — the append-only

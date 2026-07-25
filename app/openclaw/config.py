@@ -17,8 +17,14 @@ GEMINI_RATE_LIMIT_PER_MIN = _int_env("GEMINI_RATE_LIMIT_PER_MIN", 15)
 # LLM backend — provider-agnostic (ADR supersedes 0001). Any OpenAI-compatible
 # provider works by pointing base_url + model + key at it; llm.py holds the
 # per-provider base_url/default-model table. Default is Groq's free tier
-# (llama-3.3-70b, 100k tokens/day, no context cap). Blank LLM_MODEL = provider
-# default. LLM_PROVIDER=gemini keeps the legacy backend (extract only) for
+# (llama-3.3-70b-versatile). Measured limits 2026-07-25 from the API itself,
+# because the previous note here ("100k tokens/day, no context cap") and
+# agent.py's ("8k context cap") contradicted each other and were both wrong:
+#   context window          131,072 tokens   (not 8k, and not uncapped)
+#   max completion tokens    32,768
+#   x-ratelimit-limit-tokens 12,000 per MINUTE  <- the real binding constraint
+#   x-ratelimit-limit-requests 1,000 per day    (no daily token limit exists)
+# Blank LLM_MODEL = provider default. LLM_PROVIDER=gemini keeps the legacy backend (extract only) for
 # rollback; Gemini also serves the vision-OCR fallback regardless of provider.
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").lower()
 LLM_MODEL = os.environ.get("LLM_MODEL", "")

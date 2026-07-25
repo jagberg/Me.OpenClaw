@@ -535,9 +535,16 @@ _pending_condition: dict[int, int] = {}
 _pending_actions: dict[str, dict] = {}
 
 
+_action_seq = 0
+
+
 def _register_action(proposal: dict) -> str:
-    # action:claim_id stays well under Telegram's 64-byte callback_data limit.
-    token = f"{proposal['action']}:{proposal['claim_id']}"
+    """Opaque counter token. Was `action:claim_id`, which task proposals have no
+    value for — and a claim-shaped key silently collapsed two proposals for the
+    same claim into one. Well inside Telegram's 64-byte callback_data limit."""
+    global _action_seq
+    _action_seq += 1
+    token = str(_action_seq)
     _pending_actions[token] = proposal
     return token
 
@@ -545,7 +552,7 @@ def _register_action(proposal: dict) -> str:
 def _execute_action(proposal: dict) -> str:
     """Run a confirmed mutation through the same domain functions the slash
     commands use — the write happens here, only after a Confirm tap."""
-    action, claim_id, arg = proposal["action"], proposal["claim_id"], proposal.get("arg")
+    action, claim_id, arg = proposal["action"], proposal.get("claim_id"), proposal.get("arg")
     if action == "mark_sent":
         return claim_status.mark_sent(claim_id)["message"]
     if action == "set_condition":
@@ -554,6 +561,20 @@ def _execute_action(proposal: dict) -> str:
         return claim_forms.assign_pet(claim_id, arg)["message"]
     if action == "mark_resolved":
         return claim_status.confirm_resolved(claim_id)["message"]
+    # Assistant side — no claim_id involved anywhere in the round trip. Imported
+    # here, not at module scope: tasks -> reminders -> scheduler constructs a
+    # jobstore against the DB at import time, and the bot shouldn't trigger that.
+    from . import tasks
+
+    if action == "create_task":
+        try:
+            task_id = tasks.create_task(arg, source="chat")
+        except llm.LLMUnavailableError as exc:  # visible, never a silent drop
+            return f"⚠️ Couldn't save the task — {exc}"
+        return f"Task #{task_id} saved: {arg}"
+    if action == "close_task":
+        tasks.record_outcome(proposal["task_id"], arg)
+        return f"Task #{proposal['task_id']} closed: {arg}"
     return f"Unknown action: {action}"
 
 

@@ -1,13 +1,21 @@
 """Conversational agent for the Telegram bot: read/act tools over the claims
 domain, driven by llm.chat's bounded tool loop.
 
-Read tools run immediately and return compact summaries (never raw email dumps —
-keeps turns under the provider's 8k context cap). Act tools NEVER mutate: they
+Read tools run immediately and return compact summaries (never raw email dumps).
+The reason is NOT a context cap — measured 2026-07-25, llama-3.3-70b-versatile
+has a 131,072-token context window. The real ceiling is Groq's free-tier
+**12,000 tokens per minute** (`x-ratelimit-limit-tokens`; 1,000 requests/day is
+the other limit, and there is no daily *token* limit). One turn is up to 7
+requests (max_iterations=6 plus the forced answer), each re-sending the whole
+tool schema and history — so a turn that dumps raw emails can exhaust a minute's
+budget by itself. llm._completion retries 429s with backoff, so hitting it
+degrades to a slow answer rather than a failed one. Act tools NEVER mutate: they
 record a *proposed action* that the Telegram layer renders as a Confirm button;
 the write happens only on the tap (telegram_bot._execute_action). That harness
 gate — not the model's good behaviour — is what enforces the hard rules.
 """
 import json
+from datetime import datetime, timezone
 
 from . import claim_status, db, llm
 
@@ -33,10 +41,22 @@ _BASE_SYSTEM_PROMPT = (
     "- NEVER invent a pet name. The only pets are listed below. If you need a pet and don't know "
     "which, ask using those names — never guess a name and never ask Justin to confirm a name he "
     "did not say.\n"
-    "- You CANNOT read Justin's mailbox, search his email, or see what he has sent. If he asks you "
-    "to check his sent mail or emails, say plainly that you can't read his mailbox, then offer "
-    "reconcile_sent_invoice_requests, which checks Gmail for invoice-request drafts he has since "
-    "sent and updates those claims. Never imply you looked at his email.\n"
+    # Narrowed, not lifted: the absolute version existed because the agent once
+    # answered "I checked your sent mail" with no such capability. It now has
+    # three named sweeps and nothing else — the fabrication risk is unchanged.
+    "- You CANNOT browse, search, or read Justin's mailbox, and must never imply you did. What you "
+    "CAN do is run three specific checks: reconcile_sent_invoice_requests (did he send the "
+    "invoice-request drafts?), rematch_claims (re-run invoice matching for unmatched claims, "
+    "optionally just one vet's), and poll_petcover_now (pick up new Petcover replies). When you run "
+    "one, say what it actually covered — 'I re-checked the 3 unmatched Bondi Vet claims', never 'I "
+    "looked through your email'.\n"
+    "- poll_petcover_now only sees mail not processed before. If it finds nothing, say nothing NEW "
+    "arrived — never that Petcover hasn't replied. To see what was already recorded, use claim_detail.\n"
+    "- For tasks, ALWAYS include the task id as #N — it's how Justin closes them. Never invent an "
+    "outcome when closing one; if he didn't say what happened, ask.\n"
+    "- You cannot read OpenClaw's code, specs or docs. You CAN explain a claim's own state from its "
+    "flag and recorded replies (claim_detail). If asked how the system works internally, say that's "
+    "not something you can see rather than guessing at the implementation.\n"
     "- Never mention tool or function names to Justin. Say what you can do in plain words "
     "('I can mark it sent'), not the name of the tool that does it."
 )
@@ -49,9 +69,17 @@ def _known_pets() -> list[str]:
 
 def system_prompt() -> str:
     """The real pet list is injected rather than left to the model's imagination
-    — it hallucinated 'Whiskers' and 'Fluffy' when it had to guess."""
+    — it hallucinated 'Whiskers' and 'Fluffy' when it had to guess. Today's date
+    goes in for the same reason: without it "July 2025" vs "last July" and every
+    other relative date was a guess."""
     pets = _known_pets()
-    return f"{_BASE_SYSTEM_PROMPT}\nThe ONLY pets that exist: {', '.join(pets) if pets else '(none on file)'}."
+    today = datetime.now(timezone.utc).date()
+    return (
+        f"{_BASE_SYSTEM_PROMPT}\n"
+        f"The ONLY pets that exist: {', '.join(pets) if pets else '(none on file)'}.\n"
+        f"Today's date is {today.isoformat()}. Resolve any relative date against it and pass "
+        "explicit YYYY-MM-DD ranges to the tools; state the range you used in your answer."
+    )
 
 # ---- data access (explicit safe columns only; no bank/owner/secret fields) ----
 
@@ -64,7 +92,19 @@ LEFT JOIN bank_transactions bt ON bt.id = vc.transaction_id
 """
 
 
-def _find_claims(pet=None, reference=None, status=None, merchant=None, unassigned=False):
+def _in_range(txn_date, since, until) -> bool:
+    """Inclusive ISO-prefix compare — dates are stored as ISO strings, so a
+    lexical compare on the first 10 chars is the date compare, no parsing."""
+    day = (txn_date or "")[:10]
+    if not day:
+        return not (since or until)  # undated claim can't satisfy a range
+    if since and day < since[:10]:
+        return False
+    return not (until and day > until[:10])
+
+
+def _find_claims(pet=None, reference=None, status=None, merchant=None, unassigned=False,
+                 since=None, until=None):
     with db.get_connection() as conn:
         rows = conn.execute(_CLAIMS_SQL).fetchall()
     out = []
@@ -78,6 +118,8 @@ def _find_claims(pet=None, reference=None, status=None, merchant=None, unassigne
         if merchant and merchant.lower() not in (r["merchant"] or "").lower():
             continue
         if unassigned and r["pet_id"] is not None:
+            continue
+        if (since or until) and not _in_range(r["txn_date"], since, until):
             continue
         out.append(r)
     return out
@@ -130,18 +172,35 @@ def _single_target(rows):
 # ---- tool implementations (closures capture the per-turn proposals list) ----
 
 
+def _range_label(since, until) -> str:
+    if since and until:
+        return f" between {since[:10]} and {until[:10]}"
+    if since:
+        return f" on or after {since[:10]}"
+    return f" on or before {until[:10]}" if until else ""
+
+
 def _build_impls(proposals: list) -> dict:
-    def query_claims(status=None, pet=None):
-        rows = _find_claims(pet=pet, status=status)
+    def query_claims(status=None, pet=None, merchant=None, since=None, until=None):
+        rows = _find_claims(pet=pet, status=status, merchant=merchant, since=since, until=until)
         if not rows:
-            return "No matching claims."
+            # Say the range was empty rather than answering as if unfiltered —
+            # a silently-widened range is a wrong answer that reads as a right one.
+            return f"No claims with a transaction{_range_label(since, until)}."
         return "\n".join(_summary_line(r) for r in rows[:25])
 
-    def pending_actions():
+    def pending_actions(since=None, until=None):
         """Authoritative 'what does Justin have to do' — the same derivation the
-        /actions cards use, so chat and cards can never disagree."""
+        /actions cards use, so chat and cards can never disagree. since/until
+        filter here on the claim's own transaction date; the shared derivation
+        is left untouched so cards and chat keep agreeing."""
         actions = claim_status.pending_actions()
+        if since or until:
+            actions = [a for a in actions if _in_range(a["date"], since, until)]
         if not actions:
+            scope = _range_label(since, until)
+            if scope:
+                return f"Nothing waiting on Justin for transactions{scope}."
             return "Nothing is waiting on Justin — every claim is with Petcover or closed."
         lines = []
         for a in actions:
@@ -177,6 +236,132 @@ def _build_impls(proposals: list) -> dict:
         if not result["confirmed_sent"] and not result["stale_drafts"]:
             parts.append("None had been sent yet.")
         return " ".join(parts)
+
+    def rematch_claims(merchant=None, claim_id=None):
+        """'Go through the emails from <vet> and see if they can be processed.'
+
+        Acts directly rather than proposing: this is the identical call the
+        pipeline makes unattended every 15 minutes, it cannot send anything
+        (Gmail is read + drafts only), and a wrong match is reversible with the
+        ❌ Wrong invoice button. Per-claim confirmation would also defeat it —
+        the request is inherently a sweep over several claims.
+
+        Idempotent, which is what makes direct action safe under at-least-once
+        update replay (ADR-0014): only pending_match claims are considered, so a
+        claim the first run matched is no longer in the set."""
+        from . import invoice_matching, pipeline
+
+        candidates = list(pipeline._pending_claims())
+        if claim_id is not None:
+            candidates = [c for c in candidates if c["id"] == int(claim_id)]
+        elif merchant:
+            candidates = [c for c in candidates if merchant.lower() in (c["txn_merchant"] or "").lower()]
+        if not candidates:
+            scope = f" for '{merchant}'" if merchant else (f" for #{claim_id}" if claim_id else "")
+            return f"No claims are awaiting an invoice match{scope}, so there was nothing to re-check."
+
+        matched, still_waiting, failed = [], [], []
+        for claim in candidates:
+            try:
+                if invoice_matching.match_claim(claim):
+                    matched.append(claim["id"])
+                else:
+                    still_waiting.append(claim["id"])
+            except Exception as exc:  # one bad claim must not kill the sweep
+                failed.append(f"#{claim['id']} ({type(exc).__name__}: {exc})")
+
+        parts = [f"Re-checked {len(candidates)} claim(s) awaiting an invoice match."]
+        if matched:
+            parts.append("Now matched: " + ", ".join(f"#{i}" for i in matched))
+        if still_waiting:
+            parts.append("Still no invoice found: " + ", ".join(f"#{i}" for i in still_waiting))
+        if failed:
+            parts.append("Failed: " + "; ".join(failed))
+        return " ".join(parts)
+
+    def poll_petcover_now():
+        """Pick up Petcover replies now instead of waiting for the tick.
+
+        Only sees mail not processed before (gmail_ingest._already_processed).
+        Re-reading a seen email would risk re-applying a status against the
+        append-only event log, so 'nothing new' must never be reported as
+        'Petcover hasn't replied' — the reply text says which it is."""
+        from . import pipeline
+
+        try:
+            result = pipeline.poll_petcover_status()
+        except Exception as exc:  # visible failure, never a silent "all clear"
+            return f"Couldn't check Petcover mail: {exc}. Tell Justin it failed."
+        if not result["checked"]:
+            return ("No Petcover emails have arrived that weren't already processed. This only "
+                    "checks NEW mail — it does not mean Petcover has never replied.")
+        changed = ", ".join(f"#{i}" for i in result["claims_changed"]) or "none"
+        return (f"Processed {result['checked']} new Petcover email(s), recording "
+                f"{result['events']} event(s). Claims affected: {changed}.")
+
+    def submissions_awaiting_reply():
+        """What's been sent to Petcover and whether an answer came back."""
+        rows = claim_status.submissions_awaiting_reply()
+        if not rows:
+            return "Nothing is sitting with Petcover — every submission is settled, declined or closed."
+        lines = []
+        for s in rows:
+            ids = ", ".join(f"#{i}" for i in s["claim_ids"])
+            who = s["pet_name"] or "no pet"
+            ref = s["reference"] or "no reference yet"
+            answer = (f"last reply: {s['last_event']}" if s["last_event"]
+                      else "NO reply recorded yet")
+            lines.append(
+                f"{ids} · {who} · {ref} · {s['status']} · ${s['total_amount']:.2f} · "
+                f"{answer} · {s['days_waiting']}d since last activity"
+            )
+        return "\n".join(lines)
+
+    def claim_detail(claim_id):
+        """One claim in full — the 'why is #N like this' answer."""
+        detail = claim_status.claim_detail(int(claim_id))
+        if detail is None:
+            return f"No claim #{claim_id} found."
+        lines = [
+            f"#{detail['claim_id']} {detail['pet_name'] or 'unassigned'} · {detail['status']}"
+            f" · {detail['reference'] or 'no reference'}"
+            + (f" Sr{detail['petcover_sr']}" if detail["petcover_sr"] else ""),
+            f"charge: {detail['txn_date']} ${abs(detail['txn_amount'] or 0):.2f} at {detail['merchant']}",
+            f"condition: {detail['condition_text'] or '(not set)'}",
+        ]
+        if detail["invoice_amount"] is not None:
+            lines.append(
+                f"invoice {detail['invoice_number'] or '?'}: ${float(detail['invoice_amount']):.2f}"
+                f", claimable ${float(detail['claimable_amount'] or 0):.2f}"
+            )
+        for item in detail["items"][:10]:
+            lines.append(f"  - {item.get('description', 'item')} {item.get('amount', '')}")
+        if detail["flag"]:
+            lines.append(f"FLAG: {detail['flag']}")
+        for e in detail["events"]:
+            figures = " ".join(
+                f"{k}=${v}" for k, v in e.items()
+                if k.endswith("_amount") or k.endswith("_stated")
+            )
+            lines.append(f"  {e['at'][:10]} {e['event_type']}{' ' + figures if figures else ''}")
+        return "\n".join(lines)
+
+    def list_tasks(status=None):
+        """Assistant-side tasks. Nothing else in OpenClaw reads this table."""
+        with db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, description, status, follow_up_at, outcome FROM tasks "
+                "WHERE (? IS NULL OR status = ?) ORDER BY id",
+                (status, status),
+            ).fetchall()
+        if not rows:
+            return f"No {status or ''} tasks on file.".replace("  ", " ")
+        lines = []
+        for r in rows[:25]:
+            follow_up = f" · follow up {r['follow_up_at'][:16]}" if r["follow_up_at"] else ""
+            outcome = f" · outcome: {r['outcome']}" if r["outcome"] else ""
+            lines.append(f"#{r['id']} [{r['status']}] {r['description']}{follow_up}{outcome}")
+        return "\n".join(lines)
 
     def claim_history(pet=None, reference=None):
         rows = _find_claims(pet=pet, reference=reference)
@@ -223,15 +408,48 @@ def _build_impls(proposals: list) -> dict:
     def propose_mark_resolved(pet=None, reference=None):
         return _propose("mark_resolved", _find_claims(pet=pet, reference=reference))
 
+    def propose_create_task(description):
+        """Gated rather than immediate for two reasons: it spends an LLM call
+        extracting a follow-up date, and a misheard task resurfaces later as a
+        false obligation — the worst failure mode for a reminder system."""
+        if not description or not description.strip():
+            return "No task text supplied. Ask Justin what the task is — never invent one."
+        description = description.strip()
+        proposals.append({"action": "create_task", "label": f"new task: {description}",
+                          "arg": description})
+        return f"Proposed new task: {description}. Tell Justin and ask him to tap Confirm."
+
+    def propose_close_task(task_id, outcome):
+        if not outcome or not outcome.strip():
+            return "No outcome supplied. Ask Justin what happened — never invent an outcome."
+        with db.get_connection() as conn:
+            task = conn.execute("SELECT id, description, status FROM tasks WHERE id = ?",
+                                (int(task_id),)).fetchone()
+        if task is None:
+            return f"No task #{task_id} found. Ask Justin which task he means."
+        if task["status"] == "closed":
+            return f"Task #{task['id']} is already closed."
+        proposals.append({"action": "close_task", "task_id": task["id"], "arg": outcome.strip(),
+                          "label": f"close task #{task['id']}: {outcome.strip()}"})
+        return (f"Proposed closing task #{task['id']} ({task['description']}) with that outcome. "
+                "Tell Justin and ask him to tap Confirm.")
+
     return {
         "query_claims": query_claims,
         "pending_actions": pending_actions,
         "reconcile_sent_invoice_requests": reconcile_sent_invoice_requests,
+        "rematch_claims": rematch_claims,
+        "poll_petcover_now": poll_petcover_now,
+        "submissions_awaiting_reply": submissions_awaiting_reply,
+        "claim_detail": claim_detail,
         "claim_history": claim_history,
+        "list_tasks": list_tasks,
         "propose_mark_sent": propose_mark_sent,
         "propose_set_condition": propose_set_condition,
         "propose_assign_pet": propose_assign_pet,
         "propose_mark_resolved": propose_mark_resolved,
+        "propose_create_task": propose_create_task,
+        "propose_close_task": propose_close_task,
     }
 
 
@@ -248,19 +466,36 @@ def _fn(name, description, properties, required=None):
 
 _PET = {"type": "string", "description": "pet name (partial ok)"}
 _REF = {"type": "string", "description": "Petcover reference (partial ok)"}
+# Descriptions stay one line each on purpose: the whole schema ships in EVERY
+# request on a free-tier budget, and test_tools_schema_stays_small guards it.
+_SINCE = {"type": "string", "description": "earliest transaction date, YYYY-MM-DD"}
+_UNTIL = {"type": "string", "description": "latest transaction date, YYYY-MM-DD"}
+_MERCHANT = {"type": "string", "description": "vet/merchant name (partial ok)"}
 
 TOOLS = [
-    _fn("query_claims", "List claims, optionally filtered by status and/or pet, as compact summaries.",
+    _fn("query_claims", "List claims filtered by status, pet, vet and/or transaction-date range.",
         {"status": {"type": "string", "description": "e.g. pending_match, matched, drafted, sent, acknowledged, "
-                    "info_requested, suspended, settled, declined"}, "pet": _PET}),
+                    "info_requested, suspended, approved, settled, declined"},
+         "pet": _PET, "merchant": _MERCHANT, "since": _SINCE, "until": _UNTIL}),
     _fn("pending_actions", "THE list of everything waiting on Justin, with claim ids, amounts and age. "
-        "Use this for any 'what do I need to do / what's outstanding / what's blocked' question.", {}),
+        "Use this for any 'what do I need to do / what's outstanding / what's blocked' question; "
+        "pass since/until to scope it to a transaction period.", {"since": _SINCE, "until": _UNTIL}),
     _fn("reconcile_sent_invoice_requests",
-        "Check Gmail for invoice-request drafts Justin has since sent himself and update those claims. "
-        "Use when he says he sent emails and wants statuses updated. This is the ONLY way to look at "
-        "his mail — you cannot search or read his mailbox.", {}),
+        "Check Gmail for invoice-request drafts Justin has since sent himself and update those claims.", {}),
+    _fn("rematch_claims", "Re-run invoice matching now for claims still awaiting an invoice, "
+        "optionally just one vet's or one claim. Use for 'go through the emails from <vet>'.",
+        {"merchant": _MERCHANT, "claim_id": {"type": "integer"}}),
+    _fn("poll_petcover_now", "Pick up NEW Petcover replies now and report which claims changed. "
+        "Sees only mail not processed before — never report 'nothing new' as 'no reply exists'.", {}),
+    _fn("submissions_awaiting_reply",
+        "What has been sent to Petcover and whether a reply came back, one entry per submission.", {}),
+    _fn("claim_detail", "One claim in full by id: invoice items, claimable, flag, and every reply "
+        "with its dollar figures. Use for 'why is claim #N like this'.",
+        {"claim_id": {"type": "integer"}}, required=["claim_id"]),
     _fn("claim_history", "Show a claim's Petcover reply/status-event history, found by pet and/or reference.",
         {"pet": _PET, "reference": _REF}),
+    _fn("list_tasks", "List Justin's non-claim tasks (household admin, follow-ups).",
+        {"status": {"type": "string", "description": "open or closed"}}),
     _fn("propose_mark_sent", "Propose marking a drafted claim as sent (starts Petcover reply tracking). "
         "Queues a confirmation; does not act.", {"pet": _PET, "reference": _REF}),
     _fn("propose_set_condition", "Propose setting the condition being claimed for. Queues a confirmation.",
@@ -272,6 +507,13 @@ TOOLS = [
         required=["pet_name"]),
     _fn("propose_mark_resolved", "Propose confirming an info-request/suspension has been dealt with. "
         "Queues a confirmation.", {"pet": _PET, "reference": _REF}),
+    _fn("propose_create_task", "Propose saving a non-claim task Justin wants remembered. Queues a "
+        "confirmation.", {"description": {"type": "string", "description": "the task, in his words"}},
+        required=["description"]),
+    _fn("propose_close_task", "Propose closing a task with what actually happened. Queues a "
+        "confirmation; never invent the outcome.",
+        {"task_id": {"type": "integer"}, "outcome": {"type": "string", "description": "what happened, "
+         "supplied by Justin"}}, required=["task_id", "outcome"]),
 ]
 
 
@@ -291,7 +533,9 @@ def handle_message(text: str, chat_id: int | None = None) -> tuple[str, dict | N
     impls = _build_impls(proposals)
     prior = _history.get(chat_id, []) if chat_id is not None else []
     messages = [{"role": "system", "content": system_prompt()}, *prior, {"role": "user", "content": text}]
-    result = llm.chat(messages, tools=TOOLS, tool_impls=impls, purpose="chat")
+    # 6, not the default 4: a real request is now sweep -> read -> answer, and
+    # 4 rounds left no headroom for a follow-up read before the forced answer.
+    result = llm.chat(messages, tools=TOOLS, tool_impls=impls, purpose="chat", max_iterations=6)
     if chat_id is not None:
         turns = [*prior, {"role": "user", "content": text}, {"role": "assistant", "content": result["text"] or ""}]
         _history[chat_id] = turns[-HISTORY_TURNS * 2 :]

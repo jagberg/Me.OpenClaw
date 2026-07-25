@@ -2319,7 +2319,12 @@ def test_agent_summary_carries_claim_id_and_never_invents_a_pet():
     # the real pet list is injected, so the model never has to guess one
     prompt = agent.system_prompt()
     assert "Aari" in prompt and "Echo" in prompt
-    assert "cannot read" in prompt.lower(), "must state the Gmail limit rather than imply access"
+    # Specifically the MAILBOX limit. A loose "cannot read" match started
+    # passing off the unrelated "cannot read OpenClaw's code" line once the
+    # mailbox rule was reworded — the assertion has to name what it guards.
+    lowered = prompt.lower()
+    assert "cannot browse, search, or read justin's mailbox" in lowered, \
+        "must state the mailbox limit rather than imply access"
 
     impls = agent._build_impls([])
     rejection = impls["propose_assign_pet"]("Whiskers")
@@ -2327,6 +2332,309 @@ def test_agent_summary_carries_claim_id_and_never_invents_a_pet():
     assert "Aari" in rejection and "Echo" in rejection, "and the real pets offered, so it can't guess again"
     # the actions answer must reach the drafted claim that was silently omitted
     assert f"#{claim_id}" in impls["pending_actions"]()
+
+
+# --- telegram-agent-reach: wider agent tool surface -------------------------
+# Tests target the tool IMPLS (plain callables from _build_impls), never the
+# model — the suite is hermetic and spends no tokens.
+
+
+def test_agent_date_scoped_actions_and_claims():
+    """'What actions do I have for July 2025 transactions' — the question that
+    was unanswerable: neither pending_actions nor _find_claims could filter by
+    date, and the prompt never stated today, so relative dates were guesses."""
+    from openclaw import agent
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        july = _insert_txn(conn, "2025-07-14", -120.00, merchant="JULY VET")
+        august = _insert_txn(conn, "2025-08-14", -95.00, merchant="AUGUST VET")
+        july_claim = _insert_ledger_claim(conn, july, aari, "drafted", "Arthritis", 120.00)
+        august_claim = _insert_ledger_claim(conn, august, aari, "drafted", "Arthritis", 95.00)
+
+    impls = agent._build_impls([])
+    scoped = impls["pending_actions"](since="2025-07-01", until="2025-07-31")
+    assert f"#{july_claim}" in scoped, "the July claim is in range"
+    assert f"#{august_claim}" not in scoped, "the August claim must not leak into a July answer"
+    assert f"#{august_claim}" in impls["pending_actions"](), "unscoped still sees everything"
+
+    claims = impls["query_claims"](since="2025-07-01", until="2025-07-31")
+    assert f"#{july_claim}" in claims and f"#{august_claim}" not in claims
+    assert "JULY VET" in impls["query_claims"](merchant="july")
+
+    # An empty range must SAY it's empty, not answer as though unfiltered —
+    # a silently-widened range reads as a correct answer.
+    empty = impls["pending_actions"](since="2020-01-01", until="2020-12-31")
+    assert "2020-01-01" in empty and "2020-12-31" in empty
+    assert f"#{july_claim}" not in empty
+
+    prompt = agent.system_prompt()
+    assert datetime.now(timezone.utc).date().isoformat() in prompt, "today's date is injected"
+
+
+def test_agent_rematch_sweep_is_scoped_and_idempotent():
+    """rematch_claims acts directly, which is only safe because it's idempotent
+    under ADR-0014's at-least-once update replay: only pending_match claims are
+    considered, so a second run of the same sweep changes nothing. If this ever
+    fails, the tool must become proposal-gated instead."""
+    from openclaw import agent, invoice_matching
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        wanted = _insert_claim(conn, aari, "2026-07-01", status="pending_match", merchant="BONDI VET")
+        other_vet = _insert_claim(conn, aari, "2026-07-02", status="pending_match", merchant="OTHER VET")
+        already = _insert_claim(conn, aari, "2026-07-03", status="drafted", merchant="BONDI VET")
+
+    seen = []
+    original = invoice_matching.match_claim
+    invoice_matching.match_claim = lambda claim: seen.append(claim["id"]) or False
+    try:
+        impls = agent._build_impls([])
+        report = impls["rematch_claims"](merchant="bondi")
+        assert seen == [wanted], f"only the pending Bondi claim is swept, got {seen}"
+        assert f"#{wanted}" in report and f"#{already}" not in report
+        assert f"#{other_vet}" not in report, "another vet's claim is out of scope"
+
+        # Replay: same sweep again. Nothing matched, so the set is unchanged —
+        # and the report stays truthful rather than claiming new work.
+        seen.clear()
+        impls["rematch_claims"](merchant="bondi")
+        assert seen == [wanted], "replay re-checks the same still-pending claim, no extra targets"
+
+        # Once matched, the claim leaves pending_match and the sweep is a no-op.
+        with db.get_connection() as conn:
+            conn.execute("UPDATE vet_claims SET status = 'matched' WHERE id = ?", (wanted,))
+        seen.clear()
+        assert "nothing to re-check" in impls["rematch_claims"](merchant="bondi")
+        assert seen == [], "a matched claim is never re-swept"
+    finally:
+        invoice_matching.match_claim = original
+
+
+def test_agent_poll_petcover_now_reports_scope_not_absence():
+    """'Nothing new' must never be reported as 'Petcover hasn't replied' — the
+    poll only sees unprocessed mail, and conflating the two would tell Justin a
+    reply doesn't exist when it was simply already recorded."""
+    from openclaw import agent, pipeline
+
+    original = pipeline.poll_petcover_status
+    try:
+        pipeline.poll_petcover_status = lambda: {"checked": 0, "events": 0, "claims_changed": []}
+        impls = agent._build_impls([])
+        quiet = impls["poll_petcover_now"]()
+        assert "NEW" in quiet, "must scope the claim to new mail"
+        assert "does not mean" in quiet, \
+            "must explicitly disclaim the stronger reading, not just avoid stating it"
+
+        pipeline.poll_petcover_status = lambda: {"checked": 2, "events": 3, "claims_changed": [18, 21]}
+        busy = impls["poll_petcover_now"]()
+        assert "#18" in busy and "#21" in busy, "changed claims are named by id"
+
+        # A Gmail failure is surfaced, never swallowed into a false all-clear.
+        def boom():
+            raise RuntimeError("token expired")
+
+        pipeline.poll_petcover_status = boom
+        assert "token expired" in impls["poll_petcover_now"]()
+    finally:
+        pipeline.poll_petcover_status = original
+
+
+def test_poll_petcover_status_summary_counts_only_new_events():
+    """The summary is derived from the append-only log's max id, so it reports
+    what THIS poll recorded and not the table's whole history."""
+    from openclaw import pipeline
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        claim = _insert_claim(conn, aari, "2026-07-01", status="sent")
+        _insert_settled_event(conn, claim, datetime.now(timezone.utc).isoformat(), 100.0)
+
+    before = pipeline._latest_event_id()
+    assert before > 0, "a pre-existing event is present"
+    assert pipeline._claims_touched_since(before) == [], "nothing recorded after the snapshot yet"
+    with db.get_connection() as conn:
+        _insert_settled_event(conn, claim, datetime.now(timezone.utc).isoformat(), 120.0)
+    assert pipeline._claims_touched_since(before) == [claim]
+
+
+def test_submissions_awaiting_reply_groups_by_submission():
+    """One entry per Submission, not per claim — claims sharing a draft_id move
+    together, so three claims in one batch are one thing waiting on Petcover."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        a = _insert_claim(conn, aari, "2026-07-01", status="sent", draft_id="draft-1", reference="DC1-1")
+        b = _insert_claim(conn, aari, "2026-07-02", status="sent", draft_id="draft-1", reference="DC1-1")
+        solo = _insert_claim(conn, aari, "2026-07-03", status="acknowledged", draft_id="draft-2")
+        no_draft = _insert_claim(conn, aari, "2026-07-04", status="drafted")
+        settled = _insert_claim(conn, aari, "2026-07-05", status="settled", draft_id="draft-3")
+        _insert_settled_event(conn, solo, datetime.now(timezone.utc).isoformat(), 90.0)
+
+    rows = claim_status.submissions_awaiting_reply()
+    by_ids = {tuple(r["claim_ids"]): r for r in rows}
+    assert (a, b) in by_ids, f"the batch is one entry, got {[r['claim_ids'] for r in rows]}"
+    assert all(settled not in r["claim_ids"] for r in rows), "a settled submission isn't awaiting anything"
+
+    assert by_ids[(a, b)]["last_event"] is None, "no reply recorded for the batch"
+    assert by_ids[(solo,)]["last_event"] == "settled", "the newest event is reported"
+    # A claim with no draft_id is its own submission, never merged with other
+    # draft-less claims under a shared NULL key.
+    assert (no_draft,) in by_ids and by_ids[(no_draft,)]["draft_id"] is None
+    assert all(r["days_waiting"] >= 0 for r in rows)
+
+    from openclaw import agent
+    text = agent._build_impls([])["submissions_awaiting_reply"]()
+    assert f"#{a}" in text and f"#{b}" in text and "NO reply recorded" in text
+
+
+def test_claim_detail_explains_why_with_recorded_figures():
+    """'Why did #21 flag?' — needs the flag plus the dollar figures the reply
+    actually carried. claim_history gives event types only and is keyed by
+    pet/reference, so it cannot answer a question about one claim id."""
+    import json as _json
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        invoice = _json.dumps({
+            "invoice_number": "INV-9",
+            "amount": 55.74,
+            "claimable_amount": 44.75,
+            "items": [{"description": "Consultation", "amount": 44.75},
+                      {"description": "Food", "amount": 10.99}],
+        })
+        claim = _insert_claim(conn, aari, "2025-09-26", status="approved", reference="DC1-27-5628",
+                              sr=4, condition="Arthritis", invoice_data=invoice)
+        conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?",
+                     ("settlement mismatch — we expected $44.75, Petcover paid $22.75 — review", claim))
+        conn.execute(
+            "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
+            "VALUES (?, 'approved', 'mail-1', ?, ?)",
+            (claim, _json.dumps({"subject": "Claim Approval", "claimed_amount": 35.0,
+                                 "paid_amount": 22.75, "fixed_excess_stated": 0.0,
+                                 "age_contribution_stated": 12.25,
+                                 "body": "a long body that must not reach the chat turn"}),
+             datetime.now(timezone.utc).isoformat()),
+        )
+
+    detail = claim_status.claim_detail(claim)
+    assert detail["claimable_amount"] == 44.75 and detail["petcover_sr"] == 4
+    assert len(detail["items"]) == 2
+    event = detail["events"][0]
+    assert event["paid_amount"] == 22.75 and event["age_contribution_stated"] == 12.25
+    assert "body" not in event, "raw bodies are dropped — they blow the token budget for no answer"
+    assert claim_status.claim_detail(999999) is None
+
+    from openclaw import agent
+    text = agent._build_impls([])["claim_detail"](claim)
+    assert "settlement mismatch" in text, "the flag is the answer to 'why'"
+    assert "22.75" in text and "Consultation" in text
+    assert "No claim #999999" in agent._build_impls([])["claim_detail"](999999)
+
+
+def test_agent_task_proposals_write_nothing_until_confirmed():
+    """The assistant side had no Telegram surface at all. Capture is gated for
+    two reasons: it spends an LLM call extracting a follow-up date, and a
+    misheard task resurfaces later as a false obligation."""
+    from openclaw import agent, telegram_bot
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM tasks")
+
+    def _count():
+        with db.get_connection() as conn:
+            return conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    proposals = []
+    impls = agent._build_impls(proposals)
+    reply = impls["propose_create_task"]("Call the painter back about the quote")
+    assert "Confirm" in reply and _count() == 0, "proposing must not write"
+    assert proposals[-1]["action"] == "create_task"
+    assert "claim_id" not in proposals[-1], "a task proposal carries no claim id"
+
+    # Blank text is refused rather than stored as an empty task.
+    assert "never invent" in impls["propose_create_task"]("   ")
+    assert _count() == 0
+
+    # The tap is what writes. tasks.create_task spends an LLM call on the
+    # follow-up date, which the hermetic suite must not make — stub just that.
+    from openclaw import tasks as tasks_module
+    original = tasks_module._extract_follow_up
+    tasks_module._extract_follow_up = lambda description: None
+    try:
+        message = telegram_bot._execute_action(proposals[-1])
+        assert "saved" in message and _count() == 1
+        with db.get_connection() as conn:
+            task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
+
+        listed = impls["list_tasks"]()
+        assert f"#{task_id}" in listed, "task ids are always shown — it's how he closes them"
+
+        # Closing needs an outcome from Justin; one is never invented.
+        assert "never invent an outcome" in impls["propose_close_task"](task_id, "")
+        assert "No task #999999" in impls["propose_close_task"](999999, "done")
+        impls["propose_close_task"](task_id, "spoke to him, quote arriving Friday")
+        with db.get_connection() as conn:
+            assert conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] == "open", \
+                "still open until the tap"
+        telegram_bot._execute_action(proposals[-1])
+        with db.get_connection() as conn:
+            row = conn.execute("SELECT status, outcome FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row["status"] == "closed" and "Friday" in row["outcome"]
+        assert "already closed" in impls["propose_close_task"](task_id, "again")
+    finally:
+        tasks_module._extract_follow_up = original
+
+
+def test_action_tokens_are_not_claim_shaped():
+    """The token was `action:claim_id`, which tasks have no value for — and it
+    silently collapsed two proposals for the same claim into one."""
+    from openclaw import telegram_bot
+
+    first = telegram_bot._register_action({"action": "mark_sent", "claim_id": 7, "label": "a"})
+    second = telegram_bot._register_action({"action": "mark_sent", "claim_id": 7, "label": "b"})
+    assert first != second, "two proposals for one claim must not overwrite each other"
+    assert telegram_bot._pending_actions[first]["label"] == "a"
+    task_token = telegram_bot._register_action({"action": "create_task", "arg": "x", "label": "t"})
+    assert len(task_token) < 64, "must fit Telegram's callback_data limit"
+    assert "None" not in task_token, "no claim id is stringified into it"
+
+
+def test_agent_prompt_narrows_mailbox_rule_without_dropping_it():
+    """The absolute 'you cannot read his mailbox' rule existed because the agent
+    once answered 'I checked your sent mail' with no such capability. Adding real
+    sweeps narrows it; it must not quietly become permission to imply a search."""
+    from openclaw import agent
+
+    prompt = agent.system_prompt().lower()
+    assert "cannot browse, search, or read justin's mailbox" in prompt
+    assert "never imply you did" in prompt
+    for sweep in ("reconcile_sent_invoice_requests", "rematch_claims", "poll_petcover_now"):
+        assert sweep in prompt, f"{sweep} must be named as an allowed, specific check"
+    assert "does not mean petcover has never replied" not in prompt  # that wording lives in the tool
+    assert "nothing new" in prompt, "the new-mail-only limit is stated"
+    assert "cannot read openclaw's code" in prompt, "no code/spec reading in the container"
+
+
+def test_tools_schema_stays_small():
+    """The whole schema ships in EVERY request on a free-tier budget. This went
+    8 tools -> 15; the ceiling makes the next addition deliberate rather than
+    something that silently eats the turn's context."""
+    import json as _json
+    from openclaw import agent
+
+    encoded = _json.dumps(agent.TOOLS)
+    assert len(encoded) < 9000, f"tool schema is {len(encoded)} bytes — trim descriptions or drop a tool"
+
+    names = {t["function"]["name"] for t in agent.TOOLS}
+    assert names == set(agent._build_impls([])), "every declared tool has an impl and vice versa"
+    for tool in agent.TOOLS:
+        assert "\n" not in tool["function"]["description"], "descriptions stay one line"
 
 
 if __name__ == "__main__":

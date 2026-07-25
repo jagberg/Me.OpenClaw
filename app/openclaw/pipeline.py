@@ -571,11 +571,35 @@ def _maybe_draft_invoice_request(claim) -> None:
         )
 
 
-def poll_petcover_status() -> None:
+def _latest_event_id() -> int:
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM claim_status_events").fetchone()
+    return row["max_id"]
+
+
+def _claims_touched_since(event_id: int) -> list[int]:
+    """Which claims gained an event after `event_id`. Reads the append-only log
+    rather than diffing statuses, so an event that records something without
+    moving the status (unclassified, mismatch) is still reported."""
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT claim_id FROM claim_status_events "
+            "WHERE id > ? AND claim_id IS NOT NULL ORDER BY claim_id",
+            (event_id,),
+        ).fetchall()
+    return [r["claim_id"] for r in rows]
+
+
+def poll_petcover_status() -> dict:
     """Polls Petcover's claims-relevant senders for status replies (ack, info
     request, suspended, settled, declined) and records them via claim_status.
     Raises on Gmail API failure — same retry-next-interval behavior as
-    gmail_ingest.poll_once; unprocessed messages stay unmarked so they retry."""
+    gmail_ingest.poll_once; unprocessed messages stay unmarked so they retry.
+
+    Returns {checked, events, claims_changed} so an on-demand caller (the chat
+    agent's poll_petcover_now) can say what actually changed instead of "done".
+    The scheduled tick ignores the return value."""
+    before_event_id = _latest_event_id()
     service = gmail_client.build_service()
     unprocessed = []
     for sender in PETCOVER_STATUS_SENDERS:
@@ -606,6 +630,12 @@ def poll_petcover_status() -> None:
         body = gmail_client.full_message_text(service, message)
         claim_status.process_reply(message["id"], subject, body)
         gmail_ingest._mark_processed(message["id"], None)
+
+    return {
+        "checked": len(unprocessed),
+        "events": _latest_event_id() - before_event_id,
+        "claims_changed": _claims_touched_since(before_event_id),
+    }
 
 
 # flags run_once writes on match failure — cleared before the next attempt so

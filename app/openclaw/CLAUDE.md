@@ -26,7 +26,7 @@ Root rules live in the repo-root `CLAUDE.md` (hard rules, domain rules, working 
 | `main.py` + `templates/` | FastAPI dashboard: claims list, flags, CSV upload, condition entry. |
 | `scheduler.py` | APScheduler wiring for ticks + Gmail ingest. |
 | `config.py` | All env; `.env` loaded from cwd. Container paths are `/data/...` (compose binds host `app/data`). |
-| `agent.py` | Telegram free-chat agent (LLM tool-calling; reads are direct, mutations are *proposals* confirmed by a tap). `system_prompt()` injects the real pet list — the model invented pet names when left to guess. It has NO mailbox access: `reconcile_sent_invoice_requests` (Gmail SENT labels) is the only thing that touches mail, and the prompt requires saying so rather than implying it looked. |
+| `agent.py` | Telegram free-chat agent (LLM tool-calling; reads are direct, mutations are *proposals* confirmed by a tap). `system_prompt()` injects the real pet list **and today's date** — the model invented pet names when left to guess, and guessed at "July 2025" with no date to anchor on. It cannot browse or search mail, but it has **three named sweeps** that do touch Gmail: `reconcile_sent_invoice_requests`, `rematch_claims`, `poll_petcover_now`. They act directly (not proposals) because the tick already makes those exact calls unattended, and they're safe under ADR-0014 replay only because each is idempotent — ADR-0016. No code/spec/doc access: claim-level "why" is `claim_detail`, anything about the implementation it must decline. |
 | `netbank_csv.py` | CSV upload parsing/dedupe into `bank_transactions`. |
 | `tasks.py` / `reminders.py` / `gmail_ingest.py` | Assistant side (email → tasks/reminders), independent of claims. |
 | `db_backup.py` | Drive backup of the SQLite DB. |

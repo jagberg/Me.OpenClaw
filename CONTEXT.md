@@ -32,3 +32,23 @@ _Avoid_: bill, statement (a statement is precisely NOT an invoice — running to
 **Charge**:
 A bank transaction from the NetBank CSV. The ceiling on what its Claim can be worth, never the claimed amount itself.
 _Avoid_: payment, transaction (ambiguous with Petcover payouts)
+
+## Language — assistant side
+
+This half of OpenClaw (`tasks.py`, `reminders.py`, `gmail_ingest.py`) is independent of claims and shares none of the vocabulary above. It had no entry here at all until 2026-07-25, when it gained its first interface (Telegram chat) and the ambiguity started to matter.
+
+**Task**:
+One `tasks` row: a piece of household admin to be chased (call the painter, book the service). Identified by `#id`, which is the handle for closing it. Has an *outcome* recorded when closed — who was spoken to, what was said. Nothing to do with a Claim, and never a step in the claims pipeline.
+_Avoid_: action (an Action is claims-side, one of `pending_actions`' nine kinds), todo, item
+
+**Follow-up**:
+A datetime extracted from a Task's own text by the LLM at capture time, which schedules a Reminder. Absent when the text implies no date — most Tasks have none.
+
+**Reminder**:
+One `reminders` row plus an APScheduler job. Fires by flipping to `due`; restart-safe (a reminder whose time passed while the app was down fires on startup, not skipped).
+_Avoid_: notification, alert (those are the claims side's Telegram pushes and `ops_alerts`)
+
+## Sweep
+
+A named, on-demand check over Gmail the chat agent may run — `reconcile_sent_invoice_requests`, `rematch_claims`, `poll_petcover_now`. Deliberately not "searching email": each has a fixed scope, and the agent must state that scope rather than imply it read the mailbox (ADR-0016). All three act immediately rather than proposing, because the 15-minute tick already makes the same calls unattended and each is idempotent under replay.
+_Avoid_: search, reading my email
