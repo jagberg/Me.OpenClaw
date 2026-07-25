@@ -31,6 +31,13 @@ _BASE_SYSTEM_PROMPT = (
     "- Use the read tools to answer; summarise, don't dump.\n"
     "- For 'what do I need to do' / 'what's outstanding', call pending_actions. Never assemble "
     "that answer yourself from query_claims — you will miss things.\n"
+    # Live miss: "what claim emails were sent" fetched the vet invoice-request
+    # sweep and answered "nothing to verify" while 5 submissions sat awaiting
+    # Petcover. Two different mailings, two different tools.
+    "- Two kinds of outbound mail exist and must not be confused. Claims go to PETCOVER — for "
+    "anything about those ('what was sent', 'awaiting a response', 'did they reply') use "
+    "submissions_awaiting_reply. Invoice requests go to the VET — only those use "
+    "reconcile_sent_invoice_requests.\n"
     "- To change anything, call a propose_* tool. It does NOT act — it queues a confirmation the "
     "user must tap. Never claim an action is done; say it's awaiting confirmation.\n"
     "- Never send email (drafts only) and never invent a required field such as a condition. If a "
@@ -486,15 +493,21 @@ TOOLS = [
     _fn("pending_actions", "THE list of everything waiting on Justin, with claim ids, amounts and age. "
         "Use this for any 'what do I need to do / what's outstanding / what's blocked' question; "
         "pass since/until to scope it to a transaction period.", {"since": _SINCE, "until": _UNTIL}),
+    # Named "…invoice_requests" but the model still grabbed it for "what CLAIM
+    # emails were sent" (live, 2026-07-25) and answered "nothing to verify"
+    # while 5 submissions sat awaiting Petcover. Both descriptions now say who
+    # the mail went TO, which is the only thing that separates them.
     _fn("reconcile_sent_invoice_requests",
-        "Check Gmail for invoice-request drafts Justin has since sent himself and update those claims.", {}),
+        "Emails to the VET asking for a missing invoice: check Gmail for those drafts Justin has "
+        "since sent. NOT for questions about claims sent to Petcover.", {}),
     _fn("rematch_claims", "Re-run invoice matching now for claims still awaiting an invoice, "
         "optionally just one vet's or one claim. Use for 'go through the emails from <vet>'.",
         {"merchant": _MERCHANT, "claim_id": {"type": "integer"}}),
     _fn("poll_petcover_now", "Pick up NEW Petcover replies now and report which claims changed. "
         "Sees only mail not processed before — never report 'nothing new' as 'no reply exists'.", {}),
     _fn("submissions_awaiting_reply",
-        "What has been sent to Petcover and whether a reply came back, one entry per submission.", {}),
+        "Claims sent to PETCOVER and whether a reply came back, one entry per submission. Use for "
+        "'what claim emails were sent / what's awaiting a response / has Petcover replied'.", {}),
     _fn("claim_detail", "One claim in full by id: invoice items, claimable, flag, and every reply "
         "with its dollar figures. Use for 'why is claim #N like this'.",
         {"claim_id": {"type": "integer"}}, required=["claim_id"]),

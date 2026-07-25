@@ -2621,6 +2621,26 @@ def test_agent_prompt_narrows_mailbox_rule_without_dropping_it():
     assert "cannot read openclaw's code" in prompt, "no code/spec reading in the container"
 
 
+def test_petcover_and_vet_mail_tools_are_distinguishable():
+    """Live miss (2026-07-25): asked "what claim emails were sent that you can
+    verify and check for a response", the model called the VET invoice-request
+    sweep and answered "nothing to verify" — while five submissions sat awaiting
+    Petcover. Claims go to Petcover, invoice requests go to the vet; whatever
+    else changes, the schema must keep saying which is which."""
+    from openclaw import agent
+
+    by_name = {t["function"]["name"]: t["function"]["description"] for t in agent.TOOLS}
+    vet = by_name["reconcile_sent_invoice_requests"]
+    petcover = by_name["submissions_awaiting_reply"]
+    assert "VET" in vet and "Petcover" in vet, "the vet sweep must name both, to exclude one"
+    assert "PETCOVER" in petcover
+    assert "awaiting a response" in petcover, "must claim his actual phrasing"
+
+    prompt = agent.system_prompt()
+    assert "Invoice requests go to the VET" in prompt
+    assert "submissions_awaiting_reply" in prompt
+
+
 def test_tools_schema_stays_small():
     """The whole schema ships in EVERY request on a free-tier budget. This went
     8 tools -> 15; the ceiling makes the next addition deliberate rather than
