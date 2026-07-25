@@ -636,6 +636,8 @@ def _draft_matched_claims() -> None:
 
 
 def run_once() -> None:
+    if telegram_bot.polling_alive() is False:
+        logger.error("Telegram polling is DOWN — inbound taps/messages are being lost.")
     vet_detection.classify_unflagged()
 
     # Every remaining step reads or writes Gmail — if the token is dead, alert

@@ -567,9 +567,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     await query.answer()
     username = query.from_user.username if query.from_user else None
-    if not _is_authorized(username):
-        return
     data = query.data or ""
+    # Taps left no trace at all, so "did my button press register?" was only
+    # answerable by diffing the DB. Log arrival before anything can reject it.
+    logger.info("telegram tap: %r from %r", data[:64], username)
+    if not _is_authorized(username):
+        logger.warning("telegram tap ignored — %r not authorized", username)
+        return
     if data.startswith("sent:"):
         result = claim_status.mark_sent(int(data.split(":", 1)[1]))
         await _append_result(query, f"✅ {result['message']}")
@@ -663,6 +667,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             media=InputMediaPhoto(media=png, caption=caption),
             reply_markup=_history_keyboard(page, total_pages),
         )
+    else:
+        # A button whose prefix nobody handles used to do nothing, silently —
+        # indistinguishable from a tap that never arrived.
+        logger.error("telegram tap: unhandled callback_data %r", data[:64])
+        await _append_result(query, "⚠️ That button isn't wired up — tell Claude.")
+
+
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Without this PTB swallows handler exceptions into its own logger with no
+    user feedback: the tap looked accepted and nothing happened."""
+    logger.error("telegram handler failed on %r", update, exc_info=context.error)
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        try:
+            await _append_result(query, f"⚠️ Failed: {context.error}")
+        except Exception:  # noqa: BLE001 — feedback is best-effort; the log above is the record
+            logger.exception("could not report failure back to Telegram")
 
 
 async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -727,6 +748,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("actions", actions_command))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_reply))
+    application.add_error_handler(_on_error)
     return application
 
 
@@ -739,6 +761,16 @@ async def start_polling() -> None:
     await _application.initialize()
     await _application.start()
     await _application.updater.start_polling()
+
+
+def polling_alive() -> bool | None:
+    """True/False once the bot is configured, None when it's disabled. The
+    updater task is fire-and-forget: if it dies (host suspend killed the long
+    poll), inbound taps stop arriving with nothing in the logs. Probing
+    getUpdates from outside can't tell — it races the gap between polls."""
+    if _application is None:
+        return None
+    return bool(_application.updater.running)
 
 
 async def stop_polling() -> None:

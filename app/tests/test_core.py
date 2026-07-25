@@ -589,6 +589,38 @@ def test_append_result_falls_back_to_caption_on_document_message():
     assert q_txt.edited[0] == "text" and "plain message" in q_txt.edited[1], q_txt.edited
 
 
+def test_unhandled_callback_data_reports_instead_of_silently_returning():
+    """A tap whose prefix no branch handles used to fall off the end of
+    on_callback doing nothing — indistinguishable from a tap that never
+    arrived, which is exactly how a morning of button presses vanished."""
+    import asyncio
+    from openclaw import config, telegram_bot
+
+    class FakeQuery:
+        def __init__(self, data):
+            self.data = data
+            self.from_user = type("U", (), {"username": config.TELEGRAM_USERNAME})()
+            self.message = type("M", (), {"text": "card", "caption": None})()
+            self.edited = None
+
+        async def answer(self):
+            pass
+
+        async def edit_message_text(self, text):
+            self.edited = text
+
+    q = FakeQuery("bogusprefix:7")
+    update = type("Upd", (), {"callback_query": q})()
+    asyncio.run(telegram_bot.on_callback(update, None))
+    assert q.edited and "isn't wired up" in q.edited, q.edited
+
+    # Unauthorized taps still return without acting — but now they say so in the log.
+    q2 = FakeQuery("sent:1")
+    q2.from_user = type("U", (), {"username": "someone_else"})()
+    asyncio.run(telegram_bot.on_callback(type("Upd", (), {"callback_query": q2})(), None))
+    assert q2.edited is None, q2.edited
+
+
 def test_ack_reacts_thumbs_up_and_swallows_failures():
     """Every incoming user message gets an instant 👍 reaction receipt; a
     reaction failure must never break the real handler."""
