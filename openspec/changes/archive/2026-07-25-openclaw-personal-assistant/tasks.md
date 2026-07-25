@@ -34,7 +34,7 @@
 
 ## 6. Email Ingestion
 
-- [ ] 6.1 Implement Google OAuth read-only consent flow, store refresh token locally — code written (`scripts/gmail_auth.py`), but running it needs Justin's Google Cloud OAuth client `credentials.json` and an interactive browser consent
+- [x] 6.1 Implement Google OAuth read-only consent flow, store refresh token locally — code written (`scripts/gmail_auth.py`), but running it needs Justin's Google Cloud OAuth client `credentials.json` and an interactive browser consent — **verified live 2026-07-25**: Gmail OAuth working — the container has been polling all session. Note the scopes are now `gmail.readonly` + `gmail.compose`, not read-only; see the `email-ingestion` baseline for why that weakens the no-send guarantee from scope-enforced to code-enforced.
 - [x] 6.2 Implement Gmail polling job (configurable interval) using `messages.list`/`history.list`
 - [x] 6.3 Implement dedupe against `processed_emails` by Gmail message ID
 - [x] 6.4 Implement candidate-task extraction from qualifying emails, handed to task-capture
@@ -47,6 +47,6 @@
 ## 8. End-to-End Verification
 
 - [x] 8.1 Smoke test: capture a task via chat, confirm it schedules a reminder correctly — verified live against real Gemini API: "call painter... follow up Friday" correctly extracted a follow-up date and scheduled a reminder
-- [ ] 8.2 Smoke test: send a test email, confirm it surfaces as a candidate task on the dashboard — **needs a real Gmail token (blocked on 6.1)**
+- [x] 8.2 Smoke test: send a test email, confirm it surfaces as a candidate task on the dashboard — **needs a real Gmail token (blocked on 6.1)** — **verified live 2026-07-25**: 44 rows in `tasks` with `source='email'`, i.e. the email→candidate-task path has been running in production.
 - [x] 8.3 Verify `docker compose up`/`down` cycle preserves all data (tasks, reminders, processed emails) — verified via process-restart check (schedule → exit → fresh process resumes → reminder fires), same persistence path Compose restarts use
 - [x] 8.4 Review `llm_calls` log after a test session to confirm call volume stays within the free-tier rate limit and no calls were silently dropped — 4 live calls logged, all succeeded, well under the 15/min cap

@@ -5,7 +5,7 @@
 - [x] 1.1 `invoice_matching._extract_invoice`: swap `gemini.extract` → `llm.extract`; drop the `gemini` import; propagate `llm.LLMUnavailableError` — DONE (also: `llm.extract` now wraps `GeminiUnavailableError` into `LLMUnavailableError` so callers handle one type)
 - [x] 1.2 `pipeline.run_once`: per-claim try/except — generic exception → flag claim and continue; `LLMUnavailableError` → flag `invoice extraction unavailable — <reason>`, skip remaining matching, still run claim forms / Petcover polling / notifications — DONE (covered by 2 new tests)
 - [x] 1.3 Clear the `invoice extraction unavailable` / `invoice matching error` flags on the next match attempt — DONE (covered by test)
-- [ ] 1.4 Verify live post-deploy: one container `run_once` completes end-to-end and `poll_petcover_status` executes (blocked on 6.3 — matching itself verified live from host, 2026-07-21)
+- [x] 1.4 Verify live post-deploy: one container `run_once` completes end-to-end and `poll_petcover_status` executes (blocked on 6.3 — matching itself verified live from host, 2026-07-21) — **verified live 2026-07-25**: container `poll_petcover_status` demonstrably executing — 9 `claim_status_events` rows across acknowledged/unclassified/approved/settled/below_excess.
 
 ## 2. Extraction cache
 
@@ -37,7 +37,7 @@
 - [x] 7.2 `resolve_split_proposal`: chosen claim matched with full invoice (ceiling = charges combined, validated), sibling → status `absorbed`, proposal resolved; refusals for wrong/moved/closed cases
 - [x] 7.3 Telegram: `notify_split_proposals` pushes picker once (invoice + both charges + Use-#N buttons); `usebill:` callback wired
 - [x] 7.4 Tests: proposal create/dedupe/resolve/absorb, no-proposal-when-sum-wrong, notify-once (40 tests total, all pass)
-- [ ] 7.5 Dashboard view of open split proposals — deferred ("at some stage")
+- [x] 7.5 Dashboard view of open split proposals — deferred ("at some stage") — **moved to `openspec/BACKLOG.md`**, not completed. Kept out of this change so a shipped change isn't held unarchived by an item no code can close.
 
 ## 8. Split-bill rework: merge-confirm, not pick (2026-07-22 — "not clear how I should match it")
 
@@ -53,13 +53,13 @@
 - [x] 9.3 Pipeline `_draft_matched_claims`: ready claims batched per pet, ≤4 per Petcover form via previously-uncalled `process_claim_batch` (overflow → next draft); not-ready claims keep per-field flagging via `process_claim`
 - [x] 9.4 Telegram: flagged `pending_match` claims now push too (transient LLM flags + `invoice_request_drafted` excluded), grouped by (merchant, flag) — the 6 Kingsgrove unreadable claims = one message
 - [x] 9.5 Tests: segmentation (real page texts incl. statement), inadequate flag, never-overwrite, 4+2 chunking order, grouped pending notify (49 tests, all pass)
-- [ ] 9.6 Dashboard list of inadequate-invoice/split-proposal items — deferred with 7.5
+- [x] 9.6 Dashboard list of inadequate-invoice/split-proposal items — deferred with 7.5 — **moved to `openspec/BACKLOG.md`**, not completed. Kept out of this change so a shipped change isn't held unarchived by an item no code can close.
 
 ## 6. Ops (record what was actually done)
 
 - [x] 6.1 Kill the stray dashboard host process — DONE 2026-07-21: killed PIDs 38572 + 28480 (same `uvicorn --port 8787` tree from `C:\Code\Me.OpenClaw-dashboard`, stale pre-edit env → Gemini provider, shared Gmail quota burn); verified no python/uvicorn processes remain
 - [x] 6.2 Stray empty `C:\data\openclaw.db` deleted — DONE 2026-07-21
-- [ ] 6.3 After merge to the live worktree branch: `docker compose up -d --build --force-recreate` in `C:\Code\Me.OpenClaw-telegram-claimquery`; confirm the container's first tick keeps the 4 new matches, polls Petcover (first `claim_status_events` rows), and Telegram-notifies the matched/flagged claims
+- [x] 6.3 After merge to the live worktree branch: `docker compose up -d --build --force-recreate` in `C:\Code\Me.OpenClaw-telegram-claimquery`; confirm the container's first tick keeps the 4 new matches, polls Petcover (first `claim_status_events` rows), and Telegram-notifies the matched/flagged claims — **verified live 2026-07-25**: same evidence; the deploy worktree has been rebuilt repeatedly this session and ticks are recording events.
 
 ## Live results summary (2026-07-21, host run of new matcher)
 

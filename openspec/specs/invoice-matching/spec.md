@@ -1,9 +1,13 @@
 # invoice-matching Specification
 
-<!-- NOTE: Partial spec. Base requirements for this capability are still pending sync from the active `vet-claim-automation` change; only the requirement modified by `petcover-claim-status-tracking` is captured here. -->
-
 ## Purpose
-TBD — full purpose lands when the base `vet-claim-automation` change syncs.
+Find the vet's invoice for a bank charge, and decide what of it is claimable. `invoice_matching.py`.
+
+Almost every requirement here exists because a plausible assumption was disproved by real mail. The "confirmed live" notes are load-bearing — they are why each rule is shaped the way it is.
+
+See ADR-0007 (charge as ceiling), ADR-0009 (LLM seam), ADR-0010 (vision-OCR fallback).
+
+*(Consolidated 2026-07-25 from the `vet-claim-automation` and `fix-email-matching-gaps` deltas. This file previously carried a note saying base requirements were "pending sync" — they never were, so the baseline described one requirement out of the capability's real behaviour.)*
 
 ## Requirements
 
@@ -20,16 +24,147 @@ The bank charge is the MAXIMUM possible claim — it can exceed the invoice tota
 
 #### Scenario: Charge covers more than the matched invoice
 - **WHEN** the matched invoice's total is below the charge by more than a plausible surcharge (>2%)
-- **THEN** the claim still matches but is flagged `possible additional invoice — unexplained $X` for manual follow-up (a second invoice may exist for the same charge)
+- **THEN** the claim still matches but is flagged `possible additional invoice — unexplained $X` for manual follow-up
 
 #### Scenario: Invoice contains routine-care line items
 - **WHEN** a matched invoice mixes claimable treatment with routine/preventive items (e.g. a consultation plus a vaccination)
 - **THEN** the claim form's charge is the claimable subtotal only, with the routine items excluded
 
 #### Scenario: Invoice is routine care only
-- **WHEN** a matched invoice's claimable subtotal is zero (every line item is routine/preventive)
+- **WHEN** a matched invoice's claimable subtotal is zero
 - **THEN** no claim document is drafted; the claim is flagged `routine care only — not claimable`
 
 #### Scenario: Extraction returns no itemization
-- **WHEN** the invoice's line items can't be read (extraction returns no items)
+- **WHEN** the invoice's line items can't be read
 - **THEN** the invoice total is used as the claimable amount — a whole invoice is never silently dropped for lacking itemization
+
+### Requirement: Search Gmail for the invoice, bounded by the invoice's own date rather than arrival
+When a transaction is flagged vet-related, the system SHALL search Gmail for the merchant, including a query with **no upper arrival bound** (from the transaction date onward), for both the merchant and spouse-forward queries. Eligibility SHALL be governed by the **invoice's own date** falling within the match window of the transaction date — not by when the email arrived.
+
+**This supersedes the original ±3-day arrival window.** Forwarded invoices arrive long after the visit (confirmed live: February and January invoices forwarded in July), so an arrival-based window silently loses real invoices.
+
+#### Scenario: Months-late spouse forward
+- **WHEN** an invoice dated 23/02/2026 matching a 23/02/2026 transaction is forwarded in July
+- **THEN** the claim matches it, regardless of `invoice_request_sent_at`
+
+#### Scenario: Wide window catches an unrelated old invoice
+- **WHEN** the wide query returns a real invoice whose own date is outside the match window of the transaction date
+- **THEN** it does not match
+
+#### Scenario: No matching email found
+- **WHEN** no message matches the merchant
+- **THEN** the claim stays `pending_match` and is surfaced as needing follow-up, not silently dropped
+
+### Requirement: The owner's own outgoing mail is never an invoice candidate
+Candidate searches SHALL exclude self-sent mail (`-from:me`), and any message carrying Gmail's SENT label SHALL be skipped as a second layer.
+
+Justin's own invoice-request emails list visit dates and charge amounts, so extraction reads them as invoices with *exact* amount+date fits — the most convincing possible false positive. Confirmed live: 12 claims matched his own requests the moment the wide arrival window surfaced them.
+
+#### Scenario: Own invoice-request email in the search window
+- **WHEN** the merchant query returns Justin's own "Invoice request" email listing the visit's exact date and amount
+- **THEN** it is never matched — the claim keeps searching for the vet's actual invoice
+
+### Requirement: Extraction uses the provider-agnostic LLM seam
+Invoice extraction SHALL call `llm.extract` (ADR-0009), never a provider SDK directly, so provider and quota problems are solved by configuration rather than code changes.
+
+**Supersedes** the original "Gemini extracts structured invoice fields", which named the only backend that existed at the time.
+
+#### Scenario: Provider swap
+- **WHEN** `LLM_PROVIDER` is changed and the app restarted
+- **THEN** invoice extraction uses the new provider with no code change
+
+### Requirement: Each email is extracted at most once
+Extraction results SHALL be cached per Gmail message id and reused across claims and ticks; a candidate email SHALL cost at most one LLM extraction ever. A **failed** extraction SHALL NOT be cached, so it retries.
+
+The cache is permanent — invalidate the row if what extraction must return ever changes.
+
+#### Scenario: Rejected candidate reappears next tick
+- **WHEN** a candidate email was extracted and rejected by the gates on a previous tick
+- **THEN** the next tick re-evaluates it from cache with no LLM call
+
+### Requirement: Multi-invoice emails match per contained invoice
+An email MAY contain several invoices (confirmed live: a vet's bulk reply to a yearly invoice request listed three invoices totalling $1,134.82). Extraction SHALL return every invoice found; the matcher SHALL test each individually against the ceiling and invoice-date gates and match the passing one — **never the email's grand total**.
+
+#### Scenario: Bulk vet reply covering several visits
+- **WHEN** a claim for $407.56 is matched against an email containing invoices for $141.87, $585.39 and $407.56
+- **THEN** the claim matches the $407.56 invoice, and the email remains available to other claims
+
+#### Scenario: No contained invoice fits
+- **WHEN** every invoice in the email exceeds the charge or fails the invoice-date gate
+- **THEN** the claim does not match that email
+
+#### Scenario: Extraction reply truncated by the model's output budget
+- **WHEN** a long bulk email's extraction reply is cut mid-array (confirmed live on a 12k-char invoice PDF)
+- **THEN** the complete invoice objects are salvaged and the partial one dropped
+
+### Requirement: An invoice already carried by another claim is never re-matched
+Invoice identity across claims SHALL be `invoice_number` where present, else amount + date. A claim SHALL NOT match an invoice another claim already carries, and where several candidates pass the gates the closest amount match SHALL win.
+
+#### Scenario: Two claims, one invoice already assigned
+- **WHEN** a candidate invoice is already carried by another claim
+- **THEN** it is not matched again, and the claim keeps searching
+
+### Requirement: One invoice paid over several charges merges on confirmation — never a pick, never guessed
+One vet invoice can be paid in several card swipes (confirmed live: invoice #411193, $2,521.46, whose own payment section lists −$1,970.40 and −$551.06 = the two bank charges). Which claim row carries the invoice is internal bookkeeping — Petcover sees the invoice, never the bank charges — so the system SHALL NOT ask Justin to choose between claims.
+
+When this claim plus exactly one other pending claim at the same vet sum to the invoice total (within ceiling tolerance), the system SHALL record a merge proposal and push one Telegram message showing the invoice, both charges and their sum — stating additionally when the invoice's own payment records list both amounts — offering Merge or Not-the-same-invoice. **Nothing merges without the tap.** Where no sibling explains the total, the claim SHALL be flagged for manual review.
+
+#### Scenario: One invoice, two charges — confirm merge
+- **WHEN** a date-plausible invoice equals this claim's charge plus one sibling's, and Justin taps Merge
+- **THEN** the larger charge's claim carries the full invoice (ceiling validated against the charges combined), the other becomes `absorbed` with a flag naming the carrier, and the proposal resolves
+
+#### Scenario: Justin rejects the merge
+- **WHEN** Justin taps "Not the same invoice"
+- **THEN** the proposal is rejected, both claims are flagged for manual matching, and the pair is never proposed again
+
+#### Scenario: Proposal notified exactly once
+- **WHEN** a merge proposal is created
+- **THEN** the message is pushed once, not re-sent every tick, and stays actionable until resolved
+
+#### Scenario: No sibling explains the total
+- **WHEN** the only date-plausible invoice exceeds the charge and no pending sibling completes the sum
+- **THEN** the claim is flagged for manual review and no match is recorded
+
+### Requirement: Image-only scans fall back to vision OCR, hard-capped
+When a candidate PDF has no text layer, the system SHALL fall back to vision OCR page-by-page, capped at 3 attempts per email. Attempts SHALL be refunded on provider outage — a provider being down is not evidence the scan is unreadable. Successful vision results are cached like any extraction. See ADR-0010.
+
+#### Scenario: Scanned invoice with no text layer
+- **WHEN** text extraction returns nothing for a PDF from the claim's vet
+- **THEN** vision OCR reads it page-by-page and the result is cached
+
+#### Scenario: Provider outage during a vision attempt
+- **WHEN** the vision call fails because the provider is unavailable
+- **THEN** the attempt is refunded rather than counted against the 3-attempt cap
+
+### Requirement: Unreadable invoice attachments are flagged, not skipped silently
+When a candidate email from the claim's vet has a PDF attachment but yields no extractable amount, the claim SHALL be flagged `invoice attachment unreadable — <subject>` so Justin can request a readable copy. The flag SHALL clear when the claim matches.
+
+#### Scenario: Vet reply with unparseable PDF
+- **WHEN** the vet's reply carries an invoice PDF whose extraction returns nothing
+- **THEN** the claim is flagged unreadable-attachment and stays `pending_match`
+
+### Requirement: Spouse-forward vet confirmation resists generic word overlap
+A spouse-forwarded candidate SHALL be accepted only when the known vet email address appears in the forwarded content, or a distinctive merchant-name word (length ≥ 5, excluding generic tokens such as `veterinary`/`animal`/`hospital`) appears.
+
+Confirmed live: a human-hospital forward passed the previous check on a short generic word and burned extraction quota.
+
+#### Scenario: Human-medical forward
+- **WHEN** the spouse forwards a non-vet medical email sharing only a short or generic word with the merchant descriptor
+- **THEN** it is not treated as a candidate and no extraction is spent on it
+
+### Requirement: Request the invoice from the vet when none is found, then keep rechecking
+When a vet-flagged transaction has been `pending_match` past the match window, the system SHALL draft (never send) an email to the vet requesting the invoice, using the `vet_contacts` override address where present. Rechecking SHALL continue from the original transaction date onward on every later pass.
+
+Where no vet email is on file the claim SHALL be flagged as such rather than silently skipped — that flag is actionable via the vet-email command.
+
+#### Scenario: Pending-match transaction ages past the window
+- **WHEN** a `pending_match` transaction has no matching email after the match window elapses
+- **THEN** a Gmail draft to the vet is created and surfaced for Justin to review and send — never sent automatically
+
+#### Scenario: Vet replies with the invoice
+- **WHEN** a new email arrives from the vet after a request was sent
+- **THEN** it is treated as a normal candidate, with the same merchant and ceiling checks as any other
+
+#### Scenario: No vet address on file
+- **WHEN** an invoice request is due but the merchant has no contact address
+- **THEN** the claim is flagged that no vet email is on file, rather than failing silently

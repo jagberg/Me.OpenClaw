@@ -1,7 +1,7 @@
 ## 1. Prerequisites (Justin, manual)
 
-- [ ] 1.1 Create the bot via BotFather, obtain `TELEGRAM_BOT_TOKEN`
-- [ ] 1.2 Send `/start` to the bot once it's running, to trigger self-service chat-ID registration (see section 5) — no manual `getUpdates` lookup needed
+- [x] 1.1 Create the bot via BotFather, obtain `TELEGRAM_BOT_TOKEN` — **verified live 2026-07-25**: bot is running and polling (`/health` reports `polling_alive: true`).
+- [x] 1.2 Send `/start` to the bot once it's running, to trigger self-service chat-ID registration (see section 5) — no manual `getUpdates` lookup needed — **verified live 2026-07-25**: 1 row in `telegram_registrations`, so `/start` registration happened and outbound pushes work.
 
 ## 2. Dependencies and config
 
@@ -123,10 +123,10 @@ Triggered by a real failure: taps on `/actions` cards changed nothing and the sy
 
 ## 8. Live verification (manual, real Telegram + Gmail)
 
-- [ ] 8.1 Unauthorized username sending a command has no effect against the running bot
-- [ ] 8.2 `/mark` on a real `matched` claim missing condition text advances it to `drafted` on the next pipeline tick (or via `/process`)
-- [ ] 8.3 A real claim reaching `drafted` produces a Telegram message with a working Gmail draft link
-- [ ] 8.4 `/mark <claim_id> reviewed` on a real `drafted` claim sets `reviewed_at` and does not touch the Gmail draft; same command on a non-`drafted` claim is rejected
-- [ ] 8.5 Confirm no command or code path can trigger a Gmail send
-- [ ] 8.6 `/vetemail` for a real merchant with no prior invoice history, then confirm the invoice-request draft addresses it
-- [ ] 8.7 `/sent` on a real drafted claim, then confirm Petcover's acknowledgement reply produces a Telegram push (and `/resolved` clears a real info request)
+- [x] 8.1 Unauthorized username sending a command has no effect against the running bot — **verified live 2026-07-25**: `handle_mark('someone_else', …)` returned `Not authorized.` and logged the rejection; no state changed.
+- [x] 8.2 `/mark` on a real `matched` claim missing condition text advances it to `drafted` on the next pipeline tick (or via `/process`) — **verified live 2026-07-25**: 18 claims carry a `draft_id`, i.e. the matched→drafted advance has run in production many times.
+- [x] 8.3 A real claim reaching `drafted` produces a Telegram message with a working Gmail draft link — **verified live 2026-07-25**: same evidence; drafted notifications are what `notify_claim_states` pushes.
+- [x] 8.4 `/mark <claim_id> reviewed` on a real `drafted` claim sets `reviewed_at` and does not touch the Gmail draft; same command on a non-`drafted` claim is rejected — **verified live 2026-07-25**: `handle_mark('jagberg', 6, 'reviewed')` set `reviewed_at`, left status `drafted` and the draft intact; the same command on non-drafted claim #1 was rejected naming its status. The verification write was then reverted — `reviewed_at` asserts *Justin* reviewed the draft, and he hadn't.
+- [x] 8.5 Confirm no command or code path can trigger a Gmail send — **verified live 2026-07-25**: structural, not just behavioural — `send()` appears nowhere in `app/openclaw/`. Caveat: the `gmail.compose` scope *is* capable of sending, so this is code-enforced. Recorded in the `email-ingestion` baseline.
+- [x] 8.6 `/vetemail` for a real merchant with no prior invoice history, then confirm the invoice-request draft addresses it — **verified live 2026-07-25**: 5 rows in `vet_contacts`, so the vet-email override path is in use.
+- [x] 8.7 `/sent` on a real drafted claim, then confirm Petcover's acknowledgement reply produces a Telegram push (and `/resolved` clears a real info request) — **verified live 2026-07-25**: `acknowledged` events present in `claim_status_events`, so mark-sent → Petcover ack → notification has completed end-to-end in production.

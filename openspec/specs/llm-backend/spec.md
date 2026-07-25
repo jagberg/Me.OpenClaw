@@ -3,7 +3,9 @@
 ## Purpose
 One seam for every LLM call in OpenClaw. `app/openclaw/llm.py` exposes `chat()`, `extract()` and `extract_vision()`; no other module imports a provider SDK — the sole exception is `gemini.py`, which *is* the Gemini implementation sitting behind that seam.
 
-See ADR-0009 (provider-agnostic backend, supersedes ADR-0001) and ADR-0010 (vision-OCR fallback).
+See ADR-0009 (provider-agnostic backend, supersedes ADR-0001), ADR-0010 (vision-OCR fallback), ADR-0017 (per-model daily-budget fallback).
+
+**This capability replaces `llm-extraction`.** That capability was defined by the `openclaw-personal-assistant` change and required, in its own words, that the system "SHALL send every extraction/chat request to Google Gemini 2.5 Flash" with a 15-requests/min throttle. ADR-0009 superseded that wholesale. When the five stale changes were synced and archived on 2026-07-25, `llm-extraction` was therefore **deliberately not promoted to a baseline** — doing so would have put two contradicting specs in `openspec/specs/`. Its delta survives in `openspec/changes/archive/2026-07-25-openclaw-personal-assistant/` as the record of what was originally required. Rate limiting, call logging and non-silent failure — the parts that outlived the provider — are requirements below.
 
 ## Requirements
 

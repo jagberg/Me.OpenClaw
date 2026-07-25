@@ -1,7 +1,7 @@
 ## 1. Policy attributes (excess / cap)
 
 - [x] 1.1 Add nullable `annual_excess` and `annual_cap` columns to the `pets` CREATE TABLE in `db.py` (for fresh DBs)
-- [ ] 1.2 Run manual `ALTER TABLE pets ADD COLUMN annual_excess REAL` and `... ADD COLUMN annual_cap REAL` against `app/data/openclaw.db` (CLAUDE.md: IF NOT EXISTS won't touch existing tables)
+- [x] 1.2 Run manual `ALTER TABLE pets ADD COLUMN annual_excess REAL` and `... ADD COLUMN annual_cap REAL` against `app/data/openclaw.db` (CLAUDE.md: IF NOT EXISTS won't touch existing tables) — **verified live 2026-07-25**: `pets.annual_excess` and `pets.annual_cap` both present in the live DB (PRAGMA table_info).
       — NOT run: this dashboard checkout has no `app/data/openclaw.db`. Must run on Justin's deployment box. Fresh DBs get the columns from 1.1.
 - [x] 1.3 Seed Aari's policy: `annual_excess = 150`, `annual_cap = 10000`; leave Echo NULL (Bow Wow, process undefined) — in `SEED_PETS` (fresh DBs). On the live DB, set with an UPDATE after the ALTER in 1.2.
 
