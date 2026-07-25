@@ -33,8 +33,17 @@ _PROVIDERS = {
 # is the same failure one level down, and it took the whole chat agent out.
 # Ordered by capability: a weaker answer beats no answer, and the degradation is
 # reported to Justin rather than passed off as normal (see agent.handle_message).
+#
+# Every link probed end-to-end 2026-07-25 against the real 15-tool schema — an
+# unproven last link is exactly what fails when the chain is finally needed.
+# All picked the right tool with the right date args and completed the loop:
+#   openai/gpt-oss-120b    0.9s
+#   llama-3.1-8b-instant   2.1s
+#   openai/gpt-oss-20b     1.3s
+# Deliberately EXCLUDED: qwen/qwen3.6-27b. It answers correctly but took 62s,
+# which is not a fallback — it's a hang with a reply at the end.
 _FALLBACK_MODELS = {
-    "groq": ("openai/gpt-oss-120b", "llama-3.1-8b-instant"),
+    "groq": ("openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"),
 }
 
 

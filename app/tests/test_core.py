@@ -2712,16 +2712,18 @@ def test_daily_budget_exhaustion_falls_through_to_another_model():
     assert llm._last_model_used == "openai/gpt-oss-120b", "the answering model is recorded"
 
     # Everything spent -> visible failure that says what's actually wrong, and
-    # doesn't send him hunting an outage.
+    # doesn't send him hunting an outage. The model set is DERIVED from the
+    # configured chain, not hardcoded — hardcoding it broke the moment a fourth
+    # link was added, by silently letting the "everything is spent" case succeed.
     tried.clear()
-    all_models = {"llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant"}
+    chain = ["llama-3.3-70b-versatile", *llm._FALLBACK_MODELS["groq"]]
     try:
-        llm._completion(_client(all_models), "llama-3.3-70b-versatile",
+        llm._completion(_client(set(chain)), "llama-3.3-70b-versatile",
                         [{"role": "user", "content": "hi"}], None, "test")
         raise AssertionError("must fail visibly once every budget is gone")
     except llm.LLMUnavailableError as exc:
         assert "daily token budget" in str(exc) and "rolling window" in str(exc)
-        assert len(tried) == 3, f"tries each model exactly once: {tried}"
+        assert tried == chain, f"tries each model exactly once, in order: {tried}"
 
 
 def test_fallback_model_is_disclosed_in_the_reply():
