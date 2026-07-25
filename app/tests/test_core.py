@@ -2744,6 +2744,44 @@ def test_fallback_model_is_disclosed_in_the_reply():
         llm.chat = original
 
 
+def test_assistant_turn_drops_output_only_fields():
+    """Live 400 (2026-07-25): `messages[2].reasoning: reasoning is not supported
+    with this model`. The tool loop replayed the whole assistant message back
+    into the conversation, so gpt-oss-120b's `reasoning` field poisoned the next
+    request and killed the turn. Latent since the loop was written — it could
+    only surface once the fallback chain could route to a reasoning model."""
+    from openclaw import llm
+
+    class _Fn:
+        name = "query_claims"
+        arguments = '{"pet":"Aari"}'
+
+    class _Call:
+        id = "call_1"
+        function = _Fn()
+
+    class _Message:
+        content = "let me look"
+        tool_calls = [_Call()]
+        reasoning = "a long chain of thought the API will not accept back"
+        model_extra = {"reasoning": "..."}
+
+    turn = llm._assistant_turn(_Message())
+    assert set(turn) == {"role", "content", "tool_calls"}, f"whitelist only: {sorted(turn)}"
+    assert "reasoning" not in turn
+    # The parts the loop actually needs survive intact, or tool results can't pair.
+    assert turn["tool_calls"][0]["id"] == "call_1"
+    assert turn["tool_calls"][0]["function"]["name"] == "query_claims"
+    assert turn["tool_calls"][0]["function"]["arguments"] == '{"pet":"Aari"}'
+    assert turn["content"] == "let me look"
+
+    class _NoContent:
+        content = None
+        tool_calls = [_Call()]
+
+    assert llm._assistant_turn(_NoContent())["content"] == "", "None content must not serialize as null"
+
+
 def test_petcover_and_vet_mail_tools_are_distinguishable():
     """Live miss (2026-07-25): asked "what claim emails were sent that you can
     verify and check for a response", the model called the VET invoice-request

@@ -161,6 +161,35 @@ def _completion(client, model: str, messages: list, tools, purpose: str):
     raise LLMUnavailableError(f"LLM request failed after retries: {last_error}") from last_error
 
 
+def _assistant_turn(message) -> dict:
+    """The assistant's tool-call turn, reduced to the fields the API accepts BACK
+    as input. Was `message.model_dump(exclude_none=True)`, which replayed every
+    field the provider happened to emit.
+
+    That broke live the moment a reasoning-capable model answered: gpt-oss-120b
+    returns a `reasoning` field, and echoing it produced
+    `messages[2].reasoning: reasoning is not supported with this model` — a 400
+    that killed the turn. Latent since the tool loop was written; it could only
+    surface once the fallback chain (ADR-0016) could route to such a model.
+
+    A whitelist, not a `reasoning` blacklist: the next model to emit some other
+    output-only field would otherwise reproduce this exactly. The loop needs
+    nothing beyond these three — tool_calls to pair with the tool results, and
+    content because some models put text alongside the calls."""
+    return {
+        "role": "assistant",
+        "content": message.content or "",
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.function.name, "arguments": call.function.arguments or "{}"},
+            }
+            for call in (message.tool_calls or [])
+        ],
+    }
+
+
 def chat(messages: list, tools: list | None = None, tool_impls: dict | None = None,
          purpose: str = "chat", max_iterations: int = 4) -> dict:
     """Bounded tool-calling loop over an OpenAI-compatible provider.
@@ -180,7 +209,7 @@ def chat(messages: list, tools: list | None = None, tool_impls: dict | None = No
         message = _completion(client, model, convo, tools, purpose)
         if not getattr(message, "tool_calls", None):
             return {"text": message.content or "", "model": _last_model_used}
-        convo.append(message.model_dump(exclude_none=True))  # assistant tool-call turn
+        convo.append(_assistant_turn(message))
         for call in message.tool_calls:
             name = call.function.name
             try:
