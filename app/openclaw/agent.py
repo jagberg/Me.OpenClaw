@@ -561,7 +561,16 @@ def handle_message(text: str, chat_id: int | None = None) -> tuple[str, dict | N
     # charged against a budget of under 40 requests a day. 4 rounds still cover
     # the deepest real path (sweep -> read -> answer) with a spare.
     result = llm.chat(messages, tools=TOOLS, tool_impls=impls, purpose="chat")
+    # NOT named `text` — that's this function's user-message parameter, and the
+    # history below records it as the user turn.
+    reply = result["text"]
+    # A fallback model means the primary's daily budget ran out. Say so: a
+    # quietly weaker answer is exactly the invisible failure the hard rules
+    # forbid, and Justin should weigh a downgraded reply accordingly.
+    _base, primary, _key = llm._resolve()
+    if result.get("model") and result["model"] != primary:
+        reply = f"⚠️ {primary} is out of daily tokens — answered with {result['model']}.\n\n{reply}"
     if chat_id is not None:
         turns = [*prior, {"role": "user", "content": text}, {"role": "assistant", "content": result["text"] or ""}]
         _history[chat_id] = turns[-HISTORY_TURNS * 2 :]
-    return result["text"], (proposals[-1] if proposals else None)
+    return reply, (proposals[-1] if proposals else None)

@@ -9,10 +9,13 @@ provider (sole vision-capable backend, ADR-0010). Cerebras was removed
 2026-07-23: its free inference tier is sold out for this account (ADR-0009).
 """
 import json
+import logging
 import time
 
 from . import config
 from .gemini import _RateLimiter, _log_call  # reuse limiter + call logging (and the tests' anchor)
+
+logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 2
@@ -21,6 +24,17 @@ BASE_BACKOFF_SECONDS = 2
 _PROVIDERS = {
     "groq": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", config.GROQ_API_KEY),
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini", config.OPENAI_API_KEY),
+}
+
+# Groq's daily token budget is PER MODEL ("Rate limit reached for model
+# llama-3.3-70b-versatile … on tokens per day"), so an exhausted TPD is
+# survivable by moving models — unlike TPM, where waiting is the only cure.
+# ADR-0009 made the provider swappable to absorb single-provider failure; this
+# is the same failure one level down, and it took the whole chat agent out.
+# Ordered by capability: a weaker answer beats no answer, and the degradation is
+# reported to Justin rather than passed off as normal (see agent.handle_message).
+_FALLBACK_MODELS = {
+    "groq": ("openai/gpt-oss-120b", "llama-3.1-8b-instant"),
 }
 
 
@@ -70,9 +84,17 @@ def _is_malformed_tool_call(exc: Exception) -> bool:
     return "tool_use_failed" in str(exc)
 
 
-def _completion(client, model: str, messages: list, tools, purpose: str):
-    """One provider round-trip with retry/backoff, rate limiting and call logging.
-    Returns the assistant message object. Raises LLMUnavailableError on failure."""
+def _is_daily_budget_exhausted(exc: Exception) -> bool:
+    """Groq's per-day token cap, distinct from the per-minute one. Only the 429
+    body says which — the rate-limit headers never mention TPD at all, which is
+    how it went undocumented long enough to take the agent down (ADR-0016)."""
+    text = str(exc).lower()
+    return "tokens per day" in text or "(tpd)" in text
+
+
+def _try_model(client, model: str, messages: list, tools, purpose: str):
+    """Retry loop for ONE model. Returns the assistant message, or raises the
+    last error for _completion to decide whether another model can help."""
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         _limiter.acquire()
@@ -87,6 +109,8 @@ def _completion(client, model: str, messages: list, tools, purpose: str):
         except Exception as exc:  # network/API errors — logged, not swallowed
             last_error = exc
             _log_call(purpose, False, int((time.monotonic() - start) * 1000), str(exc))
+            if _is_daily_budget_exhausted(exc):
+                raise  # no amount of retrying frees a daily cap
             if attempt < MAX_RETRIES:
                 if _is_rate_limited(exc):
                     time.sleep(BASE_BACKOFF_SECONDS * attempt)
@@ -94,12 +118,45 @@ def _completion(client, model: str, messages: list, tools, purpose: str):
                 if _is_malformed_tool_call(exc):
                     continue  # no backoff: nothing is overloaded, the output was just malformed
             break
+    raise last_error
+
+
+# The model that answered the most recent successful call. Read by chat() so a
+# caller can tell Justin when he got a fallback instead of the primary.
+_last_model_used: str | None = None
+
+
+def _completion(client, model: str, messages: list, tools, purpose: str):
+    """One provider round-trip with retry/backoff, rate limiting and call logging.
+    Falls through to the next model's own daily budget when this one's is spent.
+    Returns the assistant message object. Raises LLMUnavailableError on failure."""
+    global _last_model_used
+    chain = [model, *(m for m in _FALLBACK_MODELS.get(config.LLM_PROVIDER, ()) if m != model)]
+    last_error: Exception | None = None
+    for candidate in chain:
+        try:
+            message = _try_model(client, candidate, messages, tools, purpose)
+        except Exception as exc:
+            last_error = exc
+            if _is_daily_budget_exhausted(exc) and candidate != chain[-1]:
+                logger.warning(
+                    "%s daily token budget exhausted — falling back to the next model", candidate
+                )
+                continue
+            break
+        _last_model_used = candidate
+        return message
     if _is_malformed_tool_call(last_error):
         # Distinct message: nothing is down, so "LLM unavailable" would send
         # Justin looking for an outage that isn't there.
         raise LLMUnavailableError(
             f"the model kept producing a malformed tool call after {MAX_RETRIES} attempts — "
             "try rephrasing the question"
+        ) from last_error
+    if _is_daily_budget_exhausted(last_error):
+        raise LLMUnavailableError(
+            f"every model's daily token budget is spent ({', '.join(chain)}). "
+            "It's a rolling window, so try again shortly."
         ) from last_error
     raise LLMUnavailableError(f"LLM request failed after retries: {last_error}") from last_error
 
@@ -111,7 +168,8 @@ def chat(messages: list, tools: list | None = None, tool_impls: dict | None = No
     tool_impls maps a tool name -> callable(**args) -> str (the tool's result
     text fed back to the model). The loop runs at most max_iterations rounds,
     then forces a final answer with tools disabled so it always terminates.
-    Returns {"text": <assistant reply>}.
+    Returns {"text": <assistant reply>, "model": <the model that answered>} —
+    "model" may differ from the configured one if a daily budget ran out.
     """
     if config.LLM_PROVIDER == "gemini":
         raise LLMUnavailableError("chat() needs an OpenAI-compatible provider; gemini supports extract() only")
@@ -121,7 +179,7 @@ def chat(messages: list, tools: list | None = None, tool_impls: dict | None = No
     for _ in range(max_iterations):
         message = _completion(client, model, convo, tools, purpose)
         if not getattr(message, "tool_calls", None):
-            return {"text": message.content or ""}
+            return {"text": message.content or "", "model": _last_model_used}
         convo.append(message.model_dump(exclude_none=True))  # assistant tool-call turn
         for call in message.tool_calls:
             name = call.function.name
@@ -135,7 +193,7 @@ def chat(messages: list, tools: list | None = None, tool_impls: dict | None = No
             output = impl(**args) if impl else f"unknown tool: {name}"
             convo.append({"role": "tool", "tool_call_id": call.id, "content": str(output)})
     final = _completion(client, model, convo, None, purpose)
-    return {"text": final.content or ""}
+    return {"text": final.content or "", "model": _last_model_used}
 
 
 def extract_vision(prompt: str, image_jpeg: bytes, purpose: str = "vision_extraction") -> str:

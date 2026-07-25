@@ -2670,6 +2670,80 @@ def test_malformed_tool_call_retries_then_fails_readably():
         assert "try rephrasing" in str(exc)
 
 
+def test_daily_budget_exhaustion_falls_through_to_another_model():
+    """Groq's token-per-day cap is PER MODEL, so an exhausted budget is
+    survivable by moving models — unlike the per-minute cap, where waiting is the
+    only cure. Justin hit this in normal use and the whole chat agent was dead.
+    ADR-0009 made the provider swappable; this is the same failure one level down."""
+    from openclaw import llm
+
+    tpd = Exception(
+        "Error code: 429 - {'message': 'Rate limit reached for model "
+        "`llama-3.3-70b-versatile` ... on tokens per day (TPD): Limit 100000, Used 97968'}"
+    )
+    tpm = Exception("Error code: 429 - {'message': 'Rate limit reached ... on tokens per minute'}")
+    assert llm._is_daily_budget_exhausted(tpd)
+    assert not llm._is_daily_budget_exhausted(tpm), "per-minute must NOT trigger a model switch"
+    assert llm._is_rate_limited(tpd), "still a 429"
+
+    tried = []
+
+    def _client(fail_for):
+        class C:
+            class chat:
+                class completions:
+                    @staticmethod
+                    def create(model, **kwargs):
+                        tried.append(model)
+                        if model in fail_for:
+                            raise tpd
+                        class _M:
+                            content = f"answered by {model}"
+                            tool_calls = None
+                        return type("R", (), {"choices": [type("C", (), {"message": _M()})()]})
+        return C()
+
+    # Primary spent -> second model's own budget answers, and only ONE attempt is
+    # spent on the exhausted model (retrying can't free a daily cap).
+    msg = llm._completion(_client({"llama-3.3-70b-versatile"}), "llama-3.3-70b-versatile",
+                          [{"role": "user", "content": "hi"}], None, "test")
+    assert msg.content == "answered by openai/gpt-oss-120b", tried
+    assert tried == ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"], f"no wasted retries: {tried}"
+    assert llm._last_model_used == "openai/gpt-oss-120b", "the answering model is recorded"
+
+    # Everything spent -> visible failure that says what's actually wrong, and
+    # doesn't send him hunting an outage.
+    tried.clear()
+    all_models = {"llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant"}
+    try:
+        llm._completion(_client(all_models), "llama-3.3-70b-versatile",
+                        [{"role": "user", "content": "hi"}], None, "test")
+        raise AssertionError("must fail visibly once every budget is gone")
+    except llm.LLMUnavailableError as exc:
+        assert "daily token budget" in str(exc) and "rolling window" in str(exc)
+        assert len(tried) == 3, f"tries each model exactly once: {tried}"
+
+
+def test_fallback_model_is_disclosed_in_the_reply():
+    """A quietly weaker answer is the invisible failure the hard rules forbid."""
+    from openclaw import agent, llm
+
+    original = llm.chat
+    llm.chat = lambda *a, **k: {"text": "here you go", "model": "llama-3.1-8b-instant"}
+    try:
+        reply, _proposal = agent.handle_message("what's outstanding", chat_id=None)
+        assert "out of daily tokens" in reply and "llama-3.1-8b-instant" in reply
+        assert "here you go" in reply, "the actual answer survives the notice"
+
+        # Primary answering must NOT be annotated.
+        _b, primary, _k = llm._resolve()
+        llm.chat = lambda *a, **k: {"text": "clean", "model": primary}
+        reply, _proposal = agent.handle_message("what's outstanding", chat_id=None)
+        assert reply == "clean"
+    finally:
+        llm.chat = original
+
+
 def test_petcover_and_vet_mail_tools_are_distinguishable():
     """Live miss (2026-07-25): asked "what claim emails were sent that you can
     verify and check for a response", the model called the VET invoice-request
