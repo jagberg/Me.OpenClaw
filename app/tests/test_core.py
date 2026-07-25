@@ -18,6 +18,8 @@ os.environ["DATABASE_PATH"] = os.path.join(_tmpdir, "test.db")
 os.environ["GEMINI_API_KEY"] = ""
 os.environ["GROQ_API_KEY"] = ""
 os.environ["OPENAI_API_KEY"] = ""
+# Message-log rows are version-stamped; a known value lets the tests assert it.
+os.environ["APP_VERSION"] = "test-sha+test"
 
 from openclaw import claim_forms, claim_status, db, gemini, invoice_matching, llm, netbank_csv, reminders, tasks, vet_detection  # noqa: E402
 from openclaw.scheduler import scheduler  # noqa: E402
@@ -587,6 +589,226 @@ def test_append_result_falls_back_to_caption_on_document_message():
     q_txt = FakeQuery(text="plain message", caption=None)
     asyncio.run(telegram_bot._append_result(q_txt, "✅ done"))
     assert q_txt.edited[0] == "text" and "plain message" in q_txt.edited[1], q_txt.edited
+
+
+def _clear_message_log():
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM telegram_messages")
+
+
+def _fake_update(update_id):
+    """A real Update object — every field but update_id is optional, so this
+    round-trips through to_dict/de_json exactly like a live one."""
+    from telegram import Update
+
+    return Update(update_id=update_id)
+
+
+def test_message_log_keeps_a_failed_update_queued_for_replay():
+    """The subtle invariant: PTB runs its error handler *inside* process_update,
+    so a failed update reaches mark_processed looking successful. If it settled,
+    the update would be silently dropped — exactly the class of loss this whole
+    table exists to prevent."""
+    from telegram import Update
+
+    from openclaw import config, message_log
+
+    db.init_db()
+    _clear_message_log()
+
+    uid = message_log.record_inbound(Update(update_id=9001))
+    assert uid == 9001, uid
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT * FROM telegram_messages WHERE update_id = 9001").fetchone()
+    assert row["processed_at"] is None, "arrival row must start unprocessed — that's the queue"
+    assert row["app_version"] == config.APP_VERSION, row["app_version"]
+
+    message_log.mark_failed(9001, "boom")
+    message_log.mark_processed(9001)  # what LoggedApplication does next
+    assert [r["update_id"] for r in message_log.pending()] == [9001]
+
+    # A second arrival of the same update_id (Telegram redelivery) must not duplicate.
+    assert message_log.record_inbound(Update(update_id=9001)) is None
+    with db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM telegram_messages WHERE update_id = 9001").fetchone()[0] == 1
+
+
+def test_logged_application_records_every_update_then_settles_it():
+    """The real seam, wired exactly as production wires it: one override catches
+    commands, taps, text and uploads alike. Never touches the network — the app
+    is marked initialized rather than calling get_me()."""
+    import asyncio
+
+    from openclaw import config, telegram_bot
+
+    db.init_db()
+    _clear_message_log()
+
+    original_token = config.TELEGRAM_BOT_TOKEN
+    config.TELEGRAM_BOT_TOKEN = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"  # never used, never dialled
+    try:
+        app = telegram_bot.build_application()
+        assert type(app).__name__ == "LoggedApplication", type(app).__name__
+        assert type(app.bot).__name__ == "LoggedBot", type(app.bot).__name__
+        app._initialized = True
+        asyncio.run(app.process_update(_fake_update(9401)))
+    finally:
+        config.TELEGRAM_BOT_TOKEN = original_token
+
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT * FROM telegram_messages WHERE update_id = 9401").fetchone()
+    assert row is not None, "process_update must log the arrival"
+    assert row["processed_at"] is not None, "a clean run must settle the row"
+
+
+def test_confirm_resolved_is_idempotent_so_replay_cannot_double_log():
+    """Replay is at-least-once, so every mutation it can re-trigger has to be
+    idempotent. This one wasn't: two calls wrote two audit events for one
+    decision, and confirming a claim with nothing outstanding invented an event
+    out of nothing."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM claim_status_events")
+        claim_id = conn.execute(
+            "INSERT INTO vet_claims (transaction_id, status, created_at, updated_at) "
+            "VALUES (9902, 'sent', '2026-07-01', '2026-07-01')"
+        ).lastrowid
+
+    # Nothing outstanding yet — confirming must be refused, not recorded.
+    assert claim_status.confirm_resolved(claim_id)["ok"] is False
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT INTO claim_status_events (claim_id, event_type, detail, created_at) "
+            "VALUES (?, 'info_requested', '{}', '2026-07-02')",
+            (claim_id,),
+        )
+
+    assert claim_status.confirm_resolved(claim_id)["ok"] is True
+    assert claim_status.confirm_resolved(claim_id)["ok"] is False, "second confirm must be a no-op"
+    with db.get_connection() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM claim_status_events WHERE claim_id = ? AND event_type = 'confirmed_resolved'",
+            (claim_id,),
+        ).fetchone()[0]
+    assert count == 1, count
+
+
+def test_replay_pending_reruns_only_unprocessed_and_settles_them():
+    import asyncio
+
+    from openclaw import message_log
+
+    db.init_db()
+    _clear_message_log()
+
+    for uid in (9101, 9102):
+        message_log.record_inbound(_fake_update(uid))
+    message_log.mark_processed(9102)  # already handled — must not be replayed
+
+    class FakeApp:
+        bot = None
+
+        def __init__(self):
+            self.seen = []
+
+        async def process_update(self, update):
+            self.seen.append(update.update_id)
+            message_log.mark_processed(update.update_id)
+
+    app = FakeApp()
+    assert asyncio.run(message_log.replay_pending(app)) == 1
+    assert app.seen == [9101], app.seen
+    # Second pass is a no-op: nothing left owed.
+    assert asyncio.run(message_log.replay_pending(FakeApp())) == 0
+
+
+def test_expire_queue_keeps_the_row_but_drops_it_from_the_queue():
+    """'Purge after 24h' applies to the queue, not the log — the row is the
+    reinforcement-learning dataset and deleting it defeats the purpose."""
+    from openclaw import message_log
+
+    db.init_db()
+    _clear_message_log()
+
+    stale = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    message_log.record_inbound(_fake_update(9201))
+    message_log.record_inbound(_fake_update(9202))
+    with db.get_connection() as conn:
+        conn.execute("UPDATE telegram_messages SET received_at = ? WHERE update_id = 9201", (stale,))
+
+    assert message_log.expire_queue() == 1
+    assert [r["update_id"] for r in message_log.pending()] == [9202], "fresh row must stay queued"
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT * FROM telegram_messages WHERE update_id = 9201").fetchone()
+    assert row is not None, "the row must survive — it's training data"
+    assert row["processed_at"] is not None and "abandoned" in row["error"], dict(row)
+
+
+def test_message_log_records_outbound_and_exports_jsonl():
+    import json as _json
+
+    from openclaw import config, message_log
+
+    db.init_db()
+    _clear_message_log()
+
+    message_log.record_inbound(_fake_update(9301))
+    message_log.record_outbound("send_message", "Claim #2 marked sent", {"chat_id": 1, "text": "Claim #2 marked sent"})
+
+    lines = [_json.loads(line) for line in message_log.iter_jsonl()]
+    assert [line["direction"] for line in lines] == ["in", "out"], lines
+    assert all(line["app_version"] == config.APP_VERSION for line in lines)
+    # payload is re-inlined as an object so a consumer doesn't double-decode
+    assert isinstance(lines[1]["payload"], dict), lines[1]["payload"]
+    assert message_log.stats()["queued"] == 1
+
+
+def test_transient_errors_are_warnings_not_action_required_errors():
+    """ERROR must mean "Justin has to do something". A dropped Gmail socket is
+    retried by the next tick unaided — it logged a full traceback before."""
+    import http.client
+    import socket
+
+    from googleapiclient.errors import HttpError
+    from openclaw import pipeline
+
+    assert pipeline._is_transient(http.client.IncompleteRead(b""))
+    assert pipeline._is_transient(socket.timeout())
+    assert pipeline._is_transient(ConnectionResetError())
+    assert pipeline._is_transient(HttpError(type("R", (), {"status": 503, "reason": "busy"})(), b""))
+    assert not pipeline._is_transient(HttpError(type("R", (), {"status": 404, "reason": "gone"})(), b""))
+    assert not pipeline._is_transient(ValueError("real bug"))
+
+
+def test_watchdog_restarts_the_process_when_polling_is_dead():
+    """Nothing awaits the updater task, so its death is silent and inbound stops.
+    The watchdog must alert (sending still works) and then take the process down
+    for compose to restart."""
+    from openclaw import pipeline, telegram_bot
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM ops_alerts WHERE kind = ?", (pipeline._POLLING_ALERT,))
+
+    exits, sent = [], []
+    original_alive, original_send = telegram_bot.polling_alive, telegram_bot.send_message_sync
+    telegram_bot.send_message_sync = lambda msg: sent.append(msg)
+    try:
+        telegram_bot.polling_alive = lambda: True
+        assert pipeline._watchdog_telegram_polling(exit_fn=lambda: exits.append(1)) is False
+        assert exits == [] and sent == []
+
+        telegram_bot.polling_alive = lambda: None  # bot disabled — not a fault
+        assert pipeline._watchdog_telegram_polling(exit_fn=lambda: exits.append(1)) is False
+        assert exits == []
+
+        telegram_bot.polling_alive = lambda: False
+        assert pipeline._watchdog_telegram_polling(exit_fn=lambda: exits.append(1)) is True
+        assert exits == [1], "a dead updater must take the process down"
+        assert sent and "Telegram polling" in sent[0], sent
+    finally:
+        telegram_bot.polling_alive = original_alive
+        telegram_bot.send_message_sync = original_send
 
 
 def test_unhandled_callback_data_reports_instead_of_silently_returning():

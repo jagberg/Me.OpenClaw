@@ -77,4 +77,8 @@ def start_polling() -> None:
         minutes=config.GMAIL_POLL_INTERVAL_MINUTES,
         id="gmail-poll",
         replace_existing=True,
+        # Without these a run missed while the host slept is skipped entirely
+        # (default grace is 1s), and a long sleep would otherwise fire a backlog.
+        coalesce=True,
+        misfire_grace_time=config.GMAIL_POLL_INTERVAL_MINUTES * 60,
     )

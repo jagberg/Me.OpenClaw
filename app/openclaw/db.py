@@ -165,6 +165,29 @@ CREATE TABLE IF NOT EXISTS ops_alerts (
     kind TEXT NOT NULL,
     sent_at TEXT NOT NULL
 );
+
+-- Every Telegram message in and out. Three jobs in one table: the training
+-- dataset (payload + app_version), the audit trail that answers "did my tap
+-- register?", and the replay queue (processed_at IS NULL = still owed).
+-- A morning of taps changed nothing and left no evidence of why, because
+-- nothing durable recorded them.
+-- update_id is Telegram's own, so UNIQUE + INSERT OR IGNORE dedupes replays
+-- and Telegram redeliveries for free. NULL for outbound rows.
+CREATE TABLE IF NOT EXISTS telegram_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    update_id INTEGER UNIQUE,
+    direction TEXT NOT NULL,
+    kind TEXT,
+    summary TEXT,
+    payload TEXT NOT NULL,
+    app_version TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    processed_at TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_messages_pending
+    ON telegram_messages(direction, processed_at);
 """
 
 # vet_claims columns added after the table's initial release — CREATE TABLE IF
@@ -178,12 +201,6 @@ _VET_CLAIMS_ADDED_COLUMNS = {
     "rejected_email_ids": "TEXT",  # JSON list of invoice emails Justin unmatched — never re-match these
     "item_conditions": "TEXT",  # JSON [{description, amount, condition}] when one invoice spans >1 condition
     "petcover_sr": "INTEGER",  # Petcover's per-document serial within a Condition Thread ("DC1-27-5628 Sr 3")
-}
-
-# pets columns added after the table's initial release — same migration reason
-# as _VET_CLAIMS_ADDED_COLUMNS.
-_PETS_ADDED_COLUMNS = {
-    "policy_anniversary": "TEXT",
 }
 
 # Echo's claim_email stays NULL until Justin supplies Bow Wow Insurance's process
@@ -225,6 +242,14 @@ def init_db(path: str | None = None) -> None:
 def get_connection(path: str | None = None):
     path = path or config.DATABASE_PATH
     conn = sqlite3.connect(path)
+    # The host and the container both open this bind-mounted file. In the default
+    # rollback journal a writer blocks readers outright, which is how a host-side
+    # write during a container read produced a "disk I/O error". WAL lets them
+    # coexist; busy_timeout waits its turn instead of failing instantly. Verified
+    # working (and persisting) on the Docker bind mount — not all virtual
+    # filesystems support WAL, so re-check if the mount ever changes.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     try:
         yield conn

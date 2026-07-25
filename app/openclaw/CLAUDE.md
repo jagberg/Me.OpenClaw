@@ -21,6 +21,7 @@ Root rules live in the repo-root `CLAUDE.md` (hard rules, domain rules, working 
 | `gmail_client.py` | OAuth, `full_message_text` (includes PDF text — settlement breakdowns need it), attachment iteration. Read + drafts only; `send()` is forbidden (hard rule). |
 | `db.py` | Schema (`CREATE TABLE IF NOT EXISTS` — live schema CHANGES to existing tables need manual DDL against `app/data/openclaw.db`), connections. |
 | `telegram_bot.py` | Bot commands/callbacks (auth = single username), notify send helpers (`send_message_sync`, `send_document_sync`, `send_photo_sync`), 👍 ack on every incoming user message, `_append_result` (edits text OR caption — PDF alerts have no text). `/history` (paged claim-card images) and `/actions` (summary card + one tap-to-resolve card per outstanding action, capped at `ACTION_CARD_CAP`). |
+| `message_log.py` | Durable record of every Telegram message in/out (`telegram_messages`): the RL dataset (raw payload + `app_version`), the audit trail for "did my tap register?", and the replay queue. `record_inbound` writes *before* handlers run, so a crash mid-handler leaves `processed_at IS NULL` and `replay_pending` re-runs it at startup. `expire_queue` drops rows from the queue after `MESSAGE_QUEUE_TTL_HOURS` but never deletes them. |
 | `claim_card.py` | Pillow renderers for the Telegram cards: `render` (month-grouped claim history) and `render_actions_summary` (what's waiting on Justin, blocked items separated). Status labels/colours mirror `templates/index.html`'s `status_chip`. Fonts resolve DejaVu (Docker, installed by the Dockerfile) → Windows → `load_default`. |
 | `main.py` + `templates/` | FastAPI dashboard: claims list, flags, CSV upload, condition entry. |
 | `scheduler.py` | APScheduler wiring for ticks + Gmail ingest. |
@@ -37,6 +38,10 @@ Root rules live in the repo-root `CLAUDE.md` (hard rules, domain rules, working 
 - `notify_claim_states` is a **change-feed**, not a state list — it dedupes on `(telegram_notified_status, telegram_notified_flag)`, so a claim that stays outstanding is announced once and never again. `claim_status.pending_actions()` + the daily `pipeline.nudge_stale_actions` job are the state-based counterpart.
 - `draft_id` is overloaded (claim drafts AND invoice-request drafts), so `invoice_request_sent_at IS NULL AND draft_id IS NOT NULL` matches almost every claim. Use `flag = 'invoice_request_drafted'` to find awaiting-invoice-request claims.
 - Telegram messages with a PDF are documents: edit the **caption**, not text (`_append_result`).
+- `message_log.mark_processed` refuses rows that already carry an `error`. PTB runs its error handler *inside* `process_update`, so a failed update otherwise reaches `mark_processed` looking successful and gets silently dropped from the replay queue.
+- Outbound logging lives in `LoggedBot`, so anything that constructs a plain `telegram.Bot` bypasses the message log. The three `*_sync` senders use `LoggedBot` for exactly this reason.
+- ERROR means *Justin must act*. Transient network failures are WARNING (`pipeline._is_transient`) — a Gmail `IncompleteRead` used to log a full traceback and read like a crisis.
+- The updater task is fire-and-forget: nothing awaits it, so its death is silent. `polling_alive()` + `pipeline._watchdog_telegram_polling` (SIGTERM, compose restarts) is the safety net.
 - `email_extractions` caches successful extraction FOREVER; invalidate the row if you change what extraction must return.
 - Vision attempts are refunded on `LLMUnavailableError` (provider outage ≠ unreadable scan).
 - Invoice identity across claims: `invoice_number` first, else amount+date (`_already_claimed`).

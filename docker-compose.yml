@@ -1,6 +1,12 @@
 services:
   app:
-    build: ./app
+    build:
+      context: ./app
+      args:
+        # scripts/deploy.ps1 sets APP_VERSION from the git SHA + branch. Building
+        # by hand leaves it "unknown", which the app warns about at startup
+        # rather than silently mistagging the message log.
+        APP_VERSION: "${APP_VERSION:-unknown}"
     env_file:
       - ./app/.env
     restart: unless-stopped

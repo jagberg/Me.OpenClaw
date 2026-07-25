@@ -10,7 +10,7 @@ Personal assistant for Justin: task/reminder capture from Gmail, plus a vet-insu
 - `docs/adr/` — architecture decisions; read 0006–0010 before touching the claims service (0007 ceiling matching, 0008 status events, 0009 LLM backends, 0010 vision OCR).
 - `README.md` — goal, end-to-end process, matching algorithm, every third-party call. Keep it current when behavior changes.
 - `app/data/` and `app/.env` — real SQLite DB, Gmail credentials/token, secrets. Gitignored; never commit, never print contents.
-- Deploy = Docker from the worktree `C:\Code\Me.OpenClaw-telegram-claimquery` (compose binds `C:/code/Me.OpenClaw/app/data:/data`): `docker compose up -d --build --force-recreate`.
+- Deploy = Docker from the worktree `C:\Code\Me.OpenClaw-telegram-claimquery` (compose binds `C:/code/Me.OpenClaw/app/data:/data`): run `./scripts/deploy.ps1`, which stamps `APP_VERSION` from the git SHA and prints `/health`. A bare `docker compose up -d --build` works but leaves the version `unknown`, which mistags every row in `telegram_messages`.
 
 ## Hard rules (non-negotiable)
 

@@ -1,15 +1,30 @@
 from datetime import datetime, timedelta, timezone
 
+import http.client
 import json
 import logging
+import os
+import signal
+import socket
 
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
-from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, llm, telegram_bot, vet_detection
+from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, llm, message_log, telegram_bot, vet_detection
 from .scheduler import scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """A network blip the next tick retries by itself, as opposed to something
+    Justin has to fix. Decides WARNING vs ERROR — ERROR is reserved for
+    "someone must act", so a dropped socket must not claim it."""
+    if isinstance(exc, (http.client.IncompleteRead, socket.timeout, TimeoutError, ConnectionError)):
+        return True
+    if isinstance(exc, HttpError):
+        return exc.resp.status in (429, 500, 502, 503, 504)
+    return False
 
 # Gmail auth-death alerting (ADR-0011 ops-alerting). When the OAuth token dies
 # every Gmail step fails silently in logs while Telegram still works — so make
@@ -18,6 +33,27 @@ logger = logging.getLogger(__name__)
 _GMAIL_AUTH_ALERT = "gmail_auth"
 _MAX_AUTH_ALERTS_24H = 5
 _GMAIL_AUTH_RECOVERY_MSG = "✅ Gmail access restored — the pipeline is reading mail again."
+_POLLING_ALERT = "telegram_polling"
+
+
+def _alert_rate_limited(kind: str, message: str, cap: int = _MAX_AUTH_ALERTS_24H, send_fn=None) -> bool:
+    """Send an ops alert to Telegram at most `cap` times per rolling 24h.
+    ops_alerts is the ledger, so a container restart can't reset the count and
+    re-spam. Returns whether it actually sent."""
+    send = send_fn or telegram_bot.send_message_sync
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=24)).isoformat()
+    with db.get_connection() as conn:
+        recent = conn.execute(
+            "SELECT COUNT(*) FROM ops_alerts WHERE kind = ? AND sent_at >= ?", (kind, cutoff)
+        ).fetchone()[0]
+        if recent < cap:
+            conn.execute("INSERT INTO ops_alerts (kind, sent_at) VALUES (?, ?)", (kind, now.isoformat()))
+    if recent >= cap:
+        logger.warning("%s alert cap (%s/24h) reached, staying quiet", kind, cap)
+        return False
+    send(message)
+    return True
 
 
 def _is_gmail_auth_failure(exc: Exception) -> bool:
@@ -39,26 +75,13 @@ def _ensure_gmail_auth(send_fn=None) -> bool:
     except Exception as exc:  # noqa: BLE001 — non-auth errors re-raise below
         if not _is_gmail_auth_failure(exc):
             raise
-        now = datetime.now(timezone.utc)
-        cutoff = (now - timedelta(hours=24)).isoformat()
-        with db.get_connection() as conn:
-            recent = conn.execute(
-                "SELECT COUNT(*) FROM ops_alerts WHERE kind = ? AND sent_at >= ?",
-                (_GMAIL_AUTH_ALERT, cutoff),
-            ).fetchone()[0]
-            if recent < _MAX_AUTH_ALERTS_24H:
-                conn.execute(
-                    "INSERT INTO ops_alerts (kind, sent_at) VALUES (?, ?)",
-                    (_GMAIL_AUTH_ALERT, now.isoformat()),
-                )
-        if recent < _MAX_AUTH_ALERTS_24H:
-            send(
-                "⚠ Gmail access has stopped working — the OAuth token needs re-authorizing.\n"
-                "Run: python scripts/gmail_auth.py (opens a browser; click Allow).\n"
-                "Claims processing is paused until then."
-            )
-        else:
-            logger.warning("Gmail auth still failing; alert cap (%s/24h) reached, staying quiet", _MAX_AUTH_ALERTS_24H)
+        _alert_rate_limited(
+            _GMAIL_AUTH_ALERT,
+            "⚠ Gmail access has stopped working — the OAuth token needs re-authorizing.\n"
+            "Run: python scripts/gmail_auth.py (opens a browser; click Allow).\n"
+            "Claims processing is paused until then.",
+            send_fn=send,
+        )
         return False
 
     # Success — confirm recovery exactly once if we had been alerting.
@@ -635,9 +658,37 @@ def _draft_matched_claims() -> None:
         claim_forms.process_claim(claim["id"])
 
 
+def _watchdog_telegram_polling(exit_fn=None) -> bool:
+    """The updater task is fire-and-forget: nothing awaits it, so when it dies
+    (a host suspend killing the long poll is the observed case) inbound stops
+    with no log line and taps vanish. Restarting the whole process is the honest
+    fix — a fresh event loop, updater and Gmail service, no half-restarted
+    state. compose has restart: unless-stopped, so SIGTERM means "come back".
+
+    Sending still works while the updater is dead (separate HTTP call), so the
+    alert genuinely reaches the phone before we go down. Returns whether it
+    triggered a restart."""
+    if telegram_bot.polling_alive() is not False:
+        return False
+    logger.error("Telegram polling is DOWN — inbound messages are being lost. Restarting the process.")
+    try:
+        _alert_rate_limited(
+            _POLLING_ALERT,
+            "⚠ Telegram polling had stopped — anything you sent may not have been received.\n"
+            "Restarting now; re-send or re-tap whatever didn't take effect.",
+        )
+    except Exception:  # noqa: BLE001 — the restart matters more than the notification
+        logger.exception("could not send the polling-down alert")
+    (exit_fn or _sigterm_self)()
+    return True
+
+
+def _sigterm_self() -> None:
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
 def run_once() -> None:
-    if telegram_bot.polling_alive() is False:
-        logger.error("Telegram polling is DOWN — inbound taps/messages are being lost.")
+    _watchdog_telegram_polling()
     vet_detection.classify_unflagged()
 
     # Every remaining step reads or writes Gmail — if the token is dead, alert
@@ -661,7 +712,14 @@ def run_once() -> None:
             invoice_matching._flag_claim(claim["id"], f"invoice extraction unavailable — {str(exc)[:120]}")
             break
         except Exception as exc:
-            logger.exception("matching: claim %s failed", claim["id"])
+            # ERROR means Justin must act. A dropped Gmail connection is retried
+            # by the next tick unaided, so it's a WARNING without a traceback —
+            # it was previously logging a full stack trace and reading like a
+            # crisis (real case: IncompleteRead on claim 5).
+            if _is_transient(exc):
+                logger.warning("matching: claim %s hit a transient error, retrying next tick: %s", claim["id"], exc)
+            else:
+                logger.exception("matching: claim %s failed", claim["id"])
             invoice_matching._flag_claim(claim["id"], f"invoice matching error — {str(exc)[:120]}")
             continue
         if not matched:
@@ -677,12 +735,18 @@ def run_once() -> None:
 
 
 def start() -> None:
+    interval_minutes = config.VET_CLAIM_PIPELINE_INTERVAL_MINUTES
     scheduler.add_job(
         run_once,
         "interval",
-        minutes=config.VET_CLAIM_PIPELINE_INTERVAL_MINUTES,
+        minutes=interval_minutes,
         id="vet-claim-pipeline",
         replace_existing=True,
+        # Waking from sleep, APScheduler's default grace of 1s means the missed
+        # run is SKIPPED — the pipeline then sat idle until the next interval.
+        # coalesce collapses a backlog into one run instead of firing N times.
+        coalesce=True,
+        misfire_grace_time=interval_minutes * 60,
     )
     scheduler.add_job(
         nudge_stale_actions,
@@ -690,4 +754,15 @@ def start() -> None:
         hour=config.ACTION_NUDGE_HOUR,
         id="stale-action-nudge",
         replace_existing=True,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        message_log.expire_queue,
+        "cron",
+        hour=config.ACTION_NUDGE_HOUR,
+        id="message-queue-expiry",
+        replace_existing=True,
+        coalesce=True,
+        misfire_grace_time=3600,
     )

@@ -459,8 +459,24 @@ def mark_sent(claim_id: int) -> dict:
     return {"ok": True, "message": f"Claim #{claim_id} marked sent{suffix} — Petcover replies now tracked."}
 
 
-def confirm_resolved(claim_id: int) -> None:
+def confirm_resolved(claim_id: int) -> dict:
+    """Clears a needs-action flag (info_requested/suspended) by Justin's explicit
+    confirmation — ADR-0008.
+
+    Idempotent on purpose: an update can be replayed after a crash, and two
+    confirmations of the same request would otherwise write two audit events for
+    one decision. Nothing outstanding means nothing to confirm."""
+    with db.get_connection() as conn:
+        events = conn.execute(
+            "SELECT event_type FROM claim_status_events WHERE claim_id = ? ORDER BY id",
+            (claim_id,),
+        ).fetchall()
+    types = [e["event_type"] for e in events]
+    last_flag = max((i for i, t in enumerate(types) if t in ("info_requested", "suspended")), default=None)
+    if last_flag is None or "confirmed_resolved" in types[last_flag + 1 :]:
+        return {"ok": False, "message": f"Claim #{claim_id} has nothing outstanding to confirm."}
     _record_event(claim_id, "confirmed_resolved", None, {})
+    return {"ok": True, "message": f"Claim #{claim_id} confirmed resolved."}
 
 
 def _policy_year_key(txn_date: str, anniversary: str | None) -> str:

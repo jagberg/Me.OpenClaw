@@ -4,10 +4,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-from . import claim_forms, claim_status, config, db, gmail_ingest, netbank_csv, pipeline, tasks, telegram_bot
+from . import claim_forms, claim_status, config, db, gmail_ingest, message_log, netbank_csv, pipeline, tasks, telegram_bot
 from .scheduler import scheduler
 
 # Without this the root level is WARNING and every logger.info in the app is
@@ -28,6 +28,12 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Every logged message is stamped with this, so a wrong version silently
+    # mislabels the training data — say so rather than shipping "unknown".
+    if config.APP_VERSION == "unknown":
+        logger.warning("APP_VERSION is 'unknown' — built without scripts/deploy.ps1; messages will be mistagged.")
+    else:
+        logger.info("OpenClaw starting, version %s", config.APP_VERSION)
     db.init_db()
     scheduler.start()
     gmail_ingest.start_polling()
@@ -87,6 +93,20 @@ def basic_status(request: Request):
     return templates.TemplateResponse(
         "basic.html", {"request": request, "outstanding": outstanding, "closed": closed}
     )
+
+
+@app.get("/health")
+def health():
+    """One URL that answers "is the bot actually listening?". Probing Telegram's
+    getUpdates from outside can't tell — it races the gap between long polls."""
+    return {"app_version": config.APP_VERSION, "polling_alive": telegram_bot.polling_alive(), **message_log.stats()}
+
+
+@app.get("/messages.jsonl")
+def messages_jsonl():
+    """The full in/out message stream as JSONL for reinforcement learning, one
+    object per line, oldest first, each stamped with the deploy that handled it."""
+    return StreamingResponse(message_log.iter_jsonl(), media_type="application/x-ndjson")
 
 
 @app.post("/tasks")

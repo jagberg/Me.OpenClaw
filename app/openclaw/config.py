@@ -79,6 +79,17 @@ DRIVE_BACKUP_LOG_SUBFOLDER = os.environ.get("DRIVE_BACKUP_LOG_SUBFOLDER", "logs"
 # backup failure is never silent (CLAUDE.md: failures must be visible).
 DB_BACKUP_LOCAL_LOG = os.environ.get("DB_BACKUP_LOCAL_LOG", "./data/backup.log")
 
+# Deploy identity, baked into the image at build time (Dockerfile ARG, set by
+# scripts/deploy.ps1 from the git short SHA + branch). Stamped on every logged
+# message so behaviour can be attributed to the deploy that produced it.
+# "unknown" means someone built without the script — main.py warns about it.
+APP_VERSION = os.environ.get("APP_VERSION", "unknown")
+
+# An inbound update still unprocessed after this long stops being replay-eligible:
+# Telegram itself only retains updates ~24h, so anything older is moot. The row
+# survives (it's training data) — only its place in the queue expires.
+MESSAGE_QUEUE_TTL_HOURS = int(os.environ.get("MESSAGE_QUEUE_TTL_HOURS", "24"))
+
 # Root log level. Default INFO because it was effectively WARNING (no
 # basicConfig anywhere), which discarded every logger.info and left a morning's
 # bot activity impossible to reconstruct.

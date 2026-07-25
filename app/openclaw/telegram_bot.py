@@ -5,16 +5,23 @@ import logging
 from datetime import datetime, timezone
 
 from telegram import (
-    Bot,
     ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
     Update,
 )
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ExtBot,
+    MessageHandler,
+    filters,
+)
 
-from . import agent, claim_card, claim_forms, claim_status, config, db, invoice_matching, llm
+from . import agent, claim_card, claim_forms, claim_status, config, db, invoice_matching, llm, message_log
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +138,7 @@ def handle_resolved(username: str | None, claim_id: int) -> dict:
         claim = conn.execute("SELECT 1 FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
     if claim is None:
         return {"ok": False, "message": f"No claim #{claim_id} found."}
-    claim_status.confirm_resolved(claim_id)
-    return {"ok": True, "message": f"Claim #{claim_id} confirmed resolved."}
+    return claim_status.confirm_resolved(claim_id)
 
 
 def handle_vetemail(username: str | None, merchant: str, email: str) -> dict:
@@ -547,8 +553,7 @@ def _execute_action(proposal: dict) -> str:
     if action == "assign_pet":
         return claim_forms.assign_pet(claim_id, arg)["message"]
     if action == "mark_resolved":
-        claim_status.confirm_resolved(claim_id)
-        return f"Claim #{claim_id} confirmed resolved."
+        return claim_status.confirm_resolved(claim_id)["message"]
     return f"Unknown action: {action}"
 
 
@@ -655,9 +660,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         result = claim_status.dismiss_mismatch(int(data.split(":", 1)[1]))
         await _append_result(query, f"{'👍' if result['ok'] else '⚠️'} {result['message']}")
     elif data.startswith("resolved:"):
-        claim_id = int(data.split(":", 1)[1])
-        claim_status.confirm_resolved(claim_id)
-        await _append_result(query, f"✅ Claim #{claim_id} confirmed resolved.")
+        result = claim_status.confirm_resolved(int(data.split(":", 1)[1]))
+        await _append_result(query, f"{'✅' if result['ok'] else '⚠️'} {result['message']}")
     elif data.startswith("hist:"):
         result = _history_page(int(data.split(":", 1)[1]))
         if result is None:
@@ -678,6 +682,10 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Without this PTB swallows handler exceptions into its own logger with no
     user feedback: the tap looked accepted and nothing happened."""
     logger.error("telegram handler failed on %r", update, exc_info=context.error)
+    # PTB swallows handler exceptions into process_error, so process_update
+    # returns cleanly and would mark this update done. Record the failure here
+    # and leave processed_at NULL so the update is retried at next startup.
+    message_log.mark_failed(getattr(update, "update_id", None), context.error)
     query = getattr(update, "callback_query", None)
     if query is not None:
         try:
@@ -731,8 +739,68 @@ async def _handle_chat(update: Update) -> None:
         await update.message.reply_text(reply or "…")
 
 
+class LoggedApplication(Application):
+    """Records every inbound update before handlers touch it.
+
+    One seam covers commands, taps, free text and uploads. The row is written
+    *first* so a crash mid-handler leaves processed_at NULL and the update gets
+    replayed at startup — that's the whole durability story.
+
+    PTB routes handler exceptions to process_error, so they never surface here;
+    _on_error is what stamps the failure on the row.
+    """
+
+    async def process_update(self, update: object) -> None:
+        update_id = message_log.record_inbound(update)
+        await super().process_update(update)
+        message_log.mark_processed(update_id)
+
+
+class LoggedBot(ExtBot):
+    """Records every outbound message. Overrides the public senders only —
+    reply_text and friends funnel through these, so handlers stay untouched and
+    no private PTB internals can break on upgrade. Photo/document bytes are
+    summarised by size, never inlined into the log."""
+
+    async def send_message(self, chat_id, text, *args, **kwargs):
+        message_log.record_outbound("send_message", text, {"chat_id": chat_id, "text": text})
+        return await super().send_message(chat_id, text, *args, **kwargs)
+
+    async def send_photo(self, chat_id, photo, *args, caption=None, **kwargs):
+        message_log.record_outbound(
+            "send_photo", caption or "", {"chat_id": chat_id, "caption": caption, "photo": _blob_size(photo)}
+        )
+        return await super().send_photo(chat_id, photo, *args, caption=caption, **kwargs)
+
+    async def send_document(self, chat_id, document, *args, caption=None, **kwargs):
+        message_log.record_outbound(
+            "send_document", caption or "", {"chat_id": chat_id, "caption": caption, "document": _blob_size(document)}
+        )
+        return await super().send_document(chat_id, document, *args, caption=caption, **kwargs)
+
+    async def edit_message_text(self, text, *args, **kwargs):
+        message_log.record_outbound("edit_message_text", text, {"text": text})
+        return await super().edit_message_text(text, *args, **kwargs)
+
+    async def edit_message_caption(self, *args, caption=None, **kwargs):
+        message_log.record_outbound("edit_message_caption", caption or "", {"caption": caption})
+        return await super().edit_message_caption(*args, caption=caption, **kwargs)
+
+
+def _blob_size(blob) -> str:
+    try:
+        return f"<{len(blob)} bytes>"
+    except TypeError:
+        return f"<{type(blob).__name__}>"
+
+
 def build_application() -> Application:
-    application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .application_class(LoggedApplication)
+        .bot(LoggedBot(config.TELEGRAM_BOT_TOKEN))
+        .build()
+    )
     # Group -1 runs before all group-0 handlers: instant 👍 receipt ack.
     application.add_handler(MessageHandler(filters.ALL, _ack_user_message), group=-1)
     application.add_handler(CommandHandler("start", start_command))
@@ -761,6 +829,9 @@ async def start_polling() -> None:
     await _application.initialize()
     await _application.start()
     await _application.updater.start_polling()
+    # Replay after polling starts: anything Telegram redelivers itself is then
+    # deduped by update_id instead of being logged and acted on twice.
+    await message_log.replay_pending(_application)
 
 
 def polling_alive() -> bool | None:
@@ -789,11 +860,11 @@ def send_document_sync(caption: str, document: bytes, filename: str, reply_marku
     captions at 1024 chars — truncated, the document is the point."""
     chat_id = get_registered_chat_id()
     if chat_id is None or not config.TELEGRAM_BOT_TOKEN:
-        logger.warning("Telegram document skipped — no chat id or token.")
+        logger.error("Telegram document skipped — no chat id or token; output is being dropped.")
         return
 
     async def _send() -> None:
-        bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
+        bot = LoggedBot(token=config.TELEGRAM_BOT_TOKEN)
         await bot.send_document(
             chat_id=chat_id, document=document, filename=filename,
             caption=caption[:1024], reply_markup=reply_markup,
@@ -807,11 +878,11 @@ def send_photo_sync(caption: str, photo: bytes, reply_markup=None) -> None:
     nudge job). Same throwaway-loop pattern as send_message_sync."""
     chat_id = get_registered_chat_id()
     if chat_id is None or not config.TELEGRAM_BOT_TOKEN:
-        logger.warning("Telegram photo skipped — no chat id or token.")
+        logger.error("Telegram photo skipped — no chat id or token; output is being dropped.")
         return
 
     async def _send() -> None:
-        bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
+        bot = LoggedBot(token=config.TELEGRAM_BOT_TOKEN)
         await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption[:1024], reply_markup=reply_markup)
 
     asyncio.run(_send())
@@ -823,14 +894,14 @@ def send_message_sync(text: str, reply_markup=None) -> None:
     event loop for the one call. Optional reply_markup attaches inline buttons."""
     chat_id = get_registered_chat_id()
     if chat_id is None:
-        logger.warning("Telegram notification skipped — no registered chat ID (send /start to the bot).")
+        logger.error("Telegram notification skipped — no registered chat ID; send /start to the bot.")
         return
     if not config.TELEGRAM_BOT_TOKEN:
-        logger.warning("Telegram notification skipped — TELEGRAM_BOT_TOKEN not set.")
+        logger.error("Telegram notification skipped — TELEGRAM_BOT_TOKEN not set.")
         return
 
     async def _send() -> None:
-        bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
+        bot = LoggedBot(token=config.TELEGRAM_BOT_TOKEN)
         await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
 
     asyncio.run(_send())
