@@ -309,8 +309,14 @@ def _build_impls(proposals: list) -> dict:
             ids = ", ".join(f"#{i}" for i in s["claim_ids"])
             who = s["pet_name"] or "no pet"
             ref = s["reference"] or "no reference yet"
-            answer = (f"last reply: {s['last_event']}" if s["last_event"]
-                      else "NO reply recorded yet")
+            # 'unclassified' is a real reply we couldn't read, not a status —
+            # live output read as though Petcover had answered something.
+            if not s["last_event"]:
+                answer = "NO reply recorded yet"
+            elif s["last_event"] == "unclassified":
+                answer = "a reply arrived that we couldn't classify"
+            else:
+                answer = f"last reply: {s['last_event']}"
             lines.append(
                 f"{ids} · {who} · {ref} · {s['status']} · ${s['total_amount']:.2f} · "
                 f"{answer} · {s['days_waiting']}d since last activity"
