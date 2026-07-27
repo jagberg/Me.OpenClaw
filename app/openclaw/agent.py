@@ -43,6 +43,12 @@ _BASE_SYSTEM_PROMPT = (
     "- Never send email (drafts only) and never invent a required field such as a condition. If a "
     "detail is missing, ask for it.\n"
     "- If a target claim is ambiguous or not found, ask the user to clarify. Do not guess.\n"
+    # Live 2026-07-27: replying to the ASSIGN PET card, the model had no way to
+    # name claim #1, asked for "the reference", then sent the tool schema's own
+    # description strings as argument values and 400'd three times.
+    "- Whenever you know the claim's id — he typed it, or a context line above gives it — pass it as "
+    "claim_id and act. Never ask for a Petcover reference to identify a claim you already have the id "
+    "for, and NEVER pass a description of an argument as its value.\n"
     "- Never reveal API keys, bank details, or configuration.\n"
     # Each of these three was a real, observed failure in one morning's chat.
     "- NEVER invent a pet name. The only pets are listed below. If you need a pet and don't know "
@@ -61,6 +67,13 @@ _BASE_SYSTEM_PROMPT = (
     "arrived — never that Petcover hasn't replied. To see what was already recorded, use claim_detail.\n"
     "- For tasks, ALWAYS include the task id as #N — it's how Justin closes them. Never invent an "
     "outcome when closing one; if he didn't say what happened, ask.\n"
+    # 2026-07-27: "This is actually split between echo and Aari. Aari cost was
+    # $35 out of this" had no tool that fitted, and the model reached for
+    # assign-one-pet and then for a task.
+    "- One invoice covering TWO PETS ('split between X and Y', 'X's share was $N') means "
+    "propose_split_between_pets with a share per pet — NOT assign-one-pet, and NOT a task. Splitting by "
+    "condition is a different thing (that's propose_set_condition). If he gave no amounts, ask; never "
+    "invent a share or decide which pet had the bigger one.\n"
     # Live: "remember I need to call the vet..." made it call list_tasks.
     "- 'Remember X' / 'don't let me forget X' / 'add a task' means propose_create_task with X as "
     "the description. Only use list_tasks when he asks what tasks he HAS.\n"
@@ -119,11 +132,17 @@ def _in_range(txn_date, since, until) -> bool:
 
 
 def _find_claims(pet=None, reference=None, status=None, merchant=None, unassigned=False,
-                 since=None, until=None):
+                 since=None, until=None, claim_id=None):
     with db.get_connection() as conn:
         rows = conn.execute(_CLAIMS_SQL).fetchall()
     out = []
     for r in rows:
+        # An id is exact and beats every other filter: it's how Justin names a
+        # claim, and it's what a replied-to card supplies.
+        if claim_id is not None:
+            if r["id"] == int(claim_id):
+                return [r]
+            continue
         if pet and pet.lower() not in (r["pet_name"] or "").lower():
             continue
         if reference and reference.lower() not in (r["petcover_reference"] or "").lower():
@@ -409,30 +428,72 @@ def _build_impls(proposals: list) -> dict:
         proposals.append({"action": action, "claim_id": target["id"], "label": label, "arg": arg})
         return f"Proposed: {action.replace('_', ' ')} for {label}. Tell the user and ask them to tap Confirm."
 
-    def propose_mark_sent(pet=None, reference=None):
-        return _propose("mark_sent", _find_claims(pet=pet, reference=reference))
+    def propose_mark_sent(pet=None, reference=None, claim_id=None):
+        return _propose("mark_sent", _find_claims(pet=pet, reference=reference, claim_id=claim_id))
 
-    def propose_set_condition(condition_text, pet=None, reference=None):
+    def propose_set_condition(condition_text, pet=None, reference=None, claim_id=None):
         if not condition_text or not condition_text.strip():
             return "No condition text supplied. Ask the user what condition to record — never invent one."
-        rows = _find_claims(pet=pet, reference=reference)
+        rows = _find_claims(pet=pet, reference=reference, claim_id=claim_id)
         target, why = _single_target(rows)
         label = _label(target) + f" → condition: {condition_text}" if target else None
         return _propose("set_condition", rows, arg=condition_text.strip(), label=label)
 
-    def propose_assign_pet(pet_name, reference=None, merchant=None):
+    def propose_assign_pet(pet_name, reference=None, merchant=None, claim_id=None):
         with db.get_connection() as conn:
             pet = conn.execute("SELECT id, name FROM pets WHERE name = ? COLLATE NOCASE", (pet_name,)).fetchone()
             known = [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
         if pet is None:
             return f"No pet named '{pet_name}'. Known pets: {', '.join(known)}."
-        rows = _find_claims(reference=reference, merchant=merchant, unassigned=True)
+        # unassigned=True only when there's no id: with an id Justin has named
+        # the claim, and re-assigning an already-assigned one is legitimate.
+        rows = _find_claims(reference=reference, merchant=merchant, claim_id=claim_id,
+                            unassigned=claim_id is None)
         target, why = _single_target(rows)
         label = f"{_summary_line(target)} → assign {pet['name']}" if target else None
         return _propose("assign_pet", rows, arg=pet["id"], label=label)
 
-    def propose_mark_resolved(pet=None, reference=None):
-        return _propose("mark_resolved", _find_claims(pet=pet, reference=reference))
+    def propose_split_between_pets(claim_id, pets_and_amounts):
+        """One invoice, two pets, one share each. Validated against the same
+        guards the write uses, so an impossible split is refused in the reply
+        instead of failing after the tap."""
+        from . import claim_forms
+
+        rows = _find_claims(claim_id=claim_id)
+        target, _why = _single_target(rows)
+        if target is None:
+            return f"No claim #{claim_id} found. Ask Justin which claim he means."
+        shares, names = [], []
+        with db.get_connection() as conn:
+            for entry in pets_and_amounts or []:
+                name = (entry.get("pet") or "").strip()
+                pet = conn.execute("SELECT id, name FROM pets WHERE name = ? COLLATE NOCASE",
+                                   (name,)).fetchone()
+                if pet is None:
+                    known = [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
+                    return f"No pet named '{name}'. Known pets: {', '.join(known)}."
+                amount = entry.get("amount")
+                shares.append((pet["id"], None if amount in (None, "") else float(amount)))
+                names.append(pet["name"])
+        if len(shares) < 2:
+            return "A split needs at least two pets. Ask Justin which pets share the invoice."
+        if sum(1 for _pet_id, amount in shares if amount is None) > 1:
+            return ("Only one share can be left out — ask Justin for the missing amounts. Never invent "
+                    "a share.")
+        # Dry run against the real guards: ceiling, status, duplicate pets.
+        check = claim_forms.check_split(int(claim_id), shares)
+        if not check["ok"]:
+            return check["message"] + " Tell Justin exactly this."
+        label = f"#{claim_id} split: " + ", ".join(
+            f"{pets_name} ${amount:.2f}" for pets_name, amount in zip(names, check["amounts"])
+        )
+        proposals.append({"action": "split_pets", "claim_id": int(claim_id), "label": label,
+                          "arg": shares})
+        return (f"Proposed {label}. Tell Justin the pets and each share in dollars, then ask him to tap "
+                "Confirm. Say it is not done yet.")
+
+    def propose_mark_resolved(pet=None, reference=None, claim_id=None):
+        return _propose("mark_resolved", _find_claims(pet=pet, reference=reference, claim_id=claim_id))
 
     def propose_create_task(description):
         """Gated rather than immediate for two reasons: it spends an LLM call
@@ -470,6 +531,7 @@ def _build_impls(proposals: list) -> dict:
         "claim_detail": claim_detail,
         "claim_history": claim_history,
         "list_tasks": list_tasks,
+        "propose_split_between_pets": propose_split_between_pets,
         "propose_mark_sent": propose_mark_sent,
         "propose_set_condition": propose_set_condition,
         "propose_assign_pet": propose_assign_pet,
@@ -497,6 +559,7 @@ _REF = {"type": "string", "description": "Petcover reference (partial ok)"}
 _SINCE = {"type": "string", "description": "earliest transaction date, YYYY-MM-DD"}
 _UNTIL = {"type": "string", "description": "latest transaction date, YYYY-MM-DD"}
 _MERCHANT = {"type": "string", "description": "vet/merchant name (partial ok)"}
+_CLAIM_ID = {"type": "integer", "description": "the claim's id — use it whenever you know it"}
 
 TOOLS = [
     _fn("query_claims", "List claims filtered by status, pet, vet and/or transaction-date range.",
@@ -529,16 +592,26 @@ TOOLS = [
     _fn("list_tasks", "List Justin's non-claim tasks (household admin, follow-ups).",
         {"status": {"type": "string", "description": "open or closed"}}),
     _fn("propose_mark_sent", "Propose marking a drafted claim as sent (starts Petcover reply tracking). "
-        "Queues a confirmation; does not act.", {"pet": _PET, "reference": _REF}),
+        "Queues a confirmation; does not act.", {"pet": _PET, "reference": _REF, "claim_id": _CLAIM_ID}),
     _fn("propose_set_condition", "Propose setting the condition being claimed for. Queues a confirmation.",
         {"condition_text": {"type": "string", "description": "the condition, supplied by the user"},
-         "pet": _PET, "reference": _REF}, required=["condition_text"]),
+         "pet": _PET, "reference": _REF, "claim_id": _CLAIM_ID}, required=["condition_text"]),
     _fn("propose_assign_pet", "Propose assigning a pet to an unattributed vet transaction. Queues a confirmation.",
-        {"pet_name": {"type": "string"}, "reference": _REF,
+        {"pet_name": {"type": "string"}, "reference": _REF, "claim_id": _CLAIM_ID,
          "merchant": {"type": "string", "description": "vet/merchant name to locate the unassigned claim"}},
         required=["pet_name"]),
+    # One invoice, two pets. Amounts come from Justin; the remainder of a
+    # two-pet split is the only figure this may leave out.
+    _fn("propose_split_between_pets", "ONE invoice covering SEVERAL PETS: propose a claim per pet, each "
+        "with its dollar share. Not for splitting by condition. Queues a confirmation.",
+        {"claim_id": _CLAIM_ID,
+         "pets_and_amounts": {"type": "array", "description": "one entry per pet; omit an amount only if "
+                              "he didn't state it, and only for one pet",
+                              "items": {"type": "object", "properties": {
+                                  "pet": {"type": "string"}, "amount": {"type": "number"}}}}},
+        required=["claim_id", "pets_and_amounts"]),
     _fn("propose_mark_resolved", "Propose confirming an info-request/suspension has been dealt with. "
-        "Queues a confirmation.", {"pet": _PET, "reference": _REF}),
+        "Queues a confirmation.", {"pet": _PET, "reference": _REF, "claim_id": _CLAIM_ID}),
     _fn("propose_create_task", "Propose saving a non-claim task Justin wants remembered. Queues a "
         "confirmation.", {"description": {"type": "string", "description": "the task, in his words"}},
         required=["description"]),
@@ -558,13 +631,24 @@ _history: dict[int, list] = {}
 HISTORY_TURNS = 6
 
 
-def handle_message(text: str, chat_id: int | None = None) -> tuple[str, dict | None]:
+def handle_message(text: str, chat_id: int | None = None,
+                   claim_id: int | None = None) -> tuple[str, dict | None]:
     """Run one chat turn. Returns (reply_text, proposed_action_or_None). The
-    proposal, if any, is what the Telegram layer turns into a Confirm button."""
+    proposal, if any, is what the Telegram layer turns into a Confirm button.
+
+    `claim_id` is the claim of the card this message replies to, if any. It goes
+    in as its own context line rather than being glued onto Justin's words —
+    concatenating it made the model quote the annotation back at him."""
     proposals: list = []
     impls = _build_impls(proposals)
     prior = _history.get(chat_id, []) if chat_id is not None else []
-    messages = [{"role": "system", "content": system_prompt()}, *prior, {"role": "user", "content": text}]
+    context = (
+        [{"role": "system", "content": f"Justin is replying to the card for claim #{claim_id}. "
+          f"Unless he names a different claim, that is the one he means: pass claim_id={claim_id}."}]
+        if claim_id is not None else []
+    )
+    messages = [{"role": "system", "content": system_prompt()}, *prior, *context,
+                {"role": "user", "content": text}]
     # Left at the default 4. It was briefly raised to 6 for headroom, before a
     # live 429 revealed a 100k tokens/DAY cap (config.py) that header-only
     # measurement had missed: at ~2.6k tokens a request, extra iterations are

@@ -94,6 +94,14 @@ def _is_malformed_tool_call(exc: Exception) -> bool:
     return "tool_use_failed" in str(exc)
 
 
+def _is_request_shape_error(exc: Exception) -> bool:
+    """A 400 that is NOT a malformed tool call: our own request is wrong (an
+    unsupported field, a bad message shape), so every retry reproduces it and
+    charges the day's budget to do so. Fail fast and let the caller see it."""
+    status = getattr(exc, "status_code", None)
+    return (status == 400 or "Error code: 400" in str(exc)) and not _is_malformed_tool_call(exc)
+
+
 def _is_daily_budget_exhausted(exc: Exception) -> bool:
     """Groq's per-day token cap, distinct from the per-minute one. Only the 429
     body says which — the rate-limit headers never mention TPD at all, which is
@@ -121,12 +129,19 @@ def _try_model(client, model: str, messages: list, tools, purpose: str):
             _log_call(purpose, False, int((time.monotonic() - start) * 1000), str(exc))
             if _is_daily_budget_exhausted(exc):
                 raise  # no amount of retrying frees a daily cap
+            if _is_request_shape_error(exc):
+                raise  # retrying our own bad request only spends tokens
             if attempt < MAX_RETRIES:
-                if _is_rate_limited(exc):
-                    time.sleep(BASE_BACKOFF_SECONDS * attempt)
-                    continue
                 if _is_malformed_tool_call(exc):
                     continue  # no backoff: nothing is overloaded, the output was just malformed
+                # Everything else is retried: a whitelist of retryable statuses
+                # has to be extended by whatever edge response comes next, and
+                # the one it was missing (a single `403 Access denied. Please
+                # check your network settings.` from Groq, 2026-07-27) ended a
+                # chat turn on its FIRST attempt — llm_calls holds one row for
+                # it — while the identical request seconds later succeeded.
+                time.sleep(BASE_BACKOFF_SECONDS * attempt)
+                continue
             break
     raise last_error
 

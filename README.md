@@ -58,7 +58,8 @@ For each unmatched vet charge, `invoice_matching`:
    - Invoice **exceeds** the charge but the date fits → probably one invoice paid over several card swipes. If a sibling charge completes the sum, a **merge proposal** goes to Telegram (with the invoice PDF attached) — Justin confirms; the larger charge carries the invoice, the other closes as its second payment.
    - Charge with no invoice anywhere → an **invoice-request email to the vet** is drafted (never sent) using the visit date and amount.
    - Pet assignment is read off printed facts only — the email naming exactly one known pet, or the invoice's patient field. Both dogs named / nothing printed → Telegram asks.
-5. **Claim math**: the form never claims the bank charge. It claims the invoice's **claimable subtotal** — line items minus routine-care keywords (vaccination, worming, flea, …) — against the charge as a ceiling.
+   - **One invoice, two pets** (one visit, both dogs) → reply to the pet card in Telegram with the pets and one pet's share; a Confirm tap turns it into **one claim per pet**, each carrying its own share of the claimable subtotal, sharing the invoice and the single bank charge. Shares come from Justin — only the last one is derived as the remainder. A pet whose insurer has no defined process (Echo/Bow Wow) still gets a claim; it sits blocked and visible instead of being lost. ADR-0019.
+5. **Claim math**: the form never claims the bank charge. It claims the invoice's **claimable subtotal** — line items minus routine-care keywords (vaccination, worming, flea, …) — against the charge as a ceiling. On a per-pet split, each claim carries only its own share and the charge is the ceiling on their sum.
 
 ## Third-party calls (complete list)
 

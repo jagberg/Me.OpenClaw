@@ -38,13 +38,20 @@ def _describe(update) -> tuple[str, str]:
     """(kind, summary) for a human skimming the log or a query filtering it."""
     if getattr(update, "callback_query", None) is not None:
         return "tap", (update.callback_query.data or "")[:_SUMMARY_LIMIT]
-    message = getattr(update, "message", None)
+    # effective_message, not .message: an edit arrives as `edited_message` and
+    # left .message None, so Justin's correction ("Aari cost was $35 out of
+    # this", 2026-07-27) logged as kind `other` with an empty summary — the one
+    # message that mattered was the one the log couldn't show.
+    message = getattr(update, "effective_message", None) or getattr(update, "message", None)
     if message is not None:
+        # Marked, not given its own kind: it is a text message for every query
+        # that filters on kind, and the marker says it replaced earlier words.
+        prefix = "edit: " if getattr(update, "edited_message", None) is not None else ""
         text = message.text or ""
         if text.startswith("/"):
-            return "command", text[:_SUMMARY_LIMIT]
+            return "command", f"{prefix}{text}"[:_SUMMARY_LIMIT]
         if text:
-            return "text", text[:_SUMMARY_LIMIT]
+            return "text", f"{prefix}{text}"[:_SUMMARY_LIMIT]
         return "non_text", f"<{'document' if message.document else 'photo' if message.photo else 'other'}>"
     return "other", ""
 

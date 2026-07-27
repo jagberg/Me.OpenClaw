@@ -84,3 +84,18 @@ We extracted a claimable of $44.75; Petcover's approval letter states $35.00 cla
 *Recorded in ADR-0012 as future work.*
 
 The continuation box is currently hard-defaulted to ticked. Now that Condition Threads are modelled (ADR-0011), it could be derived. Unbuilt.
+
+### No undo for a confirmed per-pet split
+*Deferred by ADR-0019, 2026-07-27. Capability: `multi-pet-invoice-split`.*
+
+A confirmed split inserts a sibling claim and rewrites both rows' claimable shares. Guarded (pre-`sent` only, every resulting claim named in the confirmation) but not reversible: a wrong split leaves a stray claim that nothing removes. Whether undo should merge the shares back or just close the sibling was never decided.
+
+### Does the ASSIGN PET card need an explicit "Shared invoice" button?
+*Deferred by ADR-0019, 2026-07-27. Capability: `telegram-bot`.*
+
+Splitting is discoverable only through the card's one-line hint that a reply works. A button that prompts for amounts would be explicit, at the cost of another multi-step tap flow. Deferred until the reply path has been used live at least once.
+
+### Bow Wow Insurance claim process still undefined
+*Ongoing operational item. Capability: `claim-form-automation`.*
+
+Echo has no insurer claim email or process on file (`pets.claim_process_defined = 0`), so 6 claims — plus Echo's share of every per-pet split, starting with claim #1's $372.56 — sit blocked with no button that can clear them. Needs Bow Wow's actual claim process from Justin, not code.

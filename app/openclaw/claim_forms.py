@@ -133,6 +133,24 @@ def create_claim_draft(to: str, subject: str, body: str, attachment_paths: list[
     return draft["message"]["id"]
 
 
+def discard_claim_draft(message_id: str) -> None:
+    """Delete a draft this app created, by the MESSAGE id we store in
+    `draft_id`. Needed when a split makes an existing draft wrong: a draft
+    stating the pre-split amount must not be sendable, and `create_claim_draft`
+    always creates a new one rather than updating in place.
+
+    `drafts().delete` needs the DRAFT id, so the message id is mapped through
+    `drafts().list` first. Allowed by the gmail.compose scope; deleting our own
+    unsent draft is not the forbidden operation — send() is."""
+    service = gmail_client.build_service()
+    drafts = service.users().drafts().list(userId="me", maxResults=500).execute().get("drafts", [])
+    for draft in drafts:
+        if (draft.get("message") or {}).get("id") == message_id:
+            service.users().drafts().delete(userId="me", id=draft["id"]).execute()
+            return
+    raise ClaimFillError(f"no Gmail draft found for message {message_id}")
+
+
 def _flag(claim_id: int, message: str) -> None:
     with db.get_connection() as conn:
         conn.execute(
@@ -528,6 +546,174 @@ def assign_pet(claim_id: int, pet_id: int) -> dict:
             (pet_id, datetime.now(timezone.utc).isoformat(), claim_id),
         )
     return {"ok": True, "message": f"Claim #{claim_id} assigned to {pet['name']}."}
+
+
+# Pre-submission only. Anything later is already with the insurer, where a
+# quiet re-apportioning would contradict what was sent.
+_SPLITTABLE_STATUSES = ("matched", "drafted")
+CENT = 0.01
+
+
+def check_split(claim_id: int, shares: list[tuple[int, float | None]]) -> dict:
+    """Every guard on a split, with no writes. The chat agent runs this BEFORE
+    proposing, so an impossible split is refused in the reply rather than after
+    Justin has tapped Confirm; `split_between_pets` runs it again as the real
+    gate. On success returns the resolved per-pet `amounts` (the one unstated
+    share filled in), the claimable `subtotal` and any `unapportioned` remainder."""
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        if claim is None:
+            return {"ok": False, "message": f"No claim #{claim_id} found."}
+        if claim["status"] not in _SPLITTABLE_STATUSES:
+            if claim["status"] == "pending_match":
+                return {"ok": False, "message": f"Claim #{claim_id} has no invoice matched yet — "
+                                                "nothing to apportion until it does."}
+            return {"ok": False, "message": f"Claim #{claim_id} is already with the insurer "
+                                            f"(status: {claim['status']}) — that correction has to go to "
+                                            "them, it can't be split here."}
+        invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
+        subtotal = invoice.get("claimable_amount")
+        if subtotal is None:
+            subtotal = invoice.get("amount")
+        if subtotal is None:
+            return {"ok": False, "message": f"Claim #{claim_id} has no invoice amount on file to split."}
+        subtotal = float(subtotal)
+
+        if len(shares) < 2:
+            return {"ok": False, "message": "A split needs at least two pets."}
+        if sum(1 for _pet_id, amount in shares if amount is None) > 1:
+            return {"ok": False, "message": "Only one share can be left unstated — a remainder is only "
+                                            "derivable when everything else is known. Ask for the amounts."}
+        pets = {}
+        for pet_id, _amount in shares:
+            pet = conn.execute("SELECT * FROM pets WHERE id = ?", (int(pet_id),)).fetchone()
+            if pet is None:
+                return {"ok": False, "message": f"No pet #{pet_id} found."}
+            pets[int(pet_id)] = pet
+        if len(pets) != len(shares):
+            return {"ok": False, "message": "The same pet is listed twice in the split."}
+
+        stated = sum(float(amount) for _pet_id, amount in shares if amount is not None)
+        if stated > subtotal + CENT:
+            return {"ok": False, "message": f"Those shares total ${stated:.2f}, more than the invoice's "
+                                            f"claimable ${subtotal:.2f} — the invoice is the ceiling."}
+        resolved = [
+            (int(pet_id), round(subtotal - stated, 2) if amount is None else round(float(amount), 2))
+            for pet_id, amount in shares
+        ]
+        if any(amount <= 0 for _pet_id, amount in resolved):
+            return {"ok": False, "message": "Every share has to be more than $0 — a pet with nothing to "
+                                            "claim doesn't belong in the split."}
+    return {
+        "ok": True,
+        "message": "; ".join(f"{pets[pet_id]['name']} ${amount:.2f}" for pet_id, amount in resolved),
+        "amounts": [amount for _pet_id, amount in resolved],
+        "pet_names": [pets[pet_id]["name"] for pet_id, _amount in resolved],
+        "subtotal": subtotal,
+        "unapportioned": round(subtotal - sum(amount for _pet_id, amount in resolved), 2),
+    }
+
+
+def split_between_pets(claim_id: int, shares: list[tuple[int, float | None]]) -> dict:
+    """Apportion one invoice's claimable amount between pets: the claim keeps the
+    first share, and one new claim per remaining pet carries its own.
+
+    One invoice can treat two pets (live: The Shire Veterinary Caringbah,
+    $407.56, Aari $35 and Echo the rest) while a claim carries exactly one
+    `pet_id` — so either pet button over-claims and loses the other's share.
+
+    The share lives in each row's own `invoice_data.claimable_amount`, which is
+    already what `_charge` puts on the form, so no column and no live DDL. The
+    invoice itself is untouched and shared: same `matched_email_id`,
+    `invoice_number`, total and attached pages on every sibling.
+
+    `shares` is [(pet_id, amount)] with at most ONE amount left None — the
+    remainder Justin didn't state. Two unknowns aren't arithmetic, they're a
+    guess, and a guessed claim amount is the same class of error as a guessed
+    condition."""
+    checked = check_split(claim_id, shares)
+    if not checked["ok"]:
+        return checked
+    subtotal, unapportioned = checked["subtotal"], checked["unapportioned"]
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
+        pets = {}
+        for pet_id, _amount in shares:
+            pets[int(pet_id)] = conn.execute("SELECT * FROM pets WHERE id = ?", (int(pet_id),)).fetchone()
+        resolved = [(int(pet_id), amount) for (pet_id, _stated), amount
+                    in zip(shares, checked["amounts"])]
+
+        # The claim keeps the first share; the rest become new claims on the SAME
+        # transaction (one charge, one bank row — the ceiling applies to the sum).
+        # condition_text is deliberately NOT copied: the other pet's condition is
+        # not knowable from this one, and inventing it is forbidden.
+        first_pet, first_amount = resolved[0]
+        results = [{"claim_id": claim_id, "pet_name": pets[first_pet]["name"], "amount": first_amount}]
+        for pet_id, amount in resolved[1:]:
+            sibling_invoice = {**invoice, "claimable_amount": amount}
+            cursor = conn.execute(
+                "INSERT INTO vet_claims (transaction_id, pet_id, matched_email_id, invoice_data, "
+                "invoice_file_path, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'matched', ?, ?)",
+                (claim["transaction_id"], pet_id, claim["matched_email_id"],
+                 json.dumps(sibling_invoice), claim["invoice_file_path"], now, now),
+            )
+            results.append({"claim_id": cursor.lastrowid, "pet_name": pets[pet_id]["name"], "amount": amount})
+
+        note = "per-pet split of ${:.2f} claimable: {}".format(
+            subtotal, ", ".join(f"#{r['claim_id']} {r['pet_name']} ${r['amount']:.2f}" for r in results)
+        )
+        for result, (pet_id, amount) in zip(results, resolved):
+            row_invoice = {**invoice, "claimable_amount": amount, "split_note": note}
+            conn.execute(
+                "UPDATE vet_claims SET pet_id = ?, invoice_data = ?, status = 'matched', "
+                "updated_at = ? WHERE id = ?",
+                (pet_id, json.dumps(row_invoice), now, result["claim_id"]),
+            )
+        # A draft naming the pre-split amount must not stay sendable. Reset the
+        # draft columns here; the Gmail-side deletion is below (needs no lock).
+        superseded_draft = claim["draft_id"] if claim["status"] == "drafted" else None
+        if superseded_draft:
+            conn.execute(
+                "UPDATE vet_claims SET claim_file_path = NULL, draft_id = NULL, reviewed_at = NULL, "
+                "updated_at = ? WHERE id = ?",
+                (now, claim_id),
+            )
+
+    if superseded_draft:
+        try:
+            discard_claim_draft(superseded_draft)
+        except Exception as exc:  # visible, never silent — the stale draft is a wrong claim
+            _flag(claim_id, f"split applied, but the earlier ${subtotal:.2f} Gmail draft could not be "
+                            f"deleted ({exc}) — delete it yourself before sending")
+
+    for result in results:
+        process_claim(result["claim_id"])
+
+    # After process_claim, not before: a successful draft clears `flag`, which
+    # would have wiped this. Where process_claim left its own blocker (missing
+    # condition, undefined insurer process) both are kept — one flag column, and
+    # dropping either one hides something Justin has to act on.
+    if unapportioned > CENT:
+        shortfall = f"split leaves ${unapportioned:.2f} of this invoice unapportioned — unexplained"
+        with db.get_connection() as conn:
+            for result in results:
+                existing = conn.execute(
+                    "SELECT flag FROM vet_claims WHERE id = ?", (result["claim_id"],)
+                ).fetchone()["flag"]
+                conn.execute(
+                    "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ?",
+                    (f"{shortfall}; {existing}" if existing else shortfall, now, result["claim_id"]),
+                )
+
+    lines = ", ".join(f"#{r['claim_id']} {r['pet_name']} ${r['amount']:.2f}" for r in results)
+    message = f"Claim #{claim_id} split across {len(results)} pets: {lines}."
+    if unapportioned > CENT:
+        message += f" ${unapportioned:.2f} of the ${subtotal:.2f} claimable is unapportioned — flagged."
+    return {"ok": True, "message": message, "claims": results, "claimable_subtotal": subtotal,
+            "unapportioned": unapportioned}
 
 
 def mark_reviewed(claim_id: int) -> dict:

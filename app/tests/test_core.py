@@ -4,7 +4,7 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -631,6 +631,130 @@ def test_message_log_keeps_a_failed_update_queued_for_replay():
     assert message_log.record_inbound(Update(update_id=9001)) is None
     with db.get_connection() as conn:
         assert conn.execute("SELECT COUNT(*) FROM telegram_messages WHERE update_id = 9001").fetchone()[0] == 1
+
+
+def _edited_reply_to_card_update(update_id=9401, text="This is actually split between echo and Aari. "
+                                                     "Aari cost was $35 out of this"):
+    """The real 2026-07-27 payload shape (telegram_messages id 96): Justin EDITED
+    his message, and it was a reply to the ASSIGN PET card for claim #1."""
+    from telegram import Update
+
+    from openclaw import config
+
+    chat = {"id": 8995277418, "type": "private", "username": "jagberg"}
+    return Update.de_json({
+        "update_id": update_id,
+        "edited_message": {
+            "message_id": 233,
+            "date": 1785149076,
+            "edit_date": 1785149753,
+            "chat": chat,
+            "from": {"id": 1, "is_bot": False, "first_name": "Justin",
+                     "username": config.TELEGRAM_USERNAME or "jagberg"},
+            "text": text,
+            "reply_to_message": {
+                "message_id": 227,
+                "date": 1785148834,
+                "chat": chat,
+                "from": {"id": 2, "is_bot": True, "first_name": "BettyVet", "username": "bettyvet_bot"},
+                "text": "🐾 ASSIGN PET\nClaim #1 · The Shire Veterinary Ca… · $407.56\n"
+                        "2026-07-06 (21d ago)\nBlocks: the claim can't be filled",
+                "reply_markup": {"inline_keyboard": [
+                    [{"text": "Aari", "callback_data": "setpet:1:1"}],
+                    [{"text": "Echo", "callback_data": "setpet:1:2"}],
+                ]},
+            },
+        },
+    }, bot=None)
+
+
+def test_edited_message_is_handled_and_logged_not_crashed():
+    """Justin edited his message to name the pet's share. `filters.TEXT` matches
+    `edited_message`, where `update.message` is None, so the handler died with
+    "'NoneType' object has no attribute 'text'" — and the log recorded it as kind
+    `other` with an EMPTY summary, hiding the one message that mattered."""
+    import asyncio
+
+    from telegram import Message
+
+    from openclaw import agent, config, message_log, telegram_bot
+
+    db.init_db()
+    _clear_message_log()
+    update = _edited_reply_to_card_update()
+
+    assert update.message is None, "the fixture must be a genuine edit, not a new message"
+    assert message_log._describe(update) == (
+        "text", "edit: This is actually split between echo and Aari. Aari cost was $35 out of this"
+    ), message_log._describe(update)
+    assert telegram_bot._replied_to_claim_id(update.effective_message) == 1
+
+    acked, replies, seen = [], [], {}
+    original_username = config.TELEGRAM_USERNAME
+    original_reply, original_reaction = Message.reply_text, Message.set_reaction
+    original_handle = agent.handle_message
+    try:
+        telegram_bot.config.TELEGRAM_USERNAME = config.TELEGRAM_USERNAME = "jagberg"
+
+        async def _reply(self, text, **kwargs):
+            replies.append(text)
+
+        async def _react(self, reaction, **kwargs):
+            acked.append(reaction)
+
+        Message.reply_text, Message.set_reaction = _reply, _react
+
+        def _handle(text, chat_id=None, claim_id=None):
+            seen.update({"text": text, "claim_id": claim_id})
+            return "ok", None
+
+        agent.handle_message = _handle
+        asyncio.run(telegram_bot._ack_user_message(update, None))
+        asyncio.run(telegram_bot.on_text_reply(update, None))
+    finally:
+        Message.reply_text, Message.set_reaction = original_reply, original_reaction
+        agent.handle_message = original_handle
+        telegram_bot.config.TELEGRAM_USERNAME = config.TELEGRAM_USERNAME = original_username
+
+    assert acked == ["👍"], "an edit gets the same acknowledgement as a new message"
+    assert seen["claim_id"] == 1, f"the replied-to card's claim must reach the agent: {seen}"
+    assert seen["text"].startswith("This is actually split"), seen
+    assert replies == ["ok"]
+
+
+def test_replied_to_claim_id_refuses_to_guess():
+    """A submission card names every member claim, and `act:`/`hist:` tokens are
+    not claims at all. Taking an id from either would act on a claim Justin
+    wasn't looking at, so nothing is better than a guess."""
+    from telegram import Update
+
+    from openclaw import telegram_bot
+
+    def _reply_to(card: dict):
+        chat = {"id": 1, "type": "private", "username": "jagberg"}
+        return Update.de_json({
+            "update_id": 9402,
+            "message": {"message_id": 2, "date": 1785149076, "chat": chat, "text": "do it",
+                        "from": {"id": 1, "is_bot": False, "first_name": "J"},
+                        "reply_to_message": {**card, "message_id": 1, "date": 1785148834, "chat": chat,
+                                             "from": {"id": 2, "is_bot": True, "first_name": "B"}}},
+        }, bot=None).effective_message
+
+    two_claims = _reply_to({"text": "SEND GMAIL DRAFT\nS6+7 · 2 claims\n  • Claim #6 …\n  • Claim #7 …"})
+    assert telegram_bot._replied_to_claim_id(two_claims) is None, "two ids named → no target"
+
+    proposal_token = _reply_to({"text": "Confirm this?", "reply_markup": {"inline_keyboard": [
+        [{"text": "✅ Confirm", "callback_data": "act:2"}]]}})
+    assert telegram_bot._replied_to_claim_id(proposal_token) is None, "act: token is not a claim id"
+
+    from_caption = _reply_to({"caption": "Review this settlement for claim #21",
+                              "document": {"file_id": "f", "file_unique_id": "u"}})
+    assert telegram_bot._replied_to_claim_id(from_caption) == 21, "PDF alerts carry it in the caption"
+
+    no_parent = Update.de_json({"update_id": 9403, "message": {
+        "message_id": 3, "date": 1785149076, "chat": {"id": 1, "type": "private"}, "text": "hi",
+        "from": {"id": 1, "is_bot": False, "first_name": "J"}}}, bot=None).effective_message
+    assert telegram_bot._replied_to_claim_id(no_parent) is None
 
 
 def test_logged_application_records_every_update_then_settles_it():
@@ -2714,6 +2838,185 @@ def test_agent_prompt_narrows_mailbox_rule_without_dropping_it():
     assert "cannot read openclaw's code" in prompt, "no code/spec reading in the container"
 
 
+_shared_invoice_charges = 0
+
+
+def _shared_invoice_claim(claimable=407.56, status="matched"):
+    """Claim #1's real shape: The Shire Veterinary Caringbah, $407.56 charged
+    2026-07-06, invoice matched, no pet, no condition, no itemization. Each call
+    walks the charge date back a day — (date, amount, merchant) is unique."""
+    import json as _json
+
+    global _shared_invoice_charges
+    txn_date = (date.fromisoformat("2026-07-06") - timedelta(days=_shared_invoice_charges)).isoformat()
+    _shared_invoice_charges += 1
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        conn.execute("INSERT INTO bank_transactions (date, amount, merchant, vet_flag, created_at) "
+                     "VALUES (?, ?, ?, 1, ?)",
+                     (txn_date, -407.56, "THE SHIRE VETERINARY CARINGBAH NSW", now))
+        txn_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO vet_claims (transaction_id, pet_id, status, matched_email_id, invoice_data, "
+            "created_at, updated_at) VALUES (?, NULL, ?, 'em-shire', ?, ?, ?)",
+            (txn_id, status, _json.dumps({"date": "2026-07-06", "amount": 407.56, "items": [],
+                                          "claimable_amount": claimable, "invoice_number": "INV-9"}),
+             now, now),
+        )
+        return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def _claim_row(claim_id):
+    with db.get_connection() as conn:
+        return conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+
+
+def test_one_invoice_splits_between_two_pets_each_carrying_its_own_share():
+    """One invoice can treat two pets (live: $407.56 at The Shire Veterinary
+    Caringbah — Aari $35, Echo the rest), but a claim carries one pet_id, so
+    either pet button over-claims and loses the other's share entirely."""
+    import json as _json
+
+    db.init_db()
+    claim_id = _shared_invoice_claim()
+
+    result = claim_forms.split_between_pets(claim_id, [(1, 35.0), (2, None)])
+    assert result["ok"], result
+    aari, echo = result["claims"]
+    assert (aari["pet_name"], aari["amount"]) == ("Aari", 35.0), result
+    assert (echo["pet_name"], echo["amount"]) == ("Echo", 372.56), "the remainder is derived, not guessed"
+    assert result["unapportioned"] == 0.0
+
+    kept, sibling = _claim_row(claim_id), _claim_row(echo["claim_id"])
+    assert kept["pet_id"] == 1 and sibling["pet_id"] == 2
+    assert kept["transaction_id"] == sibling["transaction_id"], "one charge, one bank row"
+    assert kept["matched_email_id"] == sibling["matched_email_id"] == "em-shire"
+    for row, share in ((kept, 35.0), (sibling, 372.56)):
+        invoice = _json.loads(row["invoice_data"])
+        assert invoice["claimable_amount"] == share, invoice
+        assert invoice["amount"] == 407.56 and invoice["invoice_number"] == "INV-9", "invoice untouched"
+        assert f"#{echo['claim_id']} Echo $372.56" in invoice["split_note"], invoice["split_note"]
+    assert sibling["condition_text"] is None, "the other pet's condition is never copied — that's a guess"
+
+    # Echo is with Bow Wow, whose process isn't on file: her share is recorded and
+    # visible, never dropped for lack of a claim process.
+    assert "Bow Wow" in (sibling["flag"] or ""), sibling["flag"]
+    blocked = [a for a in claim_status.pending_actions() if a["claim_id"] == echo["claim_id"]]
+    assert blocked and not blocked[0]["actionable"], f"Echo's share must show as blocked: {blocked}"
+
+
+def test_split_guards_refuse_rather_than_guess_or_over_claim():
+    """Every refusal here is a wrong claim that didn't get filed."""
+    db.init_db()
+
+    over = claim_forms.split_between_pets(_shared_invoice_claim(), [(1, 400.0), (2, 100.0)])
+    assert not over["ok"] and "ceiling" in over["message"], over
+    assert "$500.00" in over["message"] and "$407.56" in over["message"], "both figures, so it's checkable"
+
+    two_unknowns = claim_forms.split_between_pets(_shared_invoice_claim(), [(1, None), (2, None)])
+    assert not two_unknowns["ok"] and "Only one share" in two_unknowns["message"], two_unknowns
+
+    one_pet = claim_forms.split_between_pets(_shared_invoice_claim(), [(1, 35.0)])
+    assert not one_pet["ok"] and "at least two pets" in one_pet["message"], one_pet
+
+    dupe = claim_forms.split_between_pets(_shared_invoice_claim(), [(1, 35.0), (1, 100.0)])
+    assert not dupe["ok"] and "twice" in dupe["message"], dupe
+
+    already_sent = claim_forms.split_between_pets(_shared_invoice_claim(status="sent"), [(1, 35.0), (2, None)])
+    assert not already_sent["ok"], already_sent
+    assert "already with the insurer" in already_sent["message"], already_sent["message"]
+
+    unmatched = claim_forms.split_between_pets(_shared_invoice_claim(status="pending_match"),
+                                               [(1, 35.0), (2, None)])
+    assert not unmatched["ok"] and "no invoice matched yet" in unmatched["message"], unmatched
+
+    # Shares that fall short still split, but the gap is flagged — a quietly
+    # unapportioned $72.56 is money nobody claims.
+    short_id = _shared_invoice_claim()
+    short = claim_forms.split_between_pets(short_id, [(1, 35.0), (2, 300.0)])
+    assert short["ok"] and short["unapportioned"] == 72.56, short
+    assert "unapportioned" in short["message"], short["message"]
+    flag = _claim_row(short_id)["flag"] or ""
+    assert "$72.56" in flag, flag
+    assert "condition text missing" in flag, f"process_claim's own blocker survives too: {flag}"
+
+
+def test_the_split_conversation_that_failed_live_now_reaches_one_proposal():
+    """2026-07-27, four messages, nothing done: no tool fitted, no way to name
+    the claim, and the model ended up sending its own schema's description
+    strings as arguments. Same request, stubbed model, must now produce exactly
+    one confirmable split proposal — and write nothing until it's confirmed."""
+    from openclaw import agent, telegram_bot
+
+    db.init_db()
+    claim_id = _shared_invoice_claim()
+
+    captured = {}
+
+    def _fake_chat(messages, tools=None, tool_impls=None, purpose="chat", max_iterations=4):
+        captured["context"] = [m["content"] for m in messages if m["role"] == "system"]
+        captured["tool_names"] = {t["function"]["name"] for t in tools or []}
+        # What the model does with the reply-context line: act on that claim id.
+        captured["tool_result"] = tool_impls["propose_split_between_pets"](
+            claim_id=claim_id, pets_and_amounts=[{"pet": "Aari", "amount": 35}, {"pet": "Echo"}]
+        )
+        return {"text": "Aari $35.00, Echo $372.56 — tap Confirm.", "model": "llama-3.3-70b-versatile"}
+
+    original_chat = agent.llm.chat
+    try:
+        agent.llm.chat = _fake_chat
+        reply, proposal = agent.handle_message(
+            "This is actually split between echo and Aari. Aari cost was $35 out of this",
+            chat_id=None, claim_id=claim_id,
+        )
+    finally:
+        agent.llm.chat = original_chat
+
+    assert "propose_split_between_pets" in captured["tool_names"], "the tool has to exist to be reachable"
+    assert any(f"claim #{claim_id}" in line for line in captured["context"]), captured["context"]
+    assert "Proposed" in captured["tool_result"] and "$35.00" in captured["tool_result"], captured
+    assert proposal and proposal["action"] == "split_pets", proposal
+    assert proposal["claim_id"] == claim_id and proposal["arg"] == [(1, 35.0), (2, None)], proposal
+    assert "Confirm" in reply
+
+    assert _claim_row(claim_id)["pet_id"] is None, "nothing may change before the tap"
+
+    message = telegram_bot._execute_action(proposal)
+    assert "Aari $35.00" in message and "Echo $372.56" in message, message
+    assert _claim_row(claim_id)["pet_id"] == 1, "the tap is what writes"
+
+
+def test_split_proposal_is_refused_before_the_tap_when_it_cannot_work():
+    """An impossible split must be refused in the reply, not after Justin taps
+    Confirm — the agent runs the same guards the write does."""
+    from openclaw import agent
+
+    db.init_db()
+    claim_id = _shared_invoice_claim()
+    proposals = []
+    impls = agent._build_impls(proposals)
+
+    over = impls["propose_split_between_pets"](
+        claim_id=claim_id, pets_and_amounts=[{"pet": "Aari", "amount": 400}, {"pet": "Echo", "amount": 100}]
+    )
+    assert "ceiling" in over and not proposals, over
+
+    unknown_pet = impls["propose_split_between_pets"](
+        claim_id=claim_id, pets_and_amounts=[{"pet": "Whiskers", "amount": 35}, {"pet": "Echo"}]
+    )
+    assert "No pet named 'Whiskers'" in unknown_pet and not proposals, unknown_pet
+
+    no_amounts = impls["propose_split_between_pets"](
+        claim_id=claim_id, pets_and_amounts=[{"pet": "Aari"}, {"pet": "Echo"}]
+    )
+    assert "Only one share" in no_amounts and not proposals, no_amounts
+
+    missing_claim = impls["propose_split_between_pets"](
+        claim_id=999999, pets_and_amounts=[{"pet": "Aari", "amount": 35}, {"pet": "Echo"}]
+    )
+    assert "No claim #999999" in missing_claim and not proposals, missing_claim
+
+
 def test_malformed_tool_call_retries_then_fails_readably():
     """Groq rejects its own garbled output with a 400 `tool_use_failed` (seen
     live: `<function=list_tasks,{...}</function>`). That's a nondeterministic
@@ -2761,6 +3064,68 @@ def test_malformed_tool_call_retries_then_fails_readably():
     except llm.LLMUnavailableError as exc:
         assert "malformed tool call" in str(exc), "says what actually went wrong"
         assert "try rephrasing" in str(exc)
+
+
+def test_transient_non_429_failure_is_retried_but_a_bad_request_is_not():
+    """A single `403 Access denied. Please check your network settings.` from Groq
+    ended a chat turn on its FIRST attempt (2026-07-27, llm_calls #1659 — one
+    row) because only 429 and tool_use_failed were retried; the same request
+    seconds later worked. Retry unless a retry provably cannot help: a per-day
+    cap (switch model instead) or a 400 that is our own request shape."""
+    from openclaw import llm
+
+    edge_403 = Exception("Error code: 403 - {'error': {'message': 'Access denied. "
+                         "Please check your network settings.'}}")
+    bad_shape = Exception("Error code: 400 - {'error': {'message': "
+                          "'messages[2].reasoning: reasoning is not supported with this model'}}")
+    garbled = Exception("Error code: 400 - {'code': 'tool_use_failed'}")
+    assert not llm._is_request_shape_error(edge_403), "403 says nothing about our request"
+    assert llm._is_request_shape_error(bad_shape)
+    assert not llm._is_request_shape_error(garbled), "a garbled tool call keeps its own retry path"
+
+    original_backoff = llm.BASE_BACKOFF_SECONDS
+    llm.BASE_BACKOFF_SECONDS = 0  # the backoff is asserted elsewhere; don't sleep here
+
+    def _client(exc, fail_times):
+        class C:
+            class chat:
+                class completions:
+                    calls = []
+
+                    @classmethod
+                    def create(cls, **kwargs):
+                        cls.calls.append(1)
+                        if len(cls.calls) <= fail_times:
+                            raise exc
+                        class _M:
+                            content = "recovered"
+                            tool_calls = None
+                        return type("R", (), {"choices": [type("C", (), {"message": _M()})()]})
+        return C()
+
+    def _llm_call_count():
+        with db.get_connection() as conn:
+            return conn.execute("SELECT COUNT(*) FROM llm_calls WHERE purpose = 'retrytest'").fetchone()[0]
+
+    try:
+        before = _llm_call_count()
+        client = _client(edge_403, fail_times=1)
+        message = llm._completion(client, "m", [{"role": "user", "content": "hi"}], None, "retrytest")
+        assert message.content == "recovered", "a one-off 403 must not kill the turn"
+        assert len(client.chat.completions.calls) == 2, client.chat.completions.calls
+        assert _llm_call_count() - before == 2, "every attempt logs its own llm_calls row"
+
+        before = _llm_call_count()
+        client = _client(bad_shape, fail_times=99)
+        try:
+            llm._completion(client, "m", [{"role": "user", "content": "hi"}], None, "retrytest")
+            raise AssertionError("a request-shape 400 must surface, not be retried")
+        except llm.LLMUnavailableError as exc:
+            assert "reasoning is not supported" in str(exc), "the provider's own message survives"
+        assert len(client.chat.completions.calls) == 1, "no tokens spent reproducing our own bug"
+        assert _llm_call_count() - before == 1
+    finally:
+        llm.BASE_BACKOFF_SECONDS = original_backoff
 
 
 def test_daily_budget_exhaustion_falls_through_to_another_model():

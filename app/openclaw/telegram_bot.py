@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from telegram import (
@@ -64,12 +65,13 @@ async def _ack_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     uploads) before the real handlers run. Callback taps carry no update.message
     so they're excluded — they already get feedback via _append_result."""
     username = update.effective_user.username if update.effective_user else None
-    if update.message and _is_authorized(username):
+    message = update.effective_message
+    if message and _is_authorized(username):
         # Diagnostic trail, not an archive: enough to reconstruct what was asked
         # when a session goes wrong. Nothing persisted this before, so a whole
         # morning's conversation was unrecoverable.
-        logger.info("telegram in: %r", (update.message.text or "<non-text>")[:200])
-        await _ack(update.message)
+        logger.info("telegram in: %r", (message.text or "<non-text>")[:200])
+        await _ack(message)
 
 
 def get_registered_chat_id() -> int | None:
@@ -364,6 +366,10 @@ def _action_card_text(action: dict) -> str:
         who = " · ".join(filter(None, [action["pet_name"], action["condition_text"]]))
         lines.append(f"{_esc(who) + ' · ' if who else ''}{action['date']} ({action['age_days']}d ago)")
     lines.append(f"<i>Blocks: {_esc(action["blocks"])}</i>")
+    if action["kind"] == "assign_pet":
+        # The buttons can only say ONE pet. An invoice covering two needs a share
+        # each, which is a reply, not a tap — and he has to know that's allowed.
+        lines.append("<i>Shared invoice? Reply with the pets and one amount.</i>")
     return "\n".join(lines)
 
 
@@ -580,6 +586,10 @@ def _execute_action(proposal: dict) -> str:
         return claim_forms.assign_pet(claim_id, arg)["message"]
     if action == "mark_resolved":
         return claim_status.confirm_resolved(claim_id)["message"]
+    # Named split_pets, not split: `split:` callbacks are the per-item CONDITION
+    # split, a different axis on the same invoice.
+    if action == "split_pets":
+        return claim_forms.split_between_pets(claim_id, arg)["message"]
     # Assistant side — no claim_id involved anywhere in the round trip. Imported
     # here, not at module scope: tasks -> reminders -> scheduler constructs a
     # jobstore against the DB at import time, and the bot shouldn't trigger that.
@@ -734,6 +744,40 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("could not report failure back to Telegram")
 
 
+_CLAIM_IN_CARD = re.compile(r"claim #(\d+)", re.IGNORECASE)
+# Callback prefixes whose first field is a claim id. `act:` (proposal token),
+# `hist:`, `si*` and the *bill: (proposal id) tokens are NOT claims — reading a
+# claim id out of them would target whatever row shares that number.
+_CLAIM_CALLBACK_PREFIXES = frozenset(
+    {"sent", "cond", "condother", "setpet", "unmatch", "split", "invreq", "dismiss", "resolved"}
+)
+
+
+def _replied_to_claim_id(message) -> int | None:
+    """The claim of the card this message replies to, or None.
+
+    Cards name it in their text — or their caption, since PDF alerts have no
+    text — and again in their buttons' callback data. None unless EXACTLY one
+    claim is named: a submission-level card names every member, and picking one
+    of those would act on a claim Justin wasn't looking at.
+
+    Without this, a reply to the ASSIGN PET card was a message with no target:
+    the agent asked for "the reference" three times and then fabricated
+    arguments out of its own tool schema (2026-07-27)."""
+    parent = getattr(message, "reply_to_message", None)
+    if parent is None:
+        return None
+    body = f"{getattr(parent, 'text', None) or ''}\n{getattr(parent, 'caption', None) or ''}"
+    ids = {int(found) for found in _CLAIM_IN_CARD.findall(body)}
+    markup = getattr(parent, "reply_markup", None)
+    for row in getattr(markup, "inline_keyboard", None) or ():
+        for button in row:
+            fields = (getattr(button, "callback_data", None) or "").split(":")
+            if len(fields) >= 2 and fields[0] in _CLAIM_CALLBACK_PREFIXES and fields[1].isdigit():
+                ids.add(int(fields[1]))
+    return ids.pop() if len(ids) == 1 else None
+
+
 async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Free-text condition entry: after 'Other', the next plain-text message
     from the authorized user sets the condition for the pending claim."""
@@ -741,7 +785,12 @@ async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not _is_authorized(username):
         return
     chat_id = update.effective_chat.id
-    text = update.message.text.strip()
+    # effective_message, not .message: an edit is an `edited_message` update
+    # where .message is None, which crashed this handler with
+    # "'NoneType' object has no attribute 'text'" (2026-07-27) and lost the
+    # correction Justin had just made.
+    message = update.effective_message
+    text = message.text.strip()
     # A typed condition for the current item in a split flow takes priority.
     split = _pending_split.get(chat_id)
     if split and split.get("await_type"):
@@ -751,7 +800,7 @@ async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     claim_id = _pending_condition.pop(chat_id, None)
     if claim_id is not None:
         result = claim_forms.set_condition_text(claim_id, text)
-        await update.message.reply_text(result["message"])
+        await message.reply_text(result["message"])
         return
     # No pending typed-reply flow owns this message — treat it as free-form chat.
     await _handle_chat(update)
@@ -760,23 +809,25 @@ async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _handle_chat(update: Update) -> None:
     """Free-form message → conversational agent. A proposed mutation comes back
     as a Confirm button; the write happens only on the tap (see on_callback)."""
+    message = update.effective_message
     try:
         reply, proposal = await asyncio.to_thread(
-            agent.handle_message, update.message.text, update.effective_chat.id
+            agent.handle_message, message.text, update.effective_chat.id,
+            _replied_to_claim_id(message),
         )
     except llm.LLMUnavailableError as exc:
-        await update.message.reply_text(f"⚠️ LLM unavailable: {exc}")
+        await message.reply_text(f"⚠️ LLM unavailable: {exc}")
         return
     except Exception as exc:  # never leave the user staring at silence
         logger.exception("chat handler failed")
-        await update.message.reply_text(f"⚠️ Something broke handling that: {type(exc).__name__}: {exc}")
+        await message.reply_text(f"⚠️ Something broke handling that: {type(exc).__name__}: {exc}")
         return
     if proposal:
         token = _register_action(proposal)
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm", callback_data=f"act:{token}")]])
-        await update.message.reply_text(reply or f"Confirm: {proposal['label']}?", reply_markup=markup)
+        await message.reply_text(reply or f"Confirm: {proposal['label']}?", reply_markup=markup)
     else:
-        await update.message.reply_text(reply or "…")
+        await message.reply_text(reply or "…")
 
 
 class LoggedApplication(Application):
