@@ -45,7 +45,7 @@
 - [x] 6.2 `README.md`: the shared-invoice case in the matching/claim walkthrough.
 - [x] 6.3 `app/openclaw/CLAUDE.md`: `invoice_data.claimable_amount` is the per-claim share and `split_note` is its record; `split_proposals` is charge-merge, not pet-split; edited messages arrive as `edited_message`.
 - [x] 6.4 `openspec/BACKLOG.md`: undo for a confirmed split; whether the ASSIGN PET card needs an explicit "Shared invoice" button; Bow Wow's claim process still undefined (6 claims + Echo's share now blocked on it).
-- [ ] 6.5 Sync these deltas into `openspec/specs/` before archiving the change.
+- [x] 6.5 Synced 2026-07-27: `multi-pet-invoice-split` created (baseline 16 -> 17 capabilities), 2 added + 1 modified each into `invoice-matching`, `conversational-agent` and `telegram-bot`, 1 modified into `llm-backend`. `openspec validate --specs` passes 17/17.
 
 ## 7. Automatic apportionment (added 2026-07-27 after the live diagnosis)
 
