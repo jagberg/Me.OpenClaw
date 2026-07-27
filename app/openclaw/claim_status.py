@@ -2,13 +2,21 @@ import json
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from . import claim_forms, db
+from . import claim_forms, config, db
 
 # "Automatic reply: ..." fires instantly on submission, before the real
 # Acknowledgement Letter (1-2 business days later per its own boilerplate) —
 # noise, not a status event. Distinct from "unclassified" (a real reply we
 # couldn't classify) so it never shows up needing manual review.
 IGNORE_KEYWORDS = ["automatic reply"]
+
+# requiredinfo.au@ is a dedicated single-purpose channel — every email from it is
+# an information request, so the sender classifies it without any phrase match.
+# That is what rescues the vet-addressed cover note: one sentence of body, the
+# reference only in the subject, and the detail in an attachment we get no text
+# for. It matched nothing and was recorded `unclassified` — the one classification
+# that produces no action (confirmed live 2026-07-19 and 2026-07-27).
+INFO_REQUEST_SENDER = "requiredinfo.au@petcovergroup.com"
 
 # Ordered: first match wins. Checked against subject first, then body as a
 # fallback for subjects that don't carry a clean keyword (confirmed real
@@ -23,7 +31,15 @@ SUBJECT_KEYWORDS = [
     # phrase is body-only, confirmed live ("Claim assessment outcome: Under
     # excess ... Less Fixed excess: $105.00").
     ("below_excess", ["claim assessment outcome: under excess", "under your fixed excess"]),
-    ("suspended", ["suspended"]),
+    # info_requested MUST stay ahead of suspended. The request letter contains the
+    # sentence "Your claim will be suspended until we have the required
+    # information" — a statement about its own future, not a suspension. With
+    # suspended first, every request was filed as a suspension: the live DB held
+    # zero info_requested events and two suspended ones, both of which were
+    # requests (confirmed 2026-07-27). A genuine "Claim suspended" letter exists
+    # separately (29 Jan 2026) and carries no request wording, so the two stay
+    # distinguishable — the distinction is "a document is missing" vs "we have
+    # stopped assessing".
     (
         "info_requested",
         [
@@ -33,8 +49,12 @@ SUBJECT_KEYWORDS = [
             "request for completed claim form",
             "request for itemized invoice",
             "request for cf",
+            "further information required",
+            "information required",
+            "please provide the following",
         ],
     ),
+    ("suspended", ["suspended"]),
     ("settled", ["settlement eft", "claim settlement"]),
     ("declined", ["declined"]),
 ]
@@ -49,6 +69,33 @@ REFERENCE_CONTEXT_PATTERNS = [
     r"Claim Reference[:\s]+([A-Za-z0-9-]+)",
     r"Petcover Claim\s+([A-Za-z0-9-]+)",
 ]
+
+# The policy number (GABR-0306-DC1-00000001R) is the only thing shaped enough to
+# be mistaken for a reference, and it is why bare patterns were rejected here
+# originally. Deleting it before the shape fallback runs is cheaper and more
+# honest than trying to write a regex that steps around it.
+_POLICY_NUMBER = re.compile(r"\b[A-Za-z]{2,4}-\d{4}-[A-Za-z]{2,4}\d?-\d{6,}[A-Za-z]?\b")
+
+# Shape fallback for letters that carry the reference with no context phrase at
+# all — the vet cover note has it only in a free-form subject ("Petcover claim
+# for Ari DC1-27-5628 Sr.8"), where the phrases above match nothing and are
+# additionally case-sensitive. Petcover has used at least five subject shapes in
+# two years; the reference's own shape has been stable across all of them.
+_REFERENCE_SHAPE = re.compile(r"\b(?:[A-Za-z]{2,4}\d?-\d{2}-\d{4}|GABR-\d{4})\b", re.IGNORECASE)
+
+# Petcover's letters — and the PDF text behind them — render the reference with
+# U+2010 non-breaking hyphens: "DC1‐26‐5992". Every pattern here uses ASCII "-",
+# so a raw letter yielded the reference "DC1", missed its exact (reference, Sr)
+# lookup, and correlated by recency onto the wrong claim (confirmed live
+# 2026-07-27: the DC1-26-5992 Sr 1 letter attached to claim #2 instead of #8).
+# Normalizing once at this seam keeps stored references canonical ASCII, so they
+# can still match one stored earlier; widening each character class instead would
+# let a non-ASCII hyphen into petcover_reference, where nothing would match it.
+_DASHES = dict.fromkeys(map(ord, "‐‑‒–—―−"), "-")
+
+
+def _normalize(text: str) -> str:
+    return (text or "").translate(_DASHES)
 
 # Petcover's own emails have used a nickname inconsistent with our records at
 # least once (real: "Ari" for Aari) — checked in addition to the exact name.
@@ -73,7 +120,7 @@ SETTLEMENT_TOLERANCE = 2.00
 
 
 def _match_keywords(text: str) -> str | None:
-    lowered = text.lower()
+    lowered = _normalize(text).lower()
     if any(kw in lowered for kw in IGNORE_KEYWORDS):
         return "ignore"
     for event_type, keywords in SUBJECT_KEYWORDS:
@@ -82,15 +129,37 @@ def _match_keywords(text: str) -> str | None:
     return None
 
 
-def classify(subject: str, body: str) -> str:
+def classify(subject: str, body: str, sender: str | None = None) -> str:
+    # Ignore-check first so an "Automatic reply:" from the required-info channel
+    # is still noise rather than a fabricated request.
+    if any(kw in _normalize(subject).lower() for kw in IGNORE_KEYWORDS):
+        return "ignore"
+    if sender and INFO_REQUEST_SENDER in sender.lower():
+        return "info_requested"
     return _match_keywords(subject) or _match_keywords(body) or "unclassified"
 
 
 def extract_reference(text: str) -> str | None:
+    """Shape first, context phrase second.
+
+    The phrase looked like the higher-confidence signal, but it captures whatever
+    token follows it, and Petcover's subjects put junk there: "Petcover claim
+    for--Aari--DC1-27-5628 Serial Number: 2" yields `for--Aari--DC1-27-5628`. In a
+    live trial that string was written to a claim as its reference. A shape match
+    is unambiguous when it hits, so it goes first; the phrase remains the fallback
+    for a future format the shape doesn't know, where a loose capture beats none."""
+    text = _normalize(text)
+    match = _REFERENCE_SHAPE.search(_POLICY_NUMBER.sub(" ", text))
+    if match:
+        return match.group(0)
     for pattern in REFERENCE_CONTEXT_PATTERNS:
-        match = re.search(pattern, text)
+        match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return match.group(1).rstrip(".,")
+            candidate = match.group(1).rstrip(".,")
+            # Still has to look like an identifier — the phrase can sit next to a
+            # bare word ("Petcover claim for Ari …" captures "for").
+            if "-" in candidate and any(c.isdigit() for c in candidate):
+                return candidate
     return None
 
 
@@ -105,10 +174,15 @@ def extract_sr(text: str, reference: str | None) -> int | None:
     claim, confirmed live)."""
     if not reference:
         return None
-    match = re.search(re.escape(reference) + r"\s*SR\s*0*(\d+)", text, re.IGNORECASE)
+    text = _normalize(text)
+    # Separator is [\s.:]* not \s*: "DC1-27-5628 Sr.8" and "sr.1" are both live
+    # (2026-07-27) and a whitespace-only separator silently missed them.
+    match = re.search(re.escape(reference) + r"\s*SR[\s.:]*0*(\d+)", text, re.IGNORECASE)
     if match:
         return int(match.group(1))
-    match = re.search(r"Treatment number:?\s*(\d+)", text, re.IGNORECASE)
+    # "Serial Number: 2" is a third labeled form beside "Treatment number: N",
+    # live 2026-07-19 on a letter whose reference is subject-only.
+    match = re.search(r"(?:Treatment number|Serial Number):?\s*0*(\d+)", text, re.IGNORECASE)
     return int(match.group(1)) if match else None
 
 
@@ -117,6 +191,7 @@ def extract_settlement_amounts(text: str) -> dict:
     email body — confirmed via dry-run). Newer 'Claim Approval' emails use a
     different template entirely; see extract_approval_amounts."""
     result = {}
+    text = _normalize(text)
     claimed = re.search(r"Amount Claimed\s*\$?([\d,]+\.\d{2})", text)
     payable = re.search(r"Total Payable\s*:?\s*\$?([\d,]+\.\d{2})", text)
     if claimed:
@@ -142,11 +217,42 @@ _APPROVAL_PATTERNS = {
 
 def extract_approval_amounts(text: str) -> dict:
     result = {}
+    # Not broken today (these patterns match $ amounts, not references) — but the
+    # text comes from the same PDFs, and one letter using an en dash in "Less
+    # Fixed excess" would fail silently. Normalizing removes the class, not the case.
+    text = _normalize(text)
     for key, pattern in _APPROVAL_PATTERNS.items():
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             result[key] = float(match.group(1).replace(",", ""))
     return result
+
+
+_EMAIL_IN_HEADER = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
+def resolve_owed_by(recipients: str | None) -> dict:
+    """Who owes the requested information, read from the letter's To:/Cc:.
+
+    The sender cannot answer this — claims.au@ sends both kinds (real:
+    "GABR-0305-Request for consult note" went to a vet, "GABR-0306 First Request
+    for CF" went to Justin). The To: header is the only discriminator.
+
+    Never defaults to Justin: silently reassigning a vet's obligation to him is
+    the failure that loses the claim, so an unrecognized address is reported as a
+    vet with its raw address rather than absorbed.
+    """
+    addresses = [a.lower() for a in _EMAIL_IN_HEADER.findall(recipients or "")]
+    ours = {e.lower() for e in (config.OWNER_EMAIL, config.SPOUSE_EMAIL) if e}
+    external = [a for a in addresses if a not in ours]
+    if not external:
+        return {"owed_by": "justin", "clinic": None, "clinic_email": None}
+    with db.get_connection() as conn:
+        contacts = {r["email"].lower(): r["merchant"] for r in conn.execute("SELECT merchant, email FROM vet_contacts")}
+    for address in external:
+        if address in contacts:
+            return {"owed_by": "vet", "clinic": contacts[address], "clinic_email": address}
+    return {"owed_by": "vet", "clinic": None, "clinic_email": external[0]}
 
 
 def _mentions_pet(text: str, pet_name: str) -> bool:
@@ -251,6 +357,55 @@ def _claim_for_sr(submission_claims: list) -> object:
     return min(pool, key=lambda c: (c["_txn_date"] or "", c["id"]))
 
 
+def _already_recorded(claim_id: int | None, event_type: str, email_id: str | None) -> bool:
+    """Has this exact (email, claim, event) already been logged?
+
+    Makes re-reading Petcover mail safe, which is what lets a classifier fix be
+    applied to mail already in `processed_emails` — the reason the four live
+    misclassifications found 2026-07-27 would otherwise stay wrong forever.
+    Without this, a re-read appends duplicate events AND re-runs the status/flag
+    write, which would resurrect a settlement mismatch Justin had dismissed."""
+    if email_id is None:
+        return False  # manual events (confirm_resolved, dismiss) have no email
+    with db.get_connection() as conn:
+        return conn.execute(
+            "SELECT 1 FROM claim_status_events WHERE raw_email_id IS ? AND claim_id IS ? AND event_type = ?",
+            (email_id, claim_id, event_type),
+        ).fetchone() is not None
+
+
+def detach_reference(claim_id: int) -> dict:
+    """Un-learns a wrongly-learned Petcover reference, returning the claim to the
+    correlation pool so a re-read can route it correctly.
+
+    Reference learning had no undo, and a mis-learned reference is self-sealing:
+    the claim stops being an un-referenced candidate, so correlation can never
+    reconsider it. Live proof — claim #2 learned `DC1` from a letter whose
+    non-breaking hyphens truncated the reference, and while that value sat there
+    the letter naming its real thread would have routed to a sibling claim.
+
+    Logged, not silently wiped: the append-only log is the audit trail."""
+    with db.get_connection() as conn:
+        claim = conn.execute(
+            "SELECT petcover_reference, petcover_sr FROM vet_claims WHERE id = ?", (claim_id,)
+        ).fetchone()
+        if claim is None:
+            return {"ok": False, "message": f"No claim #{claim_id} found."}
+        if claim["petcover_reference"] is None and claim["petcover_sr"] is None:
+            return {"ok": False, "message": f"Claim #{claim_id} holds no reference to detach."}
+        detached = {"reference": claim["petcover_reference"], "sr": claim["petcover_sr"]}
+        conn.execute(
+            "UPDATE vet_claims SET petcover_reference = NULL, petcover_sr = NULL, updated_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), claim_id),
+        )
+    _record_event(claim_id, "reference_detached", None, detached)
+    return {
+        "ok": True,
+        "message": f"Claim #{claim_id}: detached reference {detached['reference']} "
+        f"(Sr {detached['sr']}) — it can be re-learned from Petcover's letters.",
+    }
+
+
 def _record_event(claim_id: int | None, event_type: str, email_id: str | None, detail: dict) -> int:
     with db.get_connection() as conn:
         cur = conn.execute(
@@ -261,13 +416,15 @@ def _record_event(claim_id: int | None, event_type: str, email_id: str | None, d
         return cur.lastrowid
 
 
-def process_reply(email_id: str, subject: str, body: str) -> None:
+def process_reply(
+    email_id: str, subject: str, body: str, sender: str | None = None, recipients: str | None = None
+) -> None:
     """Classifies one Petcover reply and routes it to the claim(s) it concerns.
     Routing precedence: (reference, Sr) → the one cited claim; reference-only →
     the thread's non-terminal claims; no stored reference → ack correlation by
     pet + condition + recency. Never guesses across Condition Threads, and never
     reopens a settled/declined claim."""
-    event_type = classify(subject, body)
+    event_type = classify(subject, body, sender)
     if event_type == "ignore":
         return
 
@@ -300,6 +457,22 @@ def process_reply(email_id: str, subject: str, body: str) -> None:
         claims = correlate_ack(text)
 
     detail = {"subject": subject}
+    if event_type == "info_requested":
+        # Which party owes the document decides Justin's next move: chase the vet,
+        # or supply it himself. Nothing recorded this before — process_reply never
+        # saw a header.
+        detail.update(resolve_owed_by(recipients))
+        requested = re.search(
+            r"(?:we need a copy of|please provide the following(?: information)?(?: in order)?(?: for us)?"
+            r"(?: to review the claim)?)\s*[:\-]?\s*(.+)",
+            _normalize(body),
+            re.IGNORECASE,
+        )
+        if requested:
+            # First line only — the letter continues into boilerplate. Left absent
+            # rather than guessed when the phrase isn't there (the vet cover note's
+            # detail lives in an attachment we get no text for).
+            detail["requested_document"] = requested.group(1).strip().splitlines()[0][:200]
     if event_type == "settled":
         detail.update(extract_settlement_amounts(body))
     elif event_type == "approved":
@@ -308,11 +481,14 @@ def process_reply(email_id: str, subject: str, body: str) -> None:
         detail.update(extract_approval_amounts(body))
 
     if not claims:
-        _record_event(None, event_type, email_id, {**detail, "flag": "needs manual link — no claim matched"})
+        if not _already_recorded(None, event_type, email_id):
+            _record_event(None, event_type, email_id, {**detail, "flag": "needs manual link — no claim matched"})
         return
 
     now = datetime.now(timezone.utc).isoformat()
     for claim in claims:
+        if _already_recorded(claim["id"], event_type, email_id):
+            continue  # re-read of mail already applied — nothing new to record or write
         # Validate whenever a paid amount is actually stated — the newer
         # 'approved' email carries it; the older settled-with-PDF style
         # carries it directly in the settled email itself. Either way, the

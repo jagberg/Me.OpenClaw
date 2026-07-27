@@ -593,7 +593,7 @@ def _claims_touched_since(event_id: int) -> list[int]:
     return [r["claim_id"] for r in rows]
 
 
-def poll_petcover_status() -> dict:
+def poll_petcover_status(reread: bool = False, since: str | None = None) -> dict:
     """Polls Petcover's claims-relevant senders for status replies (ack, info
     request, suspended, settled, declined) and records them via claim_status.
     Raises on Gmail API failure — same retry-next-interval behavior as
@@ -601,7 +601,18 @@ def poll_petcover_status() -> dict:
 
     Returns {checked, events, claims_changed} so an on-demand caller (the chat
     agent's poll_petcover_now) can say what actually changed instead of "done".
-    The scheduled tick ignores the return value."""
+    The scheduled tick ignores the return value.
+
+    `reread=True` ignores the `processed_emails` guard so a classification or
+    extraction fix can be applied to mail already ingested — without it, every
+    such fix only ever helps the *next* letter, and the four live
+    misclassifications found 2026-07-27 would stay wrong permanently. This
+    reverses `telegram-agent-reach`'s deliberate exclusion of force-reprocessing,
+    which was correct while a re-read meant duplicate events: `process_reply` now
+    skips any (email, claim, event) already logged, so a re-read records only
+    what is genuinely new and cannot re-write a status or resurrect a dismissed
+    settlement mismatch. Re-reads deliberately do NOT re-mark `processed_emails`
+    (the row is already there) and stay bounded by `since`."""
     before_event_id = _latest_event_id()
     service = gmail_client.build_service()
     unprocessed = []
@@ -610,12 +621,12 @@ def poll_petcover_status() -> dict:
         while True:
             response = service.users().messages().list(
                 userId="me",
-                q=f"from:{sender} after:{config.PETCOVER_STATUS_SINCE}",
+                q=f"from:{sender} after:{since or config.PETCOVER_STATUS_SINCE}",
                 maxResults=100,
                 pageToken=page_token,
             ).execute()
             for item in response.get("messages", []):
-                if gmail_ingest._already_processed(item["id"]):
+                if not reread and gmail_ingest._already_processed(item["id"]):
                     continue
                 message = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
                 unprocessed.append(message)
@@ -631,8 +642,13 @@ def poll_petcover_status() -> dict:
         headers = {h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])}
         subject = headers.get("Subject", "")
         body = gmail_client.full_message_text(service, message)
-        claim_status.process_reply(message["id"], subject, body)
-        gmail_ingest._mark_processed(message["id"], None)
+        # From: classifies the dedicated required-info channel; To:/Cc: says who
+        # owes any requested document (claims.au@ sends both kinds, so the sender
+        # cannot answer that).
+        recipients = ", ".join(filter(None, (headers.get("To", ""), headers.get("Cc", ""))))
+        claim_status.process_reply(message["id"], subject, body, headers.get("From", ""), recipients)
+        if not reread:
+            gmail_ingest._mark_processed(message["id"], None)
 
     return {
         "checked": len(unprocessed),
