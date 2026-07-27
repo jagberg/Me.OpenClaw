@@ -39,13 +39,20 @@ def _seed_matched_claim(merchant: str, condition_text: str | None = "ear infecti
             "VALUES (?, ?, ?, ?, 1, ?)",
             ("2026-07-01", -100.0, merchant, "medical", now),
         ).lastrowid
+        # The invoice PDF has to be ON FILE before a claim can draft (Petcover
+        # requires it attached), so a seed without one can only ever reach
+        # `awaiting invoice` — which silently broke every draft assertion in
+        # this file. A stub file is enough: create_claim_draft is stubbed too.
+        invoice_path = Path(_tmpdir) / f"invoice-{merchant.replace(' ', '-')}.pdf"
+        invoice_path.write_text("stub invoice")
         claim_id = conn.execute(
-            "INSERT INTO vet_claims (transaction_id, pet_id, invoice_data, condition_text, status, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, 'matched', ?, ?)",
+            "INSERT INTO vet_claims (transaction_id, pet_id, invoice_data, invoice_file_path, "
+            "condition_text, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'matched', ?, ?)",
             (
                 txn_id,
                 pet["id"],
                 json.dumps({"date": "2026-07-01", "amount": 100.0, "services": ["consult"]}),
+                str(invoice_path),
                 condition_text,
                 now,
                 now,
@@ -322,6 +329,10 @@ def test_batch_action_card_is_one_card_naming_every_member():
 
 def test_resolved_records_event():
     claim_id = _seed_drafted_claim("RESOLVED VET", draft_id="draft-resolved-1")
+    # confirm_resolved clears an OUTSTANDING needs-action event and is a no-op
+    # without one (ADR-0008, idempotent under replay) — so the request has to
+    # exist before it can be confirmed.
+    claim_status._record_event(claim_id, "info_requested", None, {"subject": "more info please"})
     result = telegram_bot.handle_resolved(AUTHORIZED_USER, claim_id)
     assert result["ok"] is True
     with db.get_connection() as conn:
