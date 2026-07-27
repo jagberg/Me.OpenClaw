@@ -99,3 +99,8 @@ Splitting is discoverable only through the card's one-line hint that a reply wor
 *Ongoing operational item. Capability: `claim-form-automation`.*
 
 Echo has no insurer claim email or process on file (`pets.claim_process_defined = 0`), so 6 claims — plus Echo's share of every per-pet split, starting with claim #1's $372.56 — sit blocked with no button that can clear them. Needs Bow Wow's actual claim process from Justin, not code.
+
+### The manual per-pet split has never run live
+*Open since 2026-07-27. Capability: `multi-pet-invoice-split`.*
+
+`claim_forms.split_between_pets` and the chat proposal that drives it are tested but unexercised against a real bill: the charge that prompted them turned out to be two invoices, handled by automatic apportionment instead. The path needs one genuine single-document, two-patient invoice (the vet's bulk history email bills Aari and Echo on one document, so the shape exists) before it can be called verified.

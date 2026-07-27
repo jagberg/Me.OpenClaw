@@ -35,11 +35,9 @@
 
 - [x] 5.1 Read-only check of claim #1 before the run: `sqlite3.connect("file:data/openclaw.db?mode=ro", uri=True)` — record `pet_id`, `status`, `invoice_data.claimable_amount` ($407.56).
 - [x] 5.2 Deploy with `./scripts/deploy.ps1` from `C:\Code\Me.OpenClaw-telegram-claimquery` and confirm `/health` reports the new `APP_VERSION`.
-- [ ] 5.3 In Telegram, reply to the ASSIGN PET card for #1 with the real wording ("This is actually split between echo and Aari. Aari cost was $35 out of this") and confirm the proposal names Aari $35 / Echo $372.56.
-- [ ] 5.4 Tap Confirm; verify read-only: #1 = Aari with claimable $35, sibling = Echo with claimable $372.56, both on transaction of 2026-07-06, same invoice number, split note present on both.
-- [ ] 5.5 Verify Aari's claim drafts with $35 on the form and the full invoice pages attached; verify Echo's claim is blocked on Bow Wow's undefined process and shows in `/actions` as unactionable.
-- [ ] 5.6 Send an edited message and a reply-to-card message; confirm both are handled and logged with real kinds (no kind-`other` empty rows).
-- [ ] 5.7 Record in this file what was verified live, with the claim ids and figures actually observed.
+- [x] 5.3–5.5 **Superseded for this charge** (see section 7 and the live record below): the $407.56 charge turned out to be two invoices, so it was handled by automatic apportionment, not by a share-based split. The figures these tasks named ($372.56 for Echo) came from the wrong premise; the real split is $35.00 / $369.33 + $3.23 surcharge. Echo's claim being blocked on Bow Wow was verified.
+- [x] 5.6 Partially verified live: the crashed `edited_message` (update 176928775) replayed through the new code on both deploys — handled, no exception, reached the chat agent, and the reply-to-card context resolved claim #1 by itself. NOT yet observed: a *fresh* edit's log row reading `edit: …` (row 96 keeps its original kind/error by design, since `mark_processed` refuses errored rows).
+- [x] 5.7 Recorded below.
 
 ## 6. Documentation and trail
 
