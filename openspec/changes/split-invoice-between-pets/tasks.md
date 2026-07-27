@@ -57,7 +57,7 @@
 - [x] 7.4 Sibling claim carries its own `matched_email_id`, invoice, claimable subtotal and pet (printed patient field / single pet in text); both rows record `invoice_data.charge_note`.
 - [x] 7.5 Tests: the real Shire numbers apportion into two claims with the right pets and invoice numbers; every refusal case (gap unclosed, pair over the charge, wrong date window, two candidates, same invoice twice, nothing to explain); the receipt-payment-line gate including the different-lines rejection.
 - [x] 7.6 Live: clear claim #1's wrong match (it points at a payment-list email), re-match, and confirm the two receipts land as two claims — Aari $35.00 and Echo $369.33 on the one 2026-07-06 charge.
-- [ ] 7.7 Live follow-up: the receipts are inline email text with no PDF attachment, so `invoice_file_path` stays NULL and neither claim can draft (Petcover requires the invoice attached). Decide whether to ask the vet for PDFs or generate one from the receipt text.
+- [x] 7.7 ~~Live follow-up: the receipts are inline email text with no PDF attachment~~ — **wrong, corrected 2026-07-27.** Each email carries its own invoice PDF (`SHV49c1622284e5.pdf`, `SHVd5b232905fdb.pdf`, ~115 kB each). The earlier reading came from listing only top-level MIME parts, which misses nested multipart attachments — use `gmail_client._iter_attachment_parts`. `invoice_file_path` was NULL only because `_draft_matched_claims` (which calls `ensure_invoice_file`) had not run since the manual match; running it produced `/data/invoices/claim-1-2026-06-19.pdf` and `/data/invoices/claim-25-2026-06-30.pdf`. Nothing to ask the vet for.
 
 ## Verified live 2026-07-27 (task 5.7)
 
@@ -76,4 +76,6 @@ Both carry `charge_note: one $407.56 charge paid two invoices: $35.00 + $369.33`
 
 Pets were assigned automatically from each receipt naming exactly one dog (`_single_pet_in_text`); the text-extraction prompt returns no `patient`/`invoice_number` field, so identity fell back to amount+date, which is unambiguous here.
 
-Still open: neither claim has an `invoice_file_path` (the receipts are inline email text, no PDF attachment), so neither can draft — Petcover requires the invoice attached. See task 7.7. Aari's $35 is also below the $150 per-condition excess.
+Both claims then got their invoice PDFs from the emails' own attachments via `ensure_invoice_file`: `/data/invoices/claim-1-2026-06-19.pdf` and `/data/invoices/claim-25-2026-06-30.pdf`. (An earlier note here claimed the receipts had no PDF attachment — that was a bad reading of the MIME tree, corrected in 7.7.)
+
+Still open: each claim needs a `condition_text` from Justin before it can draft; Echo's #25 stays blocked on Bow Wow's undefined claim process; Aari's $35 is below the $150 per-condition excess. Checked for double-claiming: claim #9 shares the 2026-06-19 invoice date but is Echo's separate $3,147.00 charge with a $580.74 invoice — no overlap.
