@@ -141,6 +141,21 @@ The agent SHALL be able to propose splitting a claim's claimable amount between 
 - **WHEN** a split is requested for a claim that exists and is splittable
 - **THEN** the agent proposes the split rather than saving a task describing the request
 
+### Requirement: A message naming two pets is never a one-pet assignment
+When the user's own message names more than one pet on file, the agent SHALL NOT propose assigning a single pet to a claim. It MUST instead be told to propose a per-pet split with each pet's share, and to ask for the amounts if none were given. The refusal is enforced by the harness, not left to the prompt.
+
+Rationale: the prompt rule alone lost live. Replaying "This is actually split between echo and Aari. Aari cost was $35 out of this" against the ASSIGN PET card on 2026-07-27, the primary model — no API error, the split tool present in the schema — proposed assigning Aari *and* Echo. Assigning one pet when two are named claims the whole charge against that pet, which is the over-claim this capability exists to prevent.
+
+**Known limitation:** the check is on pet names appearing in the message, so a phrasing that names two pets while genuinely meaning one ("that one is Aari's, not Echo's") is refused too. The refusal explains itself and the user can restate; a wrong claim cannot be restated once sent.
+
+#### Scenario: Two pets named
+- **WHEN** the message names two pets on file and the model proposes assigning one of them
+- **THEN** nothing is queued, and the agent is directed to the split with each pet's share
+
+#### Scenario: One pet named
+- **WHEN** the message names a single pet
+- **THEN** pet assignment is proposed exactly as before
+
 ## Known limitation — "do X" with no tool for X becomes a saved task (found 2026-07-25, live)
 
 `propose_create_task` accepts any free-text description, so it is the tool that always fits. When Justin asks for an operation the surface does not implement, the agent does not say "I can't do that" — it proposes a task describing the request, and the confirm tap saves it.

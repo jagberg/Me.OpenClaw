@@ -67,3 +67,15 @@ Capture happens at two seams, both in `telegram_bot.py`:
 ### Risks
 - **Known gap, accepted**: updates Telegram has already confirmed that sit in PTB's in-memory queue when the process dies never reach `process_update`, so they are neither logged nor replayable. The window is milliseconds; closing it means reaching into the updater's fetch loop, which is not worth the coupling.
 - The payload is a verbatim Telegram update, so anything Justin types is stored in plaintext in the DB. The DB is already gitignored, local, and single-user; `/messages.jsonl` is bound to `127.0.0.1` like the rest of the dashboard. No bot token or media bytes are ever written (photos/documents are recorded as `<N bytes>`).
+
+## Amendment (2026-07-27) — replay runs *after* startup completes, not as part of it
+
+The decision stands; one mechanical detail in it was wrong. This ADR records that `message_log.replay_pending` "re-runs it at startup", and the implementation awaited it inside the FastAPI lifespan, immediately after `updater.start_polling()`.
+
+That ordering is still right — replaying after polling starts is what makes Telegram's own redelivery dedupe by `update_id` — but **awaiting** it is not. Replaying a queued *chat* message runs a full LLM turn: on 2026-07-27 it held HTTP startup for ~30 seconds, so uvicorn had not bound, `/health` refused the connection, and `scripts/deploy.ps1` reported a failed deploy for a container that was fine. A provider that retries (or a queue with several chat messages in it) would hold it for minutes, with the dashboard down the whole time.
+
+Replay is now a background task created after polling starts, with a module-level reference (an unreferenced task can be garbage-collected mid-replay) and a done-callback that logs failure at ERROR — a fire-and-forget task's death is otherwise silent, the same trap as the updater in ADR-0015.
+
+**Trade-off accepted:** the app can serve HTTP and accept *new* updates while older queued ones are still being replayed, so the two can interleave. That is safe under the at-least-once contract this ADR already imposes (every replayable mutation must be idempotent) and it was already possible anyway — polling starts before replay either way.
+
+**Caveat, unchanged by this:** a row that carries an `error` is refused by `mark_processed`, so a genuinely crashed update stays in the queue and replays on **every** restart until `MESSAGE_QUEUE_TTL_HOURS` expires it. Update `176928775` (the edited message that crashed the text handler) did exactly that across two deploys on 2026-07-27 — one LLM turn and one Telegram message each time. Intended, but worth knowing before wondering why a restart re-answers an old question.

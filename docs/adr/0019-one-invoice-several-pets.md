@@ -43,6 +43,8 @@ Constraints that shaped it:
 
 ## Amendment: the live case was two invoices, not one (2026-07-27)
 
+*Process note: this ADR's title and Status line were edited when this amendment was added (title was "One invoice covering several pets — a claim per pet, share in `invoice_data`"). Editing an accepted ADR's own text is against the convention in `docs/adr/README.md`; it happened within hours of acceptance, before the record left this machine, and the original title is preserved here rather than lost. The Context and Decision sections were not touched.*
+
 The decision above stands, but the case that prompted it was diagnosed wrong. Reading the actual documents that afternoon — two receipts Justin's wife forwarded — showed the $407.56 charge paid **two separate invoices**, one per pet, each its own document:
 
 | Invoice | Patient | Service date | Total |
