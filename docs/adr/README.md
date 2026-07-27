@@ -32,4 +32,4 @@ Why not always supersede: most corrections are factual, not directional. A new A
 | [0016](0016-telegram-agent-tool-surface.md) | How far the chat agent's tools reach (named mail sweeps, no repo access), and why not MCP | accepted | 2026-07-25 |
 | [0017](0017-per-model-daily-budget-fallback.md) | Fall through to another model's own daily budget, and disclose the downgrade — amends 0009 | accepted | 2026-07-25 |
 | [0018](0018-host-side-db-access-is-read-only.md) | Host-side access to the live SQLite DB is read-only, always | accepted | 2026-07-25 |
-| [0019](0019-one-invoice-several-pets.md) | One invoice covering several pets → a claim per pet, share in `invoice_data` — builds on 0007 | accepted | 2026-07-27 |
+| [0019](0019-one-invoice-several-pets.md) | One charge covering several pets → a claim per pet; the matcher apportions two invoices itself, a receipt's payment line beats the service-date window — builds on 0007 | accepted | 2026-07-27 |

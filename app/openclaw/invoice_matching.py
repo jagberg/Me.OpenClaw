@@ -1,9 +1,12 @@
 import base64
 import json
+import logging
 import re
 from datetime import date, datetime, timedelta, timezone
 
 from . import config, db, gmail_client, llm
+
+logger = logging.getLogger(__name__)
 
 # The bank charge is the CEILING on what can be claimed — it can exceed the
 # invoice total via card surcharge (confirmed live: real $580.74 invoice
@@ -53,6 +56,43 @@ def _invoice_date_plausible(invoice: dict, txn_date: date) -> bool:
     except ValueError:
         return True
     return abs((invoice_date - txn_date).days) <= config.INVOICE_MATCH_WINDOW_DAYS
+
+
+def _charge_date_forms(txn_date: date) -> tuple[str, ...]:
+    """The charge date as a receipt might print it: ISO, and Australian d/m/y
+    both padded and unpadded (Windows strftime has no %-d)."""
+    return (
+        txn_date.isoformat(),
+        f"{txn_date.day:02d}/{txn_date.month:02d}/{txn_date.year}",
+        f"{txn_date.day}/{txn_date.month}/{txn_date.year}",
+        f"{txn_date.day:02d}/{txn_date.month:02d}/{txn_date.year % 100:02d}",
+    )
+
+
+def _paid_on_charge_date(text: str, invoice: dict, txn_date: date) -> bool:
+    """True when the document itself says THIS invoice was paid on the day of
+    the bank charge.
+
+    A receipt's service date is not its payment date. Confirmed live 2026-07-27:
+    The Shire Vet's receipts bill visits on 19 Jun and 30 Jun but both carry
+    "Paid Date 06/07/2026 Credit Card" against the 6 Jul charge — so the ±3-day
+    service-date window (config.INVOICE_MATCH_WINDOW_DAYS) rejected both real
+    invoices for the charge that actually paid them.
+
+    Deliberately not a wider window: the window exists because an open-ended one
+    let a Shire Vet claim grab another Shire Vet visit's invoice. This is the
+    printed fact instead — the payment line must carry BOTH the charge's date and
+    THIS invoice's own amount, so a bulk email listing many visits' payments
+    can't lend its dates to the wrong invoice."""
+    amount = invoice.get("amount")
+    if not text or amount is None:
+        return False
+    amount_forms = (f"{float(amount):,.2f}", f"{float(amount):.2f}")
+    date_forms = _charge_date_forms(txn_date)
+    for line in text.replace("\r", "\n").split("\n"):
+        if any(d in line for d in date_forms) and any(a in line for a in amount_forms):
+            return True
+    return False
 
 
 def _unexplained_remainder(invoice_amount: float, txn_amount: float) -> float | None:
@@ -379,6 +419,52 @@ def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None 
         )
 
 
+def _pet_for(invoice: dict, text: str, claim) -> int | None:
+    """Pet from printed facts only (ADR: never inferred): the invoice's own
+    patient field, else exactly one known pet named in the email text."""
+    if claim["pet_id"] is not None:
+        return None  # already attributed; COALESCE leaves it alone
+    return _pet_id_by_name(invoice.get("patient")) or _single_pet_in_text(text)
+
+
+def _apply_match(claim, chosen: dict, pool: list[dict]) -> bool:
+    """Write the match. When a second invoice explains the rest of the charge,
+    apportion: this claim takes one invoice, a sibling claim on the SAME
+    transaction takes the other, each with its own pet, invoice and claimable
+    subtotal. One charge, two documents, two claims — the case that previously
+    ended as an `unexplained $X` flag and a never-claimed second pet."""
+    txn_date = date.fromisoformat(claim["txn_date"])
+    invoice = {**chosen["invoice"], "claimable_amount": claimable_amount(chosen["invoice"])}
+    complement = _complement_for(chosen, pool, claim["txn_amount"], txn_date, claim["id"])
+    total = float(invoice["amount"])
+    if complement is None:
+        remainder = _unexplained_remainder(total, claim["txn_amount"])
+        flag = f"possible additional invoice — unexplained ${remainder:.2f}" if remainder else None
+        _mark_matched(claim["id"], chosen["email_id"], invoice,
+                      flag, pet_id=_pet_for(invoice, chosen["text"], claim))
+        return True
+
+    other = dict(complement["invoice"])
+    other["claimable_amount"] = claimable_amount(other)
+    note = (f"one ${abs(claim['txn_amount']):.2f} charge paid two invoices: "
+            f"${total:.2f} + ${float(other['amount']):.2f}")
+    invoice = {**invoice, "charge_note": note}
+    other["charge_note"] = note
+    _mark_matched(claim["id"], chosen["email_id"], invoice, None,
+                  pet_id=_pet_for(invoice, chosen["text"], claim))
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        sibling_id = conn.execute(
+            "INSERT INTO vet_claims (transaction_id, pet_id, matched_email_id, invoice_data, status, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, 'matched', ?, ?)",
+            (claim["transaction_id"], _pet_id_by_name(other.get("patient")) or _single_pet_in_text(complement["text"]),
+             complement["email_id"], json.dumps(other), now, now),
+        ).lastrowid
+    logger.info("claim %s: charge covers two invoices — claim %s created for the second (%s)",
+                claim["id"], sibling_id, note)
+    return True
+
+
 def _already_claimed(invoice: dict, claim_id: int) -> bool:
     """True when another claim already carries this invoice — a bulk bundle's
     smaller invoice can slip under a different charge's ceiling (confirmed
@@ -401,7 +487,8 @@ def _already_claimed(invoice: dict, claim_id: int) -> bool:
     return False
 
 
-def _pick_invoice(invoices: list, txn_amount: float, txn_date: date, claim_id: int | None = None) -> dict | None:
+def _pick_invoice(invoices: list, txn_amount: float, txn_date: date, claim_id: int | None = None,
+                  text: str = "") -> dict | None:
     """The best-fitting invoice in the email: under the charge ceiling, date
     near the transaction, not already carried by another claim — preferring
     the closest amount then the closest date, so an exact match beats another
@@ -413,7 +500,7 @@ def _pick_invoice(invoices: list, txn_amount: float, txn_date: date, claim_id: i
         total = float(invoice["amount"])
         if not _within_ceiling(total, txn_amount):
             continue
-        if not _invoice_date_plausible(invoice, txn_date):
+        if not _invoice_date_plausible(invoice, txn_date) and not _paid_on_charge_date(text, invoice, txn_date):
             continue
         if claim_id is not None and _already_claimed(invoice, claim_id):
             continue
@@ -440,6 +527,61 @@ def _oversized_candidate(invoices: list, txn_amount: float, txn_date: date) -> d
         if _invoice_date_plausible(invoice, txn_date) and invoice.get("date") and not _within_ceiling(total, txn_amount):
             return invoice
     return None
+
+
+def _invoice_identity(invoice: dict) -> tuple:
+    """Same identity rule the already-claimed gate uses: invoice number where
+    present, else amount + date."""
+    number = (invoice.get("invoice_number") or "").strip()
+    return ("n", number) if number else ("ad", invoice.get("amount"), str(invoice.get("date"))[:10])
+
+
+def _complement_for(chosen: dict, pool: list[dict], txn_amount: float, txn_date: date,
+                    claim_id: int) -> dict | None:
+    """The OTHER invoice this one charge also paid for.
+
+    One card charge can settle several invoices at once — most often one per pet,
+    each its own document (confirmed live 2026-07-27: The Shire Vet's $407.56
+    charge on 2026-07-06 = invoice SHV49c1622284e5 for Aari $35.00 + invoice
+    SHVd5b232905fdb for Echo $369.33, forwarded as two separate emails, the
+    $3.23 balance being the card surcharge).
+
+    Until now the first invoice matched and the rest of the charge became the
+    flag `possible additional invoice — unexplained $X`, so the second pet's
+    invoice was never claimed at all.
+
+    Deliberately strict, because a wrong pairing invents a claim: the pair must
+    sum to the charge within the surcharge margin, be two DIFFERENT invoices
+    (identity: number, else amount+date), and each must clear the ceiling, the
+    date-plausibility gate and the already-claimed gate on its own. Ambiguity is
+    refused rather than resolved — if more than one candidate would complete the
+    sum, we cannot tell which invoice the charge paid."""
+    chosen_total = float(chosen["invoice"]["amount"])
+    if _unexplained_remainder(chosen_total, txn_amount) is None:
+        return None  # nothing left to explain
+    chosen_identity = _invoice_identity(chosen["invoice"])
+    matches = []
+    for entry in pool:
+        invoice = entry["invoice"]
+        if invoice.get("amount") is None or _invoice_identity(invoice) == chosen_identity:
+            continue
+        total = float(invoice["amount"])
+        if not _within_ceiling(total, txn_amount):
+            continue
+        if not _invoice_date_plausible(invoice, txn_date) and not _paid_on_charge_date(
+                entry.get("text", ""), invoice, txn_date):
+            continue  # the pool holds a year of bulk-email invoices; most aren't this visit
+        if _already_claimed(invoice, claim_id):
+            continue
+        combined = chosen_total + total
+        if combined > abs(txn_amount) + 0.01:
+            continue  # the pair can't have cost more than the charge
+        if _unexplained_remainder(combined, txn_amount) is not None:
+            continue  # still a gap this pair doesn't explain
+        matches.append(entry)
+    if len(matches) != 1:
+        return None  # zero explains nothing; several is a guess
+    return matches[0]
 
 
 _AMOUNT_RE = re.compile(r"\$\s?\d[\d,]*\.\d{2}")
@@ -476,6 +618,8 @@ def match_claim(claim) -> bool:
     seen: set[str] = set()
     unreadable_subject = None
     oversized = None
+    chosen = None
+    pool: list[dict] = []
 
     service = gmail_client.build_service()
     for query, needs_vet_confirmation in queries:
@@ -516,7 +660,20 @@ def match_claim(claim) -> bool:
             if not invoices:
                 continue
 
-            invoice = _pick_invoice(invoices, claim["txn_amount"], txn_date, claim_id=claim["id"])
+            # Pool every invoice seen, in case one charge covers several of them
+            # (see _complementary_invoice). Extractions are cached, so pooling
+            # costs Gmail reads, not tokens.
+            for candidate_invoice in invoices:
+                pool.append({"email_id": item["id"], "invoice": candidate_invoice, "text": text})
+
+            if chosen is not None:
+                # Already have this claim's invoice; still scanning only to find
+                # the one that explains the rest of the charge.
+                if _complement_for(chosen, pool, claim["txn_amount"], txn_date, claim["id"]) is not None:
+                    break
+                continue
+
+            invoice = _pick_invoice(invoices, claim["txn_amount"], txn_date, claim_id=claim["id"], text=text)
             if invoice is None:
                 if oversized is None:
                     candidate = _oversized_candidate(invoices, claim["txn_amount"], txn_date)
@@ -526,17 +683,16 @@ def match_claim(claim) -> bool:
                         # is the strongest merge evidence (see _propose_split)
                         oversized = {**candidate, "_email_id": item["id"], "_text_amounts": _text_amounts(text)}
                 continue
-            total = float(invoice["amount"])
-            invoice["claimable_amount"] = claimable_amount(invoice)
-            remainder = _unexplained_remainder(total, claim["txn_amount"])
-            flag = f"possible additional invoice — unexplained ${remainder:.2f}" if remainder else None
-            pet_id = None
-            if claim["pet_id"] is None:
-                # scanned invoices have no email text — the vision extraction's
-                # patient field is the printed fact instead
-                pet_id = _pet_id_by_name(invoice.get("patient")) or _single_pet_in_text(text)
-            _mark_matched(claim["id"], item["id"], invoice, flag, pet_id=pet_id)
-            return True
+            chosen = {"email_id": item["id"], "invoice": invoice, "text": text}
+            # Fully explained by this one invoice (or explained bar a surcharge):
+            # the old behaviour, and the common case — stop scanning.
+            if _unexplained_remainder(float(invoice["amount"]), claim["txn_amount"]) is None:
+                break
+        if chosen is not None and _complement_for(chosen, pool, claim["txn_amount"], txn_date, claim["id"]) is not None:
+            break
+
+    if chosen is not None:
+        return _apply_match(claim, chosen, pool)
 
     if unreadable_subject:
         flag = f"invoice attachment unreadable — {unreadable_subject}"

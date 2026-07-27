@@ -40,6 +40,9 @@ HELP_TEXT = (
 )
 
 _application: Application | None = None
+# Holds the startup replay task: create_task alone doesn't keep a strong
+# reference, and a GC'd task stops mid-replay with nothing in the log.
+_replay_task: "asyncio.Task | None" = None
 
 
 def _is_authorized(username: str | None) -> bool:
@@ -911,6 +914,17 @@ def build_application() -> Application:
     return application
 
 
+def _log_replay_outcome(task: asyncio.Task) -> None:
+    """ERROR, not a warning: a failed replay means logged messages Justin sent
+    were never acted on, and only he can re-send them."""
+    if task.cancelled():
+        logger.warning("Telegram replay was cancelled — queued updates stay queued")
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("replaying queued Telegram updates failed: %s", exc, exc_info=exc)
+
+
 async def start_polling() -> None:
     global _application
     if not config.TELEGRAM_BOT_TOKEN:
@@ -922,7 +936,17 @@ async def start_polling() -> None:
     await _application.updater.start_polling()
     # Replay after polling starts: anything Telegram redelivers itself is then
     # deduped by update_id instead of being logged and acted on twice.
-    await message_log.replay_pending(_application)
+    #
+    # NOT awaited: replaying a queued chat message runs a full LLM turn, and this
+    # runs inside the FastAPI lifespan — so awaiting it held HTTP startup for
+    # ~30s on 2026-07-27 (uvicorn hadn't bound, /health refused the connection,
+    # and deploy.ps1 read that as a failed deploy). A slow or retrying provider
+    # would hold it for minutes. Kept in a module reference so the task isn't
+    # garbage-collected mid-flight, with its outcome logged — a fire-and-forget
+    # task's death is otherwise silent (same trap as the updater).
+    global _replay_task
+    _replay_task = asyncio.create_task(message_log.replay_pending(_application))
+    _replay_task.add_done_callback(_log_replay_outcome)
 
 
 def polling_alive() -> bool | None:

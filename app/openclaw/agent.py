@@ -15,6 +15,7 @@ the write happens only on the tap (telegram_bot._execute_action). That harness
 gate — not the model's good behaviour — is what enforces the hard rules.
 """
 import json
+import re
 from datetime import datetime, timezone
 
 from . import claim_status, db, llm
@@ -214,7 +215,15 @@ def _range_label(since, until) -> str:
     return f" on or before {until[:10]}" if until else ""
 
 
-def _build_impls(proposals: list) -> dict:
+def _pets_named_in(text: str) -> list[str]:
+    """Which pets on file this message names. Word-boundary matched so 'Echo'
+    doesn't fire on 'echoed'."""
+    with db.get_connection() as conn:
+        names = [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
+    return [name for name in names if re.search(rf"\b{re.escape(name)}\b", text or "", re.IGNORECASE)]
+
+
+def _build_impls(proposals: list, user_text: str = "") -> dict:
     def query_claims(status=None, pet=None, merchant=None, since=None, until=None):
         rows = _find_claims(pet=pet, status=status, merchant=merchant, since=since, until=until)
         if not rows:
@@ -440,6 +449,19 @@ def _build_impls(proposals: list) -> dict:
         return _propose("set_condition", rows, arg=condition_text.strip(), label=label)
 
     def propose_assign_pet(pet_name, reference=None, merchant=None, claim_id=None):
+        # Deterministic steer, because the prompt lost this live: replaying
+        # "This is actually split between echo and Aari. Aari cost was $35 out of
+        # this" against the ASSIGN PET card, the model proposed assigning Aari
+        # AND Echo (2026-07-27, primary model, no API error). Assigning one pet
+        # when Justin's own words name two is the over-claim this change exists
+        # to stop, so the harness refuses it rather than hoping for better tool
+        # choice next turn.
+        named = _pets_named_in(user_text)
+        if len(named) > 1:
+            return (f"That message names {' and '.join(named)}. One invoice covering several pets is a "
+                    "SPLIT, not an assignment: call propose_split_between_pets with each pet's share. If "
+                    "he gave no amounts, ask him — never invent one. Assign a pet only when a single pet "
+                    "is named.")
         with db.get_connection() as conn:
             pet = conn.execute("SELECT id, name FROM pets WHERE name = ? COLLATE NOCASE", (pet_name,)).fetchone()
             known = [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
@@ -640,7 +662,7 @@ def handle_message(text: str, chat_id: int | None = None,
     in as its own context line rather than being glued onto Justin's words —
     concatenating it made the model quote the annotation back at him."""
     proposals: list = []
-    impls = _build_impls(proposals)
+    impls = _build_impls(proposals, user_text=text)
     prior = _history.get(chat_id, []) if chat_id is not None else []
     context = (
         [{"role": "system", "content": f"Justin is replying to the card for claim #{claim_id}. "

@@ -13,6 +13,17 @@ Justin tried to say so in chat, four times on the evening of 2026-07-27, and got
 
 Result: 21 days after the charge, claim #1 still has `pet_id IS NULL`.
 
+## Revision (2026-07-27, after reading the actual documents)
+
+The premise above was wrong in one respect, and the correction is recorded rather than edited away. The $407.56 charge did not pay **one** invoice covering two pets — it paid **two separate invoices**, forwarded by Justin's wife as two emails that afternoon: SHV49c1622284e5 (Aari, visit 19 Jun, **$35.00**) and SHVd5b232905fdb (Echo, visit 30 Jun, **$369.33**), with the remaining **$3.23** being card surcharge.
+
+Two consequences:
+
+- Claim #1's existing match is **wrong**: it points at a payment-list email (extracted as three bare amounts, no items, no services), which is why it could never draft. It needs the ❌ Wrong invoice path and a re-match.
+- The apportionment must be **per invoice**, not per share: each claim carries its own email, invoice number, itemization and pet. That is now automatic in the matcher (`_complement_for` / `_apply_match`), and it exposed a second defect — `INVOICE_MATCH_WINDOW_DAYS` is 3 measured on the *service* date, so **both** real invoices were being rejected for the charge that paid them. A receipt's own payment line now satisfies date plausibility.
+
+The manual share-based split still ships: one document billing both pets is a real shape (the same vet's bulk history email does it) and only Justin can say how such a bill divides.
+
 ## What Changes
 
 - **New capability: an invoice's claimable amount can be apportioned between pets.** One charge → one claim per pet, each carrying its own share of the claimable subtotal. Shares are supplied by Justin and confirmed by a tap; nothing is inferred from the invoice.

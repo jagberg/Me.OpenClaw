@@ -1,7 +1,7 @@
-# ADR-0019: One invoice covering several pets — a claim per pet, share in `invoice_data`
+# ADR-0019: One charge covering several pets — a claim per pet
 
 **Date**: 2026-07-27
-**Status**: accepted
+**Status**: accepted (amended same day — see "Amendment: the live case was two invoices, not one")
 **Deciders**: Justin
 
 ## Context
@@ -40,6 +40,25 @@ Constraints that shaped it:
 - `invoice_data.split_note` is an untyped JSON convention, asserted in the smoke suite. The day it needs querying is the day it earns a column.
 - The dashboard now shows two claims under one bank charge. That is what happened in reality.
 - **No undo.** Guarded by the pre-`sent` restriction and by naming every resulting claim, pet and share in the confirmation; a wrong split leaves a visible stray claim. Tracked in `openspec/BACKLOG.md`.
+
+## Amendment: the live case was two invoices, not one (2026-07-27)
+
+The decision above stands, but the case that prompted it was diagnosed wrong. Reading the actual documents that afternoon — two receipts Justin's wife forwarded — showed the $407.56 charge paid **two separate invoices**, one per pet, each its own document:
+
+| Invoice | Patient | Service date | Total |
+|---|---|---|---|
+| SHV49c1622284e5 | Aari | 19 Jun 2026 | $35.00 |
+| SHVd5b232905fdb | Echo | 30 Jun 2026 | $369.33 |
+
+$35.00 + $369.33 = $404.33; the remaining **$3.23 is card surcharge** (0.79%, inside `SURCHARGE_MARGIN_PCT`). ADR-0007's ceiling rule already covers this shape ("one $177.50 charge = a $35 + a $142.50 invoice, different pets") — what was missing was any code that *acted* on it.
+
+Two further decisions follow, both automatic (no confirmation tap), because unlike the merge case nothing is closed or overwritten — a second claim is added, and a wrong one is reversible with the existing ❌ Wrong invoice button:
+
+1. **The matcher apportions a charge across two invoices itself.** When the matched invoice leaves an unexplained remainder and exactly ONE other candidate closes the charge within the surcharge margin, the claim takes one invoice and a sibling claim on the same transaction takes the other, each with its own `matched_email_id`, invoice, claimable subtotal and pet (read off the invoice's printed patient field). Both must independently clear the ceiling, date and already-claimed gates, and **ambiguity is refused** — if two candidates would each complete the sum, we cannot know which invoice the charge paid, so nothing is apportioned. Previously the first invoice matched and the rest of the charge became the flag `possible additional invoice — unexplained $372.56`, leaving the second pet's invoice unclaimed indefinitely.
+
+2. **A receipt's payment line stands in for the service-date window.** `INVOICE_MATCH_WINDOW_DAYS` is 3, measured on the invoice's service date, which rejected *both* real invoices: the visits were 19 Jun and 30 Jun, the card was charged 6 Jul. Each receipt prints `06/07/2026 Credit Card $35.00`. So an invoice is also date-plausible when a single line of its own document carries **both** the charge's date and that invoice's amount. The window is not widened — it exists because an open-ended one let one Shire Vet claim take another Shire Vet visit's invoice — and requiring both facts on one line stops a bulk email lending its payment dates to the wrong invoice.
+
+`split_between_pets` (shares of ONE invoice) is retained: a single invoice listing both patients is real — the same vet's bulk history email bills Aari and Echo on one document — and only Justin can say how such a bill divides. Automatic apportionment handles the two-document case; the manual split handles the one-document case.
 
 ## Alternatives considered
 

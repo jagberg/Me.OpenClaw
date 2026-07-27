@@ -48,3 +48,13 @@
 - [x] 6.3 `app/openclaw/CLAUDE.md`: `invoice_data.claimable_amount` is the per-claim share and `split_note` is its record; `split_proposals` is charge-merge, not pet-split; edited messages arrive as `edited_message`.
 - [x] 6.4 `openspec/BACKLOG.md`: undo for a confirmed split; whether the ASSIGN PET card needs an explicit "Shared invoice" button; Bow Wow's claim process still undefined (6 claims + Echo's share now blocked on it).
 - [ ] 6.5 Sync these deltas into `openspec/specs/` before archiving the change.
+
+## 7. Automatic apportionment (added 2026-07-27 after the live diagnosis)
+
+- [x] 7.1 `_paid_on_charge_date`: an invoice is date-plausible when one line of its own text carries both the charge's date (ISO + d/m/y forms) and that invoice's amount; wired into `_pick_invoice` and the complement search without widening `INVOICE_MATCH_WINDOW_DAYS`.
+- [x] 7.2 `_complement_for`: the one other pooled invoice that closes the charge within the surcharge margin — ceiling, date, already-claimed and distinct-identity gates each applied, ambiguity (2+ candidates) refused.
+- [x] 7.3 `match_claim` pools every extracted invoice and keeps scanning for a complement instead of returning on the first acceptable one; `_apply_match` writes either the single match (unchanged flag behaviour) or the apportioned pair.
+- [x] 7.4 Sibling claim carries its own `matched_email_id`, invoice, claimable subtotal and pet (printed patient field / single pet in text); both rows record `invoice_data.charge_note`.
+- [x] 7.5 Tests: the real Shire numbers apportion into two claims with the right pets and invoice numbers; every refusal case (gap unclosed, pair over the charge, wrong date window, two candidates, same invoice twice, nothing to explain); the receipt-payment-line gate including the different-lines rejection.
+- [ ] 7.6 Live: clear claim #1's wrong match (it points at a payment-list email), re-match, and confirm the two receipts land as two claims — Aari $35.00 and Echo $369.33 on the one 2026-07-06 charge.
+- [ ] 7.7 Live follow-up: the receipts are inline email text with no PDF attachment, so `invoice_file_path` stays NULL and neither claim can draft (Petcover requires the invoice attached). Decide whether to ask the vet for PDFs or generate one from the receipt text.

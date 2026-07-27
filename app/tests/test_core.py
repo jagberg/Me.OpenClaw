@@ -2841,6 +2841,135 @@ def test_agent_prompt_narrows_mailbox_rule_without_dropping_it():
 _shared_invoice_charges = 0
 
 
+_AARI_INVOICE = {"invoice_number": "SHV49c1622284e5", "date": "2026-06-19", "patient": "Aari",
+                 "amount": 35.0, "items": [{"description": "Prescription fee", "amount": 35.0}]}
+_ECHO_INVOICE = {"invoice_number": "SHVd5b232905fdb", "date": "2026-06-30", "patient": "Echo",
+                 "amount": 369.33, "items": [{"description": "CLINDAMYCIN 150MG CAPSULES", "amount": 206.12},
+                                             {"description": "ENROFLOXACIN 150MG TABLETS", "amount": 163.21}]}
+# The receipts' own wording. Both visits are weeks before the 6 Jul charge, so
+# only the payment line makes them matchable at all.
+_AARI_RECEIPT_TEXT = ("TAX INVOICE - RECEIPT 19 Jun 2026 # SHV49c1622284e5\n"
+                      "Aari 19 Jun 2026 Prescription fee 1.00 $0.00 $31.82 $35.00\n"
+                      "TOTAL $35.00\nThe following payments have been received with thanks\n"
+                      "Paid Date Payment Method Payment\n06/07/2026 Credit Card $35.00")
+_ECHO_RECEIPT_TEXT = ("TAX INVOICE - RECEIPT 30 Jun 2026 # SHVd5b232905fdb\n"
+                      "Echo 30 Jun 2026 CLINDAMYCIN 150MG CAPSULES 28.00 $206.12\n"
+                      "Echo 30 Jun 2026 ENROFLOXACIN 150MG TABLETS 11.00 $163.21\n"
+                      "TOTAL $369.33\nThe following payments have been received with thanks\n"
+                      "Paid Date Payment Method Payment\n06/07/2026 Credit Card $369.33")
+
+
+def test_a_receipt_paid_on_the_charge_date_is_matchable_though_the_visit_is_older():
+    """INVOICE_MATCH_WINDOW_DAYS is 3, measured on the SERVICE date — which
+    silently rejected both real invoices for this charge: The Shire Vet billed
+    19 Jun and 30 Jun, the card was charged 6 Jul, and each receipt says so on
+    its own payment line ("06/07/2026 Credit Card $35.00")."""
+    from datetime import date as _date
+
+    from openclaw import config
+
+    txn_date = _date(2026, 7, 6)
+    assert config.INVOICE_MATCH_WINDOW_DAYS == 3, "this test exists because the window is tight"
+    assert not invoice_matching._invoice_date_plausible(_AARI_INVOICE, txn_date), "17 days out on service date"
+    assert invoice_matching._paid_on_charge_date(_AARI_RECEIPT_TEXT, _AARI_INVOICE, txn_date)
+    assert invoice_matching._paid_on_charge_date(_ECHO_RECEIPT_TEXT, _ECHO_INVOICE, txn_date)
+
+    # Both facts required on ONE line: a bulk email full of other visits' payment
+    # dates must not lend them to this invoice.
+    assert not invoice_matching._paid_on_charge_date(
+        "06/07/2026 Credit Card $999.00\nsome other invoice $35.00", _AARI_INVOICE, txn_date
+    ), "the date and THIS invoice's amount have to be the same payment line"
+    assert not invoice_matching._paid_on_charge_date(_AARI_RECEIPT_TEXT, _AARI_INVOICE, _date(2026, 7, 7))
+    assert not invoice_matching._paid_on_charge_date("", _AARI_INVOICE, txn_date)
+
+    # And it reaches the picker: the receipt is chosen where the window alone refuses.
+    assert invoice_matching._pick_invoice([_AARI_INVOICE], -35.0, txn_date) is None, "window-only: refused"
+    picked = invoice_matching._pick_invoice([_AARI_INVOICE], -35.0, txn_date, text=_AARI_RECEIPT_TEXT)
+    assert picked and picked["invoice_number"] == "SHV49c1622284e5"
+
+
+def test_one_charge_two_invoices_two_pets_is_apportioned_automatically():
+    """Live 2026-07-27: The Shire Vet's $407.56 charge on 2026-07-06 paid TWO
+    invoices, forwarded as two separate emails — SHV49c1622284e5 (Aari, $35.00)
+    and SHVd5b232905fdb (Echo, $369.33), the $3.23 balance being card surcharge.
+    The first invoice matched and the rest of the charge became the flag
+    `possible additional invoice — unexplained $372.56`, so Echo's invoice was
+    never claimed at all."""
+    import json as _json
+
+    db.init_db()
+    claim_id = _shared_invoice_claim(claimable=None)
+    claim = _matched_row(claim_id)
+
+    chosen = {"email_id": "em-aari", "invoice": {**_AARI_INVOICE}, "text": _AARI_RECEIPT_TEXT}
+    pool = [chosen, {"email_id": "em-echo", "invoice": {**_ECHO_INVOICE}, "text": _ECHO_RECEIPT_TEXT}]
+
+    assert invoice_matching._apply_match(claim, chosen, pool) is True
+    rows = sorted(
+        (dict(r) for r in _claims_on_transaction(claim["transaction_id"])), key=lambda r: r["id"]
+    )
+    assert len(rows) == 2, f"the second invoice must get its own claim: {rows}"
+    kept, sibling = rows
+    assert kept["id"] == claim_id and kept["pet_id"] == 1, kept
+    assert sibling["pet_id"] == 2, "the pet comes off each invoice's printed patient field"
+    assert sibling["matched_email_id"] == "em-echo", "each claim carries its OWN invoice email"
+    assert kept["flag"] is None, f"nothing is unexplained once both invoices are known: {kept['flag']}"
+    kept_invoice, sibling_invoice = _json.loads(kept["invoice_data"]), _json.loads(sibling["invoice_data"])
+    assert kept_invoice["invoice_number"] == "SHV49c1622284e5"
+    assert sibling_invoice["invoice_number"] == "SHVd5b232905fdb"
+    assert (kept_invoice["claimable_amount"], sibling_invoice["claimable_amount"]) == (35.0, 369.33)
+    assert "$35.00 + $369.33" in kept_invoice["charge_note"], kept_invoice
+    assert sibling["status"] == "matched" and sibling["transaction_id"] == claim["transaction_id"]
+
+
+def test_complement_search_refuses_anything_it_cannot_prove():
+    """A wrong pairing invents a claim, so every gate is a refusal: the pair must
+    close the charge within the surcharge margin, be two different invoices, sit
+    in the visit's date window, and be unambiguous."""
+    from datetime import date as _date
+
+    db.init_db()
+    txn_date, charge = _date(2026, 7, 6), -407.56
+    # Distinct invoice numbers: the apportionment test above already parked the
+    # real ones on claims, and an invoice another claim carries is never a
+    # candidate (_already_claimed).
+    aari = {**_AARI_INVOICE, "invoice_number": "T2-AARI"}
+    echo = {**_ECHO_INVOICE, "invoice_number": "T2-ECHO"}
+    chosen = {"email_id": "em-aari", "invoice": aari, "text": _AARI_RECEIPT_TEXT}
+
+    def complement(pool):
+        return invoice_matching._complement_for(chosen, [chosen, *pool], charge, txn_date, 999999)
+
+    assert complement([{"email_id": "e", "invoice": echo, "text": _ECHO_RECEIPT_TEXT}]) is not None
+
+    # Doesn't close the gap.
+    assert complement([{"email_id": "e", "invoice": {**echo, "amount": 100.0,
+                                                    "invoice_number": "X1", "date": "2026-07-06"}, "text": ""}]) is None
+    # Together they exceed the charge.
+    assert complement([{"email_id": "e", "invoice": {**echo, "amount": 400.0,
+                                                     "invoice_number": "X2", "date": "2026-07-06"}, "text": ""}]) is None
+    # Right amount, wrong visit — outside the date window.
+    assert complement([{"email_id": "e", "invoice": {**echo, "date": "2025-06-30",
+                                                     "invoice_number": "X3"}, "text": ""}]) is None
+    # Two candidates would both close it: which one the charge paid is unknowable.
+    assert complement([
+        {"email_id": "e1", "invoice": echo, "text": _ECHO_RECEIPT_TEXT},
+        {"email_id": "e2", "invoice": {**echo, "invoice_number": "X4"}, "text": _ECHO_RECEIPT_TEXT},
+    ]) is None
+    # The same invoice seen twice is not a complement.
+    assert complement([{"email_id": "e-dup", "invoice": {**aari}, "text": _AARI_RECEIPT_TEXT}]) is None
+    # Nothing left to explain (invoice covers the charge bar a surcharge).
+    covered = {"email_id": "em", "invoice": {**aari, "amount": 404.33}, "text": ""}
+    assert invoice_matching._complement_for(
+        covered, [covered, {"email_id": "e", "invoice": echo, "text": _ECHO_RECEIPT_TEXT}],
+        charge, txn_date, 999999) is None
+
+
+def _claims_on_transaction(txn_id):
+    with db.get_connection() as conn:
+        return conn.execute("SELECT * FROM vet_claims WHERE transaction_id = ?", (txn_id,)).fetchall()
+
+
 def _shared_invoice_claim(claimable=407.56, status="matched"):
     """Claim #1's real shape: The Shire Veterinary Caringbah, $407.56 charged
     2026-07-06, invoice matched, no pet, no condition, no itemization. Each call
@@ -2984,6 +3113,33 @@ def test_the_split_conversation_that_failed_live_now_reaches_one_proposal():
     message = telegram_bot._execute_action(proposal)
     assert "Aari $35.00" in message and "Echo $372.56" in message, message
     assert _claim_row(claim_id)["pet_id"] == 1, "the tap is what writes"
+
+
+def test_assigning_one_pet_is_refused_when_the_message_names_two():
+    """Live 2026-07-27: replaying "This is actually split between echo and Aari.
+    Aari cost was $35 out of this" against the ASSIGN PET card, the primary model
+    proposed assigning Aari AND Echo — no API error, the split tool right there
+    in the schema, the prompt rule simply lost. Assigning one pet when his own
+    words name two is the over-claim this change exists to prevent, so the
+    harness refuses it instead of relying on the next turn choosing better."""
+    from openclaw import agent
+
+    db.init_db()
+    claim_id = _shared_invoice_claim()
+    proposals = []
+    text = "This is actually split between echo and Aari. Aari cost was $35 out of this"
+    impls = agent._build_impls(proposals, user_text=text)
+
+    refusal = impls["propose_assign_pet"](pet_name="Aari", claim_id=claim_id)
+    assert not proposals, "nothing may be queued when the message names two pets"
+    assert "SPLIT" in refusal and "propose_split_between_pets" in refusal, refusal
+    assert "Aari and Echo" in refusal, refusal
+
+    # One pet named → ordinary assignment, unchanged.
+    single = agent._build_impls(proposals, user_text="that one is Aari's")
+    assert "Proposed" in single["propose_assign_pet"](pet_name="Aari", claim_id=claim_id)
+    assert proposals and proposals[-1]["action"] == "assign_pet", proposals
+    assert agent._pets_named_in("the vet echoed the diagnosis") == [], "word-boundary, not substring"
 
 
 def test_split_proposal_is_refused_before_the_tap_when_it_cannot_work():
