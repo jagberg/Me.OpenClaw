@@ -33,8 +33,8 @@
 
 ## 5. Verify live (do not tick from unit tests alone)
 
-- [ ] 5.1 Read-only check of claim #1 before the run: `sqlite3.connect("file:data/openclaw.db?mode=ro", uri=True)` — record `pet_id`, `status`, `invoice_data.claimable_amount` ($407.56).
-- [ ] 5.2 Deploy with `./scripts/deploy.ps1` from `C:\Code\Me.OpenClaw-telegram-claimquery` and confirm `/health` reports the new `APP_VERSION`.
+- [x] 5.1 Read-only check of claim #1 before the run: `sqlite3.connect("file:data/openclaw.db?mode=ro", uri=True)` — record `pet_id`, `status`, `invoice_data.claimable_amount` ($407.56).
+- [x] 5.2 Deploy with `./scripts/deploy.ps1` from `C:\Code\Me.OpenClaw-telegram-claimquery` and confirm `/health` reports the new `APP_VERSION`.
 - [ ] 5.3 In Telegram, reply to the ASSIGN PET card for #1 with the real wording ("This is actually split between echo and Aari. Aari cost was $35 out of this") and confirm the proposal names Aari $35 / Echo $372.56.
 - [ ] 5.4 Tap Confirm; verify read-only: #1 = Aari with claimable $35, sibling = Echo with claimable $372.56, both on transaction of 2026-07-06, same invoice number, split note present on both.
 - [ ] 5.5 Verify Aari's claim drafts with $35 on the form and the full invoice pages attached; verify Echo's claim is blocked on Bow Wow's undefined process and shows in `/actions` as unactionable.
@@ -56,5 +56,24 @@
 - [x] 7.3 `match_claim` pools every extracted invoice and keeps scanning for a complement instead of returning on the first acceptable one; `_apply_match` writes either the single match (unchanged flag behaviour) or the apportioned pair.
 - [x] 7.4 Sibling claim carries its own `matched_email_id`, invoice, claimable subtotal and pet (printed patient field / single pet in text); both rows record `invoice_data.charge_note`.
 - [x] 7.5 Tests: the real Shire numbers apportion into two claims with the right pets and invoice numbers; every refusal case (gap unclosed, pair over the charge, wrong date window, two candidates, same invoice twice, nothing to explain); the receipt-payment-line gate including the different-lines rejection.
-- [ ] 7.6 Live: clear claim #1's wrong match (it points at a payment-list email), re-match, and confirm the two receipts land as two claims — Aari $35.00 and Echo $369.33 on the one 2026-07-06 charge.
+- [x] 7.6 Live: clear claim #1's wrong match (it points at a payment-list email), re-match, and confirm the two receipts land as two claims — Aari $35.00 and Echo $369.33 on the one 2026-07-06 charge.
 - [ ] 7.7 Live follow-up: the receipts are inline email text with no PDF attachment, so `invoice_file_path` stays NULL and neither claim can draft (Petcover requires the invoice attached). Decide whether to ask the vet for PDFs or generate one from the receipt text.
+
+## Verified live 2026-07-27 (task 5.7)
+
+Deployed `df05e0b+feat/telegram-agent-reach`; `/health` returned 200 in ~13s (before the fix, the awaited startup replay held it ~30s and `/health` refused the connection).
+
+Claim #1 before: `pet_id NULL`, status `matched`, matched to email `19f7c8844bdac573` — a payment-list email extracted as three bare amounts (141.87 / 585.39 / 407.56), no items, no services, `invoice_file_path NULL`. That match was wrong, which is why the claim could never draft.
+
+After `unmatch(1)` + `match_claim`, on the one 2026-07-06 charge of $407.56:
+
+| Claim | Pet | Email | Invoice date | Amount | Claimable | Flag |
+|---|---|---|---|---|---|---|
+| #1 | Aari | `19fa2a26f2b06eb5` | 2026-06-19 | $35.00 | $35.00 | none |
+| #25 (new) | Echo | `19fa2a2422c5727e` | 2026-06-30 | $369.33 | $369.33 | none |
+
+Both carry `charge_note: one $407.56 charge paid two invoices: $35.00 + $369.33`. The $3.23 balance is card surcharge and is not claimed. No `unexplained $372.56` flag anywhere — previously that flag was the end of the story and Echo's invoice was never claimed.
+
+Pets were assigned automatically from each receipt naming exactly one dog (`_single_pet_in_text`); the text-extraction prompt returns no `patient`/`invoice_number` field, so identity fell back to amount+date, which is unambiguous here.
+
+Still open: neither claim has an `invoice_file_path` (the receipts are inline email text, no PDF attachment), so neither can draft — Petcover requires the invoice attached. See task 7.7. Aari's $35 is also below the $150 per-condition excess.
