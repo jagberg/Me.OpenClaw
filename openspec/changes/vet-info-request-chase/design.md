@@ -40,11 +40,59 @@ A shared `_normalize(text)` maps U+2010–U+2015 and U+2212 to `-` and is applie
 
 ### 2. Shape-anchored reference extraction, with the policy number explicitly excluded
 
-Context phrases (`Claim Reference:`, `Claim Number`) stay first — they are the highest-confidence signal and they are what the letters use. They fail on the vet cover note, where the reference lives in a free-form subject (`Petcover claim for Ari DC1-27-5628 Sr.8`) and the existing patterns are additionally case-sensitive.
+**Shape first, context phrase second** (revised 2026-07-27 after a live failure — see Changelog).
 
-A shape fallback runs second: `\b[A-Z]{2,4}-\d{2}-\d{4}\b` and `\bGABR-\d{4}\b`, case-insensitive. The original objection to bare patterns is documented in the code and is correct — the policy number is `GABR-0306-DC1-00000001R`, and a `GABR-####` match sits inside it. So the fallback rejects a candidate that is immediately preceded or followed by `-` plus another alphanumeric group, which is exactly what distinguishes `GABR-0306-DC1-…` from a standalone `GABR-0305`.
+The shape is `[A-Za-z]{2,4}\d?-\d{2}-\d{4}` or `GABR-\d{4}`, case-insensitive, matched after the policy number has been deleted from the text. The policy number `GABR-0306-DC1-00000001R` is the one string shaped enough to be mistaken for a reference — the documented reason bare patterns were rejected here originally — and stripping it first is cheaper and more honest than a regex that steps around it.
+
+Context phrases (`Claim Reference:`, `Claim Number`, `Petcover Claim`) run second, as the fallback for a format the shape doesn't know, where a loose capture beats none. A phrase capture must still contain a hyphen and a digit, because a phrase can sit next to a bare word (`Petcover claim for Ari …` captures `for`).
 
 *Alternative rejected*: adding more context phrases as they appear. Petcover has used at least five subject shapes in two years; each new one is another lost claim before it is discovered. Shape is stable across all of them.
+
+### 9. A re-read of already-ingested mail must write no status at all
+
+A classification fix is useless against mail already in `processed_emails` — every fix would only ever help the *next* letter, and the four live misclassifications would stay wrong permanently. So `poll_petcover_status` gains `reread=True`, which ignores that guard.
+
+The guard exists for a stated reason. `telegram-agent-reach` design.md, Decision 3: *"Replaying a seen email against the append-only event log risks re-applying a status transition — and status is the thing this whole service exists to track correctly. The `_already_processed` guard is load-bearing, not incidental."* That decision stands. This is a narrow exception to it, not a reversal, and it is only safe under a hard constraint:
+
+**A re-read appends events and learns references. It never writes `vet_claims.status` and never writes `flag`.**
+
+Event-level idempotency alone is *not* sufficient, which was the original (wrong) form of this decision — the trial that disproved it is in the Changelog. The reason is that a re-read exists because routing *changed*: claims legitimately receive events they never had, so suppressing only identical `(email, claim, event)` triples still lets a replayed older letter set a claim's status behind where its lifecycle actually is.
+
+`needs_action` and the register are event-driven, so a corrected `info_requested` still surfaces without touching lifecycle state. Status remains owned solely by the forward-only live path.
+
+## Changelog
+
+## 2026-07-27 - Reference extraction is shape-first, not context-phrase-first
+
+**Decision:** Match the reference by its own shape before trying context phrases, inverting Decision 2's original order.
+**Reasoning:** A context phrase captures whatever token follows it. Live subject `Petcover claim for--Aari--DC1-27-5628 Serial Number: 2` yielded `for--Aari--DC1-27-5628`, and a live trial wrote exactly that string to claim #2 as its reference — replacing one junk reference with another. A shape match is unambiguous when it hits; a phrase capture never is.
+**Trade-off accepted:** A reference in a genuinely new format that the shape doesn't recognize now falls through to the phrase path, which is looser. Verified against all seven real Petcover email types: identical, correct references either way.
+**Supersedes:** Decision 2's "context phrases stay first — they are the highest-confidence signal", preserved below.
+
+## 2026-07-27 - A re-read must write no status, not merely dedupe events
+
+**Decision:** `reread=True` appends events and learns references only. Status and flag writes are suppressed entirely on a re-read.
+**Reasoning:** The first implementation assumed event-level idempotency was sufficient. A live trial disproved it: re-reading 23 emails regressed claims #6 and #7 from `settled` to `acknowledged`, #18 from `below_excess` to `acknowledged`, and #22 from `sent` to `below_excess`. A re-read exists precisely because routing changed, so claims receive genuinely new events, and replaying oldest-first leaves each claim wherever its last-routed letter points. The DB was restored from backup; no email was sent.
+**Trade-off accepted:** A claim whose status is genuinely wrong because of the old routing will not self-correct on a re-read. Correcting it stays a deliberate act (`detach_reference`, manual confirm), which is the right default for the field this service exists to track.
+**Supersedes:** n/a — `telegram-agent-reach` Decision 3 is *upheld*, not superseded. Its stated risk is exactly what occurred.
+
+## Evolution of thinking
+
+### Context phrases are the highest-confidence signal, shape is the fallback (SUPERSEDED 2026-07-27)
+
+> Context phrases (`Claim Reference:`, `Claim Number`) stay first — they are the highest-confidence signal and they are what the letters use. They fail on the vet cover note, where the reference lives in a free-form subject (`Petcover claim for Ari DC1-27-5628 Sr.8`) and the existing patterns are additionally case-sensitive.
+>
+> A shape fallback runs second … So the fallback rejects a candidate that is immediately preceded or followed by `-` plus another alphanumeric group, which is exactly what distinguishes `GABR-0306-DC1-…` from a standalone `GABR-0305`.
+
+**Superseded by:** Changelog, 2026-07-27, "Reference extraction is shape-first".
+**Why it changed:** "Highest-confidence" conflated *the phrase being a reliable marker* with *the capture after it being a reliable reference*. The phrase is reliable; the capture is not. Also, the preceded/followed-by-hyphen guard was wrong in both directions — it would have rejected the real standalone reference in `GABR-0305-Request for consult note`, whose reference is followed by `-Request`.
+
+### Event-level idempotency makes a re-read safe (SUPERSEDED 2026-07-27, same day)
+
+> `_record_event` skips when `(raw_email_id, claim_id, event_type)` already exists, and `process_reply` skips the status/flag write for a duplicate. That makes re-reading old mail safe — nothing double-logs, and a settlement mismatch you already dismissed can't come back.
+
+**Superseded by:** Decision 9 and the Changelog entry above.
+**Why it changed:** Tested live rather than reasoned about further. The guard only suppresses *identical* triples, and a re-read's whole purpose is to produce *different* routing — so the duplicate test almost never fires on the events that matter, and four claims regressed.
 
 ### 3. Classification: `info_requested` outranks `suspended`, and the sender decides on its own
 
@@ -109,6 +157,14 @@ The daily `nudge_stale_actions` currently filters on `age_days >= ACTION_NUDGE_D
 - **Backfill hits Gmail rate limits or a TLS reset** → Observed live during this investigation. Retry with backoff, and cache per message id so a re-run resumes rather than restarts.
 - **A vet address changes and no longer matches `vet_contacts`** → Falls back to "unknown recipient" with the raw address shown, never to "Justin owes it". Silently reassigning the obligation to Justin is the failure that loses the claim.
 
+### Known limitation: two requests on one thread, to different clinics, collide (found live 2026-07-27)
+
+Petcover sent two information requests for thread `DC1-27-5628` minutes apart, to *different* clinics — Sr 2 to `info@kingsvet.com.au`, Sr 8 to `admin@theshirevet.com.au`. Neither serial was held by any claim. In the live trial the first request consumed the only un-referenced awaiting candidate (learning the reference onto it), so the second fell through to reference-only routing and attached to claim #19, which the letter has nothing to do with.
+
+This is not fixed by anything in this design. `correlate_ack`'s recency rule assumes one request per pet at a time, and a thread whose serials arrive out of band breaks that assumption. A prediction made earlier in this change — that clearing claim #2's junk reference would make it the correct target for the Sr 8 letter — was **refuted live**: it became the target for the Sr 2 letter instead.
+
+Likely resolution is explicit `(reference, Sr)` assignment by Justin for an unheld serial, rather than any correlation heuristic. Recorded as a task, not designed here.
+
 ## Migration Plan
 
 1. Repair claim #2 by hand (clear `petcover_reference`, re-point event 28 to claim #8), recorded in `tasks.md`.
@@ -121,5 +177,5 @@ Rollback: the table is additive and the register is read-only to the rest of the
 
 ## Open Questions
 
-- Does Petcover ever send a *second* request for the same `(reference, Sr)`? `GABR-0306` has a "First Request"/"Second Request" pair addressed to Justin, so likely yes for vets too. The register keys on message id, so both are recorded; whether the surface should collapse them into one entry with a count is deferred until a real vet-addressed pair is observed.
+- Does Petcover ever send a *second* request for the same `(reference, Sr)`? `GABR-0306` has a "First Request"/"Second Request" pair addressed to Justin, so likely yes for vets too. The register keys on message id, so both are recorded; whether the surface should collapse them into one entry with a count is deferred until a real vet-addressed pair is observed. **Partially answered 2026-07-27**: two requests on one thread with *different* serials to *different* clinics are confirmed real (see Known limitation). Same `(reference, Sr)` twice is still unobserved.
 - The vet cover note's detail lives in an attachment `full_message_text` returns nothing for. Worth determining whether it is a non-PDF attachment or a PDF that fails extraction — the requested-document line would otherwise be unavailable for exactly the requests that matter most. Not blocking: the subject carries the reference and Sr, which is what routing needs.

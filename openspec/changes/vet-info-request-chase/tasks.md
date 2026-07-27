@@ -1,7 +1,14 @@
+## 0. Make the re-read safe (blocks group 1 — added 2026-07-27 after a live failure)
+
+- [ ] 0.1 Suppress the `status` and `flag` writes entirely when `process_reply` is running a re-read: append events and learn reference/Sr only (design Decision 9). Event-level idempotency alone was tried and disproved — it regressed claims #6, #7, #18, #22
+- [ ] 0.2 Test: replay real Petcover mail over a populated DB and assert **no** `vet_claims.status` and **no** `flag` value changes, while the corrected `info_requested` events are still appended. This is the test that should have existed before the live trial
+- [ ] 0.3 Test: a re-read of an acknowledgement whose routing has changed appends the event to the newly-correct claim without moving that claim's status
+- [ ] 0.4 Give the un-held-serial case an explicit assignment path — Justin picks the claim for a `(reference, Sr)` no claim holds — rather than letting `correlate_ack`'s recency rule guess. Two same-thread requests to different clinics collided live and one landed on an unrelated claim (design "Known limitation")
+
 ## 1. Repair the live data the extraction bug already corrupted
 
 - [x] 1.1 Confirm against `app/data/openclaw.db` (read-only) that claim #2 still holds `petcover_reference = 'DC1'` and that event 28 (`Petcover claim for Ari - DC1-26-5992 sr.1`) is still attached to claim #2 rather than claim #8
-- [ ] 1.2 Back up the DB, then clear claim #2's `petcover_reference` and re-point event 28's `claim_id` to claim #8 by hand (`UPDATE` against the live DB — no code path does this, and `link_event` only attaches *unlinked* events)
+- [ ] 1.2 Clear claim #2's `petcover_reference` and re-point event 28's `claim_id` to claim #8. **Run it inside the container (`docker exec`), not from the host** — ADR-0018 forbids host-side read-write access to the live DB, and this session broke that rule four times without noticing (see BACKLOG). Prefer `claim_status.detach_reference(2)` over raw SQL for the reference half, since it logs the undo; the event re-point has no code path (`link_event` only attaches *unlinked* events) and needs one statement
 - [ ] 1.3 Re-check claim #2's status: it was set `suspended` by the misrouted letter, so decide from the real letter whether it belongs there or reverts, and record which
 
 ## 2. Extraction fixes (standalone value — deployable on their own)
@@ -70,4 +77,14 @@
 - [ ] 9.2 `app/openclaw/CLAUDE.md`: add non-breaking hyphens in Petcover letter text to the repeated-gotchas list; update the `claim_status.py` row
 - [ ] 9.3 `README.md`: the lifecycle now branches on who owes the missing document, and the register exists alongside the claim list
 - [ ] 9.4 Record in this file what was verified against real mail and the real DB versus only unit-tested
+
+### 9.4 running record (kept current as work lands)
+
+**Verified against the real mailbox** (7 real emails, 2026-07-27, read-only): classification of both Further-Information templates as `info_requested`; the genuine suspension letter still `suspended`; reference and Sr extraction on all four previously-broken emails; no regression on approval / acknowledgement / settlement; policy number yields no reference; auto-reply from `requiredinfo.au@` still `ignore`. Re-confirmed unchanged after the shape-first reordering.
+
+**Verified against the real DB** (write, then rolled back): the re-read path. Outcome was a **failure** — 23 emails replayed, 11 events appended, and four claims regressed (#6, #7 `settled`→`acknowledged`, #18 `below_excess`→`acknowledged`, #22 `sent`→`below_excess`). Restored from `openclaw.db.bak-pre-inforequest`; live DB confirmed back at 20 events with every claim at its original status. Also refuted the prediction that detaching claim #2 would make it the Sr 8 target — it became the Sr 2 target and Sr 8 landed on claim #19.
+
+**Unit-tested only, not yet exercised live**: `detach_reference`, the event-idempotency guard, and the addressee resolver (`resolve_owed_by` — its `vet_contacts` matching is tested against seeded rows, not against a real polled header).
+
+**Not built, therefore unverified**: everything in groups 0, 5, 6, 7, 8. The delta specs assert behavior for these; they must not be synced into `openspec/specs/` until built.
 - [ ] 9.5 Deploy from `C:\Code\Me.OpenClaw-telegram-claimquery` (`docker compose up -d --build --force-recreate`) and confirm on the next tick that today's three real information requests appear as escalated actions with the right claim, the right clinic, and a deadline
