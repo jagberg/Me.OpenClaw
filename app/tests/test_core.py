@@ -21,7 +21,7 @@ os.environ["OPENAI_API_KEY"] = ""
 # Message-log rows are version-stamped; a known value lets the tests assert it.
 os.environ["APP_VERSION"] = "test-sha+test"
 
-from openclaw import claim_forms, claim_status, db, gemini, invoice_matching, llm, netbank_csv, reminders, tasks, vet_detection  # noqa: E402
+from openclaw import claim_forms, claim_status, config, db, gemini, invoice_matching, llm, netbank_csv, reminders, tasks, vet_detection  # noqa: E402
 from openclaw.scheduler import scheduler  # noqa: E402
 
 
@@ -3443,6 +3443,200 @@ def test_tools_schema_stays_small():
     assert names == set(agent._build_impls([])), "every declared tool has an impl and vice versa"
     for tool in agent.TOOLS:
         assert "\n" not in tool["function"]["description"], "descriptions stay one line"
+
+
+# ---------------------------------------------------------------------------
+# Information requests (vet-info-request-chase). Every fixture below is the real
+# text of a real email, quoted from the mailbox on 2026-07-27 — including the
+# U+2010 hyphens, which are the whole point of the first test.
+# ---------------------------------------------------------------------------
+
+# Policyholder letter, To: jagberg@gmail.com. Its reference is written with
+# non-breaking hyphens, and it says "suspended" about its own future.
+_INFO_REQUEST_LETTER = (
+    "Policy number: GABR‑0306‑DC1‑00000001R\n"
+    "Pet's name: Ari\n"
+    "Claim Reference: DC1‑26‑5992 Sr 1\n"
+    "Condition: Raised ALT\n"
+    "Further Information Required\n"
+    "Thank you for submitting your claim for treatment provided to Ari. To assess your claim, "
+    "we need a copy of \nConsultation notes dated 18/05/2026\n"
+    "Please note we cannot process the claim without the information requested. Your claim will "
+    "be suspended until we have the required information."
+)
+
+# Vet cover note, To: admin@theshirevet.com.au, from requiredinfo.au@. One
+# sentence of body; the reference lives only in the subject.
+_VET_COVER_NOTE_SUBJECT = "Petcover claim for Ari DC1-27-5628 Sr.8"
+_VET_COVER_NOTE_BODY = (
+    "Dear The Shire Vet, We recently received a claim for treatment provided to Ari, who belong "
+    "to Justin and Gabrielle Goldberg, please provide the following for us to review the claim "
+    "Consult notes dated"
+)
+
+
+def test_reference_survives_non_breaking_hyphens():
+    """The live root cause: [A-Za-z0-9-]+ stops at U+2010, so this letter taught
+    the reference "DC1", missed its exact (reference, Sr) lookup, and correlated
+    by recency onto claim #2 instead of the claim #8 it names."""
+    reference = claim_status.extract_reference(_INFO_REQUEST_LETTER)
+    assert reference == "DC1-26-5992", reference
+    assert claim_status.extract_sr(_INFO_REQUEST_LETTER, reference) == 1
+
+
+def test_policy_number_is_never_read_as_a_reference():
+    """GABR-0306-DC1-00000001R is the one thing shaped enough to be mistaken for
+    a reference, and is why bare patterns were originally rejected here."""
+    assert claim_status.extract_reference("Policy number: GABR-0306-DC1-00000001R") is None
+
+
+def test_reference_from_a_free_form_subject():
+    """No context phrase at all — the shape fallback is the only thing that can
+    read this, and the phrases are additionally case-sensitive without it."""
+    assert claim_status.extract_reference(_VET_COVER_NOTE_SUBJECT) == "DC1-27-5628"
+    assert claim_status.extract_reference("GABR-0305-Request for consult note -First Request") == "GABR-0305"
+    # Live regression: the context phrase captures whatever token follows it, and
+    # this subject puts junk there. Shape-first is what keeps it out of the DB.
+    assert claim_status.extract_reference(
+        "Petcover claim for--Aari--DC1-27-5628 Serial Number: 2"
+    ) == "DC1-27-5628"
+
+
+def test_every_live_serial_format():
+    for text, expected in [
+        ("DC1-27-5628 Sr 3", 3),           # original whitespace form
+        ("Petcover claim for Ari DC1-27-5628 Sr.8", 8),   # dot separator, live 2026-07-27
+        ("Petcover claim for Ari - DC1-27-5628 sr.1", 1),  # lowercase + dot, live 2026-07-27
+        ("Petcover claim for--Aari--DC1-27-5628 Serial Number: 2", 2),  # live 2026-07-19
+        ("DC1-27-5628 nothing adjacent\nTreatment number: 7", 7),
+    ]:
+        assert claim_status.extract_sr(text, "DC1-27-5628") == expected, text
+
+
+def test_info_request_letter_is_not_filed_as_a_suspension():
+    """It says "will be suspended" about itself. With `suspended` ordered first
+    the live DB ended up with zero info_requested events and two suspended ones,
+    both of which were actually requests."""
+    assert claim_status.classify("PetCover - Claim Further Information Required", _INFO_REQUEST_LETTER) == "info_requested"
+
+
+def test_a_genuine_suspension_is_still_a_suspension():
+    """The pair the reorder must not collapse — this is a real subject."""
+    assert claim_status.classify(
+        "Petcover Claim DC1-27-5628 SR1 - Claim suspended", "Your claim has been suspended."
+    ) == "suspended"
+
+
+def test_vet_cover_note_is_classified_not_queued():
+    """Was `unclassified` live — the one classification that produces no action."""
+    assert claim_status.classify(_VET_COVER_NOTE_SUBJECT, _VET_COVER_NOTE_BODY) == "info_requested"
+    assert claim_status.classify(
+        _VET_COVER_NOTE_SUBJECT, "", claim_status.INFO_REQUEST_SENDER
+    ) == "info_requested", "the dedicated channel classifies on the sender alone"
+
+
+def test_auto_reply_from_the_required_info_channel_is_still_noise():
+    assert claim_status.classify(
+        "Automatic reply: Aari Goldberg - GOLD093", "", claim_status.INFO_REQUEST_SENDER
+    ) == "ignore"
+
+
+def test_who_owes_the_document_comes_from_the_recipients():
+    # The suite blanks credentials, so OWNER_EMAIL has to be supplied here. With it
+    # unset the resolver falls to "a vet owes it, raw address" — the safe direction
+    # (a wasted chase, not a lost claim), never "Justin owes it".
+    _fresh_db()
+    config.OWNER_EMAIL = "jagberg@gmail.com"
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO vet_contacts (merchant, email) VALUES (?, ?)",
+            ("Kings Vet KINGSGROVE NSW", "info@kingsvet.com.au"),
+        )
+    known = claim_status.resolve_owed_by('"info@kingsvet.com.au" <info@kingsvet.com.au>, jagberg@gmail.com')
+    assert known["owed_by"] == "vet" and known["clinic"] == "Kings Vet KINGSGROVE NSW"
+
+    mine = claim_status.resolve_owed_by("jagberg@gmail.com")
+    assert mine["owed_by"] == "justin"
+
+    # An address we don't recognize must NOT quietly become Justin's problem —
+    # that reassignment is exactly how a request goes unchased.
+    unknown = claim_status.resolve_owed_by('"admin@newvet.com.au" <admin@newvet.com.au>, jagberg@gmail.com')
+    assert unknown["owed_by"] == "vet" and unknown["clinic"] is None
+    assert unknown["clinic_email"] == "admin@newvet.com.au"
+
+
+def test_info_request_event_records_the_vet_and_the_document():
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO vet_contacts (merchant, email) VALUES (?, ?)",
+            ("Kings Vet KINGSGROVE NSW", "info@kingsvet.com.au"),
+        )
+        claim = _insert_claim(conn, aari, "2026-04-02", status="acknowledged",
+                             reference="DC1-26-5992", sr=1)
+    claim_status.process_reply(
+        "m-info", "PetCover - Claim Further Information Required", _INFO_REQUEST_LETTER,
+        "claims.au@petcovergroup.com", '"info@kingsvet.com.au" <info@kingsvet.com.au>, jagberg@gmail.com',
+    )
+    with db.get_connection() as conn:
+        event = conn.execute(
+            "SELECT event_type, detail FROM claim_status_events WHERE claim_id = ? ORDER BY id DESC", (claim,)
+        ).fetchone()
+    import json as _json
+
+    detail = _json.loads(event["detail"])
+    assert event["event_type"] == "info_requested"
+    assert detail["owed_by"] == "vet" and detail["clinic"] == "Kings Vet KINGSGROVE NSW"
+    assert "Consultation notes dated 18/05/2026" in detail["requested_document"]
+
+
+def test_rereading_the_same_email_records_nothing_new():
+    """What makes `poll_petcover_status(reread=True)` safe: a classifier fix can be
+    replayed over already-ingested mail without duplicating events, and without
+    re-running the status/flag write (which would resurrect a dismissed mismatch)."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        claim = _insert_claim(conn, aari, "2026-04-02", status="sent")
+    args = ("m-ack", "PetCover - Acknowledgement Letter",
+            "Pet's name: Ari\nClaim Reference: DC1-26-5992 Sr 1\nCondition: Raised ALT")
+    claim_status.process_reply(*args)
+    claim_status.process_reply(*args)  # replay
+    with db.get_connection() as conn:
+        events = conn.execute(
+            "SELECT COUNT(*) n FROM claim_status_events WHERE raw_email_id = 'm-ack'"
+        ).fetchone()["n"]
+    assert events == 1, f"replay appended {events} events"
+    assert _claim_row(claim)["petcover_reference"] == "DC1-26-5992"
+
+    # A dismissed flag must survive the replay — the reason the guard skips the
+    # whole per-claim block rather than only the INSERT.
+    claim_status.dismiss_mismatch(claim)  # no mismatch to dismiss; flag stays None
+    claim_status.process_reply(*args)
+    assert _claim_row(claim)["flag"] is None
+
+
+def test_detach_reference_returns_a_claim_to_the_correlation_pool():
+    """A mis-learned reference is self-sealing: the claim stops being an
+    un-referenced candidate, so correlation can never reconsider it. Live case —
+    claim #2 learned the truncated `DC1`."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        claim = _insert_claim(conn, aari, "2026-06-19", status="suspended", reference="DC1", sr=None)
+    assert claim_status.detach_reference(claim)["ok"] is True
+    row = _claim_row(claim)
+    assert row["petcover_reference"] is None and row["petcover_sr"] is None
+    assert claim_status.detach_reference(claim)["ok"] is False, "nothing left to detach"
+
+    with db.get_connection() as conn:
+        types = [r["event_type"] for r in conn.execute(
+            "SELECT event_type FROM claim_status_events WHERE claim_id = ?", (claim,))]
+    assert "reference_detached" in types, "the undo is logged, not a silent wipe"
+
+    # Detached, it is a candidate again and the real letter can route to it.
+    assert claim_status.correlate_ack("Petcover claim for Ari DC1-27-5628 Sr.8")
 
 
 if __name__ == "__main__":
