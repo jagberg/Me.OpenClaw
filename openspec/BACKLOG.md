@@ -115,3 +115,8 @@ No outage resulted this time; verified from inside the container afterwards (`jo
 Two things to build, neither designed here:
 - The `scripts/query_db.py` read-only helper from ADR-0018 Alternative 4 — noting the ADR's own objection that an ad-hoc one-liner bypasses it, so a helper alone is insufficient.
 - A mechanical guard, since the failure mode is an agent writing `sqlite3.connect(<live path>)` inline. Candidates: a hook that rejects a Bash/PowerShell command containing the live DB path without `mode=ro`, or moving repair operations inside the container entirely (`docker exec`), which is where a *write* belongs regardless — ADR-0018 covers reads and says nothing about deliberate host-side writes, which is a gap in the rule as written.
+
+### Should action titles and status labels be the same words?
+*Open since 2026-07-28. Capability: `claim-status-vocabulary`.*
+
+`claim_status._ACTION_META` titles ("Set condition", "Assign pet", "Define claim process") and `status_labels` chips ("Needs condition", "Needs pet", "Blocked: no claim process") read the same determination but answer different questions — "what do I do" vs "where is this claim" — so ADR-0021 kept them separate. `status_labels.needs()` already reuses the `_ACTION_META` titles for `/basic`, so two of the three vocabularies are joined; whether the chip should follow is a judgement call worth revisiting if they drift.
