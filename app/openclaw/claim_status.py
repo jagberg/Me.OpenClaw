@@ -1363,6 +1363,61 @@ def claim_detail(claim_id: int) -> dict | None:
     }
 
 
+def unanswered_vet_requests() -> list[dict]:
+    """Information requests the vet owes and nobody has answered.
+
+    "Unanswered" cannot mean "no reply seen": the clinic replies to Petcover, not
+    to us, and all ten historical vet-addressed threads hold exactly one message
+    (ADR-0020). The only available signal is that our claim still sits on an
+    unresolved request — the same determination the dashboard's needs-action list
+    makes, so the two can never disagree.
+
+    Ordered by days remaining, not by request age: the deadline is anchored on the
+    TREATMENT date ("your claim must be submitted within one year of your pet
+    receiving treatment"), so a request made late in that year has less slack than
+    its age suggests. Past-deadline requests are excluded — they are history for
+    the register, not an action anyone can still take."""
+    unresolved = {entry["claim"]["id"] for entry in dashboard_lists()["needs_action"]}
+    if not unresolved:
+        return []
+    today = datetime.now(timezone.utc).date()
+    out = []
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT vc.id, vc.status, bt.date AS txn_date, bt.merchant, p.name AS pet_name, "
+            "(SELECT detail FROM claim_status_events e WHERE e.claim_id = vc.id "
+            " AND e.event_type = 'info_requested' ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS info, "
+            "(SELECT created_at FROM claim_status_events e WHERE e.claim_id = vc.id "
+            " AND e.event_type = 'info_requested' ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS asked_at "
+            "FROM vet_claims vc JOIN bank_transactions bt ON bt.id = vc.transaction_id "
+            "LEFT JOIN pets p ON p.id = vc.pet_id "
+            f"WHERE vc.id IN ({','.join('?' * len(unresolved))})",
+            tuple(unresolved),
+        ).fetchall()
+    for row in rows:
+        info = json.loads(row["info"] or "{}")
+        if info.get("owed_by") != "vet":
+            continue  # asked of Justin, or unrecorded — not a vet chase
+        treatment = date.fromisoformat(row["txn_date"][:10])
+        days_left = config.INFO_REQUEST_DEADLINE_DAYS - (today - treatment).days
+        if days_left < 0:
+            continue  # past the submission deadline — the register's problem now
+        out.append({
+            "claim_id": row["id"],
+            "pet_name": row["pet_name"],
+            "merchant": row["merchant"],
+            "clinic": info.get("clinic") or row["merchant"],
+            "clinic_email": info.get("clinic_email"),
+            "requested_document": info.get("requested_document"),
+            "requested_document_date": info.get("requested_document_date"),
+            "asked_at": row["asked_at"],
+            "days_outstanding": (today - date.fromisoformat(row["asked_at"][:10])).days if row["asked_at"] else None,
+            "days_left": days_left,
+        })
+    out.sort(key=lambda r: r["days_left"])
+    return out
+
+
 def dismiss_mismatch(claim_id: int) -> dict:
     """Clears a settlement-mismatch flag once Justin has looked at it. Records a
     `mismatch_dismissed` event rather than just wiping the flag — the append-only

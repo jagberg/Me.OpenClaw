@@ -29,13 +29,13 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 
 ## 4. The Monday nudge
 
-- [ ] 4.1 Add `claim_status.unanswered_vet_requests()`: claims whose latest unresolved `info_requested` event has `owed_by = "vet"` (reusing the existing unresolved determination — ADR-0008's confirm-resolved rule), each with clinic name/email, requested document, days outstanding, and days remaining to the treatment-anchored deadline. Exclude past-deadline claims.
-- [ ] 4.2 Add `INFO_REQUEST_DEADLINE_DAYS = 365` and `VET_NUDGE_DAY = "mon"` to `config.py`.
-- [ ] 4.3 Add `pipeline.nudge_unanswered_vet_requests()`: one message listing each entry (claim id, pet, clinic + email, document, age, days left); returns without sending when the list is empty.
-- [ ] 4.4 Register the cron job — `day_of_week=config.VET_NUDGE_DAY`, `hour=config.ACTION_NUDGE_HOUR`, `id="vet-request-nudge"`, `coalesce=True`, `misfire_grace_time=3600` — beside the existing daily nudge, without changing it.
-- [ ] 4.5 Test: two vet-owed unresolved requests produce one message naming both clinics and both documents; a Justin-owed request is absent; a confirmed-resolved claim is absent; a past-deadline claim is absent; an empty list sends nothing.
-- [ ] 4.6 Test: a vet-owed request with no recorded document still appears, saying the document is unstated.
-- [ ] 4.7 Run both suites: `cd app && ./.venv/Scripts/python.exe tests/test_core.py` and `tests/test_telegram.py`.
+- [x] 4.1 Add `claim_status.unanswered_vet_requests()`: claims whose latest unresolved `info_requested` event has `owed_by = "vet"` (reusing the existing unresolved determination — ADR-0008's confirm-resolved rule), each with clinic name/email, requested document, days outstanding, and days remaining to the treatment-anchored deadline. Exclude past-deadline claims.
+- [x] 4.2 Add `INFO_REQUEST_DEADLINE_DAYS = 365` and `VET_NUDGE_DAY = "mon"` to `config.py`.
+- [x] 4.3 Add `pipeline.nudge_unanswered_vet_requests()`: one message listing each entry (claim id, pet, clinic + email, document, age, days left); returns without sending when the list is empty.
+- [x] 4.4 Register the cron job — `day_of_week=config.VET_NUDGE_DAY`, `hour=config.ACTION_NUDGE_HOUR`, `id="vet-request-nudge"`, `coalesce=True`, `misfire_grace_time=3600` — beside the existing daily nudge, without changing it.
+- [x] 4.5 Test: two vet-owed unresolved requests produce one message naming both clinics and both documents; a Justin-owed request is absent; a confirmed-resolved claim is absent; a past-deadline claim is absent; an empty list sends nothing.
+- [x] 4.6 Test: a vet-owed request with no recorded document still appears, saying the document is unstated.
+- [x] 4.7 Run both suites: `cd app && ./.venv/Scripts/python.exe tests/test_core.py` and `tests/test_telegram.py`.
 
 ## 5. Coordinate, deploy, verify
 

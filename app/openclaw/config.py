@@ -112,3 +112,11 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 # drafted claims sat unsent for three days without a reminder.
 ACTION_NUDGE_DAYS = int(os.environ.get("ACTION_NUDGE_DAYS", "3"))
 ACTION_NUDGE_HOUR = int(os.environ.get("ACTION_NUDGE_HOUR", "9"))
+# A vet practice is chased on a weekday, so unanswered information requests get
+# their own weekly beat rather than competing in the daily stale-action summary.
+# Same hour as that job — one definition of "morning", one thing to keep aligned.
+VET_NUDGE_DAY = os.environ.get("VET_NUDGE_DAY", "mon")
+# The claim's real clock: Petcover's own letter says a claim must be submitted
+# within one year of the pet RECEIVING TREATMENT, so the deadline is anchored on
+# the transaction date, not on when the request arrived.
+INFO_REQUEST_DEADLINE_DAYS = int(os.environ.get("INFO_REQUEST_DEADLINE_DAYS", "365"))

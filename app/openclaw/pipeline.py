@@ -568,6 +568,40 @@ def nudge_stale_actions() -> dict:
     return {"sent": True, "stale": len(stale)}
 
 
+def nudge_unanswered_vet_requests(send_fn=None) -> dict:
+    """Monday morning: every information request the vet owes and nobody answered.
+
+    Separate from nudge_stale_actions on purpose. That one is a daily summary keyed
+    on charge age and reports only the oldest item; a vet chase needs the clinic's
+    address, the document's name, and the days left on the treatment-anchored
+    deadline — and it needs a weekday, because a clinic chased on a Sunday does
+    nothing. Two live requests sat a week producing no message at all.
+
+    Silent when there is nothing outstanding: a weekly "nothing to do" is how a
+    channel becomes one Justin stops reading."""
+    from . import claim_status, telegram_bot
+
+    outstanding = claim_status.unanswered_vet_requests()
+    if not outstanding:
+        logger.info("vet nudge: nothing outstanding")
+        return {"sent": False, "outstanding": 0}
+    lines = [f"{len(outstanding)} vet info request(s) unanswered:"]
+    for r in outstanding:
+        document = r["requested_document"] or "document not stated in the letter"
+        clinic = r["clinic"] or "clinic unknown"
+        contact = f" ({r['clinic_email']})" if r["clinic_email"] else ""
+        age = f"{r['days_outstanding']}d ago" if r["days_outstanding"] is not None else "date unknown"
+        lines.append(
+            f" • #{r['claim_id']} {r['pet_name'] or 'no pet'} — {clinic}{contact}\n"
+            f"   needs: {document}\n"
+            f"   asked {age}, {r['days_left']}d until the 1-year claim deadline"
+        )
+    text = "\n".join(lines)
+    (send_fn or telegram_bot.send_message_sync)(text)
+    logger.info("vet nudge: reminded about %s unanswered request(s)", len(outstanding))
+    return {"sent": True, "outstanding": len(outstanding), "text": text}
+
+
 def _maybe_draft_invoice_request(claim) -> None:
     if claim["invoice_request_sent_at"] or claim["draft_id"]:
         return  # already sent (rolling recheck handles it), or already drafted awaiting Justin
@@ -817,6 +851,20 @@ def start() -> None:
         "cron",
         hour=config.ACTION_NUDGE_HOUR,
         id="stale-action-nudge",
+        replace_existing=True,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    # Weekly, not daily, and its own job: a vet chase happens on a weekday and
+    # wants the clinic + document + deadline, which the daily summary has no room
+    # for. Same coalesce/grace as above — a machine asleep at the fire time would
+    # otherwise skip a whole week, not a day.
+    scheduler.add_job(
+        nudge_unanswered_vet_requests,
+        "cron",
+        day_of_week=config.VET_NUDGE_DAY,
+        hour=config.ACTION_NUDGE_HOUR,
+        id="vet-request-nudge",
         replace_existing=True,
         coalesce=True,
         misfire_grace_time=3600,

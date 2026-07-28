@@ -245,6 +245,90 @@ def test_notification_fires_on_info_requested():
     assert "suspend" not in own_sent[0].lower(), "a request is not a suspension"
 
 
+def _seed_unanswered_vet_request(pet_name: str, *, owed_by="vet", document="Consultation notes dated 18/05/2026",
+                                 txn_date="2026-07-01", resolved=False) -> int:
+    """A claim sitting on an unresolved information request, as the Monday nudge
+    sees it. `resolved=True` adds the confirm-resolved that must remove it."""
+    claim_id = _seed_matched_claim(f"{pet_name} VET", pet_name=pet_name)
+    now = datetime.now(timezone.utc).isoformat()
+    detail = {"owed_by": owed_by, "clinic": f"{pet_name} Clinic", "clinic_email": f"info@{pet_name.lower()}.example",
+              "requested_document": document}
+    with db.get_connection() as conn:
+        conn.execute("UPDATE vet_claims SET status = 'info_requested' WHERE id = ?", (claim_id,))
+        conn.execute("UPDATE bank_transactions SET date = ? WHERE id = "
+                     "(SELECT transaction_id FROM vet_claims WHERE id = ?)", (txn_date, claim_id))
+        conn.execute(
+            "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
+            "VALUES (?, 'info_requested', ?, ?, ?)",
+            (claim_id, f"m-{pet_name}", json.dumps(detail), now),
+        )
+        if resolved:
+            conn.execute(
+                "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
+                "VALUES (?, 'confirmed_resolved', NULL, '{}', ?)",
+                (claim_id, now),
+            )
+    return claim_id
+
+
+def test_monday_nudge_lists_every_unanswered_vet_request():
+    """Two live requests (19 and 27 July) sat a week and produced no message,
+    because the daily nudge reports only the oldest action by charge age. This one
+    names the clinic, the document and the days left on the treatment-anchored
+    deadline — the things a chase actually needs."""
+    kings = _seed_unanswered_vet_request("Kingspet")
+    shire = _seed_unanswered_vet_request("Shirepet", document="Itemised invoice")
+    sent = []
+    result = pipeline.nudge_unanswered_vet_requests(send_fn=lambda text, markup=None: sent.append(text))
+    assert result["sent"] is True and len(sent) == 1, "one message, not one per claim"
+    body = sent[0]
+    for claim_id in (kings, shire):
+        assert f"#{claim_id}" in body, "Justin acts by claim id"
+    assert "Consultation notes dated 18/05/2026" in body, "the full phrase, where there is room for it"
+    assert "Itemised invoice" in body
+    assert "info@kingspet.example" in body, "the address he has to write to"
+    assert "deadline" in body.lower()
+
+
+def test_monday_nudge_is_silent_and_selective():
+    """Silent when there is nothing: a weekly "nothing to do" trains the channel
+    to be ignored. And it is a VET chase — a request addressed to Justin, one he
+    has confirmed resolved, or one past the submission deadline is not one."""
+    # The silent branch, isolated from what other tests have seeded into the
+    # shared DB (asserting global silence here made this test depend on file order).
+    original = claim_status.unanswered_vet_requests
+    claim_status.unanswered_vet_requests = lambda: []
+    try:
+        assert pipeline.nudge_unanswered_vet_requests(send_fn=lambda *a, **k: None)["sent"] is False
+    finally:
+        claim_status.unanswered_vet_requests = original
+
+    mine = _seed_unanswered_vet_request("Minepet", owed_by="justin")
+    done = _seed_unanswered_vet_request("Donepet", resolved=True)
+    late = _seed_unanswered_vet_request("Latepet", txn_date="2024-01-01")  # treatment > 1 year ago
+    live = _seed_unanswered_vet_request("Realpet")
+
+    chased = {r["claim_id"] for r in claim_status.unanswered_vet_requests()}
+    assert live in chased, "a genuine vet chase must be listed"
+    assert mine not in chased, "addressed to Justin, not the vet"
+    assert done not in chased, "he has confirmed it resolved"
+    assert late not in chased, "past the one-year submission deadline"
+
+    sent = []
+    pipeline.nudge_unanswered_vet_requests(send_fn=lambda text, markup=None: sent.append(text))
+    assert f"#{live}" in sent[-1]
+    assert not any(f"#{cid}" in sent[-1] for cid in (mine, done, late))
+
+
+def test_monday_nudge_still_names_a_claim_whose_document_is_unstated():
+    """The vet cover note's detail lives in an attachment we get no text for, so
+    the document is often absent. Dropping the claim would hide a live chase."""
+    claim = _seed_unanswered_vet_request("Vaguepet", document=None)
+    sent = []
+    pipeline.nudge_unanswered_vet_requests(send_fn=lambda text, markup=None: sent.append(text))
+    assert f"#{claim}" in sent[-1] and "not stated" in sent[-1]
+
+
 def test_info_request_notification_says_the_vet_was_asked():
     """Petcover asks the vet for consult notes as often as it asks Justin, and
     he is only Cc'd on the vet's copy (live, 2026-07-27). A message that reads
