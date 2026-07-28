@@ -120,3 +120,13 @@ Two things to build, neither designed here:
 *Open since 2026-07-28. Capability: `claim-status-vocabulary`.*
 
 `claim_status._ACTION_META` titles ("Set condition", "Assign pet", "Define claim process") and `status_labels` chips ("Needs condition", "Needs pet", "Blocked: no claim process") read the same determination but answer different questions — "what do I do" vs "where is this claim" — so ADR-0021 kept them separate. `status_labels.needs()` already reuses the `_ACTION_META` titles for `/basic`, so two of the three vocabularies are joined; whether the chip should follow is a judgement call worth revisiting if they drift.
+
+### `_action_kind`'s extraction was never verified per kind
+*Open since 2026-07-28 (found by a trail audit the same day). Capability: `claim-status-vocabulary`.*
+
+`clarify-claim-status-vocabulary` task 1.2 claimed a before/after assertion for every action kind and was ticked without one. Measured: 4 of 9 kinds are asserted anywhere (`blocked_insurer`, `set_condition`, `assign_pet`, `mark_sent`, `dismiss_mismatch`). **Zero** exist for `split_proposal`, `unmatch`, `confirm_resolved`, `invoice_request_sent` — and `unmatch`/`confirm_resolved` are the two the extraction actually moved, since their precedence is preserved by a guard added when the set-membership checks stayed in `_action_kind`. Both suites pass and the refactor is believed mechanical, but that pair is untested. The fix is one assertion per kind, not more label tests. Corrected in the archived tasks.md rather than left standing.
+
+### ADR-0018's read-only rule held on 2026-07-28 — one data point, still no enforcement
+*Evidence for the entry above. Capability: `claims-pipeline-resilience`.*
+
+Every host-side DB read this session used `file:…?mode=ro`, and the live repair ran `docker exec` inside the container with a backup and a reviewed dry-run diff. So the convention was followed unaided the session after it was broken four times — which is worth recording, and is *not* evidence that convention is sufficient. The mechanical guard the previous entry asks for is still unbuilt, and the rule still says nothing about deliberate host-side *writes* (the gap that made "run it in the container" a judgement call rather than a rule).

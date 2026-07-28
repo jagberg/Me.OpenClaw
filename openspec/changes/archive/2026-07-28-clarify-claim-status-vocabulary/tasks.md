@@ -5,6 +5,8 @@ Scope note: classification (`info_requested` vs `suspended`), Unicode-hyphen ref
 - [x] 1.1 Extract the pure part of `claim_status._action_kind` into `_action_kind_from_row(claim)` — everything after the two set-membership checks (`open_split_claim_ids`, `unresolved_event_claim_ids`) — and have `_action_kind` call it. Behaviour unchanged; one definition, callable from a rendering path without DB queries.
 - [x] 1.2 Test: `_action_kind` returns exactly what it returned before for a claim of each kind (guard that the extraction was mechanical).
 
+  **Correction (2026-07-28, trail audit): this task's claim was overstated when ticked.** What exists is 4 of the 9 kinds asserted anywhere — `blocked_insurer`, `set_condition`, `assign_pet`, `mark_sent`, `dismiss_mismatch` (via the new label test plus the pre-existing `test_pending_actions_one_per_claim_priority_and_blocked_split`). **Zero assertions exist for `split_proposal`, `unmatch`, `confirm_resolved`, `invoice_request_sent`** — and `unmatch` and `confirm_resolved` are precisely the two the extraction moved, since they are the pair whose precedence had to be preserved by a guard when the set-membership checks stayed behind in `_action_kind`. The refactor is believed mechanical and both suites pass, but "each kind" was not verified. Gap recorded in `openspec/BACKLOG.md`; the guard those two need is a before/after assertion per kind, not more label tests.
+
 ## 2. The shared vocabulary
 
 - [x] 2.1 New `openclaw/status_labels.py`: `LABELS: dict[str, str]` (status → wording) plus `label(claim) -> str`. No import from `claim_status` at module level beyond `_action_kind_from_row`; pure function of the row.

@@ -11,6 +11,7 @@ Personal assistant for Justin: task/reminder capture from Gmail, plus a vet-insu
 - `README.md` — goal, end-to-end process, matching algorithm, every third-party call. Keep it current when behavior changes.
 - `app/data/` and `app/.env` — real SQLite DB, Gmail credentials/token, secrets. Gitignored; never commit, never print contents.
 - Deploy = Docker from the worktree `C:\Code\Me.OpenClaw-telegram-claimquery` (compose binds `C:/code/Me.OpenClaw/app/data:/data`): run `./scripts/deploy.ps1`, which stamps `APP_VERSION` from the git SHA and prints `/health`. A bare `docker compose up -d --build` works but leaves the version `unknown`, which mistags every row in `telegram_messages`.
+- That worktree now sits on a branch named **`deploy`**, reset to `master` when deploying (2026-07-28). A linked worktree cannot check out `master` while the main checkout holds it, so `deploy` is a movable pointer: `git switch -C deploy master` in the worktree, then `./scripts/deploy.ps1`. Consequence to expect, not to fix: `APP_VERSION` reads `<sha>+deploy` rather than `+master`, and the SHA is the authoritative part. Before that date the worktree tracked whichever feature branch was in flight, which is how it came to be deploying code four commits behind master.
 
 ## Hard rules (non-negotiable)
 

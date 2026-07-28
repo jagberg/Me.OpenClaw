@@ -140,7 +140,7 @@ Rollback is a revert; the only persisted addition is an extra key in an existing
 
 So the worst real case is **three** candidates, and the facts that separate them are the ones a card row already shows: date, merchant, amount, condition. A Telegram card with one button per candidate is sufficient — no search, no dropdown, no paging. Event 10 needs no UI at all: it failed only because `find_claim_by_reference_and_sr` refuses terminal claims, and an information request that arrived *before* a settlement is history worth recording against the settled claim rather than an action.
 
-Two questions left for Justin, neither blocking this change:
+Both questions below were **answered yes by Justin on 2026-07-28** and are recorded as decisions in `vet-info-request-chase`'s group 0. Kept here as the reasoning that produced them:
 
 - Should an exact `(reference, Sr)` hit attach to a **settled** claim as history (recording it, taking no action), or stay unlinked? Recording it looks right — it is a true fact about that claim — but it edges on ADR-0011's rule that a terminal claim is never reopened, so it needs saying explicitly.
 **Elaborating the second question — does the assignment card need a "none of these" button?**

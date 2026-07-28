@@ -3,6 +3,11 @@
 - [ ] 0.1 Suppress the `status` and `flag` writes entirely when `process_reply` is running a re-read: append events and learn reference/Sr only (design Decision 9). Event-level idempotency alone was tried and disproved — it regressed claims #6, #7, #18, #22
 - [ ] 0.2 Test: replay real Petcover mail over a populated DB and assert **no** `vet_claims.status` and **no** `flag` value changes, while the corrected `info_requested` events are still appended. This is the test that should have existed before the live trial
 - [ ] 0.3 Test: a re-read of an acknowledgement whose routing has changed appends the event to the newly-correct claim without moving that claim's status
+**Decided 2026-07-28 (Justin, both yes):**
+
+- **An exact `(reference, Sr)` hit MAY attach to a settled claim as history** — recording the event against it, taking no action and never moving its state. `find_claim_by_reference_and_sr` refusing terminal claims is what left event 10 unlinked when claim #21 held exactly its reference and serial. This does **not** loosen ADR-0011: recording a true fact about a closed claim is not reopening it, and the distinction is now the one `claim-state-from-event-log` makes explicit (state events vs stateless events).
+- **The assignment card gets a "No claim on file" button** — marks the event permanently unlinked with a reason, and it is never re-offered. Needed because `bank_transactions` starts 2025-07-17, so letters naming `GABR-0305`, `GABR-0306`, `DC1-26-4751`, `DC1-27-5631` and `DC1-26-5993` (live: event 30) can have no correct claim, and a card with three wrong buttons and no way to say so is a card that gets ignored. "Not now" was rejected — a pre-coverage visit will never gain a claim. Semantics: record that no claim applies, matching the register's `claim_id = NULL` model. Never delete, never hide.
+
 - [ ] 0.4 Give the un-held-serial case an explicit assignment path — Justin picks the claim for a `(reference, Sr)` no claim holds — rather than letting `correlate_ack`'s recency rule guess. Two same-thread requests to different clinics collided live and one landed on an unrelated claim (design "Known limitation")
 
 ## 1. Repair the live data the extraction bug already corrupted
