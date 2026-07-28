@@ -266,8 +266,15 @@ def resolve_owed_by(recipients: str | None) -> dict:
 #   Consultation notes dated 18/05/2026
 #   Please note we cannot process the claim without the information requested.
 _BOILERPLATE = r"please note|you can reach us|in line with|kind regards|thank you"
+# The filler between the ask and the item has to be consumed, or it becomes the
+# "document". Real live phrasings, both of them vet cover notes:
+#   "please provide the following information in order for us to review the"  (ends there — detail is in an attachment)
+#   "please provide the following for us to review the claim Consult notes dated ..."
+# Dropping this consumption (a 2026-07-28 refactor did) yields
+# 'information in order for us to review the' as the document Justin chases.
+_ASK_FILLER = r"(?:\s*information)?(?:\s*in order)?(?:\s*for us)?(?:\s*to review(?:\s*the(?:\s*claim)?)?)?"
 _DOCUMENT_ASK = re.compile(
-    r"(?:we (?:need|require) a copy of|please provide the following)\s*[:\-]?\s*(.+?)"
+    rf"(?:we (?:need|require) a copy of|please provide the following){_ASK_FILLER}\s*[:\-]?\s*(.+?)"
     rf"(?=\s*(?:{_BOILERPLATE})|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -316,7 +323,11 @@ def extract_requested_document(text: str) -> str | None:
         if _BOILERPLATE_LINE.match(line):
             break
         block.append(line)
-    return "; ".join(block)[:200] or None
+    document = "; ".join(block)[:200]
+    # A leftover scrap of the ask's own sentence is not a document. Live proof:
+    # one vet cover note's body ends at "...for us to review the", and a stray
+    # "the" reaching the label would send Justin chasing a word.
+    return document if len(document) >= 4 else None
 
 
 def requested_document_date(document: str | None) -> str | None:

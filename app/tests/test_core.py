@@ -3758,6 +3758,29 @@ def test_requested_document_stops_at_the_letters_boilerplate():
     ) == "Consultation notes dated 18/05/2026; Itemised invoice"
 
 
+def test_the_ask_own_filler_is_not_mistaken_for_the_document():
+    """Both real vet cover notes phrase the ask with filler before the item, and a
+    2026-07-28 refactor dropped the consumption of it — a live dry-run then
+    produced 'information in order for us to review the' and 'for us to review the
+    claim Consult notes dated' as the documents Justin was to chase. One body ends
+    mid-sentence (its detail is in an attachment we get no text for), so the honest
+    answer there is no document at all."""
+    ends_mid_sentence = (
+        "We have received a claim for treatment provided to Aari Who belongs to Mrs Gabi Goldberg , "
+        "please provide the following information in order for us to review the"
+    )
+    assert claim_status.extract_requested_document(ends_mid_sentence) is None, "filler is not a document"
+
+    names_the_item = (
+        "received a claim for treatment provided to Ari, who belong to Justin and Gabrielle Goldberg, "
+        "please provide the following for us to review the claim Consult notes dated"
+    )
+    assert claim_status.extract_requested_document(names_the_item) == "Consult notes dated"
+    # No date printed in the body — the document still names the kind, so the label
+    # can say "consult notes"; the visit simply cannot be resolved.
+    assert claim_status.requested_document_date("Consult notes dated") is None
+
+
 def test_requested_document_date_is_day_first_and_refuses_nonsense():
     """Australian letters: 18/05/2026 is 18 May. A malformed date is not a date —
     returning None keeps the label on the document alone rather than resolving the
