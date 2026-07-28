@@ -22,7 +22,7 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 - [x] 3.1 Parse the date out of the requested document (`dated 18/05/2026`, `dated 18 May 2026`) into an ISO date; record it on the event beside the phrase. No date stated → null, no guess.
 - [x] 3.2 Add `invoice_matching.find_visit_by_date(iso_date)`: match claims' `invoice_data` first (invoice date **or** any line-item date), then `email_extractions`. Return every match (claim id where one exists, merchant, invoice number, amount) — never a nearest-date fallback.
 - [x] 3.3 Add an optional per-item `date` to the extraction schema (null when the document doesn't state one) and to `find_visit_by_date`'s matching.
-- [ ] 3.4 Clear `email_extractions` as one deliberate step, stating the count re-extracted (14 rows as of 2026-07-28) — it spends tokens against the daily budget (ADR-0017), and a failed extraction isn't cached so a partial run resumes. Ask before running it live.
+- [!] 3.4 **BLOCKED** — Clear `email_extractions` as one deliberate step, stating the count re-extracted (14 rows as of 2026-07-28) — it spends tokens against the daily budget (ADR-0017), and a failed extraction isn't cached so a partial run resumes. Ask before running it live.
 - [x] 3.5 Test with the real data: `18/05/2026` resolves to Kings Vet invoice `1000229`, $351.50, claim **#6** — while the request itself stays on claim **#8**. Assert the two are reported as different claims, since that is the whole point.
 - [x] 3.6 Test: a date only in the extraction cache resolves with no claim id; an unmatched date reports "visit unknown"; two invoices sharing a date report both; a line-item date matches even when the invoice's header date differs.
 - [ ] 3.7 Test the wording never presents the resolved invoice as the requested document.
@@ -47,11 +47,11 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 
 ## 6. Docs
 
-- [ ] 6.1 Amend ADR-0021: the label names the requested document, not just who holds the claim (its rule implies this but does not say it), and why the chip carries a short name while the full phrase lives where there is room.
-- [ ] 6.2 Amend ADR-0020's addressee section: the same letter also yields *what* was asked for, by regex, and the weekly beat is how an unobservable vet reply gets chased.
-- [ ] 6.3 `README.md`: the lifecycle branch now names the document, and a Monday nudge covers unanswered vet requests.
-- [ ] 6.4 `app/openclaw/CLAUDE.md`: `requested_document` joins `owed_by` in the event detail; the label's short-name map; two nudge jobs exist with different cadences and scopes — don't merge them.
-- [ ] 6.5 Record in `vet-info-request-chase` that both design Open Questions were answered yes on 2026-07-28 (done at proposal time, not deferred to BACKLOG): an exact `(reference, Sr)` hit may attach to a settled claim as history, and the assignment card gets a "No claim on file" button. Nothing about them goes to BACKLOG — whether an exact `(reference, Sr)` hit may attach to a settled claim as history, and whether the assignment card needs a "none of these" button for letters about claims that predate the bank CSV coverage.
+- [x] 6.1 Amend ADR-0021: the label names the requested document, not just who holds the claim (its rule implies this but does not say it), and why the chip carries a short name while the full phrase lives where there is room.
+- [x] 6.2 Amend ADR-0020's addressee section: the same letter also yields *what* was asked for, by regex, and the weekly beat is how an unobservable vet reply gets chased.
+- [x] 6.3 `README.md`: the lifecycle branch now names the document, and a Monday nudge covers unanswered vet requests.
+- [x] 6.4 `app/openclaw/CLAUDE.md`: `requested_document` joins `owed_by` in the event detail; the label's short-name map; two nudge jobs exist with different cadences and scopes — don't merge them.
+- [x] 6.5 Record in `vet-info-request-chase` that both design Open Questions were answered yes on 2026-07-28 (done at proposal time, not deferred to BACKLOG): an exact `(reference, Sr)` hit may attach to a settled claim as history, and the assignment card gets a "No claim on file" button. Nothing about them goes to BACKLOG — whether an exact `(reference, Sr)` hit may attach to a settled claim as history, and whether the assignment card needs a "none of these" button for letters about claims that predate the bank CSV coverage.
 
 ### Verification record (groups 1-2, 2026-07-28)
 
@@ -88,3 +88,13 @@ Dashboard chip for #8 now reads **`Vet: consult notes needed`**. Cron job `nudge
 **A regression this change introduced was caught by that dry run**, before it wrote to the live DB: the refactored ask pattern had dropped the original's consumption of the letter's filler, so two vet cover notes yielded `information in order for us to review the` and `for us to review the claim Consult notes dated` as the document to chase. Fixed in `719009f`, with the two real phrasings quoted at the pattern and a minimum-length guard for a stray `the`. The lesson is the project's existing one: the dry run against real mail is what found it, not the unit tests, which were passing throughout.
 
 **Still not done:** task 3.4 (clear the 14 cached extractions so line-item dates populate — approved, deliberately not run at the tail of a long session because the next tick re-extracts and could alter matching for the 3 `pending_match` claims) and group 6 (docs: amend ADR-0020/0021, README, module CLAUDE.md, BACKLOG). Line-item date matching remains implemented and unit-tested but **cannot fire on real data** until 3.4 runs.
+
+### Task 3.4 is blocked by a live provider outage (2026-07-28)
+
+Attempted, and it failed all 14 on Groq `403 {"error":{"message":"Access denied. Please check your network settings."}}`. **No data changed and no tokens were consumed.** The script re-extracts in place and replaces a row only when the fresh result is non-empty — deliberately, so a vision-sourced row can never be overwritten with nothing — and it took a backup first (`/data/openclaw.db.bak-pre-item-dates-20260728`).
+
+Diagnosed from inside the container: the same 403 comes back **with and without** the API key, so this is IP/network-level denial by Groq, not the key, not a quota, and not the request shape. Last successful call 05:34 UTC; first 403 at 12:39 UTC. Why the egress is blocked is a network/account question for Justin — no code change fixes it.
+
+It also exposed a real gap, now in `openspec/BACKLOG.md`: ADR-0017's fallback chain walks four models that are **all Groq**, so a provider-level rejection defeats every link and takes invoice extraction and the chat agent down together. Gemini credentials already exist for vision OCR and would serve as a cross-provider fallback.
+
+Until 3.4 runs, line-item date matching is implemented and unit-tested but **cannot fire on real data** — `find_visit_by_date` matches invoice header dates only, which is exactly the case Justin raised (a consult on the 18th billed on an invoice dated the 30th). Re-run `reextract_item_dates.py --apply` in the container once the provider is reachable.

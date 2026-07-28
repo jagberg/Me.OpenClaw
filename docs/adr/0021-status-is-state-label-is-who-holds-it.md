@@ -42,3 +42,26 @@ Constraints: live schema changes to existing tables need a hand-run `ALTER TABLE
 - **Renaming the stored statuses** so status and label are one string again. ~40 call sites, plus the append-only event log, for a cosmetic win — and it would recreate the same conflict the first time a label needed to say something the state machine doesn't care about.
 - **A Jinja filter.** Fixes the two templates and leaves the Telegram cards and notify text on their own copies, which is the actual problem.
 - **A second copy of the "what does this claim need" logic inside the label module.** Cheaper to write, and guaranteed to drift from `pending_actions` — the two would then disagree about the same claim on the same screen.
+
+## Amendment (2026-07-28) — the label names the document, not just the party
+
+The decision stands. One thing it left implicit turned out to matter more than the part it stated.
+
+"More vet info required" satisfies the rule above — it names the party the claim waits on — and Justin's response on reading it live was that it still could not be acted on. Petcover's letter says exactly what it wants, in a fixed template phrase: *"To assess your claim, we need a copy of / Consultation notes dated 18/05/2026"*. A clinic asked for a named document on a named date answers in one look; asked for "further information", it does nothing.
+
+So the label names the document when the event records one, and still says who owes it:
+
+| `owed_by` | document | label |
+|---|---|---|
+| vet | recognized kind | **Vet: consult notes needed** |
+| Justin | recognized kind | **Consult notes needed from you** |
+| either | absent or unrecognized kind | the wording in the Decision above, unchanged |
+| unrecorded | either | **Info requested** |
+
+Three consequences worth recording:
+
+- **The chip shortens; the full phrase goes where there is room.** `status_labels.short_document` maps recognized kinds (consultation notes, itemised invoice, claim form, referral history) to a chip-sized noun phrase. A table chip and a Telegram card row cannot carry `dated 18/05/2026`, and the ledger's information density is a stated requirement of `dashboard-visit-ledger`. The full phrase reaches the claim detail, the action card and the weekly nudge.
+- **The document does not replace the party.** The document says *what*, `owed_by` says *who*, and an unrecorded owner stays neutral no matter how specific the document is — naming a document without naming who owes it invites exactly the wrong chase.
+- **`needs()` gained an action form** for the phone-first view: "Chase vet for consult notes", "Send Petcover the consult notes". Same module, still one vocabulary.
+
+**What this cost, recorded because it is the useful part:** the extraction that feeds these labels was refactored from an inline regex shipped days earlier, and the refactor dropped that regex's consumption of the letter's own filler. Two real vet cover notes then yielded `information in order for us to review the` and `for us to review the claim Consult notes dated` as the document to chase. It was caught by a dry run against the real mailbox, *while the unit tests were passing*, moments before it would have been written to the live DB. A capture shorter than four characters is now rejected too, because one letter's body ends mid-sentence at "for us to review the" and left a stray `the`. The pattern carries both real phrasings as comments so the next refactor can see what they are for.

@@ -141,3 +141,21 @@ This is worse than the failure ADR-0018 guards against. A read-write open of the
 Two things worth deciding, neither designed here:
 - Should the phantom be deleted? It is not referenced by anything, but deleting it converts silent-wrong-answers into a loud "unable to open database file", which is the better failure. Left in place for now because nothing verified what else may have written to it.
 - The correction recorded earlier today — "ADR-0018's read-only rule held on 2026-07-28" — needs the caveat that a read-write open *was* attempted from the host that day. It hit the phantom rather than the live file, so no harm resulted, and that was path resolution rather than discipline.
+
+### The model fallback chain cannot survive a provider-level block
+*Found 2026-07-28 during a live outage. Capability: `llm-backend`. Extends ADR-0017.*
+
+Groq began returning `403 {"error":{"message":"Access denied. Please check your network settings."}}` to every request at 12:39 UTC; the last successful call was 05:34 UTC. Probed from inside the container with **and without** the API key — both 403, so this is IP/network-level denial by Groq, not the key, not a quota, and not the request shape.
+
+ADR-0017's fallback walks four models — `llama-3.3-70b-versatile`, `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `llama-3.1-8b-instant` — and **all four are Groq**. The chain is designed for per-model daily budget exhaustion (TPD), so a provider-level rejection defeats every link, and every LLM path in the app (invoice extraction, the chat agent) fails together. `llm.py` correctly classifies the 403 as transient and retries with backoff, which is right for a blip and useless for a block.
+
+Gemini credentials already exist and are already used for vision OCR (ADR-0010), so a cross-provider fallback is available without new accounts or new spend: on a provider-level failure — 403, or repeated connection refusal, as distinct from a 429 — fall through to Gemini for text extraction and chat rather than failing the tick. Worth an ADR since it changes what "fallback" means in 0017.
+
+Not resolved here: **why** Groq is blocking this egress. That is a network/account question for Justin (VPN, ISP address reputation, or a region block), and no code change fixes it.
+
+### Re-extracting the cached invoices to pick up line-item dates is still owed
+*Blocked since 2026-07-28. Capability: `invoice-matching`. Task 3.4 of `vet-request-document-and-monday-nudge`.*
+
+The extraction prompts now request a per-line-item date, and the 14 cached extractions must be re-run to populate it (approved token spend). The attempt on 2026-07-28 failed all 14 on the Groq 403 above. **No data changed and no tokens were consumed** — the script replaces a row only when the fresh extraction is non-empty, precisely so a vision-sourced row is never overwritten with nothing, and a backup was taken first (`/data/openclaw.db.bak-pre-item-dates-20260728`).
+
+Re-run `reextract_item_dates.py --apply` inside the container once the provider is reachable. Until then, line-item date matching is implemented and unit-tested but **cannot fire on real data**: `find_visit_by_date` matches invoice header dates only, which is exactly the case Justin raised (a consult on the 18th billed on an invoice dated the 30th).

@@ -35,7 +35,10 @@ Justin sends the draft (manually, always)
         ▼
 claim_status ── poll Petcover replies: learn their claim reference from the
         │       acknowledgement, log every event append-only, parse settlement
-        │       amounts out of the PDF attachment
+        │       amounts out of the PDF attachment. An information request also
+        │       records WHO owes the document (To:/Cc: vs vet_contacts) and WHAT
+        │       it is ("Consultation notes dated 18/05/2026"), and resolves that
+        │       date to the visit we already hold — usually a different claim's.
         ▼
 Telegram + dashboard ── every state change, question and blocker lands as a
                         message with the claim #id and one-tap buttons
@@ -57,6 +60,7 @@ For each unmatched vet charge, `invoice_matching`:
 4. **Handles the special cases** instead of guessing:
    - Invoice **exceeds** the charge but the date fits → probably one invoice paid over several card swipes. If a sibling charge completes the sum, a **merge proposal** goes to Telegram (with the invoice PDF attached) — Justin confirms; the larger charge carries the invoice, the other closes as its second payment.
    - Charge with no invoice anywhere → an **invoice-request email to the vet** is drafted (never sent) using the visit date and amount.
+   - **Petcover asks for a missing document** → the claim reads as what it needs ("Vet: consult notes needed"), naming the party who owes it, and a **Monday-morning nudge** lists every vet request nobody has answered with the clinic's address, the document, the invoice the requested date belongs to, and the days left against the treatment-anchored one-year deadline. A vet's reply goes to Petcover, never to us, so "unanswered" can only mean the claim still sits on an unresolved request. No chase email is drafted — Justin chases; the system makes the chase answerable.
    - Pet assignment is read off printed facts only — the email naming exactly one known pet, or the invoice's patient field. Both dogs named / nothing printed → Telegram asks.
    - **One charge, two invoices** (one card payment settling both dogs' bills — confirmed live: $407.56 = Aari $35.00 + Echo $369.33 + $3.23 surcharge) → the matcher apportions it itself: this claim takes one invoice, a second claim on the same charge takes the other, each with its own invoice, pet and claimable subtotal. Only when exactly one candidate closes the charge; two possibilities means it refuses rather than guesses. ADR-0019.
    - **Receipts paid later than the visit** are matched on their own payment line (`06/07/2026 Credit Card $35.00`), not the ±3-day service-date window — the visits above were 19 and 30 June.
