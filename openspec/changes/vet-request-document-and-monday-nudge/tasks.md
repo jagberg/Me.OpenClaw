@@ -22,7 +22,7 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 - [x] 3.1 Parse the date out of the requested document (`dated 18/05/2026`, `dated 18 May 2026`) into an ISO date; record it on the event beside the phrase. No date stated → null, no guess.
 - [x] 3.2 Add `invoice_matching.find_visit_by_date(iso_date)`: match claims' `invoice_data` first (invoice date **or** any line-item date), then `email_extractions`. Return every match (claim id where one exists, merchant, invoice number, amount) — never a nearest-date fallback.
 - [x] 3.3 Add an optional per-item `date` to the extraction schema (null when the document doesn't state one) and to `find_visit_by_date`'s matching.
-- [!] 3.4 **BLOCKED** — Clear `email_extractions` as one deliberate step, stating the count re-extracted (14 rows as of 2026-07-28) — it spends tokens against the daily budget (ADR-0017), and a failed extraction isn't cached so a partial run resumes. Ask before running it live.
+- [x] 3.4 Clear `email_extractions` as one deliberate step, stating the count re-extracted (14 rows as of 2026-07-28) — it spends tokens against the daily budget (ADR-0017), and a failed extraction isn't cached so a partial run resumes. Ask before running it live.
 - [x] 3.5 Test with the real data: `18/05/2026` resolves to Kings Vet invoice `1000229`, $351.50, claim **#6** — while the request itself stays on claim **#8**. Assert the two are reported as different claims, since that is the whole point.
 - [x] 3.6 Test: a date only in the extraction cache resolves with no claim id; an unmatched date reports "visit unknown"; two invoices sharing a date report both; a line-item date matches even when the invoice's header date differs.
 - [ ] 3.7 Test the wording never presents the resolved invoice as the requested document.
@@ -89,7 +89,7 @@ Dashboard chip for #8 now reads **`Vet: consult notes needed`**. Cron job `nudge
 
 **Still not done:** task 3.4 (clear the 14 cached extractions so line-item dates populate — approved, deliberately not run at the tail of a long session because the next tick re-extracts and could alter matching for the 3 `pending_match` claims) and group 6 (docs: amend ADR-0020/0021, README, module CLAUDE.md, BACKLOG). Line-item date matching remains implemented and unit-tested but **cannot fire on real data** until 3.4 runs.
 
-### Task 3.4 is blocked by a live provider outage (2026-07-28)
+### Task 3.4: blocked, then done (2026-07-28)
 
 Attempted, and it failed all 14 on Groq `403 {"error":{"message":"Access denied. Please check your network settings."}}`. **No data changed and no tokens were consumed.** The script re-extracts in place and replaces a row only when the fresh result is non-empty — deliberately, so a vision-sourced row can never be overwritten with nothing — and it took a backup first (`/data/openclaw.db.bak-pre-item-dates-20260728`).
 
@@ -98,3 +98,19 @@ Diagnosed from inside the container: the same 403 comes back **with and without*
 It also exposed a real gap, now in `openspec/BACKLOG.md`: ADR-0017's fallback chain walks four models that are **all Groq**, so a provider-level rejection defeats every link and takes invoice extraction and the chat agent down together. Gemini credentials already exist for vision OCR and would serve as a cross-provider fallback.
 
 Until 3.4 runs, line-item date matching is implemented and unit-tested but **cannot fire on real data** — `find_visit_by_date` matches invoice header dates only, which is exactly the case Justin raised (a consult on the 18th billed on an invoice dated the 30th). Re-run `reextract_item_dates.py --apply` in the container once the provider is reachable.
+
+**3.4 completed later the same day.** The 403 was Justin's VPN — Groq denies VPN egress. With it off, `api.groq.com` returned 200 and the re-extraction ran: **11 rows replaced, 3 kept, 0 failed.**
+
+The keep-if-empty guard earned itself: `19f7c8412410fadd` (the Kings Vet bulk history, 11 invoices) returns nothing on the text path, so a delete-and-refill would have destroyed the richest row in the cache. Two rows changed invoice COUNT on re-extraction (9→10, 9→8) — the model does not partition a multi-invoice email identically every time. No claim's status or flag moved (snapshot before and after identical), because matched claims are never re-matched; the risk lives with the 3 `pending_match` claims on future ticks.
+
+**A second self-inflicted failure, worth recording because of how it presented.** The first attempt after the VPN came off failed 13 of 14 with `LLMUnavailableError: database is locked`, which reads exactly like a provider outage. It was not: the script held one write transaction open across every LLM call, so `gemini.py`'s own `llm_calls` logging insert could not acquire the write lock. Restructured into read → call → write, with that reasoning at the top of the script. Any container-side script that calls the LLM while holding a write transaction will hit this.
+
+**What the data actually says about line-item dates — the honest answer.** Only **3** line items across all 14 emails carry their own date, and **all three equal their invoice's header date**:
+
+| email | invoice date | item date | item |
+|---|---|---|---|
+| 19fa2a26 | 2026-06-19 | 2026-06-19 | Prescription fee |
+| 19fa2a24 | 2026-06-30 | 2026-06-30 | CLINDAMYCIN 150MG CAPSULES |
+| 19fa2a24 | 2026-06-30 | 2026-06-30 | ENROFLOXACIN 150MG TABLETS |
+
+So the premise behind this task — an invoice's header date differing from the date of a treatment on it — is sound in principle and **has no instance in the mail on file**. The capability is now in place and populated where documents state it; it has not yet changed a single resolution. Recorded rather than presented as a win.
