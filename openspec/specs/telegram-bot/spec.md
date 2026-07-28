@@ -226,3 +226,24 @@ The claim id SHALL be recoverable from a replied-to bot message — from its tex
 #### Scenario: Reply to a PDF alert
 - **WHEN** the replied-to message is a document whose caption names claim #N
 - **THEN** the claim id is taken from the caption, matching the existing caption-vs-text handling
+
+### Requirement: Rendered cards and notifications use the shared status vocabulary
+The claim-history renderer, the actions-summary renderer and the lifecycle notification text SHALL take their status wording from the shared display vocabulary (`claim-status-vocabulary`) rather than a copy maintained alongside the dashboard's. Card colour choices MAY remain renderer-local, but SHALL be keyed by status rather than by label text so a rewording cannot drop a colour.
+
+An `info_requested` notification SHALL say who was asked when the event records it, and SHALL NOT assert either party when it does not.
+
+#### Scenario: History card shows a blocked claim
+- **WHEN** the history card renders a `matched` claim blocked on an undefined insurer process
+- **THEN** the row reads as blocked, matching the dashboard word for word
+
+#### Scenario: No second label map
+- **WHEN** the card renderer needs a status's wording
+- **THEN** it reads the shared vocabulary, and no "mirrors the dashboard" duplicate map remains in the renderer
+
+#### Scenario: A new state costs one edit
+- **WHEN** a new claim state is introduced
+- **THEN** its wording is added to the shared vocabulary alone, and the cards and notifications pick it up with no renderer change
+
+#### Scenario: The vet was the one asked
+- **WHEN** an `info_requested` event records that Petcover asked the vet
+- **THEN** the message says the vet was asked rather than implying Justin must supply the document
