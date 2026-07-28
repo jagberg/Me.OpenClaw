@@ -18,6 +18,8 @@ Petcover's letter names the document in a fixed template phrase (confirmed live:
 ### Requirement: Unanswered vet-directed requests are identifiable
 A vet's reply to Petcover never reaches Justin's mailbox, so "unanswered" SHALL mean the claim still carries an unresolved information request owed by the vet — the same unresolved determination the dashboard's needs-action list uses. The system SHALL be able to list those claims with the clinic, the requested document, the age of the request, and the days remaining against the treatment-anchored one-year submission deadline. A request whose deadline has passed SHALL be excluded from that list.
 
+The deadline SHALL be anchored on the date the pet was **treated**, not on the bank charge: Petcover's own wording is *"within one year of your pet receiving treatment"*, and the two dates differ by an unbounded amount (confirmed live: treated 19 Jun and 30 Jun 2026, both charged 06/07/2026 — over-granting 17 and 6 days). The treatment date SHALL be the **earliest** date the attached invoice states, its own or any line item's, because an invoice billing several visits expires on its oldest one. With no invoice attached the system SHALL fall back to the transaction date and SHALL disclose that the anchor was assumed rather than presenting it as known.
+
 #### Scenario: A vet-owed request is outstanding
 - **WHEN** a claim's latest unresolved information request is owed by the vet
 - **THEN** it appears in the unanswered list with the clinic name and email, the requested document, days outstanding, and days remaining to the deadline

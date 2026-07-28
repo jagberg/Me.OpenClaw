@@ -114,3 +114,15 @@ The keep-if-empty guard earned itself: `19f7c8412410fadd` (the Kings Vet bulk hi
 | 19fa2a24 | 2026-06-30 | 2026-06-30 | ENROFLOXACIN 150MG TABLETS |
 
 So the premise behind this task — an invoice's header date differing from the date of a treatment on it — is sound in principle and **has no instance in the mail on file**. The capability is now in place and populated where documents state it; it has not yet changed a single resolution. Recorded rather than presented as a win.
+
+### Post-completion fix (2026-07-29): the deadline anchor
+
+This change was marked 33/33 and then found to have shipped the wrong deadline anchor. Recorded here rather than silently amended, because the tasks above assert live verification that was real but incomplete.
+
+Task 4.1 specified "days remaining to the treatment-anchored deadline" and the implementation computed it from `bank_transactions.date`, naming the local variable `treatment`. The live verification recorded above (`248d` for claim #8) was *correct by coincidence*: #8's invoice date and charge date are both 2026-04-02, so the two anchors agree there and the error was invisible.
+
+Justin found it by asking about a different pair of dates — the receipts forwarded 27 Jul, showing treatment 19 Jun (Aari) and 30 Jun (Echo) both charged 06/07/2026. Measured live: charge-anchoring over-granted **17 days** on claim #1 and **6 days** on claim #25.
+
+Fixed in `294d319` and deployed as `294d319+deploy`: `claim_status.treatment_date()` takes the earliest date the invoice states, falls back to the charge date, and discloses when the anchor was assumed. The delta spec now states the rule rather than only the word "treatment-anchored"; ADR-0020 carries a dated correction noting that five documents asserted treatment-anchoring for about a day before the code did it.
+
+**Lesson worth keeping:** a live check that passes because the two candidate values happen to be equal proves nothing about which one the code used. The claims that would have exposed it (#1, #25) were on file the whole time and were not in the verification set, because they are not `info_requested` — the nudge's own filter hid the only rows where the bug was observable.

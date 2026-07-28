@@ -159,3 +159,14 @@ Not resolved here: **why** Groq is blocking this egress. That is a network/accou
 The extraction prompts now request a per-line-item date, and the 14 cached extractions must be re-run to populate it (approved token spend). The attempt on 2026-07-28 failed all 14 on the Groq 403 above. **No data changed and no tokens were consumed** — the script replaces a row only when the fresh extraction is non-empty, precisely so a vision-sourced row is never overwritten with nothing, and a backup was taken first (`/data/openclaw.db.bak-pre-item-dates-20260728`).
 
 Re-run `reextract_item_dates.py --apply` inside the container once the provider is reachable. Until then, line-item date matching is implemented and unit-tested but **cannot fire on real data**: `find_visit_by_date` matches invoice header dates only, which is exactly the case Justin raised (a consult on the 18th billed on an invoice dated the 30th).
+
+### Which date anchors a claim — the deadline says treatment, the excess math still says the charge
+*Open since 2026-07-29. Capabilities: `settlement-validation`, `dashboard-visit-ledger`. Follows the ADR-0020 correction of the same date.*
+
+`claim_status.treatment_date` now anchors the submission deadline on the date the pet was treated, because Petcover's letter says *"within one year of your pet receiving treatment"* and the charge is a different date by an unbounded amount (live: treated 19 Jun / 30 Jun 2026, both charged 06/07/2026 — 17 and 6 days of slack that anchoring on the charge silently granted).
+
+`claim_status._policy_year_key` still derives the excess and annual-cap policy year from the **transaction** date. Same question, applied to money instead of a deadline. Whether that is right is **not recorded anywhere and is not inferable from the code** — the excess design (ADR-0011/0013) predates this distinction being noticed, so treating the charge date as the anchor there may have been deliberate or may simply never have been asked.
+
+Left alone on purpose: changing it moves expected-reimbursement figures and settlement-mismatch flags, and it compounds the *already recorded, still undecided* disagreement about closed policy years in `openspec/specs/dashboard-visit-ledger/spec.md` ("Known inconsistency — closed policy years"). Two open questions about the same anchor should be decided together, by Justin, not resolved one at a time by whoever is editing.
+
+Concrete case to reason about when it is decided: Aari's policy anniversary is 09-23, so a treatment on 19 Jun charged 06/07 sits in the same policy year either way. A treatment in mid-September charged in early October would not.
