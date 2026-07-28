@@ -8,8 +8,44 @@
 ## 1. Repair the live data the extraction bug already corrupted
 
 - [x] 1.1 Confirm against `app/data/openclaw.db` (read-only) that claim #2 still holds `petcover_reference = 'DC1'` and that event 28 (`Petcover claim for Ari - DC1-26-5992 sr.1`) is still attached to claim #2 rather than claim #8
-- [ ] 1.2 Clear claim #2's `petcover_reference` and re-point event 28's `claim_id` to claim #8. **Run it inside the container (`docker exec`), not from the host** — ADR-0018 forbids host-side read-write access to the live DB, and this session broke that rule four times without noticing (see BACKLOG). Prefer `claim_status.detach_reference(2)` over raw SQL for the reference half, since it logs the undo; the event re-point has no code path (`link_event` only attaches *unlinked* events) and needs one statement
-- [ ] 1.3 Re-check claim #2's status: it was set `suspended` by the misrouted letter, so decide from the real letter whether it belongs there or reverts, and record which
+- [x] 1.2 Clear claim #2's `petcover_reference` and re-point event 28's `claim_id` to claim #8. **Run it inside the container (`docker exec`), not from the host** — ADR-0018 forbids host-side read-write access to the live DB, and this session broke that rule four times without noticing (see BACKLOG). Prefer `claim_status.detach_reference(2)` over raw SQL for the reference half, since it logs the undo; the event re-point has no code path (`link_event` only attaches *unlinked* events) and needs one statement
+- [x] 1.3 Re-check claim #2's status: it was set `suspended` by the misrouted letter, so decide from the real letter whether it belongs there or reverts, and record which
+
+### Audit of the existing event log (run read-only 2026-07-28, before any repair)
+
+Every one of the 20 stored `claim_status_events` with a source email was re-fetched from Gmail and re-run through the **fixed** `classify` / `extract_reference` / `extract_sr` / `resolve_owed_by`. **Six disagree with what is stored** — so the repair is wider than claim #2 alone, and the whole set is listed here rather than rediscovered later. Nothing was written.
+
+| Event | Claim | Stored | Re-classified | Reference | Owed by |
+|---|---|---|---|---|---|
+| 27 | 8 | `suspended` | `info_requested` | `DC1-26-5992` Sr 1 | **Justin** (policyholder copy) |
+| 28 | **2** | `suspended` | `info_requested` | stored `DC1` → `DC1-26-5992` Sr 1 | vet, `info@kingsvet.com.au` |
+| 10 | — | `unclassified` | `info_requested` | `DC1-27-5628` Sr 2 | vet, `info@kingsvet.com.au` |
+| 31 | — | `unclassified` | `info_requested` | `DC1-27-5628` Sr 8 | vet, `admin@theshirevet…` |
+| 11 | 19 | `unclassified` | `below_excess` | `DC1-27-5628` Sr 3 | — |
+| 12 | 22 | `unclassified` | `below_excess` | `DC1-26-5978` Sr 1 | — |
+
+Both copies of the DC1-26-5992 letter are present (27 to Justin, 28 to the vet), and they landed on **different claims**; the vet copy is the operative one and the document is owed by Kings Vet.
+
+Three further discrepancies are routing, not classification, and are **not** decided here — they are exactly the un-held-serial collision task 0.4 exists for:
+
+- Event 7 → claim 18 (`Sr 4`), but its own text yields `Sr 2`.
+- Event 8 → claim 19 (`Sr 3`), text yields `Sr 2`.
+- Event 29 → claim 19 (`Sr 3`), text yields `Sr 8`. If 29 is misrouted, claim 19's latest real event is the `below_excess` of event 11 rather than an acknowledgement — which changes its status.
+- Event 30 (`acknowledged`, `DC1-26-5993` Sr 1) is attached to no claim at all.
+
+- [x] 1.4 Repair the six mis-typed events **by rewriting `event_type` in place, not by re-reading mail** — the re-read path is group 0 and is unsafe (it regressed four claims live). Rewriting a stored event's type is the append-only log's one legitimate correction: the event happened, we recorded what it was wrongly. Record the before/after for each of the six.
+- [x] 1.5 Recompute the affected claims' status from their own corrected event log, one claim at a time with the reasoning recorded: #2 (only event was the misrouted 28 → reverts to its pre-letter status), #8 (`acknowledged` then `info_requested` → `info_requested`, vet owes consult notes dated 18/05/2026), #22 (only event 12 → `below_excess`), #19 (**decide 0.4 first** — its status depends on whether event 29 belongs to it).
+**Repair executed 2026-07-28** (`docker exec`, backup `/data/openclaw.db.bak-pre-audit-repair-20260728`, dry-run diff reviewed first, preconditions asserted against the audited state before any write):
+
+- events 10, 31 → `info_requested`; 11, 12 → `below_excess`; 27 → `info_requested`; 28 → `info_requested` **and re-pointed from claim #2 to claim #8**. Each corrected event's `detail` now carries `corrected_from`, `corrected_at`, `corrected_by`, and `owed_by` where the audit resolved it.
+- claim #2: `suspended` → `sent`, junk reference `DC1` cleared, logged as a `reference_detached` event (event 34) the way `detach_reference` would — the running image predates that helper.
+- claim #8: `suspended` → `info_requested`. Kings Vet owes consult notes dated 18/05/2026.
+- claim #22: `sent` → `below_excess`.
+- Verified after: **zero** `suspended` events and zero `suspended` claims remain; 4 `info_requested`, 3 `below_excess`. Claim #19 untouched.
+
+- [ ] 1.6 Link events 10, 31 and 30 to their claims, or leave them unlinked deliberately and say so. Two are live vet-owed information requests that have produced no action since 19 and 27 July; 30's thread `DC1-26-5993` is held by no claim on file.
+- [x] 1.7 Back up `app/data/openclaw.db` before the repair and snapshot every claim's `(status, flag, petcover_reference, petcover_sr)` before and after; diff them and confirm nothing moved that was not in 1.4–1.6. The last live write on this change regressed four claims silently.
+- [x] 1.8 Run the repair **inside the container** (`docker exec`), never from the host — ADR-0018.
 
 ## 2. Extraction fixes (standalone value — deployable on their own)
 
@@ -42,7 +78,7 @@
 - [ ] 5.2 Add action kind `chase_vet` to `ACTION_PRIORITY` (first) and `_ACTION_META`; move `confirm_resolved` to second; keep `_action_kind` returning exactly one kind per claim
 - [ ] 5.3 Sort info-request actions by `days_to_deadline` ascending ahead of the existing date sort, leaving every other kind's ordering untouched
 - [ ] 5.4 Exclude actions whose deadline has passed from `pending_actions` (they belong to the register's expired list)
-- [ ] 5.5 Add the label and colour for `chase_vet` in `claim_card.py` and `telegram_bot.py`, matching the existing warn styling
+- [ ] 5.5 Add `chase_vet`'s **wording** to `status_labels.LABELS` (one map, every surface — `clarify-claim-status-vocabulary` landed it) and only its **colour** to `claim_card._STATUS_COLOURS`, which is now keyed by status rather than by label text. Do not add a label in `claim_card.py` or `telegram_bot.py`: that is the duplication the vocabulary change deleted
 - [ ] 5.6 `pipeline.nudge_stale_actions`: include info requests regardless of `ACTION_NUDGE_DAYS` and name the one closest to its deadline
 - [ ] 5.7 Tests: priority ordering with a mixed action set; two info requests ordered by deadline not charge age; an info request younger than `ACTION_NUDGE_DAYS` still nudged; a past-deadline request yields no action
 
@@ -83,6 +119,8 @@
 **Verified against the real mailbox** (7 real emails, 2026-07-27, read-only): classification of both Further-Information templates as `info_requested`; the genuine suspension letter still `suspended`; reference and Sr extraction on all four previously-broken emails; no regression on approval / acknowledgement / settlement; policy number yields no reference; auto-reply from `requiredinfo.au@` still `ignore`. Re-confirmed unchanged after the shape-first reordering.
 
 **Verified against the real DB** (write, then rolled back): the re-read path. Outcome was a **failure** — 23 emails replayed, 11 events appended, and four claims regressed (#6, #7 `settled`→`acknowledged`, #18 `below_excess`→`acknowledged`, #22 `sent`→`below_excess`). Restored from `openclaw.db.bak-pre-inforequest`; live DB confirmed back at 20 events with every claim at its original status. Also refuted the prediction that detaching claim #2 would make it the Sr 8 target — it became the Sr 2 target and Sr 8 landed on claim #19.
+
+**Audited read-only against the real mailbox and DB (2026-07-28)**: all 20 stored events re-classified with the fixed code — 6 disagree with what is stored, 3 more show a routing discrepancy, 1 acknowledgement is attached to no claim. Full table under group 1. No writes.
 
 **Unit-tested only, not yet exercised live**: `detach_reference`, the event-idempotency guard, and the addressee resolver (`resolve_owed_by` — its `vet_contacts` matching is tested against seeded rows, not against a real polled header).
 
