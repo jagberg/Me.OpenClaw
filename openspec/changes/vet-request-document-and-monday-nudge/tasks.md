@@ -2,18 +2,20 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 
 ## 1. Extract the requested document
 
-- [ ] 1.1 Add `claim_status.extract_requested_document(text)`: capture what follows `we need a copy of` / `we require a copy of` / `please provide the following`, stopping at the letter's trailing boilerplate (`Please note`, `You can reach us`, `In line with`), whitespace-collapsed. Return `None` when nothing matches — regex only, no LLM.
-- [ ] 1.2 Record it on the `info_requested` event's `detail` in `process_reply`, next to `owed_by`; omit the key when `None`. No DDL.
-- [ ] 1.3 Test with the real letter text (`we need a copy of\nConsultation notes dated 18/05/2026\nPlease note we cannot process…`): the document is exactly `Consultation notes dated 18/05/2026`, boilerplate excluded.
-- [ ] 1.4 Test a letter with no such phrase records no document, and that the claim's status/flag handling is unchanged.
+- [x] 1.1 Add `claim_status.extract_requested_document(text)`: capture what follows `we need a copy of` / `we require a copy of` / `please provide the following`, stopping at the letter's trailing boilerplate (`Please note`, `You can reach us`, `In line with`), whitespace-collapsed. Return `None` when nothing matches — regex only, no LLM.
+- [x] 1.2 Record it on the `info_requested` event's `detail` in `process_reply`, next to `owed_by`; omit the key when `None`. No DDL.
+
+  **Note (2026-07-28): this was already half-built.** `vet-info-request-chase` group 4 had shipped an inline `requested_document` regex in `process_reply` — so this change refined rather than introduced it. What was wrong with the inline version: it took `splitlines()[0]` (right for the one live letter, drops the second item when a letter asks for two) and had no boilerplate terminator. The scope note's claim that task 6.3 was "absorbed" was therefore only partly true; the extraction existed, the date parsing and the multi-item capture did not.
+- [x] 1.3 Test with the real letter text (`we need a copy of\nConsultation notes dated 18/05/2026\nPlease note we cannot process…`): the document is exactly `Consultation notes dated 18/05/2026`, boilerplate excluded.
+- [x] 1.4 Test a letter with no such phrase records no document, and that the claim's status/flag handling is unchanged.
 
 ## 2. The label names it
 
-- [ ] 2.1 Add `_short_document()` to `status_labels`: consultation notes → "consult notes", itemized invoice → "itemised invoice", completed claim form → "claim form", referral history → "referral history"; unrecognized → `None`.
-- [ ] 2.2 Extend `label()`: vet + document → `Vet: consult notes needed`; Justin + document → `Consult notes needed from you`; no document (or unrecognized kind) → today's wording unchanged; `owed_by` unrecorded → `Info requested` regardless of document.
-- [ ] 2.3 Carry `requested_document` alongside `owed_by` into the ledger rows (`visit_ledger` already reads every event, so no extra query) so the chip and `/basic` can use it.
-- [ ] 2.4 Show the **full** phrase where there is room: the claim detail and the action card.
-- [ ] 2.5 Test every combination of document × `owed_by`, including an unrecognized document kind falling back.
+- [x] 2.1 Add `_short_document()` to `status_labels`: consultation notes → "consult notes", itemized invoice → "itemised invoice", completed claim form → "claim form", referral history → "referral history"; unrecognized → `None`.
+- [x] 2.2 Extend `label()`: vet + document → `Vet: consult notes needed`; Justin + document → `Consult notes needed from you`; no document (or unrecognized kind) → today's wording unchanged; `owed_by` unrecorded → `Info requested` regardless of document.
+- [x] 2.3 Carry `requested_document` alongside `owed_by` into the ledger rows (`visit_ledger` already reads every event, so no extra query) so the chip and `/basic` can use it.
+- [x] 2.4 Show the **full** phrase where there is room: the claim detail and the action card.
+- [x] 2.5 Test every combination of document × `owed_by`, including an unrecognized document kind falling back.
 
 ## 3. Resolve the requested date to a visit
 
@@ -50,3 +52,15 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 - [ ] 6.3 `README.md`: the lifecycle branch now names the document, and a Monday nudge covers unanswered vet requests.
 - [ ] 6.4 `app/openclaw/CLAUDE.md`: `requested_document` joins `owed_by` in the event detail; the label's short-name map; two nudge jobs exist with different cadences and scopes — don't merge them.
 - [ ] 6.5 Record in `vet-info-request-chase` that both design Open Questions were answered yes on 2026-07-28 (done at proposal time, not deferred to BACKLOG): an exact `(reference, Sr)` hit may attach to a settled claim as history, and the assignment card gets a "No claim on file" button. Nothing about them goes to BACKLOG — whether an exact `(reference, Sr)` hit may attach to a settled claim as history, and whether the assignment card needs a "none of these" button for letters about claims that predate the bank CSV coverage.
+
+### Verification record (groups 1-2, 2026-07-28)
+
+**Verified against the real mailbox** (read-only): both live copies of the 2026-07-27 letter — Gmail `19fa2a00a6beb635` (to Justin) and `19fa2a5603b99676` (to Kings Vet) — yield `requested_document = "Consultation notes dated 18/05/2026"` and `requested_document_date = "2026-05-18"`.
+
+**A defect in this change's own first cut, found by that check and fixed:** an ask with nothing after it (`we need a copy of
+
+Please note we cannot process`) returned `"Please note"` as the requested document, because the ask pattern's trailing `\s*` consumed the blank line so the boilerplate lookahead could never fire at position 0. Now also checked per line (`_BOILERPLATE_LINE`). It would have shown Petcover's own boilerplate to Justin as the document they wanted.
+
+**Unit-tested only, not yet seen live**: the `justin`-owed label wording (no live letter has been addressed to him since the vocabulary shipped), the two-item capture, and `short_document`'s itemised-invoice / claim-form / referral-history kinds — only consultation notes has appeared in real mail.
+
+**Not built yet**: groups 3-6 (date-to-visit resolution, line-item dates and the cache invalidation, the Monday nudge, deploy, docs).

@@ -255,6 +255,96 @@ def resolve_owed_by(recipients: str | None) -> dict:
     return {"owed_by": "vet", "clinic": None, "clinic_email": external[0]}
 
 
+# What Petcover asked for, and the treatment date it names. Both come out of the
+# letter's own template phrasing, so this is a regex, not an LLM call.
+#
+# The capture has to stop somewhere: the requested item sits on its own line(s)
+# between the ask and the standard boilerplate, so the boilerplate openers are
+# the terminator. Real letter (2026-07-27):
+#
+#   ... To assess your claim, we need a copy of
+#   Consultation notes dated 18/05/2026
+#   Please note we cannot process the claim without the information requested.
+_BOILERPLATE = r"please note|you can reach us|in line with|kind regards|thank you"
+_DOCUMENT_ASK = re.compile(
+    r"(?:we (?:need|require) a copy of|please provide the following)\s*[:\-]?\s*(.+?)"
+    rf"(?=\s*(?:{_BOILERPLATE})|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+# The lookahead cannot fire when the ask's own trailing `\s*` has already eaten
+# the blank line the boilerplate sits behind: an ask with nothing after it then
+# captured "Please note we cannot process…" and would have shown that to Justin
+# as the requested document. Checked per line as well, which is where it is
+# unambiguous.
+_BOILERPLATE_LINE = re.compile(rf"^(?:{_BOILERPLATE})", re.IGNORECASE)
+_DOCUMENT_DATE = re.compile(r"\bdated\s+(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})\b", re.IGNORECASE)
+_DOCUMENT_DATE_WORDS = re.compile(r"\bdated\s+(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\b", re.IGNORECASE)
+_MONTHS = {
+    m: i
+    for i, name in enumerate(
+        ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"],
+        start=1,
+    )
+    for m in (name, name[:3])
+}
+
+
+def extract_requested_document(text: str) -> str | None:
+    """The document Petcover asked for, verbatim from its own letter.
+
+    "More vet info required" cannot be acted on; "consult notes dated 18/05/2026"
+    can — a clinic asked for a named document on a named date answers in one
+    look. Returns None when no recognized phrase is present: a null costs nothing
+    (the label falls back to who-owes-it wording), while a wrong document sends
+    Justin chasing paperwork nobody asked for.
+
+    An earlier cut took `splitlines()[0]`, which is right for the one live letter
+    (the item sits on the line after the ask) and drops the second item when a
+    letter asks for two. This keeps every line up to the boilerplate, but stops
+    at the first blank line and caps the length — an unbounded capture on a letter
+    whose boilerplate we don't recognize would otherwise swallow the footer."""
+    match = _DOCUMENT_ASK.search(_normalize(text or ""))
+    if not match:
+        return None
+    block = []
+    for line in match.group(1).splitlines():
+        line = line.strip()
+        if not line:
+            if block:
+                break  # blank line after the item(s) — the request is over
+            continue
+        if _BOILERPLATE_LINE.match(line):
+            break
+        block.append(line)
+    return "; ".join(block)[:200] or None
+
+
+def requested_document_date(document: str | None) -> str | None:
+    """The treatment date named inside a requested document, as ISO.
+
+    The date is the useful half: it identifies the visit, which is what makes the
+    request resolvable to an invoice we already hold. Day-first — these are
+    Australian letters (`18/05/2026` is 18 May)."""
+    if not document:
+        return None
+    match = _DOCUMENT_DATE.search(document)
+    if match:
+        day, month, year = (int(g) for g in match.groups())
+    else:
+        match = _DOCUMENT_DATE_WORDS.search(document)
+        if not match:
+            return None
+        day, month_name, year = match.group(1), match.group(2).lower(), match.group(3)
+        month = _MONTHS.get(month_name)
+        if month is None:
+            return None
+        day, year = int(day), int(year)
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None  # 31/02 and friends — a malformed date is not a date
+
+
 def _mentions_pet(text: str, pet_name: str) -> bool:
     candidates = [pet_name] + PET_NICKNAMES.get(pet_name, [])
     return any(re.search(rf"\b{re.escape(c)}\b", text, re.IGNORECASE) for c in candidates)
@@ -462,17 +552,15 @@ def process_reply(
         # or supply it himself. Nothing recorded this before — process_reply never
         # saw a header.
         detail.update(resolve_owed_by(recipients))
-        requested = re.search(
-            r"(?:we need a copy of|please provide the following(?: information)?(?: in order)?(?: for us)?"
-            r"(?: to review the claim)?)\s*[:\-]?\s*(.+)",
-            _normalize(body),
-            re.IGNORECASE,
-        )
-        if requested:
-            # First line only — the letter continues into boilerplate. Left absent
-            # rather than guessed when the phrase isn't there (the vet cover note's
-            # detail lives in an attachment we get no text for).
-            detail["requested_document"] = requested.group(1).strip().splitlines()[0][:200]
+        # WHAT was asked for, and the treatment date it names. Left absent rather
+        # than guessed when the phrase isn't there (the vet cover note's detail
+        # lives in an attachment we get no text for).
+        document = extract_requested_document(body)
+        if document:
+            detail["requested_document"] = document
+            requested_date = requested_document_date(document)
+            if requested_date:
+                detail["requested_document_date"] = requested_date
     if event_type == "settled":
         detail.update(extract_settlement_amounts(body))
     elif event_type == "approved":
@@ -838,6 +926,7 @@ def visit_ledger() -> list:
     last_event: dict[int, dict] = {}
     settled_paid: dict[int, float] = {}
     owed_by: dict[int, str] = {}
+    requested_document: dict[int, str] = {}
     for e in events:
         if e["event_type"] == "unclassified":
             continue
@@ -849,9 +938,13 @@ def visit_ledger() -> list:
         # Who owes the requested document — the label says so, and the events
         # are already in hand, so no second query for it.
         if e["event_type"] == "info_requested":
-            owed = json.loads(e["detail"] or "{}").get("owed_by")
-            if owed:
-                owed_by[e["claim_id"]] = owed
+            info = json.loads(e["detail"] or "{}")
+            if info.get("owed_by"):
+                owed_by[e["claim_id"]] = info["owed_by"]
+            # WHAT was asked for, so the chip can name it rather than saying
+            # "more vet info" at a clinic that needs a document name to look up.
+            if info.get("requested_document"):
+                requested_document[e["claim_id"]] = info["requested_document"]
 
     claims_by_txn: dict[int, list] = {}
     for c in claim_rows:
@@ -878,6 +971,7 @@ def visit_ledger() -> list:
                 "last_event": last_event.get(c["id"]),
                 "settled_paid": settled_paid.get(c["id"]),
                 "owed_by": owed_by.get(c["id"]),
+                "requested_document": requested_document.get(c["id"]),
             }
         )
 
@@ -1082,7 +1176,13 @@ def pending_actions() -> list[dict]:
                     "status": claim["status"],
                     "condition_text": claim["condition_text"],
                     "flag": claim["flag"],
-                    "detail": claim["flag"] or "",
+                    # The card has room for the full phrase the chip has to
+                    # shorten — "Consultation notes dated 18/05/2026" is what a
+                    # clinic can actually look up.
+                    "owed_by": claim["owed_by"],
+                    "requested_document": claim["requested_document"],
+                    # Flag first — it is a failure, and failures stay visible.
+                    "detail": claim["flag"] or claim["requested_document"] or "",
                     "age_days": (today - date.fromisoformat(txn["date"][:10])).days,
                     # blocked_insurer needs a decision from Justin, not a tap —
                     # there is no UI that can clear it.
@@ -1230,8 +1330,13 @@ def claim_detail(claim_id: int) -> dict | None:
     invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
     # Only the figures — the raw detail also holds subjects and bodies, which
     # would blow the chat turn's token budget for no answering power.
+    # Plus who owes a requested document and what it is: the chip only has room
+    # for "consult notes", and the date in the full phrase is what identifies the
+    # visit a clinic has to look up.
     figure_keys = ("claimed_amount", "paid_amount", "fixed_excess_stated",
-                   "age_contribution_stated", "subject")
+                   "age_contribution_stated", "subject",
+                   "owed_by", "clinic", "clinic_email",
+                   "requested_document", "requested_document_date")
     return {
         "claim_id": claim["id"],
         "status": claim["status"],

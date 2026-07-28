@@ -46,6 +46,36 @@ _INFO_REQUEST_LABELS = {
     "justin": "Petcover needs info from you",
 }
 
+# Petcover names the document it wants, so the label says so: "more vet info
+# required" cannot be acted on, "consult notes needed" can. The stored phrase
+# carries a date ("Consultation notes dated 18/05/2026") that a table chip and a
+# card row have no room for, so the chip gets a short name and the full phrase
+# stays where there is room (the nudge, the action card, the claim detail).
+_DOCUMENT_KINDS = (
+    ("consult", "consult notes"),
+    ("consultation", "consult notes"),
+    ("itemised invoice", "itemised invoice"),
+    ("itemized invoice", "itemised invoice"),
+    ("claim form", "claim form"),
+    ("referral", "referral history"),
+    ("history", "referral history"),
+)
+
+
+def short_document(document: str | None) -> str | None:
+    """A chip-sized name for a recognized document kind, else None.
+
+    None is not a failure: the label falls back to the who-owes-it wording, which
+    is what it said before this existed. Inventing a short name for an unknown
+    kind would be worse than the generic phrase."""
+    if not document:
+        return None
+    lowered = document.lower()
+    for needle, short in _DOCUMENT_KINDS:
+        if needle in lowered:
+            return short
+    return None
+
 
 def label(claim, owed_by: str | None = None) -> str:
     """Display wording for one claim row (`sqlite3.Row` or the ledger's dict).
@@ -58,7 +88,16 @@ def label(claim, owed_by: str | None = None) -> str:
         return _MATCHED_LABELS.get(_action_kind_from_row(claim), LABELS["matched"])
     if status == "info_requested":
         owed = owed_by or _get(claim, "owed_by")
-        return _INFO_REQUEST_LABELS.get(owed, LABELS["info_requested"])
+        if owed not in _INFO_REQUEST_LABELS:
+            # No recorded owner: neutral, whatever document is named. Naming the
+            # document without saying who owes it invites the wrong chase.
+            return LABELS["info_requested"]
+        doc = short_document(_get(claim, "requested_document"))
+        if not doc:
+            return _INFO_REQUEST_LABELS[owed]
+        if owed == "vet":
+            return f"Vet: {doc} needed"
+        return f"{doc[0].upper()}{doc[1:]} needed from you"
     return LABELS.get(status, status)
 
 
@@ -86,7 +125,12 @@ def needs(claim, owed_by: str | None = None) -> str:
     status = claim["status"]
     if status == "info_requested":
         owed = owed_by or _get(claim, "owed_by")
-        return _INFO_REQUEST_NEEDS.get(owed, "Petcover needs info")
+        doc = short_document(_get(claim, "requested_document"))
+        if owed == "vet":
+            return f"Chase vet for {doc}" if doc else _INFO_REQUEST_NEEDS["vet"]
+        if owed == "justin":
+            return f"Send Petcover the {doc}" if doc else _INFO_REQUEST_NEEDS["justin"]
+        return "Petcover needs info"
     return _WAITING.get(status) or label(claim, owed_by)
 
 

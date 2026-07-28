@@ -2432,6 +2432,39 @@ def test_an_information_request_is_worded_by_who_owes_the_document():
     assert status_labels.label({**vet, "status": "suspended"}) == "Suspended"
 
 
+def test_the_label_names_the_document_petcover_asked_for():
+    """"More vet info required" cannot be acted on; "consult notes needed" can.
+    The document says WHAT, `owed_by` says WHO, and both matter — a request naming
+    the document but not the party invites the wrong chase, so an unrecorded owner
+    stays neutral whatever was asked for."""
+    base = {"id": 1, "status": "info_requested", "flag": None, "pet_id": 1, "condition_text": "Raised ALT"}
+    vet_doc = {**base, "owed_by": "vet", "requested_document": "Consultation notes dated 18/05/2026"}
+    mine_doc = {**base, "owed_by": "justin", "requested_document": "Consultation notes dated 18/05/2026"}
+
+    assert status_labels.label(vet_doc) == "Vet: consult notes needed"
+    assert status_labels.label(mine_doc) == "Consult notes needed from you"
+    # No document, or a kind we don't recognise: exactly the wording it had before.
+    assert status_labels.label({**base, "owed_by": "vet", "requested_document": None}) == "More vet info required"
+    assert status_labels.label({**base, "owed_by": "vet", "requested_document": "a signed affidavit"}) == "More vet info required"
+    assert status_labels.label({**base, "owed_by": "justin", "requested_document": None}) == "Petcover needs info from you"
+    # Owner unrecorded stays neutral even with a document named.
+    assert status_labels.label({**base, "owed_by": None, "requested_document": "Consultation notes"}) == "Info requested"
+    # The chase line names the document too, and it is an action not a state.
+    assert status_labels.needs(vet_doc) == "Chase vet for consult notes"
+    assert status_labels.needs(mine_doc) == "Send Petcover the consult notes"
+    # A request is never worded as a suspension.
+    assert all("suspend" not in status_labels.label(c).lower() for c in (vet_doc, mine_doc))
+
+
+def test_short_document_recognises_the_kinds_seen_live():
+    assert status_labels.short_document("Consultation notes dated 18/05/2026") == "consult notes"
+    assert status_labels.short_document("Itemized invoice for the visit") == "itemised invoice"
+    assert status_labels.short_document("Completed claim form") == "claim form"
+    assert status_labels.short_document("Referral history from the treating vet") == "referral history"
+    assert status_labels.short_document("something nobody has sent before") is None
+    assert status_labels.short_document(None) is None
+
+
 def test_one_status_vocabulary_no_second_map():
     """The wording lived in three hand-synced copies (claim_card, index.html,
     basic.html) plus pipeline's notify text, linked only by a comment asking the
@@ -3643,6 +3676,34 @@ def test_info_request_event_records_the_vet_and_the_document():
     assert event["event_type"] == "info_requested"
     assert detail["owed_by"] == "vet" and detail["clinic"] == "Kings Vet KINGSGROVE NSW"
     assert "Consultation notes dated 18/05/2026" in detail["requested_document"]
+    # The date is the half that identifies the visit, so it is stored parsed.
+    assert detail["requested_document_date"] == "2026-05-18"
+
+
+def test_requested_document_stops_at_the_letters_boilerplate():
+    """The item sits between the ask and the standard footer. An ask with nothing
+    after it must yield nothing — an earlier cut of this captured "Please note we
+    cannot process the claim…" and would have shown that to Justin as the document
+    Petcover wanted."""
+    assert claim_status.extract_requested_document(_INFO_REQUEST_LETTER) == "Consultation notes dated 18/05/2026"
+    assert claim_status.extract_requested_document("we need a copy of\n\nPlease note we cannot process") is None
+    assert claim_status.extract_requested_document("a letter with no recognized ask at all") is None
+    # Two items asked for at once: the earlier first-line-only cut dropped the second.
+    assert claim_status.extract_requested_document(
+        "we need a copy of\nConsultation notes dated 18/05/2026\nItemised invoice\n\nPlease note"
+    ) == "Consultation notes dated 18/05/2026; Itemised invoice"
+
+
+def test_requested_document_date_is_day_first_and_refuses_nonsense():
+    """Australian letters: 18/05/2026 is 18 May. A malformed date is not a date —
+    returning None keeps the label on the document alone rather than resolving the
+    request to a visit that never happened."""
+    assert claim_status.requested_document_date("Consultation notes dated 18/05/2026") == "2026-05-18"
+    assert claim_status.requested_document_date("Consult notes dated 18 May 2026") == "2026-05-18"
+    assert claim_status.requested_document_date("Consult notes dated 3-6-2026") == "2026-06-03"
+    assert claim_status.requested_document_date("Consult notes dated 31/02/2026") is None
+    assert claim_status.requested_document_date("Itemised invoice") is None
+    assert claim_status.requested_document_date(None) is None
 
 
 def test_rereading_the_same_email_records_nothing_new():
