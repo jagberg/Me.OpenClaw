@@ -40,10 +40,10 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 ## 5. Coordinate, deploy, verify
 
 - [ ] 5.1 In `vet-info-request-chase/tasks.md`: mark 6.3 absorbed here, and 5.6 superseded by the Monday job (its daily-nudge folding is no longer the plan).
-- [ ] 5.2 Deploy from the `deploy` worktree with `./scripts/deploy.ps1` and confirm `/health`.
-- [ ] 5.3 Verify live, read-only from the host (ADR-0018): claim #8's chip reads `Vet: consult notes needed`, and `nudge_unanswered_vet_requests` invoked by hand produces exactly one line — #8, Aari, Kings Vet `info@kingsvet.com.au`, `Consultation notes dated 18/05/2026`, with days outstanding and days left. Record what it actually printed.
-- [ ] 5.4 Confirm the Monday job is registered on the live scheduler (job id `vet-request-nudge`, next run a Monday) rather than assuming the cron string is right.
-- [ ] 5.5 Optional, ask first: backfill `requested_document` on events 10 and 31 from their own stored emails. Container-side, backup first, dry-run diff reviewed — never from the host, never unattended.
+- [x] 5.2 Deploy from the `deploy` worktree with `./scripts/deploy.ps1` and confirm `/health`.
+- [x] 5.3 Verify live, read-only from the host (ADR-0018): claim #8's chip reads `Vet: consult notes needed`, and `nudge_unanswered_vet_requests` invoked by hand produces exactly one line — #8, Aari, Kings Vet `info@kingsvet.com.au`, `Consultation notes dated 18/05/2026`, with days outstanding and days left. Record what it actually printed.
+- [x] 5.4 Confirm the Monday job is registered on the live scheduler (job id `vet-request-nudge`, next run a Monday) rather than assuming the cron string is right.
+- [x] 5.5 Optional, ask first: backfill `requested_document` on events 10 and 31 from their own stored emails. Container-side, backup first, dry-run diff reviewed — never from the host, never unattended.
 
 ## 6. Docs
 
@@ -68,3 +68,23 @@ Please note we cannot process`) returned `"Please note"` as the requested docume
 **Trap found while verifying, now in root `CLAUDE.md` and BACKLOG:** a host-side `db.get_connection()` resolves `DATABASE_PATH=/data/openclaw.db` (the container path, from `app/.env`) to `C:\data\openclaw.db` — a real file holding 2 stale claims. The first run of this resolver returned `[]` for a date the live DB certainly holds. Quiet wrong answers, not a loud failure.
 
 **Not built yet**: task 3.4 (clear the 14 cached extractions so line-item dates are actually populated — approved token spend, not yet run), group 4 (the Monday nudge), 5 (deploy + live verify), 6 (docs). Line-item date matching is implemented and unit-tested but **no stored invoice carries an item date yet**, so it cannot fire on real data until 3.4 runs.
+
+### Live verification, groups 4-5 (2026-07-28, `4e99b4d+deploy`)
+
+The Monday nudge, run by hand inside the container against real data:
+
+```
+1 vet info request(s) unanswered:
+ * #8 Aari - Kings Vet KINGSGROVE NSW (info@kingsvet.com.au)
+   needs: Consultation notes dated 18/05/2026
+   visit: 2026-05-18 - invoice 1000229 (claim #6)
+   asked 1d ago, 248d until the 1-year claim deadline
+```
+
+Dashboard chip for #8 now reads **`Vet: consult notes needed`**. Cron job `nudge_unanswered_vet_requests` confirmed registered from the app's own startup log, not from an assumption about the cron string.
+
+**Task 5.5 (document backfill) was run**, container-side, backup `/data/openclaw.db.bak-pre-document-backfill-20260728`, dry-run reviewed first: events 27 and 28 gained `Consultation notes dated 18/05/2026` + `2026-05-18`; event 31 gained `Consult notes dated` (its body prints no date); event 10 was left null, because its body ends mid-sentence and the detail is in an attachment we get no text for.
+
+**A regression this change introduced was caught by that dry run**, before it wrote to the live DB: the refactored ask pattern had dropped the original's consumption of the letter's filler, so two vet cover notes yielded `information in order for us to review the` and `for us to review the claim Consult notes dated` as the document to chase. Fixed in `719009f`, with the two real phrasings quoted at the pattern and a minimum-length guard for a stray `the`. The lesson is the project's existing one: the dry run against real mail is what found it, not the unit tests, which were passing throughout.
+
+**Still not done:** task 3.4 (clear the 14 cached extractions so line-item dates populate — approved, deliberately not run at the tail of a long session because the next tick re-extracts and could alter matching for the 3 `pending_match` claims) and group 6 (docs: amend ADR-0020/0021, README, module CLAUDE.md, BACKLOG). Line-item date matching remains implemented and unit-tested but **cannot fire on real data** until 3.4 runs.
