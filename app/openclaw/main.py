@@ -7,7 +7,19 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-from . import claim_forms, claim_status, config, db, gmail_ingest, message_log, netbank_csv, pipeline, tasks, telegram_bot
+from . import (
+    claim_forms,
+    claim_status,
+    config,
+    db,
+    gmail_ingest,
+    message_log,
+    netbank_csv,
+    pipeline,
+    status_labels,
+    tasks,
+    telegram_bot,
+)
 from .scheduler import scheduler
 
 # Without this the root level is WARNING and every logger.info in the app is
@@ -24,6 +36,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+# One vocabulary for both templates, the Telegram cards and the notify text —
+# the three per-template label maps this replaces had to be kept in sync by hand.
+templates.env.globals["status_label"] = status_labels.label
+templates.env.globals["status_needs"] = status_labels.needs
 
 
 @asynccontextmanager

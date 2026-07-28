@@ -10,7 +10,7 @@ import socket
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
-from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, llm, message_log, telegram_bot, vet_detection
+from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, llm, message_log, status_labels, telegram_bot, vet_detection
 from .scheduler import scheduler
 
 logger = logging.getLogger(__name__)
@@ -112,6 +112,17 @@ NOTIFY_STATUSES = (
     "matched", "drafted", "info_requested", "suspended", "acknowledged",
     "approved", "below_excess", "settled", "declined",
 )
+
+
+def _owed_by(claim_id: int) -> str | None:
+    """Who owes the document on this claim's most recent information request."""
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT detail FROM claim_status_events WHERE claim_id = ? AND event_type = 'info_requested' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (claim_id,),
+        ).fetchone()
+    return json.loads(row["detail"] or "{}").get("owed_by") if row else None
 
 
 def _latest_settlement_detail(claim_id: int) -> dict:
@@ -243,7 +254,9 @@ def _summarize_group(group) -> str | None:
     if status == "drafted":
         return _summarize_drafted(group)
     if status == "info_requested":
-        return f"⚠ {label}: Petcover requested more information — reply needed."
+        # Who owes the document changes what Justin does — chase the clinic, or
+        # answer it himself. Same wording as the dashboard chip.
+        return f"⚠ {label}: {status_labels.needs(group[0], _owed_by(group[0]['id']))}."
     if status == "suspended":
         return f"⚠ {label}: suspended by Petcover — action needed."
     if status == "acknowledged":

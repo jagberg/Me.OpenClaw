@@ -14,6 +14,8 @@ from datetime import datetime
 
 from PIL import Image, ImageDraw, ImageFont
 
+from . import status_labels
+
 S = 2  # supersample factor — draw at 2x, downscale on save
 W = 560
 ROWS_PER_PAGE = 12
@@ -46,37 +48,22 @@ DIM = (140, 149, 165)
 FAINT = (98, 106, 122)
 OK = (86, 208, 122)
 
-# (dot/text colour, chip background) per status label — the labels themselves
-# come from _STATUS_LABELS so the card, the web chips and /help all agree.
+# (dot/text colour, chip background) per **status** — keyed by the stored value,
+# not by the wording, so rewording a label in status_labels can never silently
+# drop a colour back to the default. The words live there; only colour is here.
 _STATUS_COLOURS = {
-    "No invoice": ((255, 176, 66), (58, 42, 20)),
-    "Matched": ((94, 214, 195), (20, 48, 46)),
-    "Drafted": ((139, 156, 212), (27, 33, 51)),
-    "Sent": ((122, 168, 255), (26, 38, 62)),
-    "Acknowledged": ((177, 148, 255), (40, 34, 64)),
-    "Info requested": ((228, 168, 78), (46, 36, 20)),
-    "Suspended": ((232, 138, 96), (48, 30, 22)),
-    "Approved": ((110, 214, 168), (18, 46, 38)),
-    "Settled": (OK, (22, 48, 32)),
-    "Declined": ((224, 108, 96), (48, 23, 21)),
-    "Below excess": ((150, 158, 175), (44, 48, 58)),
-    "Absorbed": ((120, 128, 145), (38, 42, 52)),
-}
-
-# Mirrors templates/index.html's status_chip macro.
-_STATUS_LABELS = {
-    "pending_match": "No invoice",
-    "matched": "Matched",
-    "drafted": "Drafted",
-    "sent": "Sent",
-    "acknowledged": "Acknowledged",
-    "info_requested": "Info requested",
-    "suspended": "Suspended",
-    "approved": "Approved",
-    "settled": "Settled",
-    "declined": "Declined",
-    "below_excess": "Below excess",
-    "absorbed": "Absorbed",
+    "pending_match": ((255, 176, 66), (58, 42, 20)),
+    "matched": ((94, 214, 195), (20, 48, 46)),
+    "drafted": ((139, 156, 212), (27, 33, 51)),
+    "sent": ((122, 168, 255), (26, 38, 62)),
+    "acknowledged": ((177, 148, 255), (40, 34, 64)),
+    "info_requested": ((228, 168, 78), (46, 36, 20)),
+    "suspended": ((232, 138, 96), (48, 30, 22)),
+    "approved": ((110, 214, 168), (18, 46, 38)),
+    "settled": (OK, (22, 48, 32)),
+    "declined": ((224, 108, 96), (48, 23, 21)),
+    "below_excess": ((150, 158, 175), (44, 48, 58)),
+    "absorbed": ((120, 128, 145), (38, 42, 52)),
 }
 
 PAD = 22
@@ -105,7 +92,7 @@ def _text(d: ImageDraw.ImageDraw, xy, s: str, font, fill, anchor: str = "la", sp
 
 
 def _status_label(status: str) -> str:
-    return _STATUS_LABELS.get(status, status.replace("_", " ").capitalize())
+    return status_labels.LABELS.get(status, status.replace("_", " ").capitalize())
 
 
 def _money(value: float) -> str:
@@ -226,8 +213,10 @@ def render(
         text((x1, y + 1), _money(month_total), f_month, FAINT, anchor="ra")
         y += MONTH_H
         for row in group:
-            label = _status_label(row["status"])
-            fg, chip_bg = _STATUS_COLOURS.get(label, (DIM, LINE))
+            # The row was worded where the flag/pet/condition were in hand
+            # (claim_status.history_rows); status alone is the fallback.
+            label = row.get("label") or _status_label(row["status"])
+            fg, chip_bg = _STATUS_COLOURS.get(row["status"], (DIM, LINE))
             d.ellipse([x0 * S, (y + 6) * S, (x0 + 7) * S, (y + 13) * S], fill=fg)
             text((x0 + 17, y + 1), datetime.strptime(row["date"], "%Y-%m-%d").strftime("%d %b"), f_date, DIM)
             text((x0 + 72, y), _vet_name(row["merchant"]), f_vet, TXT)

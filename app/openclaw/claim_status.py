@@ -837,6 +837,7 @@ def visit_ledger() -> list:
 
     last_event: dict[int, dict] = {}
     settled_paid: dict[int, float] = {}
+    owed_by: dict[int, str] = {}
     for e in events:
         if e["event_type"] == "unclassified":
             continue
@@ -845,6 +846,12 @@ def visit_ledger() -> list:
             paid = json.loads(e["detail"] or "{}").get("paid_amount")
             if paid is not None:
                 settled_paid[e["claim_id"]] = paid
+        # Who owes the requested document — the label says so, and the events
+        # are already in hand, so no second query for it.
+        if e["event_type"] == "info_requested":
+            owed = json.loads(e["detail"] or "{}").get("owed_by")
+            if owed:
+                owed_by[e["claim_id"]] = owed
 
     claims_by_txn: dict[int, list] = {}
     for c in claim_rows:
@@ -870,6 +877,7 @@ def visit_ledger() -> list:
                 "policy_anniversary": c["policy_anniversary"],
                 "last_event": last_event.get(c["id"]),
                 "settled_paid": settled_paid.get(c["id"]),
+                "owed_by": owed_by.get(c["id"]),
             }
         )
 
@@ -906,6 +914,10 @@ def history_rows(days: int = 365) -> list[dict]:
     visit stops being claimable once it's a year old, so the rows nearest the
     `days` cutoff are the ones about to expire — they belong at the top of
     page 1, not buried on the last page."""
+    # Local import: status_labels reads this module's action determination, so
+    # importing it at the top would close a cycle.
+    from . import status_labels
+
     cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
     rows = []
     for entry in reversed(visit_ledger()):
@@ -919,6 +931,10 @@ def history_rows(days: int = 365) -> list[dict]:
                     "merchant": txn["merchant"],
                     "amount": txn["amount"],
                     "status": claim["status"],
+                    # Worded here, where the flag/pet/condition/owed_by the
+                    # label derives from are all in hand — the renderer only has
+                    # this row.
+                    "label": status_labels.label(claim),
                     "pet_name": claim["pet_name"],
                     "condition_text": claim["condition_text"],
                     # paid = what Petcover actually paid (settled only, a hard
@@ -983,13 +999,27 @@ _INSURER_UNDEFINED = "claim process not yet defined"
 def _action_kind(claim: dict, open_split_claim_ids: set, unresolved_event_claim_ids: set) -> str | None:
     """The single action a claim needs, or None when it's waiting on someone
     else (sent/acknowledged/approved = Petcover's turn) or finished."""
-    flag = claim["flag"] or ""
     if claim["id"] in open_split_claim_ids:
         return "split_proposal"
+    # `unmatch` outranks `confirm_resolved` and lives in the row-only part below,
+    # so it is checked here too rather than silently losing to the set check.
+    if claim["id"] in unresolved_event_claim_ids and not (claim["flag"] or "").startswith(
+        "possible additional invoice"
+    ):
+        return "confirm_resolved"
+    return _action_kind_from_row(claim)
+
+
+def _action_kind_from_row(claim: dict) -> str | None:
+    """The part of the determination that reads only the claim's own row.
+
+    Split out so `status_labels` can ask "what does this claim need" from a
+    rendering path without the two DB queries `_action_kind`'s set arguments
+    require. One function, so a label can never disagree with an action.
+    """
+    flag = claim["flag"] or ""
     if flag.startswith("possible additional invoice"):
         return "unmatch"
-    if claim["id"] in unresolved_event_claim_ids:
-        return "confirm_resolved"
     if claim["status"] == "drafted":
         return "mark_sent"
     # flag, NOT invoice_request_sent_at + draft_id: draft_id is overloaded

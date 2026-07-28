@@ -67,8 +67,8 @@
 <div class="wrap">
   <header><h1>OpenClaw</h1><a href="/">Full view &rarr;</a></header>
 
-  {% set needs = {'pending_match':'Upload invoice &rarr;','matched':'Set condition &rarr;','drafted':'Send Gmail draft &rarr;','sent':'Awaiting Petcover','acknowledged':'Awaiting Petcover','approved':'Awaiting settlement','info_requested':'Petcover needs info &rarr;','suspended':'Claim suspended &rarr;'} %}
-  {% set sev = {'pending_match':'bad','info_requested':'bad','suspended':'bad','matched':'bad','drafted':'hold','sent':'hold','acknowledged':'hold','approved':'hold'} %}
+  {# "What's needed" comes from openclaw/status_labels.py; sev is colour only. #}
+  {% set sev ={'pending_match':'bad','info_requested':'bad','suspended':'bad','matched':'bad','drafted':'hold','sent':'hold','acknowledged':'hold','approved':'hold'} %}
 
   <h2>Outstanding <span class="count">{{ outstanding|length }}</span></h2>
   <div class="list">
@@ -82,7 +82,7 @@
       <div class="right">
         <span class="amt">${{ '%.2f'|format(row.txn.amount|abs) }}</span>
         {{ status_chip(row.claim) }}
-        <span class="need">{% if row.claim.pet_id is none %}Assign pet &rarr;{% else %}{{ needs.get(row.claim.status, '')|safe }}{% endif %}</span>
+        <span class="need">{{ status_needs(row.claim) }}</span>
       </div>
     </div>
     {% else %}

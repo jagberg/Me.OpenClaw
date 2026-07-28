@@ -240,7 +240,29 @@ def test_notification_fires_on_info_requested():
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     own_sent = [t for t in sent if "InfoPet" in t]
     assert len(own_sent) == 1, "info_requested must notify exactly once"
-    assert "information" in own_sent[0]
+    # Nobody recorded as owing the document — neutral, no claim about who acts.
+    assert "Petcover needs info" in own_sent[0]
+    assert "suspend" not in own_sent[0].lower(), "a request is not a suspension"
+
+
+def test_info_request_notification_says_the_vet_was_asked():
+    """Petcover asks the vet for consult notes as often as it asks Justin, and
+    he is only Cc'd on the vet's copy (live, 2026-07-27). A message that reads
+    like he owes the document is how the chase never happens."""
+    claim_id = _seed_matched_claim("CHASE VET", pet_name="ChasePet")
+    with db.get_connection() as conn:
+        conn.execute("UPDATE vet_claims SET status = 'info_requested' WHERE id = ?", (claim_id,))
+        conn.execute(
+            "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
+            "VALUES (?, 'info_requested', 'm-inforeq', ?, ?)",
+            (claim_id, '{"owed_by": "vet", "clinic_email": "info@kingsvet.com.au"}',
+             datetime.now(timezone.utc).isoformat()),
+        )
+    sent = []
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
+    own_sent = [t for t in sent if "ChasePet" in t]
+    assert len(own_sent) == 1
+    assert "Chase vet" in own_sent[0], own_sent[0]
 
 
 def test_settled_notification_includes_amounts():

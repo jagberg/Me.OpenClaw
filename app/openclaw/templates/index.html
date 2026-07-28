@@ -100,8 +100,8 @@
 
   {# ---- Jinja macros: status chip, expected cell, row action ---- #}
   {% macro status_chip(claim) %}
-    {% set labels = {'pending_match':'No invoice','matched':'Matched','drafted':'Drafted','sent':'Sent','acknowledged':'Acknowledged','info_requested':'Info requested','suspended':'Suspended','settled':'Settled','declined':'Declined','approved':'Approved','below_excess':'Below excess','absorbed':'Absorbed'} %}
-    <span class="chip {{ claim.status }}">{{ labels.get(claim.status, claim.status) }}</span>
+    {# Wording comes from openclaw/status_labels.py — one map for every surface. #}
+    <span class="chip {{ claim.status }}">{{ status_label(claim) }}</span>
   {% endmacro %}
 
   {% macro expected_cell(claim) %}

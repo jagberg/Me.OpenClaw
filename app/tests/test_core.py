@@ -21,7 +21,7 @@ os.environ["OPENAI_API_KEY"] = ""
 # Message-log rows are version-stamped; a known value lets the tests assert it.
 os.environ["APP_VERSION"] = "test-sha+test"
 
-from openclaw import claim_forms, claim_status, config, db, gemini, invoice_matching, llm, netbank_csv, reminders, tasks, vet_detection  # noqa: E402
+from openclaw import claim_forms, claim_status, config, db, gemini, invoice_matching, llm, netbank_csv, reminders, status_labels, tasks, vet_detection  # noqa: E402
 from openclaw.scheduler import scheduler  # noqa: E402
 
 
@@ -2344,7 +2344,7 @@ def test_claim_card_renders_png_for_every_status():
         {"date": f"2026-0{(i % 9) + 1}-1{i % 9}", "merchant": "The Shire Veterinary Hospital",
          "amount": -(50 + i), "status": status, "pet_name": "Aari", "condition_text": "Arthritis",
          "paid": None, "expected": {"available": True, "value": 10.0, "estimate": True}}
-        for i, status in enumerate(list(claim_card._STATUS_LABELS) + ["some_new_status"])
+        for i, status in enumerate(list(status_labels.LABELS) + ["some_new_status"])
     ]
     png = claim_card.render(rows, page=1, total_rows=len(rows))
     assert png.startswith(b"\x89PNG"), "must be a real PNG"
@@ -2390,6 +2390,60 @@ def test_pending_actions_one_per_claim_priority_and_blocked_split():
     assert all(a["status"] != "sent" for a in actions)
     # oldest first — the near-expiry end is the urgent end
     assert [a["date"] for a in actions] == sorted(a["date"] for a in actions)
+
+
+def test_a_matched_claim_is_labelled_with_what_it_is_waiting_for():
+    """Seven live claims sat at "Matched" for weeks; every one was Echo's,
+    permanently blocked on an undefined insurer process, and they read exactly
+    like a claim that needed one condition typed in. The label derives from the
+    same determination the action list makes — never a second copy of it."""
+    blocked = {"id": 1, "status": "matched", "flag": "Bow Wow Insurance claim process not yet defined",
+               "pet_id": 2, "condition_text": None}
+    no_condition = {"id": 2, "status": "matched", "flag": None, "pet_id": 1, "condition_text": None}
+    no_pet = {"id": 3, "status": "matched", "flag": None, "pet_id": None, "condition_text": None}
+    ready = {"id": 4, "status": "matched", "flag": None, "pet_id": 1, "condition_text": "Arthritis"}
+
+    assert status_labels.label(blocked) == "Blocked: no claim process"
+    assert status_labels.label(no_condition) == "Needs condition"
+    assert status_labels.label(no_pet) == "Needs pet"
+    assert status_labels.label(ready) == "Matched", "nothing outstanding — the bare word is correct"
+    # and the derivation is the action list's, not a parallel one
+    assert claim_status._action_kind(blocked, set(), set()) == "blocked_insurer"
+    assert claim_status._action_kind(no_condition, set(), set()) == "set_condition"
+
+
+def test_an_information_request_is_worded_by_who_owes_the_document():
+    """Petcover sends the same Further-Information letter twice — one to Justin,
+    one to the vet with Justin only Cc'd (both live, 2026-07-27). Telling him the
+    vet owes it when he does is the mistake that loses a claim, so an unrecorded
+    addressee stays neutral instead of guessing."""
+    vet = {"id": 1, "status": "info_requested", "flag": None, "pet_id": 1,
+           "condition_text": "Raised ALT", "owed_by": "vet"}
+    mine = {**vet, "owed_by": "justin"}
+    unknown = {**vet, "owed_by": None}
+
+    assert status_labels.label(vet) == "More vet info required"
+    assert status_labels.label(mine) == "Petcover needs info from you"
+    assert status_labels.label(unknown) == "Info requested", "no claim about who must act"
+    # the word "suspended" belongs to an actual suspension and nothing else
+    assert "suspend" not in " ".join(
+        status_labels.label(c).lower() for c in (vet, mine, unknown)
+    )
+    assert status_labels.label({**vet, "status": "suspended"}) == "Suspended"
+
+
+def test_one_status_vocabulary_no_second_map():
+    """The wording lived in three hand-synced copies (claim_card, index.html,
+    basic.html) plus pipeline's notify text, linked only by a comment asking the
+    next reader to keep them in sync. A fourth map is a regression, not a
+    convention — and colours key off the status so a rewording can't drop one."""
+    from openclaw import claim_card
+
+    assert claim_card._status_label("below_excess") == status_labels.LABELS["below_excess"]
+    assert not hasattr(claim_card, "_STATUS_LABELS"), "the renderer's own copy is gone"
+    assert set(claim_card._STATUS_COLOURS) == set(status_labels.LABELS), (
+        "colours are keyed by status, one per known status"
+    )
 
 
 def test_submission_group_id_is_order_independent():
