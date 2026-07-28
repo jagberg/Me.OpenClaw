@@ -26,9 +26,11 @@ Scope note: classification (`info_requested` vs `suspended`), Unicode-hyphen ref
 ## 4. Coordinate and verify
 
 - [x] 4.1 Amend `vet-info-request-chase` task 5.5 to add `chase_vet`'s wording to `status_labels.LABELS` rather than to `claim_card.py` and `telegram_bot.py` separately — or, if its group 5 has already landed, absorb both of its labels into the map here and delete them from the renderers (design Decision 5).
-- [ ] 4.2 Deploy from the worktree with `./scripts/deploy.ps1` (stamps `APP_VERSION`) and confirm `/health`.
-- [ ] 4.3 Live check, read-only from the host (`sqlite3.connect("file:data/openclaw.db?mode=ro", uri=True)` — ADR-0018): the seven Echo claims (#3, #9, #10, #15, #16, #20, #25) read **Blocked: no claim process** on the dashboard, in `/basic`, and on a rendered history card. Record what each actually showed.
-- [ ] 4.4 Report to Justin — do not silently leave it — that claims #2 and #8 still read as suspensions after this ships: the classifier fix is code-only, those emails are already in the processed set, the live DB still holds zero `info_requested` events and claim #2 still holds the truncated reference `DC1` (confirmed read-only 2026-07-28). Correcting them is `vet-info-request-chase` groups 0–1, whose re-read path is blocked after regressing four claims live.
+- [x] 4.2 Deploy from the worktree with `./scripts/deploy.ps1` (stamps `APP_VERSION`) and confirm `/health`.
+- [x] 4.3 Live check, read-only from the host (`sqlite3.connect("file:data/openclaw.db?mode=ro", uri=True)` — ADR-0018): the seven Echo claims (#3, #9, #10, #15, #16, #20, #25) read **Blocked: no claim process** on the dashboard, in `/basic`, and on a rendered history card. Record what each actually showed.
+**Verified live 2026-07-28** on `bc67a4a+deploy` (`/health` polling_alive true). Dashboard chips: all seven Echo claims (#3, #9, #10, #15, #16, #20, #25) read **Blocked: no claim process**; claim #8 reads **More vet info required**; **zero** claims read Suspended anywhere. `/basic`: "Define claim process" x7, "Chase vet for the info" x1, "Awaiting Petcover" x5, "Upload invoice" x2, "Invoice request sent?" x1. A rendered history card in the container carries the same words (274kB PNG, labels incl. "Blocked: no claim process" and "More vet info required").
+
+- [x] 4.4 Report to Justin — do not silently leave it — that claims #2 and #8 still read as suspensions after this ships: the classifier fix is code-only, those emails are already in the processed set, the live DB still holds zero `info_requested` events and claim #2 still holds the truncated reference `DC1` (confirmed read-only 2026-07-28). Correcting them is `vet-info-request-chase` groups 0–1, whose re-read path is blocked after regressing four claims live.
 
 ## 5. Docs
 
