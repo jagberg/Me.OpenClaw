@@ -3680,6 +3680,29 @@ def test_info_request_event_records_the_vet_and_the_document():
     assert detail["requested_document_date"] == "2026-05-18"
 
 
+def test_the_deadline_is_anchored_on_treatment_not_on_the_bank_charge():
+    """Petcover's own words: "within one year of your pet receiving treatment".
+    The charge is a different date — The Shire Vet treated Aari on 19 Jun 2026 and
+    Echo on 30 Jun, and BOTH were paid on 06/07/2026 (receipts SHV49c1622284e5 /
+    SHVd5b232905fdb, forwarded 27 Jul). Anchoring on the charge silently grants
+    slack the policy does not give: 17 days for Aari's."""
+    import json as _json
+
+    aari_receipt = _json.dumps({"date": "2026-06-19", "amount": 35.0,
+                                "items": [{"description": "Prescription fee", "amount": 35.0,
+                                           "date": "2026-06-19"}]})
+    treated, known = claim_status.treatment_date(aari_receipt, "2026-07-06")
+    assert (treated, known) == ("2026-06-19", True), "the receipt states the treatment date"
+
+    # An invoice billing several visits expires on its OLDEST one.
+    multi = _json.dumps({"date": "2026-06-30", "items": [{"date": "2026-06-18"}, {"date": "2026-06-30"}]})
+    assert claim_status.treatment_date(multi, "2026-07-06")[0] == "2026-06-18"
+
+    # No invoice attached: fall back to the charge, and say it was assumed.
+    assert claim_status.treatment_date(None, "2026-07-06") == ("2026-07-06", False)
+    assert claim_status.treatment_date("{}", "2026-07-06") == ("2026-07-06", False)
+
+
 def test_a_date_petcover_names_resolves_to_the_visit_we_hold():
     """The letter asking for "notes dated 18/05/2026" sits on a claim from a
     DIFFERENT month — live, the request is on claim #8 (a 2 April charge) and the

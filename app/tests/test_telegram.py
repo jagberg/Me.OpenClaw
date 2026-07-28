@@ -257,6 +257,11 @@ def _seed_unanswered_vet_request(pet_name: str, *, owed_by="vet", document="Cons
         conn.execute("UPDATE vet_claims SET status = 'info_requested' WHERE id = ?", (claim_id,))
         conn.execute("UPDATE bank_transactions SET date = ? WHERE id = "
                      "(SELECT transaction_id FROM vet_claims WHERE id = ?)", (txn_date, claim_id))
+        # The invoice's own service date has to move with the charge: the deadline
+        # is anchored on TREATMENT, so a claim whose charge is old but whose
+        # invoice says last week is not past the deadline — and shouldn't look it.
+        conn.execute("UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
+                     (json.dumps({"date": txn_date, "amount": 100.0}), claim_id))
         conn.execute(
             "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
             "VALUES (?, 'info_requested', ?, ?, ?)",

@@ -617,6 +617,7 @@ def nudge_unanswered_vet_requests(send_fn=None) -> dict:
             f"   needs: {document}\n"
             f"   {_visit_line(invoice_matching, r['requested_document_date'])}\n"
             f"   asked {age}, {r['days_left']}d until the 1-year claim deadline"
+            f" (treated {r['treated_on']}{'' if r['treatment_date_known'] else ', assumed = charge date'})"
         )
     text = "\n".join(lines)
     (send_fn or telegram_bot.send_message_sync)(text)

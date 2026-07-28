@@ -1374,6 +1374,26 @@ def claim_detail(claim_id: int) -> dict | None:
     }
 
 
+def treatment_date(invoice_data: str | None, txn_date: str) -> tuple[str, bool]:
+    """When the pet was actually treated, and whether we know it or assumed it.
+
+    Petcover's deadline is anchored on treatment — *"your claim must be submitted
+    within one year of your pet receiving treatment"* — and the bank charge is a
+    different date. Confirmed live: The Shire Vet treated Aari on **19 Jun 2026**
+    and Echo on **30 Jun**, and both were paid on **06/07/2026** (receipts
+    SHV49c1622284e5 / SHVd5b232905fdb, forwarded 27 Jul). Anchoring on the charge
+    silently grants up to weeks of slack the policy does not give.
+
+    The EARLIEST date on the invoice wins, because an invoice billing several
+    visits expires on its oldest one. Falls back to the transaction date when no
+    invoice is attached, and says so, rather than pretending to know.
+    """
+    invoice = json.loads(invoice_data or "{}") if invoice_data else {}
+    candidates = {invoice.get("date")} | {item.get("date") for item in (invoice.get("items") or [])}
+    known = sorted(d for d in candidates if d)
+    return (known[0], True) if known else (txn_date[:10], False)
+
+
 def unanswered_vet_requests() -> list[dict]:
     """Information requests the vet owes and nobody has answered.
 
@@ -1395,7 +1415,7 @@ def unanswered_vet_requests() -> list[dict]:
     out = []
     with db.get_connection() as conn:
         rows = conn.execute(
-            "SELECT vc.id, vc.status, bt.date AS txn_date, bt.merchant, p.name AS pet_name, "
+            "SELECT vc.id, vc.status, vc.invoice_data, bt.date AS txn_date, bt.merchant, p.name AS pet_name, "
             "(SELECT detail FROM claim_status_events e WHERE e.claim_id = vc.id "
             " AND e.event_type = 'info_requested' ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS info, "
             "(SELECT created_at FROM claim_status_events e WHERE e.claim_id = vc.id "
@@ -1409,8 +1429,8 @@ def unanswered_vet_requests() -> list[dict]:
         info = json.loads(row["info"] or "{}")
         if info.get("owed_by") != "vet":
             continue  # asked of Justin, or unrecorded — not a vet chase
-        treatment = date.fromisoformat(row["txn_date"][:10])
-        days_left = config.INFO_REQUEST_DEADLINE_DAYS - (today - treatment).days
+        treated_on, from_invoice = treatment_date(row["invoice_data"], row["txn_date"])
+        days_left = config.INFO_REQUEST_DEADLINE_DAYS - (today - date.fromisoformat(treated_on)).days
         if days_left < 0:
             continue  # past the submission deadline — the register's problem now
         out.append({
@@ -1425,6 +1445,8 @@ def unanswered_vet_requests() -> list[dict]:
             "requested_document_date": (
                 info.get("requested_document_date") or requested_document_date(info.get("requested_document"))
             ),
+            "treated_on": treated_on,
+            "treatment_date_known": from_invoice,
             "asked_at": row["asked_at"],
             "days_outstanding": (today - date.fromisoformat(row["asked_at"][:10])).days if row["asked_at"] else None,
             "days_left": days_left,
