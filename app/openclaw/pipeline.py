@@ -568,6 +568,27 @@ def nudge_stale_actions() -> dict:
     return {"sent": True, "stale": len(stale)}
 
 
+def _visit_line(invoice_matching, requested_date: str | None) -> str:
+    """Which visit the requested date names, for the chase message.
+
+    An invoice number is what a clinic can look up; a date makes them search. The
+    visit is usually on a DIFFERENT claim from the one the letter is about (live:
+    the request sits on claim #8, a 2 April charge, and the date is claim #6's
+    invoice 1000229 — a later visit for the same condition). Says so explicitly,
+    because the invoice identifies the visit and is NOT the document requested."""
+    if not requested_date:
+        return "visit: no date stated in the letter"
+    hits = invoice_matching.find_visit_by_date(requested_date)
+    if not hits:
+        return f"visit: {requested_date} — no invoice on file for that date"
+    parts = []
+    for h in hits:
+        who = f"claim #{h['claim_id']}" if h["claim_id"] else "no claim on file"
+        number = f"invoice {h['invoice_number']}" if h["invoice_number"] else "invoice number unknown"
+        parts.append(f"{number} ({who})")
+    return f"visit: {requested_date} — " + ", ".join(parts)
+
+
 def nudge_unanswered_vet_requests(send_fn=None) -> dict:
     """Monday morning: every information request the vet owes and nobody answered.
 
@@ -579,7 +600,7 @@ def nudge_unanswered_vet_requests(send_fn=None) -> dict:
 
     Silent when there is nothing outstanding: a weekly "nothing to do" is how a
     channel becomes one Justin stops reading."""
-    from . import claim_status, telegram_bot
+    from . import claim_status, invoice_matching, telegram_bot
 
     outstanding = claim_status.unanswered_vet_requests()
     if not outstanding:
@@ -594,6 +615,7 @@ def nudge_unanswered_vet_requests(send_fn=None) -> dict:
         lines.append(
             f" • #{r['claim_id']} {r['pet_name'] or 'no pet'} — {clinic}{contact}\n"
             f"   needs: {document}\n"
+            f"   {_visit_line(invoice_matching, r['requested_document_date'])}\n"
             f"   asked {age}, {r['days_left']}d until the 1-year claim deadline"
         )
     text = "\n".join(lines)

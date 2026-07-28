@@ -288,6 +288,34 @@ def test_monday_nudge_lists_every_unanswered_vet_request():
     assert "Itemised invoice" in body
     assert "info@kingspet.example" in body, "the address he has to write to"
     assert "deadline" in body.lower()
+    # The date the letter names has no invoice on file in this fixture, and saying
+    # so beats silence — a clinic given only a date has to go searching.
+    assert "18/05/2026" in body or "2026-05-18" in body
+
+
+def test_monday_nudge_names_the_invoice_the_requested_date_belongs_to():
+    """The visit is usually on a DIFFERENT claim from the one the letter is about
+    (live: request on claim #8, a 2 April charge; the date is claim #6's invoice
+    1000229). An invoice number is what a clinic can look up."""
+    asked = _seed_unanswered_vet_request("Xraypet")
+    with db.get_connection() as conn:
+        pet = conn.execute("SELECT id FROM pets WHERE name = 'Xraypet'").fetchone()["id"]
+        txn = conn.execute(
+            "INSERT INTO bank_transactions (date, amount, merchant, vet_flag, created_at) "
+            "VALUES ('2026-05-18', -351.5, 'Xraypet VET', 1, ?)",
+            (datetime.now(timezone.utc).isoformat(),),
+        ).lastrowid
+        holds = conn.execute(
+            "INSERT INTO vet_claims (transaction_id, pet_id, status, invoice_data, created_at, updated_at) "
+            "VALUES (?, ?, 'settled', ?, ?, ?)",
+            (txn, pet, json.dumps({"date": "2026-05-18", "invoice_number": "1000229", "amount": 351.5}),
+             datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
+        ).lastrowid
+    sent = []
+    pipeline.nudge_unanswered_vet_requests(send_fn=lambda text, markup=None: sent.append(text))
+    assert "invoice 1000229" in sent[-1], sent[-1]
+    assert f"claim #{holds}" in sent[-1], "names the claim that holds the visit"
+    assert f"#{asked}" in sent[-1], "and still names the claim the request is about"
 
 
 def test_monday_nudge_is_silent_and_selective():

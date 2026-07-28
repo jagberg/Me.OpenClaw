@@ -1420,7 +1420,11 @@ def unanswered_vet_requests() -> list[dict]:
             "clinic": info.get("clinic") or row["merchant"],
             "clinic_email": info.get("clinic_email"),
             "requested_document": info.get("requested_document"),
-            "requested_document_date": info.get("requested_document_date"),
+            # Derived when the event predates the date parsing, so an older
+            # request still resolves to its visit without a backfill.
+            "requested_document_date": (
+                info.get("requested_document_date") or requested_document_date(info.get("requested_document"))
+            ),
             "asked_at": row["asked_at"],
             "days_outstanding": (today - date.fromisoformat(row["asked_at"][:10])).days if row["asked_at"] else None,
             "days_left": days_left,
