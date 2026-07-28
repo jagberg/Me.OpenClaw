@@ -19,12 +19,12 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 
 ## 3. Resolve the requested date to a visit
 
-- [ ] 3.1 Parse the date out of the requested document (`dated 18/05/2026`, `dated 18 May 2026`) into an ISO date; record it on the event beside the phrase. No date stated → null, no guess.
-- [ ] 3.2 Add `invoice_matching.find_visit_by_date(iso_date)`: match claims' `invoice_data` first (invoice date **or** any line-item date), then `email_extractions`. Return every match (claim id where one exists, merchant, invoice number, amount) — never a nearest-date fallback.
-- [ ] 3.3 Add an optional per-item `date` to the extraction schema (null when the document doesn't state one) and to `find_visit_by_date`'s matching.
+- [x] 3.1 Parse the date out of the requested document (`dated 18/05/2026`, `dated 18 May 2026`) into an ISO date; record it on the event beside the phrase. No date stated → null, no guess.
+- [x] 3.2 Add `invoice_matching.find_visit_by_date(iso_date)`: match claims' `invoice_data` first (invoice date **or** any line-item date), then `email_extractions`. Return every match (claim id where one exists, merchant, invoice number, amount) — never a nearest-date fallback.
+- [x] 3.3 Add an optional per-item `date` to the extraction schema (null when the document doesn't state one) and to `find_visit_by_date`'s matching.
 - [ ] 3.4 Clear `email_extractions` as one deliberate step, stating the count re-extracted (14 rows as of 2026-07-28) — it spends tokens against the daily budget (ADR-0017), and a failed extraction isn't cached so a partial run resumes. Ask before running it live.
-- [ ] 3.5 Test with the real data: `18/05/2026` resolves to Kings Vet invoice `1000229`, $351.50, claim **#6** — while the request itself stays on claim **#8**. Assert the two are reported as different claims, since that is the whole point.
-- [ ] 3.6 Test: a date only in the extraction cache resolves with no claim id; an unmatched date reports "visit unknown"; two invoices sharing a date report both; a line-item date matches even when the invoice's header date differs.
+- [x] 3.5 Test with the real data: `18/05/2026` resolves to Kings Vet invoice `1000229`, $351.50, claim **#6** — while the request itself stays on claim **#8**. Assert the two are reported as different claims, since that is the whole point.
+- [x] 3.6 Test: a date only in the extraction cache resolves with no claim id; an unmatched date reports "visit unknown"; two invoices sharing a date report both; a line-item date matches even when the invoice's header date differs.
 - [ ] 3.7 Test the wording never presents the resolved invoice as the requested document.
 
 ## 4. The Monday nudge
@@ -63,4 +63,8 @@ Please note we cannot process`) returned `"Please note"` as the requested docume
 
 **Unit-tested only, not yet seen live**: the `justin`-owed label wording (no live letter has been addressed to him since the vocabulary shipped), the two-item capture, and `short_document`'s itemised-invoice / claim-form / referral-history kinds — only consultation notes has appeared in real mail.
 
-**Not built yet**: groups 3-6 (date-to-visit resolution, line-item dates and the cache invalidation, the Monday nudge, deploy, docs).
+**Group 3 verified 2026-07-28** against a read-only `.backup` copy of the live DB (see the finding below for why not directly): `find_visit_by_date("2026-05-18")` returns claim **#6**, Kings Vet, invoice **1000229**, $351.50 — the visit the letter names, on a different claim from the one the letter sits on (#8, 2 April). `2026-07-06` correctly falls through to the extraction cache with no claim id; `2026-05-19` and `None` return `[]` with no nearest-date guess.
+
+**Trap found while verifying, now in root `CLAUDE.md` and BACKLOG:** a host-side `db.get_connection()` resolves `DATABASE_PATH=/data/openclaw.db` (the container path, from `app/.env`) to `C:\data\openclaw.db` — a real file holding 2 stale claims. The first run of this resolver returned `[]` for a date the live DB certainly holds. Quiet wrong answers, not a loud failure.
+
+**Not built yet**: task 3.4 (clear the 14 cached extractions so line-item dates are actually populated — approved token spend, not yet run), group 4 (the Monday nudge), 5 (deploy + live verify), 6 (docs). Line-item date matching is implemented and unit-tested but **no stored invoice carries an item date yet**, so it cannot fire on real data until 3.4 runs.

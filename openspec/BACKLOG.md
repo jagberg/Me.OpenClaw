@@ -130,3 +130,14 @@ Two things to build, neither designed here:
 *Evidence for the entry above. Capability: `claims-pipeline-resilience`.*
 
 Every host-side DB read this session used `file:…?mode=ro`, and the live repair ran `docker exec` inside the container with a backup and a reviewed dry-run diff. So the convention was followed unaided the session after it was broken four times — which is worth recording, and is *not* evidence that convention is sufficient. The mechanical guard the previous entry asks for is still unbuilt, and the rule still says nothing about deliberate host-side *writes* (the gap that made "run it in the container" a judgement call rather than a rule).
+
+### The host resolves the app's DB path to a stale phantom DB
+*Found 2026-07-28. Capability: `claims-pipeline-resilience`. Sharpens the ADR-0018 entries above.*
+
+`app/.env` sets `DATABASE_PATH=/data/openclaw.db` for the container, and `config` loads `.env` from cwd, so **any host-side `db.get_connection()` opens `C:\data\openclaw.db`** — a file created 2026-07-22, last written 2026-07-25, containing 2 stale `vet_claims`, 2 stale `bank_transactions` and no `telegram_messages` table at all.
+
+This is worse than the failure ADR-0018 guards against. A read-write open of the *live* DB breaks loudly (the container loses the WAL sidecars). This breaks *quietly*: the query succeeds, returns rows, and the rows are wrong. It surfaced only because `find_visit_by_date` returned `[]` for `2026-05-18`, a date the live DB certainly holds — had the phantom contained a plausible row instead of none, the wrong answer would have been reported as fact.
+
+Two things worth deciding, neither designed here:
+- Should the phantom be deleted? It is not referenced by anything, but deleting it converts silent-wrong-answers into a loud "unable to open database file", which is the better failure. Left in place for now because nothing verified what else may have written to it.
+- The correction recorded earlier today — "ADR-0018's read-only rule held on 2026-07-28" — needs the caveat that a read-write open *was* attempted from the host that day. It hit the phantom rather than the live file, so no harm resulted, and that was path resolution rather than discipline.

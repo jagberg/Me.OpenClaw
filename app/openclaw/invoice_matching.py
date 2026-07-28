@@ -128,12 +128,15 @@ EXTRACTION_PROMPT = """Extract ALL invoices from this email as strict JSON:
 {{"invoices": [{{"date": "<the visit/service date this invoice bills for — NOT the email, statement, \
 issue or print date — ISO 8601, or null>", "amount": <this single invoice's total as number, or null>, \
 "services": "<comma-separated itemized services, or null>", \
-"items": [{{"description": "<line item>", "amount": <number>}}, ...]}}, ...]}}
+"items": [{{"description": "<line item>", "amount": <number>, "date": "<the date printed against \
+THIS line item — ISO 8601 — or null if the document prints no per-item date>"}}, ...]}}, ...]}}
 
 One email may contain several invoices (e.g. a reply covering many visits) — return one entry per \
 invoice with its own date and total. Never combine invoices: no grand totals, and two invoices on \
 the SAME date (e.g. two pets seen the same day) stay two separate entries. "items" lists each \
-charged line item with its own amount; use [] if the itemization is unreadable. Use \
+charged line item with its own amount; use [] if the itemization is unreadable. A line item's own \
+date is often absent — return null for it rather than repeating the invoice's date, since an \
+invoice can bill treatments given on several different days. Use \
 {{"invoices": []}} if no invoice is present.
 
 Email:
@@ -228,8 +231,11 @@ def _invoices_for_email(message_id: str, text: str) -> list | None:
 VISION_MAX_ATTEMPTS = 3
 VISION_PAGE_PROMPT = """This is one scanned page of a vet invoice PDF. Extract exactly this JSON:
 {"invoice_number": "...", "date": "YYYY-MM-DD", "patient": "...", "amount": <invoice total as number>, \
-"items": [{"description": "...", "amount": <number>}, ...]}
+"items": [{"description": "...", "amount": <number>, "date": "<the date printed against THIS line item, \
+ISO 8601, or null if none is printed>"}, ...]}
 The date must be the visit/service date this invoice bills for — NOT the email, statement, issue or print date.
+A line item's own date is often absent — use null rather than repeating the invoice's date, since one \
+invoice can bill treatments given on several different days.
 If the page is not an invoice (cover letter, statement, blank), return {"not_invoice": true}.
 JSON only, no prose."""
 
@@ -463,6 +469,73 @@ def _apply_match(claim, chosen: dict, pool: list[dict]) -> bool:
     logger.info("claim %s: charge covers two invoices — claim %s created for the second (%s)",
                 claim["id"], sibling_id, note)
     return True
+
+
+def _invoice_dates(invoice: dict) -> set[str]:
+    """Every date this invoice bills for: its own, plus any printed per line item.
+
+    An invoice's header date is not always the date of the treatment on it — a
+    statement can bill several visits, so a consult on the 18th can sit on an
+    invoice dated the 30th. Line-item dates were dropped by extraction until
+    2026-07-28 (41 stored items, none with a date), so most held invoices answer
+    on their header date alone; that is a gap in the data, not in this function.
+    """
+    dates = {invoice.get("date")} | {item.get("date") for item in (invoice.get("items") or [])}
+    return {d for d in dates if d}
+
+
+def find_visit_by_date(iso_date: str) -> list[dict]:
+    """Which visit a date names, for a date an insurer cites rather than one we
+    already hold a charge for.
+
+    Petcover asks for "Consultation notes dated 18/05/2026" while assessing a
+    claim from a different month (live: the request sits on claim #8, a 2 April
+    charge, and the date is claim #6's Kings Vet invoice 1000229 — a later visit
+    for the same condition). A clinic asked for "the notes from invoice 1000229"
+    answers in one look; asked for "further information", it does nothing.
+
+    Claims first (authoritative — we hold the invoice), then the extraction cache
+    (a visit no claim covers, real for the threads predating the bank-CSV
+    coverage). Returns EVERY match: two invoices can share a date (one charge,
+    two pets), and choosing between them is not ours to do. Returns [] rather
+    than a nearest-date guess — an adjacent visit is a different consultation,
+    and chasing the wrong one wastes the only chase Justin gets.
+    """
+    if not iso_date:
+        return []
+    found: list[dict] = []
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT vc.id, vc.invoice_data, bt.merchant, p.name AS pet_name "
+            "FROM vet_claims vc JOIN bank_transactions bt ON bt.id = vc.transaction_id "
+            "LEFT JOIN pets p ON p.id = vc.pet_id WHERE vc.invoice_data IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            invoice = json.loads(row["invoice_data"] or "{}")
+            if iso_date in _invoice_dates(invoice):
+                found.append({
+                    "claim_id": row["id"],
+                    "pet_name": row["pet_name"],
+                    "merchant": row["merchant"],
+                    "invoice_number": invoice.get("invoice_number"),
+                    "amount": invoice.get("amount"),
+                    "date": iso_date,
+                })
+        if found:
+            return found
+        for row in conn.execute("SELECT message_id, extracted_json FROM email_extractions").fetchall():
+            for invoice in json.loads(row["extracted_json"] or "[]"):
+                if isinstance(invoice, dict) and iso_date in _invoice_dates(invoice):
+                    found.append({
+                        "claim_id": None,
+                        "pet_name": invoice.get("patient"),
+                        "merchant": None,
+                        "invoice_number": invoice.get("invoice_number"),
+                        "amount": invoice.get("amount"),
+                        "date": iso_date,
+                        "email_id": row["message_id"],
+                    })
+    return found
 
 
 def _already_claimed(invoice: dict, claim_id: int) -> bool:

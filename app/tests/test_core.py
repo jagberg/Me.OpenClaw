@@ -3680,6 +3680,70 @@ def test_info_request_event_records_the_vet_and_the_document():
     assert detail["requested_document_date"] == "2026-05-18"
 
 
+def test_a_date_petcover_names_resolves_to_the_visit_we_hold():
+    """The letter asking for "notes dated 18/05/2026" sits on a claim from a
+    DIFFERENT month — live, the request is on claim #8 (a 2 April charge) and the
+    date is claim #6's Kings Vet invoice 1000229, a later visit for the same
+    condition. A clinic asked for "the notes from invoice 1000229" answers in one
+    look, so the resolution has to reach across claims."""
+    import json as _json
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        asked_on = _insert_claim(conn, aari, "2026-04-02", status="info_requested", merchant="Kings Vet",
+                                 invoice_data=_json.dumps({"date": "2026-04-02", "invoice_number": "199464",
+                                                           "amount": 446.5}))
+        holds_visit = _insert_claim(conn, aari, "2026-05-18", status="settled", merchant="Kings Vet",
+                                    invoice_data=_json.dumps({"date": "2026-05-18", "invoice_number": "1000229",
+                                                              "amount": 351.5}))
+
+    hits = invoice_matching.find_visit_by_date("2026-05-18")
+    assert [h["claim_id"] for h in hits] == [holds_visit], "the date names its own visit, not the asking claim"
+    assert hits[0]["invoice_number"] == "1000229" and hits[0]["amount"] == 351.5
+    assert holds_visit != asked_on, "the whole point: the request and the visit are different claims"
+    # Never a nearest-date guess — an adjacent visit is a different consultation.
+    assert invoice_matching.find_visit_by_date("2026-05-19") == []
+    assert invoice_matching.find_visit_by_date(None) == []
+
+
+def test_a_line_item_date_matches_even_when_the_invoice_header_differs():
+    """An invoice's header date is not always the date of the treatment on it: a
+    statement can bill several visits, so a consult on the 18th sits on an invoice
+    dated the 30th. Extraction dropped per-item dates until 2026-07-28, which is
+    why this case could not be matched at all."""
+    import json as _json
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        claim = _insert_claim(conn, aari, "2026-06-30", merchant="Kings Vet",
+                              invoice_data=_json.dumps({
+                                  "date": "2026-06-30", "invoice_number": "200500", "amount": 300.0,
+                                  "items": [{"description": "Consultation", "amount": 96.5, "date": "2026-06-18"},
+                                            {"description": "Bloods", "amount": 203.5, "date": None}]}))
+    assert [h["claim_id"] for h in invoice_matching.find_visit_by_date("2026-06-18")] == [claim]
+    assert [h["claim_id"] for h in invoice_matching.find_visit_by_date("2026-06-30")] == [claim], "header date still works"
+
+
+def test_two_visits_sharing_a_date_are_both_reported():
+    """One charge can pay two pets' invoices on the same day (ADR-0019). Choosing
+    between them is the clinic's job, not ours."""
+    import json as _json
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        # Distinct amounts: bank_transactions is unique on (date, amount, merchant),
+        # and the real shape is two claims on ONE charge anyway — what matters here
+        # is two invoices carrying the same service date.
+        a = _insert_claim(conn, aari, "2026-07-06", merchant="The Shire Vet", amount=-35.0,
+                          invoice_data=_json.dumps({"date": "2026-07-06", "invoice_number": "A1", "amount": 35.0}))
+        b = _insert_claim(conn, aari, "2026-07-06", merchant="The Shire Vet", amount=-369.33,
+                          invoice_data=_json.dumps({"date": "2026-07-06", "invoice_number": "B2", "amount": 369.33}))
+    assert sorted(h["claim_id"] for h in invoice_matching.find_visit_by_date("2026-07-06")) == sorted([a, b])
+
+
 def test_requested_document_stops_at_the_letters_boilerplate():
     """The item sits between the ask and the standard footer. An ask with nothing
     after it must yield nothing — an earlier cut of this captured "Please note we
