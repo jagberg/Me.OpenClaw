@@ -232,7 +232,7 @@
                 {% else %}
                   <td><span class="na">no claim</span></td><td class="na">&mdash;</td>
                   <td class="num ceil">${{ '%.2f'|format(txn.amount|abs) }}</td>
-                  <td class="num na">&mdash;</td><td class="num na">&mdash;</td><td><span class="chip pending_match">No invoice</span></td>
+                  <td class="num na">&mdash;</td><td class="num na">&mdash;</td><td><span class="chip pending_match">{{ status_words['pending_match'] }}</span></td>
                   <td class="ref">&mdash;</td><td class="na">&mdash;</td><td></td>
                 {% endif %}
               </tr>

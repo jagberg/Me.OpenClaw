@@ -2478,6 +2478,32 @@ def test_one_status_vocabulary_no_second_map():
         "colours are keyed by status, one per known status"
     )
 
+    # The templates were the other two of the three original copies, and this test
+    # did not cover them: `index.html` still wrote "No invoice" literally for the
+    # no-claim row, where there is no claim to hand to `status_label`. That row now
+    # reads `status_words['pending_match']`, and any new literal fails here.
+    import re as _re
+    from pathlib import Path as _Path
+
+    leaks = []
+    for path in sorted((_Path(__file__).resolve().parent.parent / "openclaw" / "templates").glob("*.html")):
+        text = path.read_text(encoding="utf-8")
+        for status, word in status_labels.LABELS.items():
+            for match in _re.finditer(r">\s*" + _re.escape(word) + r"\s*<", text):
+                leaks.append(f"{path.name}:{text[:match.start()].count(chr(10)) + 1} hardcodes {word!r} ({status})")
+    assert not leaks, "templates must render wording, not restate it: " + "; ".join(leaks)
+
+    # Jinja renders an unregistered global as the empty string rather than raising,
+    # so a missing `status_words` would blank the chip silently — the exact failure
+    # mode that makes a template leak preferable to a broken lookup. Both halves
+    # checked: the global is registered, and every key the templates ask for exists.
+    package = _Path(__file__).resolve().parent.parent / "openclaw"
+    main_source = (package / "main.py").read_text(encoding="utf-8")
+    assert 'templates.env.globals["status_words"] = status_labels.LABELS' in main_source
+    for path in sorted((package / "templates").glob("*.html")):
+        for key in _re.findall(r"status_words\[['\"]([a-z_]+)['\"]\]", path.read_text(encoding="utf-8")):
+            assert key in status_labels.LABELS, f"{path.name} asks for status_words[{key!r}], which has no wording"
+
 
 def test_submission_group_id_is_order_independent():
     """The token is derived from claim ids, so read order must not change it —
@@ -3909,6 +3935,43 @@ def test_the_two_event_classifications_are_complete_and_disjoint():
         assert target in claim_status.TRANSITIONS, f"{target} is unreachable — no row in the table"
     overlap = set(claim_status.STATE_EVENTS) & claim_status.STATELESS_EVENTS
     assert not overlap, f"declared in both: {overlap}"
+    # The backfill event is the third category and belongs to neither set: it seeds
+    # a per-claim state read from its own detail. Being in STATELESS_EVENTS is what
+    # design.md said and it would have made the backfill a no-op.
+    assert claim_status.BACKFILL_EVENT not in claim_status.STATELESS_EVENTS
+    assert claim_status.BACKFILL_EVENT not in claim_status.STATE_EVENTS
+
+
+def test_a_backfilled_claim_projects_to_the_state_its_backfill_names():
+    """The backfill's only job. Without this the nineteen live claims whose
+    transitions predate the log would keep projecting `pending_match`, and Phase 2
+    handing the projection authority would reset every one of them — the 2026-07-27
+    regression at five times the scale."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="settled")
+    assert claim_status.project_state(claim) == "pending_match", "no history to fold yet"
+
+    outcome = claim_status.apply_event(claim, claim_status.BACKFILL_EVENT,
+                                      {"backfilled": True, "status": "settled"})
+    assert outcome == {"applied": True, "state": "settled", "refused": None}
+    assert claim_status.project_state(claim) == "settled"
+    assert claim_status.state_projection_disagreements() == []
+
+    # A later real event still has to be legal from the seeded state — the seed is
+    # an exemption for itself, not a licence to reopen a terminal claim.
+    assert claim_status.apply_event(claim, "acknowledged", {})["applied"] is False
+    assert claim_status.project_state(claim) == "settled"
+
+
+def test_a_backfill_naming_an_unknown_status_is_refused_not_seeded():
+    _fresh_db()
+    with db.get_connection() as conn:
+        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="sent")
+    outcome = claim_status.apply_event(claim, claim_status.BACKFILL_EVENT, {"status": "half_settled"})
+    assert outcome["applied"] is False and "half_settled" in outcome["refused"]
+    assert _claim_row(claim)["status"] == "sent"
+    assert claim_status.project_state(claim) == "pending_match", "the bad seed is ignored by the fold"
 
 
 def test_apply_event_writes_a_legal_state_and_records_it():

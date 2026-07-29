@@ -40,6 +40,10 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 # the three per-template label maps this replaces had to be kept in sync by hand.
 templates.env.globals["status_label"] = status_labels.label
 templates.env.globals["status_needs"] = status_labels.needs
+# For the rows that have no claim to pass to `status_label` — a vet charge with no
+# claim row yet still has to say "No invoice", and saying it literally is how the
+# three hand-synced maps started (ADR-0021).
+templates.env.globals["status_words"] = status_labels.LABELS
 
 
 @asynccontextmanager

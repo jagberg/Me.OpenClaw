@@ -53,7 +53,21 @@ Event types split in two, and the split is data, not an `if`:
 | `absorbed` | `absorbed` | split/merge resolution |
 | `acknowledged` `info_requested` `suspended` `approved` `settled` `declined` `below_excess` | same name | `process_reply` |
 
-**Stateless events** — recorded, never move state: `unclassified` (a review-queue entry, per the existing rule), `confirmed_resolved`, `mismatch_dismissed`, `reference_detached`, `state_reverted`, `state_backfilled`.
+**Stateless events** — recorded, never move state: `unclassified` (a review-queue entry, per the existing rule), `confirmed_resolved`, `mismatch_dismissed`, `reference_detached`, `state_reverted`.
+
+**Correction, 2026-07-29 (during implementation).** This list originally included
+`state_backfilled`, which contradicts Decision 8's "append one `state_backfilled`
+event carrying the current status". Stateless wins in the fold, so the backfill
+would have written 19 events and moved nothing — every backfilled claim would still
+project `pending_match`, and Decision 7's Phase 2 handover would then have reset all
+19 to `pending_match`. The 2026-07-27 regression again, at five times the scale, and
+caused by the step meant to prevent it.
+
+`state_backfilled` is therefore a **third category**, in neither set:
+state-bearing, but with a per-claim target read from `detail["status"]` instead of a
+fixed one, and exempt from the transition table — it *asserts* a state the log has
+no path to, which is the entire reason it is written. It is the only exemption in the
+machine, and a backfill naming an undeclared status is refused rather than seeded.
 
 `unclassified` not writing status stops being a special case in one writer and becomes a property of the event type. That is the whole shape of this change in miniature.
 

@@ -150,8 +150,22 @@ STATELESS_EVENTS = frozenset({
     "mismatch_dismissed",
     "reference_detached",
     "state_reverted",
-    "state_backfilled",
 })
+
+# The third category, and it exists because `design.md` contradicts itself: Decision
+# 1 lists `state_backfilled` as stateless, Decision 8 has it carry the claim's
+# current status. Stateless wins in the fold, so the backfill would have changed
+# nothing — all nineteen claims would still project `pending_match`, and Phase 2
+# giving the projection authority would then have reset every one of them. That is
+# the 2026-07-27 regression again, nineteen claims instead of four.
+#
+# So it is state-bearing, but its target is per-claim (in `detail["status"]`) rather
+# than fixed like every `STATE_EVENTS` entry, and it is a SEED rather than a
+# transition: it asserts a state the log has no path to, which is the whole reason
+# it is being written. It is therefore exempt from `TRANSITIONS` by construction —
+# the one exemption in the machine, and the only place a state is asserted rather
+# than transitioned to.
+BACKFILL_EVENT = "state_backfilled"
 
 # Every legal move. Derived from what the seven existing writers actually do, so
 # its first version describes current behaviour rather than an aspiration — which
@@ -607,6 +621,22 @@ def apply_event(claim_id: int, event_type: str, detail: dict | None = None, emai
     current = row["status"]
     event_id = _record_event(claim_id, event_type, email_id, detail or {})
 
+    if event_type == BACKFILL_EVENT:
+        # Seeds the state it names, exempt from TRANSITIONS by construction. The
+        # column is normally already at this value — the event exists so the fold
+        # can reach it. A status nobody declared is refused, not seeded.
+        seeded = (detail or {}).get("status")
+        if seeded not in TRANSITIONS or seeded is None:
+            refusal = f"backfill event #{event_id} names unknown status {seeded!r}"
+            _flag_claim(claim_id, refusal)
+            return {"applied": False, "state": current, "refused": refusal}
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE vet_claims SET status = ?, updated_at = ? WHERE id = ?",
+                (seeded, datetime.now(timezone.utc).isoformat(), claim_id),
+            )
+        return {"applied": True, "state": seeded, "refused": None}
+
     target = STATE_EVENTS.get(event_type)
     if target is None:
         # Stateless, or an event type nobody declared. The second is a defect, and
@@ -671,6 +701,13 @@ def _fold(rows) -> str:
     reverted = _reverted_event_ids(rows)
     for row in rows:
         if row["id"] in reverted:
+            continue
+        if row["event_type"] == BACKFILL_EVENT:
+            # A seed, not a transition — see BACKFILL_EVENT. Ignored if it names a
+            # status nobody declared, rather than seeding the fold with nonsense.
+            seeded = json.loads(row["detail"] or "{}").get("status")
+            if seeded in TRANSITIONS and seeded is not None:
+                state = seeded
             continue
         target = STATE_EVENTS.get(row["event_type"])
         if target is None:
