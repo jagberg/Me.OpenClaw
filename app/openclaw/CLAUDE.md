@@ -62,3 +62,49 @@ Root rules live in the repo-root `CLAUDE.md` (hard rules, domain rules, working 
 - `email_extractions` caches successful extraction FOREVER; invalidate the row if you change what extraction must return.
 - Vision attempts are refunded on `LLMUnavailableError` (provider outage ≠ unreadable scan).
 - Invoice identity across claims: `invoice_number` first, else amount+date (`_already_claimed`).
+
+## The move this codebase keeps making: one writer, one declared table, one mechanical guard
+
+Five times now, the same shape has fixed the same class of bug: **a rule enforced by
+convention across N callers gets collapsed into a single writer that owns a declared
+table, plus a test that fails if a caller bypasses it.** Reach for this when you find
+yourself writing "remember to also update X" — that sentence is the smell.
+
+Not a pattern catalogue. These five are the instances; the guard column is the honest
+state of each, because a convention with no check is what every one of these incidents
+was before it became an incident.
+
+| Rule | Was | Collapsed to | Mechanical guard | What it cost first |
+|---|---|---|---|---|
+| Claim status writes | 9 statements, 4 modules, 6 appending nothing | `claim_status.apply_event` + `TRANSITIONS` | **yes** — `test_no_module_outside_claim_status_writes_the_status_column` (self-checked: asserts its own regex fires on a violation) | 2026-07-27 re-read moved 4 claims backwards, restored from backup; 2026-07-28 repair had to infer a prior state from an absence |
+| Status wording | 3 hand-synced maps + notify strings | `status_labels.py` | **partial** — `test_one_status_vocabulary_no_second_map` covers `claim_card` only, not the Jinja templates. `templates/index.html:235` still hardcodes `No invoice` for the no-claim row | 7 claims read "Matched" for weeks while permanently blocked (ADR-0021) |
+| Telegram sends | plain `telegram.Bot` per caller | `LoggedBot` | **partial** — `test_core.py:776` asserts the app's bot IS a `LoggedBot`; nothing stops a second construction | a failed update reached `mark_processed` looking successful and left the replay queue (ADR-0014) |
+| LLM provider access | per-caller SDK calls | `llm.py` seam (`chat`/`extract`/`extract_vision`) | **none** — convention only | ADR-0009; a 403 took extraction and chat down together because all four fallback models are one provider |
+| Host access to the live DB | 4 plain `sqlite3.connect` sites | *not collapsed* | **none** — `docs/failure-modes.md` standing gap #1 | 51-minute total outage 2026-07-25; the rule was then broken 4 more times in one session by people who had just read it |
+
+Two related moves with 3+ instances each, both forced by this repo's constraints
+rather than chosen:
+
+- **Shadow-compare before authority.** Never let a new derivation write until it has
+  agreed with the old one for a while: the state machine's Phase 1 (`pipeline.compare_state_projection`,
+  count on `/health`), the 2026-07-28 repair's dry-run diff, `check_split` (all guards,
+  no writes) vs `split_between_pets` (writes). The reason is on record — the last
+  state-writing change that skipped the comparison regressed four claims.
+- **Derive, don't store.** `submission_group_id` -> `S6+7`, a `matched` claim's label via
+  `_action_kind_from_row`, `status` as a projection of its event log. Partly because a
+  new column needs hand-run `ALTER TABLE` on the live DB, partly because a second
+  answer to the same question eventually disagrees with the first.
+
+When you reach for the collapse, it needs all four parts or it decays back: the
+declared table, the single writer, the guard test **named**, and a shadow-compare phase
+if the thing being collapsed *writes* rather than renders. Wording needed no shadow
+phase; the status machine did.
+
+**One instance is not a pattern.** Append-only-log-plus-projection (`claim_status_events`),
+provider-fallback-with-budgets (`llm._FALLBACK_MODELS`), durable-log-with-replay
+(`message_log.replay_pending`) and the ADR-0006 service boundary each occur exactly once
+here. They are decisions with ADRs, not moves to reach for — generalising them is how you
+end up projecting `invoice_data` from events, which `claim-state-from-event-log`'s
+design.md Decision 6 already rejected. `ceiling-not-equality` does recur (three sites,
+ADR-0007) and has a deliberate counter-example: `_validate_settlement`'s tolerance
+comparison, because there the two quantities measure the same thing.

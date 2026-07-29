@@ -808,9 +808,27 @@ def _sigterm_self() -> None:
     os.kill(os.getpid(), signal.SIGTERM)
 
 
+def compare_state_projection() -> list[dict]:
+    """Shadow mode: fold every claim's events and compare to the stored column.
+
+    WARNING, not ERROR — ADR-0015 reserves ERROR for "Justin must act", and he
+    cannot fix a projection bug. Reads only, writes nothing; the whole point of
+    the phase is that the two sources are compared rather than assumed equal.
+    Before the backfill a non-zero count is expected."""
+    disagreements = claim_status.state_projection_disagreements()
+    if disagreements:
+        logger.warning(
+            "state projection: %d claim(s) disagree with the stored status: %s",
+            len(disagreements),
+            "; ".join(f"#{d['claim_id']} stored={d['stored']} projected={d['projected']}" for d in disagreements),
+        )
+    return disagreements
+
+
 def run_once() -> None:
     _watchdog_telegram_polling()
     vet_detection.classify_unflagged()
+    compare_state_projection()
 
     # Every remaining step reads or writes Gmail — if the token is dead, alert
     # (loudly, on Telegram) and skip them rather than fail silently in logs.

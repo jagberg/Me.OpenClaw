@@ -115,7 +115,15 @@ def basic_status(request: Request):
 def health():
     """One URL that answers "is the bot actually listening?". Probing Telegram's
     getUpdates from outside can't tell — it races the gap between long polls."""
-    return {"app_version": config.APP_VERSION, "polling_alive": telegram_bot.polling_alive(), **message_log.stats()}
+    return {
+        "app_version": config.APP_VERSION,
+        "polling_alive": telegram_bot.polling_alive(),
+        # Shadow mode (Phase 1): claims whose stored status differs from what
+        # their own event log projects. Expected non-zero until the backfill;
+        # must be zero for a week of ticks before the projection gets authority.
+        "state_projection_disagreements": len(claim_status.state_projection_disagreements()),
+        **message_log.stats(),
+    }
 
 
 @app.get("/messages.jsonl")

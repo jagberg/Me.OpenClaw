@@ -112,6 +112,75 @@ TERMINAL_STATUSES = ("settled", "declined")
 # invoices submitted Jul 2026), so txn-date proximity would reject real matches.
 AWAITING_REPLY_STATUSES = ("sent", "acknowledged", "info_requested", "suspended")
 
+# --- The state machine -------------------------------------------------------
+# Twelve states and, until now, nothing written down about which may move to
+# which: `status` was a mutable column written by seven statements across three
+# modules, six of which appended no event. Two live incidents are what these
+# three tables exist to make impossible — 2026-07-27, when re-reading already
+# ingested mail moved four claims backwards, and 2026-07-28, when repairing six
+# mistyped events meant inferring one claim's prior state from an absence ("it
+# holds no acknowledged event, so it was sent"). ADR-0008 established that every
+# state change is an event; this establishes which of them are legal.
+
+# Event type -> the state it moves the claim to. Data, not an `if`: `matched` and
+# `unmatched` name states that differ from their own event type, and everything
+# `process_reply` classifies happens to name its own.
+STATE_EVENTS = {
+    "matched": "matched",
+    "unmatched": "pending_match",
+    "drafted": "drafted",
+    "sent": "sent",
+    "absorbed": "absorbed",
+    "acknowledged": "acknowledged",
+    "info_requested": "info_requested",
+    "suspended": "suspended",
+    "approved": "approved",
+    "settled": "settled",
+    "declined": "declined",
+    "below_excess": "below_excess",
+}
+
+# Recorded, never move state. `unclassified` is the one that used to be a special
+# case inside process_reply's UPDATE — it is a review-queue entry, and writing it
+# to status would regress an acknowledged claim. Making that a property of the
+# event type rather than one writer's `if` is this whole change in miniature.
+STATELESS_EVENTS = frozenset({
+    "unclassified",
+    "confirmed_resolved",
+    "mismatch_dismissed",
+    "reference_detached",
+    "state_reverted",
+    "state_backfilled",
+})
+
+# Every legal move. Derived from what the seven existing writers actually do, so
+# its first version describes current behaviour rather than an aspiration — which
+# is why two entries look odd: `matched`->`matched` and `drafted`->`matched` both
+# exist because `split_between_pets` resets a draft, and `below_excess` is
+# non-terminal by decision (the invoice is retained, so Petcover can still
+# acknowledge, approve or settle it). `None` is a brand-new claim's from-state.
+# Any pair absent here is refused and flagged, never applied silently.
+TRANSITIONS: dict[str | None, frozenset] = {
+    None: frozenset({"pending_match"}),
+    "pending_match": frozenset({"matched", "absorbed"}),
+    "matched": frozenset({"drafted", "pending_match", "matched", "absorbed"}),
+    "drafted": frozenset({"sent", "matched", "pending_match"}),
+    "sent": frozenset({"acknowledged", "info_requested", "suspended", "approved",
+                       "settled", "declined", "below_excess"}),
+    "acknowledged": frozenset({"info_requested", "suspended", "approved",
+                               "settled", "declined", "below_excess"}),
+    "info_requested": frozenset({"suspended", "acknowledged", "approved",
+                                 "settled", "declined", "below_excess"}),
+    "suspended": frozenset({"info_requested", "approved", "settled", "declined", "below_excess"}),
+    "approved": frozenset({"settled"}),
+    "below_excess": frozenset({"sent", "acknowledged", "approved", "settled", "declined"}),
+    # Terminal (ADR-0011): a later letter reusing the thread's reference must
+    # never reopen them. Leaving one is reverting the event that closed it.
+    "settled": frozenset(),
+    "declined": frozenset(),
+    "absorbed": frozenset({"pending_match"}),
+}
+
 # Policy math (ADR-0011). Per-condition-thread excess and per-pet annual cap,
 # both reset on the pet's policy anniversary. $2 tolerance absorbs rounding.
 POLICY_EXCESS = 150.00
@@ -517,6 +586,152 @@ def _record_event(claim_id: int | None, event_type: str, email_id: str | None, d
         return cur.lastrowid
 
 
+def apply_event(claim_id: int, event_type: str, detail: dict | None = None, email_id: str | None = None) -> dict:
+    """The only writer of `vet_claims.status`.
+
+    Appends the event unconditionally — the event happened, and hiding it is how
+    the 2026-07-28 audit became necessary — then consults `TRANSITIONS`:
+
+    - legal      -> writes the new state
+    - illegal    -> writes nothing, flags the claim naming both states and the
+                    event id, and leaves the event in place as evidence
+    - stateless  -> records only; no state write and no refusal
+
+    Returns `{"applied", "state", "refused"}`, where `state` is the claim's state
+    afterwards either way, so a caller can report what actually happened rather
+    than what it asked for."""
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+    if row is None:
+        return {"applied": False, "state": None, "refused": f"no claim #{claim_id}"}
+    current = row["status"]
+    event_id = _record_event(claim_id, event_type, email_id, detail or {})
+
+    target = STATE_EVENTS.get(event_type)
+    if target is None:
+        # Stateless, or an event type nobody declared. The second is a defect, and
+        # a silent no-op is exactly how it would stay one, so it is flagged.
+        if event_type in STATELESS_EVENTS:
+            return {"applied": False, "state": current, "refused": None}
+        refusal = f"unknown event type '{event_type}' (event #{event_id}) — declared in neither STATE_EVENTS nor STATELESS_EVENTS"
+        _flag_claim(claim_id, refusal)
+        return {"applied": False, "state": current, "refused": refusal}
+
+    if target not in TRANSITIONS.get(current, frozenset()):
+        refusal = (
+            f"refused {current} -> {target} from event #{event_id} ('{event_type}') "
+            "— not a declared transition; state left alone"
+        )
+        _flag_claim(claim_id, refusal)
+        return {"applied": False, "state": current, "refused": refusal}
+
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE vet_claims SET status = ?, updated_at = ? WHERE id = ?",
+            (target, datetime.now(timezone.utc).isoformat(), claim_id),
+        )
+    return {"applied": True, "state": target, "refused": None}
+
+
+def _flag_claim(claim_id: int, reason: str) -> None:
+    with db.get_connection() as conn:
+        conn.execute(
+            "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ?",
+            (reason, datetime.now(timezone.utc).isoformat(), claim_id),
+        )
+
+
+# Every claim is born here. `TRANSITIONS[None]` says a new claim may only move to
+# `pending_match`, and all three INSERT sites honour that — vet_detection writes
+# it literally, and the two apportionment inserts (invoice_matching, claim_forms)
+# write 'matched' but append a `matched` event, so the fold reaches the same place
+# from this seed. Seeding at None instead would refuse every claim's first event,
+# because no creation event exists to consume the None->pending_match step.
+CREATED_STATE = "pending_match"
+
+
+def _reverted_event_ids(rows) -> set[int]:
+    """Ids that a `state_reverted` event points at.
+
+    One level only: reverting a reversion is Phase 2 (task 7.1), and until
+    `revert_state` exists nothing writes these at all. Stated rather than left
+    implicit, because a half-implemented fold is worse than an absent one."""
+    reverted = set()
+    for row in rows:
+        if row["event_type"] != "state_reverted":
+            continue
+        target = json.loads(row["detail"] or "{}").get("reverts_event_id")
+        if target is not None:
+            reverted.add(int(target))
+    return reverted
+
+
+def _fold(rows) -> str:
+    state = CREATED_STATE
+    reverted = _reverted_event_ids(rows)
+    for row in rows:
+        if row["id"] in reverted:
+            continue
+        target = STATE_EVENTS.get(row["event_type"])
+        if target is None:
+            continue  # stateless, or a type nobody declared — apply_event flagged it
+        if target in TRANSITIONS.get(state, frozenset()):
+            state = target
+        # Illegal from the replayed state: skip this event and keep folding. One
+        # bad event must not cost us the rest of the claim's history.
+    return state
+
+
+def project_state(claim_id: int) -> str | None:
+    """The claim's state as its own event log says it is, ignoring the column.
+
+    This is the fact `status` caches. During Phase 1 the two are compared and any
+    disagreement is a detectable defect; in Phase 2 this becomes authoritative.
+    Returns None only when the claim does not exist."""
+    with db.get_connection() as conn:
+        if conn.execute("SELECT 1 FROM vet_claims WHERE id = ?", (claim_id,)).fetchone() is None:
+            return None
+        rows = conn.execute(
+            "SELECT id, event_type, detail FROM claim_status_events WHERE claim_id = ? "
+            "ORDER BY created_at, id",
+            (claim_id,),
+        ).fetchall()
+    return _fold(rows)
+
+
+def project_all() -> dict[int, str]:
+    """Bulk form for the tick — two queries, not one per claim."""
+    with db.get_connection() as conn:
+        claim_ids = [r["id"] for r in conn.execute("SELECT id FROM vet_claims")]
+        events = conn.execute(
+            "SELECT claim_id, id, event_type, detail FROM claim_status_events "
+            "WHERE claim_id IS NOT NULL ORDER BY created_at, id"
+        ).fetchall()
+    by_claim: dict[int, list] = {}
+    for row in events:
+        by_claim.setdefault(row["claim_id"], []).append(row)
+    return {claim_id: _fold(by_claim.get(claim_id, [])) for claim_id in claim_ids}
+
+
+def state_projection_disagreements() -> list[dict]:
+    """Claims whose stored status differs from what their events project.
+
+    Reads only. Deliberately writes nothing — not the column, not a flag: during
+    Phase 1 the comparison is evidence about the projection, and a comparison
+    that repairs what it measures can't be trusted to have measured anything.
+
+    A non-zero count before the backfill is expected and named in the change's
+    tasks.md: every transition we performed by hand predates the event log."""
+    with db.get_connection() as conn:
+        stored = {r["id"]: r["status"] for r in conn.execute("SELECT id, status FROM vet_claims")}
+    projected = project_all()
+    return [
+        {"claim_id": claim_id, "stored": status, "projected": projected.get(claim_id)}
+        for claim_id, status in sorted(stored.items())
+        if projected.get(claim_id) != status
+    ]
+
+
 def process_reply(
     email_id: str, subject: str, body: str, sender: str | None = None, recipients: str | None = None
 ) -> None:
@@ -594,22 +809,27 @@ def process_reply(
         # dollar-less 'payment processed' settled email that FOLLOWS an
         # approval has nothing to validate and correctly no-ops here.
         settlement_flag = _validate_settlement(claim, detail.get("paid_amount"), claim["_txn_date"])
-        _record_event(claim["id"], event_type, email_id, detail)
+        # The event and the state change are `apply_event`'s to make; what stays
+        # here is the learning this reply enabled (reference, Sr) and the
+        # settlement check. "unclassified" moving no state used to be an `if` in
+        # this UPDATE and is now a property of the event type.
+        outcome = apply_event(claim["id"], event_type, detail, email_id)
         with db.get_connection() as conn:
-            # "unclassified" is a review queue entry, not a lifecycle stage —
-            # writing it to status would regress e.g. an acknowledged claim.
-            updates = ["updated_at = ?"] if event_type == "unclassified" else ["status = ?", "updated_at = ?"]
-            params = [now] if event_type == "unclassified" else [event_type, now]
+            updates = ["updated_at = ?"]
+            params = [now]
             if reference and not claim["petcover_reference"]:
                 updates.append("petcover_reference = ?")
                 params.append(reference)
             if learn_sr and sr is not None and claim["petcover_sr"] is None:
                 updates.append("petcover_sr = ?")
                 params.append(sr)
-            if settlement_flag:
+            # A refusal already flagged this claim, and it is the more serious of
+            # the two: the state did not move at all. Don't overwrite it with a
+            # settlement note — that number is still in the event's detail.
+            if settlement_flag and not outcome["refused"]:
                 updates.append("flag = ?")
                 params.append(settlement_flag)
-            elif event_type == "acknowledged" and not reference and not claim["petcover_reference"]:
+            elif event_type == "acknowledged" and not reference and not claim["petcover_reference"] and not outcome["refused"]:
                 # spec: never guess or discard — flag visibly instead
                 updates.append("flag = ?")
                 params.append("unclassified — reference format not recognized")
@@ -747,17 +967,21 @@ def mark_sent(claim_id: int) -> dict:
                     " was already marked sent — nothing to do.",
                 }
             return {"ok": False, "message": f"Claim #{claim_id} isn't drafted (status: {claim['status']})."}
+        # Same `AND status = 'drafted'` selection the single group UPDATE used to
+        # do — one tap still advances the whole submission — but resolved to ids
+        # first, so each member's send is its own event.
         if claim["draft_id"]:
-            cur = conn.execute(
-                "UPDATE vet_claims SET status = 'sent', updated_at = ? WHERE draft_id = ? AND status = 'drafted'",
-                (now, claim["draft_id"]),
-            )
+            members = [
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id FROM vet_claims WHERE draft_id = ? AND status = 'drafted' ORDER BY id",
+                    (claim["draft_id"],),
+                )
+            ]
         else:
-            cur = conn.execute(
-                "UPDATE vet_claims SET status = 'sent', updated_at = ? WHERE id = ? AND status = 'drafted'",
-                (now, claim_id),
-            )
-        count = cur.rowcount
+            members = [claim_id]
+    count = sum(1 for member in members if apply_event(member, "sent", {"draft_id": claim["draft_id"]})["applied"])
+    with db.get_connection() as conn:
         group = _sent_group_ids(conn, claim_id, claim["draft_id"])
     # Group id supplements the claim ids, never replaces them — Justin's commands
     # take ids and a regression test enforces their presence in every message.

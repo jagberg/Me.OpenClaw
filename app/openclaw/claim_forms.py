@@ -507,13 +507,17 @@ def process_claim_batch(claim_ids: list[int], continuation: bool | None = True) 
             _flag(c["id"], f"Gmail draft creation failed: {exc}")
         return
 
+    from . import claim_status  # local: claim_status imports this module
+
     with db.get_connection() as conn:
         for c in claims:
             conn.execute(
-                "UPDATE vet_claims SET status = 'drafted', claim_file_path = ?, draft_id = ?, "
+                "UPDATE vet_claims SET claim_file_path = ?, draft_id = ?, "
                 "flag = NULL, updated_at = ? WHERE id = ?",
                 (output_path, draft_message_id, datetime.now(timezone.utc).isoformat(), c["id"]),
             )
+    for c in claims:
+        claim_status.apply_event(c["id"], "drafted", {"draft_id": draft_message_id})
 
 
 def set_condition_text(claim_id: int, condition_text: str) -> dict:
@@ -631,6 +635,8 @@ def split_between_pets(claim_id: int, shares: list[tuple[int, float | None]]) ->
     remainder Justin didn't state. Two unknowns aren't arithmetic, they're a
     guess, and a guessed claim amount is the same class of error as a guessed
     condition."""
+    from . import claim_status  # local: claim_status imports this module
+
     checked = check_split(claim_id, shares)
     if not checked["ok"]:
         return checked
@@ -668,7 +674,7 @@ def split_between_pets(claim_id: int, shares: list[tuple[int, float | None]]) ->
         for result, (pet_id, amount) in zip(results, resolved):
             row_invoice = {**invoice, "claimable_amount": amount, "split_note": note}
             conn.execute(
-                "UPDATE vet_claims SET pet_id = ?, invoice_data = ?, status = 'matched', "
+                "UPDATE vet_claims SET pet_id = ?, invoice_data = ?, "
                 "updated_at = ? WHERE id = ?",
                 (pet_id, json.dumps(row_invoice), now, result["claim_id"]),
             )
@@ -681,6 +687,12 @@ def split_between_pets(claim_id: int, shares: list[tuple[int, float | None]]) ->
                 "updated_at = ? WHERE id = ?",
                 (now, claim_id),
             )
+
+    # Every row in the split lands at `matched`, and each gets its own event. For
+    # the original claim that means drafted->matched when the split superseded a
+    # draft — the only reason that pair is in the transition table.
+    for result in results:
+        claim_status.apply_event(result["claim_id"], "matched", {"split_note": note})
 
     if superseded_draft:
         try:
@@ -834,9 +846,12 @@ def process_claim(claim_id: int, continuation: bool | None = True) -> None:
         _flag(claim_id, f"Gmail draft creation failed: {exc}")
         return
 
+    from . import claim_status  # local: claim_status imports this module
+
     with db.get_connection() as conn:
         conn.execute(
-            "UPDATE vet_claims SET status = 'drafted', claim_file_path = ?, draft_id = ?, "
+            "UPDATE vet_claims SET claim_file_path = ?, draft_id = ?, "
             "flag = NULL, updated_at = ? WHERE id = ?",
             (output_path, draft_message_id, datetime.now(timezone.utc).isoformat(), claim_id),
         )
+    claim_status.apply_event(claim_id, "drafted", {"draft_id": draft_message_id})

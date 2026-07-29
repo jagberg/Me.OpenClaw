@@ -4,7 +4,7 @@ import logging
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from . import config, db, gmail_client, llm
+from . import claim_status, config, db, gmail_client, llm
 
 logger = logging.getLogger(__name__)
 
@@ -419,10 +419,13 @@ def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None 
                   pet_id: int | None = None) -> None:
     with db.get_connection() as conn:
         conn.execute(
-            "UPDATE vet_claims SET status = 'matched', matched_email_id = ?, invoice_data = ?, "
+            "UPDATE vet_claims SET matched_email_id = ?, invoice_data = ?, "
             "flag = ?, pet_id = COALESCE(?, pet_id), updated_at = ? WHERE id = ?",
             (email_id, json.dumps(invoice), flag, pet_id, datetime.now(timezone.utc).isoformat(), claim_id),
         )
+    # State last, so a refused transition's flag survives the `flag = ?` above
+    # rather than being wiped by the very write that caused the refusal.
+    claim_status.apply_event(claim_id, "matched", {"amount": invoice.get("amount")}, email_id)
 
 
 def _pet_for(invoice: dict, text: str, claim) -> int | None:
@@ -466,6 +469,10 @@ def _apply_match(claim, chosen: dict, pool: list[dict]) -> bool:
             (claim["transaction_id"], _pet_id_by_name(other.get("patient")) or _single_pet_in_text(complement["text"]),
              complement["email_id"], json.dumps(other), now, now),
         ).lastrowid
+    # The sibling is INSERTed straight at 'matched' (it is born matched — the
+    # apportionment is what created it), but it still needs the event, or its
+    # projection has nothing to fold and disagrees with the column forever.
+    claim_status.apply_event(sibling_id, "matched", {"apportioned_from": claim["id"]}, complement["email_id"])
     logger.info("claim %s: charge covers two invoices — claim %s created for the second (%s)",
                 claim["id"], sibling_id, note)
     return True
@@ -935,11 +942,12 @@ def resolve_split_proposal(proposal_id: int, chosen_claim_id: int) -> dict:
     with db.get_connection() as conn:
         for other in others:
             conn.execute(
-                "UPDATE vet_claims SET status = 'absorbed', "
-                "flag = ?, updated_at = ? WHERE id = ?",
+                "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ?",
                 (f"second payment of claim #{chosen_claim_id}'s ${total:.2f} invoice", now, other),
             )
         conn.execute("UPDATE split_proposals SET status = 'resolved' WHERE id = ?", (proposal_id,))
+    for other in others:
+        claim_status.apply_event(other, "absorbed", {"absorbed_into": chosen_claim_id, "invoice_total": total})
     return {
         "ok": True,
         "message": f"Merged: claim #{chosen_claim_id} carries the ${total:.2f} invoice; "
@@ -962,11 +970,12 @@ def unmatch(claim_id: int) -> dict:
         if claim["matched_email_id"] not in rejected:
             rejected.append(claim["matched_email_id"])
         conn.execute(
-            "UPDATE vet_claims SET status = 'pending_match', matched_email_id = NULL, invoice_data = NULL, "
+            "UPDATE vet_claims SET matched_email_id = NULL, invoice_data = NULL, "
             "invoice_file_path = NULL, flag = NULL, rejected_email_ids = ?, "
             "telegram_notified_status = NULL, telegram_notified_flag = NULL, updated_at = ? WHERE id = ?",
             (json.dumps(rejected), now, claim_id),
         )
+    claim_status.apply_event(claim_id, "unmatched", {"rejected_email_id": claim["matched_email_id"]})
     return {"ok": True, "message": f"Claim #{claim_id}: wrong invoice rejected — re-searching Gmail for the right one."}
 
 

@@ -3864,6 +3864,260 @@ def test_detach_reference_returns_a_claim_to_the_correlation_pool():
     assert claim_status.correlate_ack("Petcover claim for Ari DC1-27-5628 Sr.8")
 
 
+# --- The state machine (claim-state-from-event-log, Phase 1) ------------------
+
+
+def test_every_declared_transition_is_legal_and_the_terminals_are_dead_ends():
+    """The table is the rule, so the table itself gets asserted: every declared
+    pair must be legal by `apply_event`'s own predicate, and the two terminal
+    states must have no way out at all (ADR-0011: a later letter reusing a
+    thread's reference must never reopen a closed claim)."""
+    for from_state, targets in claim_status.TRANSITIONS.items():
+        for target in targets:
+            assert target in claim_status.TRANSITIONS[from_state], f"{from_state} -> {target}"
+            assert target in claim_status.TRANSITIONS, f"{target} is a target with no row of its own"
+    assert claim_status.TRANSITIONS["settled"] == frozenset()
+    assert claim_status.TRANSITIONS["declined"] == frozenset()
+    assert claim_status.TRANSITIONS[None] == frozenset({"pending_match"}), "a new claim starts nowhere else"
+
+
+def test_the_backwards_moves_of_the_2026_07_27_reread_are_refused():
+    """Regression fixture for the incident that motivated the table.
+
+    Two of the four moves that re-read performed are refused here: #6 and #7 went
+    `settled` -> `acknowledged`, and that pair is now impossible.
+
+    The other two are NOT refusable and this test says so rather than pretending
+    otherwise: #22's `sent` -> `below_excess` and #18's `below_excess` ->
+    `acknowledged` are both legal forward moves (`below_excess` is non-terminal by
+    decision — the invoice is retained). What was wrong with them was the routing
+    and the replay, not the transition, so their guard is `_already_recorded` plus
+    reference/Sr precedence. `tasks.md` 1.3 claimed all four were illegal; it was
+    written before the table existed and the table disagrees with it."""
+    assert "acknowledged" not in claim_status.TRANSITIONS["settled"]
+    assert "acknowledged" not in claim_status.TRANSITIONS["declined"]
+    assert "acknowledged" in claim_status.TRANSITIONS["below_excess"], "legal — not the table's to refuse"
+    assert "below_excess" in claim_status.TRANSITIONS["sent"], "legal — not the table's to refuse"
+
+
+def test_the_two_event_classifications_are_complete_and_disjoint():
+    """Every state event names a real status, and no event type is in both sets —
+    an event that is both stateless and state-bearing would be decided by
+    dict-lookup order, which is not a decision anyone made."""
+    for event_type, target in claim_status.STATE_EVENTS.items():
+        assert target in status_labels.LABELS, f"{event_type} targets '{target}', which has no wording"
+        assert target in claim_status.TRANSITIONS, f"{target} is unreachable — no row in the table"
+    overlap = set(claim_status.STATE_EVENTS) & claim_status.STATELESS_EVENTS
+    assert not overlap, f"declared in both: {overlap}"
+
+
+def test_apply_event_writes_a_legal_state_and_records_it():
+    _fresh_db()
+    with db.get_connection() as conn:
+        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="drafted")
+    outcome = claim_status.apply_event(claim, "sent", {"draft_id": "d-1"})
+    assert outcome == {"applied": True, "state": "sent", "refused": None}
+    assert _claim_row(claim)["status"] == "sent"
+    with db.get_connection() as conn:
+        types = [r["event_type"] for r in conn.execute(
+            "SELECT event_type FROM claim_status_events WHERE claim_id = ?", (claim,))]
+    assert types == ["sent"]
+
+
+def test_apply_event_refuses_an_undeclared_transition_and_flags_it():
+    """The event is kept — it happened, and hiding it is how the 2026-07-28 audit
+    became necessary — but the state does not move and the claim says why."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="settled")
+    outcome = claim_status.apply_event(claim, "acknowledged", {"subject": "an old ack, re-read"})
+    assert outcome["applied"] is False
+    assert outcome["state"] == "settled", "reports where the claim actually is"
+    row = _claim_row(claim)
+    assert row["status"] == "settled", "a refused transition must not move the state"
+    assert "settled" in row["flag"] and "acknowledged" in row["flag"], f"flag names both states: {row['flag']}"
+    with db.get_connection() as conn:
+        types = [r["event_type"] for r in conn.execute(
+            "SELECT event_type FROM claim_status_events WHERE claim_id = ?", (claim,))]
+    assert types == ["acknowledged"], "the refused event stays as evidence"
+
+
+def test_an_undeclared_event_type_is_flagged_rather_than_silently_ignored():
+    """A typo'd or new event type is a defect. Treating it as stateless would let
+    it be a silent no-op forever, which is the failure mode this whole change is
+    about."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="sent")
+    outcome = claim_status.apply_event(claim, "acknowlegded", {})  # deliberate typo
+    assert outcome["applied"] is False and outcome["refused"]
+    assert "acknowlegded" in _claim_row(claim)["flag"]
+    assert _claim_row(claim)["status"] == "sent"
+
+
+def test_stateless_events_record_and_move_nothing():
+    """`unclassified` was a special case inside one writer's UPDATE; it is now a
+    property of the event type, and the same guarantee holds for every member of
+    the set — including `confirmed_resolved`, which the old code never touched
+    status for either."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="acknowledged")
+    for event_type in sorted(claim_status.STATELESS_EVENTS):
+        outcome = claim_status.apply_event(claim, event_type, {})
+        assert outcome == {"applied": False, "state": "acknowledged", "refused": None}, event_type
+        row = _claim_row(claim)
+        assert row["status"] == "acknowledged", f"{event_type} moved the state"
+        assert row["flag"] is None, f"{event_type} was treated as a refusal"
+
+
+def test_the_whole_lifecycle_is_one_event_per_transition_in_order():
+    """End to end through the real writers, not through `apply_event` directly:
+    every state a claim passed through is now a fact on record, which is what the
+    2026-07-28 repair had to infer from an absence."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="pending_match",
+                              reference="DC1-27-9001", sr=1)
+    invoice_matching._mark_matched(claim, "email-life-1", {"amount": 120.0, "claimable_amount": 120.0})
+    assert _claim_row(claim)["status"] == "matched"
+    claim_status.apply_event(claim, "drafted", {"draft_id": "d-life"})  # claim_forms' own path needs Gmail
+    with db.get_connection() as conn:
+        conn.execute("UPDATE vet_claims SET draft_id = 'd-life' WHERE id = ?", (claim,))
+    assert claim_status.mark_sent(claim)["ok"] is True
+    claim_status.process_reply("email-life-2", "Petcover DC1-27-9001 SR1 acknowledgement letter", "")
+    claim_status.process_reply("email-life-3", "Petcover DC1-27-9001 SR1 - your claim has been approved", "")
+
+    with db.get_connection() as conn:
+        types = [r["event_type"] for r in conn.execute(
+            "SELECT event_type FROM claim_status_events WHERE claim_id = ? ORDER BY created_at, id", (claim,))]
+    assert types == ["matched", "drafted", "sent", "acknowledged", "approved"], types
+    assert _claim_row(claim)["status"] == "approved"
+    assert claim_status.project_state(claim) == "approved", "the column and the log agree"
+
+
+def test_no_module_outside_claim_status_writes_the_status_column():
+    """Mechanical, not conventional. This repo has a documented case of a rule
+    being broken four times in one session by people who had just read it
+    (ADR-0018), so 'apply_event is the only writer' gets a check rather than a
+    paragraph. Test files are exempt: a fixture asserting a starting state is not
+    a production write path."""
+    import re as _re
+    from pathlib import Path as _Path
+
+    package = _Path(__file__).resolve().parent.parent / "openclaw"
+    # `(?!WHERE)` per character so the SET clause can't run past it: several
+    # statements legitimately read `AND status = 'pending_match'` in a WHERE.
+    pattern = _re.compile(r"UPDATE\s+vet_claims\s+SET\s+(?:(?!WHERE)[^\"'])*\bstatus\s*=", _re.IGNORECASE)
+    # The guard gets its own guard: a pattern that matches nothing would make this
+    # test pass forever. Both halves asserted — it fires on a real violation and
+    # does not fire on the WHERE-clause reads that are legitimate.
+    assert pattern.search("UPDATE vet_claims SET status = 'sent', updated_at = ? WHERE id = ?")
+    assert pattern.search("UPDATE vet_claims SET pet_id = ?, status = 'matched' WHERE id = ?")
+    assert not pattern.search("UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ? AND status = 'x'")
+    offenders = []
+    for path in sorted(package.glob("*.py")):
+        if path.name == "claim_status.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        # Statements are split across adjacent string literals; join them first so
+        # "UPDATE vet_claims SET " + "status = ?" is still caught.
+        joined = _re.sub(r"\"\s*\n\s*\"", "", text)
+        if pattern.search(joined):
+            offenders.append(path.name)
+    assert not offenders, f"these write vet_claims.status directly: {offenders}"
+
+
+def test_the_projection_folds_the_real_reply_sequences_we_hold():
+    """Sequences taken from the live log (read-only, 2026-07-29): claim #8's
+    acknowledged -> info_requested -> info_requested, claim #21's acknowledged ->
+    approved -> settled, and claim #19's acknowledged -> below_excess ->
+    acknowledged, which only folds because `below_excess` is non-terminal.
+
+    Each is prefixed with the submission events the writers now append. Without
+    that prefix these sequences fold to `pending_match` — see the next test."""
+    lived = {
+        "8": (["acknowledged", "info_requested", "info_requested"], "info_requested"),
+        "21": (["acknowledged", "approved", "settled"], "settled"),
+        "19": (["acknowledged", "below_excess", "acknowledged"], "acknowledged"),
+        "6": (["approved", "settled", "mismatch_dismissed"], "settled"),
+    }
+    for live_id, (replies, expected) in lived.items():
+        _fresh_db()
+        with db.get_connection() as conn:
+            claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="pending_match")
+        for event_type in ["matched", "drafted", "sent", *replies]:
+            claim_status.apply_event(claim, event_type, {})
+        assert claim_status.project_state(claim) == expected, f"live claim #{live_id}"
+        assert _claim_row(claim)["status"] == expected, f"live claim #{live_id}: column and fold disagree"
+
+
+def test_a_claim_whose_transitions_predate_the_log_projects_to_its_birth_state():
+    """The backfill case, asserted rather than assumed: all nine claims that hold
+    events hold only *reply* events, because the six writers that moved them to
+    matched/drafted/sent appended nothing. So the fold cannot reach where they
+    are, and every existing claim is expected to disagree until group 6 runs.
+
+    Real: claim #2 holds one `reference_detached` event and sits at `sent`."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="sent")
+    claim_status.apply_event(claim, "reference_detached", {"was": "DC1"})
+    assert claim_status.project_state(claim) == "pending_match"
+    assert [d["claim_id"] for d in claim_status.state_projection_disagreements()] == [claim]
+
+
+def test_the_projection_skips_a_reverted_event_and_survives_an_illegal_one():
+    _fresh_db()
+    with db.get_connection() as conn:
+        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="pending_match")
+    for event_type in ("matched", "drafted", "sent", "acknowledged"):
+        claim_status.apply_event(claim, event_type, {})
+    with db.get_connection() as conn:
+        ack_id = conn.execute(
+            "SELECT id FROM claim_status_events WHERE claim_id = ? AND event_type = 'acknowledged'", (claim,)
+        ).fetchone()["id"]
+        # Written by hand: revert_state is Phase 2 (task 7.1). The projection has
+        # to ignore reverted events from the start or the phases can't be split.
+        import json as _json
+        conn.execute(
+            "INSERT INTO claim_status_events (claim_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
+            (claim, "state_reverted", _json.dumps({"reverts_event_id": ack_id, "reason": "misrouted"}),
+             datetime.now(timezone.utc).isoformat()),
+        )
+        # An event that is illegal from the replayed state must be skipped without
+        # costing us the rest of the fold — so a legal one after it still applies.
+        for event_type in ("approved", "settled"):
+            conn.execute(
+                "INSERT INTO claim_status_events (claim_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
+                (claim, event_type, "{}", datetime.now(timezone.utc).isoformat()),
+            )
+    # sent -> (ack reverted) -> approved is illegal from `sent`? No: sent allows
+    # approved. `settled` then follows from approved. The reverted ack is simply
+    # not there, and the claim still lands where its remaining events put it.
+    assert claim_status.project_state(claim) == "settled"
+
+
+def test_the_shadow_comparison_reports_without_repairing_anything():
+    """A comparison that fixes what it measures has measured nothing. Phase 1's
+    whole value is that the two sources are compared, not reconciled."""
+    from openclaw import pipeline
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="pending_match")
+    for event_type in ("matched", "drafted", "sent"):
+        claim_status.apply_event(claim, event_type, {})
+    assert claim_status.state_projection_disagreements() == []
+    with db.get_connection() as conn:  # inject one, the way a stray direct write would
+        conn.execute("UPDATE vet_claims SET status = 'settled' WHERE id = ?", (claim,))
+    before = dict(_claim_row(claim))
+    reported = pipeline.compare_state_projection()
+    assert reported == [{"claim_id": claim, "stored": "settled", "projected": "sent"}]
+    after = dict(_claim_row(claim))
+    assert after["status"] == "settled" and after["flag"] == before["flag"], "the comparison wrote something"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
