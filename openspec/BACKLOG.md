@@ -158,9 +158,11 @@ Not resolved here: **why** Groq is blocking this egress. That is a network/accou
 
 The re-extraction is **run**. `app/scripts/reextract_item_dates.py --apply`, container-side, backup at `/data/openclaw.db.bak-pre-item-dates-20260731`: 14 cached extractions, 11 replaced, 3 kept, 0 failed.
 
-**It produced zero new line-item dates — 3 before, 3 after.** Eleven emails re-extracted successfully with the prompt that explicitly asks for a per-item date, and the model returned none. The blocker was never the provider outage; the real invoices simply do not print per-line-item dates. The three that exist were already there, across two emails.
+**It produced zero new line-item dates — 3 before, 3 after.** Eleven emails re-extracted successfully with the prompt that explicitly asks for a per-item date, and the model returned none new.
 
-So `find_visit_by_date`'s line-item branch is implemented, unit-tested, and **has never had a real input and now demonstrably has none**. The case Justin raised — a consult on the 18th billed on an invoice dated the 30th — is real, but these documents do not carry the evidence needed to resolve it that way.
+Three item dates do exist, across two emails — **and every one of them is identical to its own invoice's header date** (`2026-06-19` on an invoice dated 2026-06-19; two items dated `2026-06-30` on an invoice dated 2026-06-30). No claim's stored `invoice_data` carries an item date at all. So the precise statement is not "there is no input" but the sharper one: **the branch's premise — that an item date can *differ* from the header date — has zero instances.** The line-item branch cannot produce a match the header branch would not already produce. (Same shape as the treatment-vs-charge bug: two candidate values that coincide in every row held, so nothing discriminates them.)
+
+So `find_visit_by_date`'s line-item branch is implemented, unit-tested, and **has never had an input that differs from the header date** — the only case it exists for. The case Justin raised — a consult on the 18th billed on an invoice dated the 30th — is real, but these documents do not carry the evidence needed to resolve it that way.
 
 **The open question this replaces the old one with:** should the line-item branch stay? Three options, none obviously right, and it is a judgement call rather than a fact to look up.
 - *Keep it.* Costs nothing at runtime, and a future vet's format may print item dates. But it is untestable against reality and reads as a working capability on the dashboard and in the nudge.

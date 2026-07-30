@@ -26,7 +26,9 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 
   **Run 2026-07-31, container-side, and the result is negative.** `app/scripts/reextract_item_dates.py --apply` (committed `6034028` — until then the instruction pointed at a script that existed only in a session scratchpad). Backup `/data/openclaw.db.bak-pre-item-dates-20260731`. 14 cached, **11 replaced, 3 kept, 0 failed** — the 3 kept are vision-sourced rows where text extraction returns nothing, protected by the keep-if-empty rule.
 
-  **Zero new line-item dates: 3 before, 3 after.** Eleven emails re-extracted with the prompt that explicitly asks for a per-item date and the model returned none. The premise behind this task — that the dates were there and the cache was stale — is false. The invoices do not print per-line-item dates. This does not "unblock" line-item matching; it establishes that it has no real input.
+  **Zero new line-item dates: 3 before, 3 after.** Eleven emails re-extracted with the prompt that explicitly asks for a per-item date and the model returned none new. The premise behind this task — that the dates were there and the cache was stale — is false.
+
+  Corrected same day, after checking rather than asserting: three item dates *do* exist across two emails, but **each equals its own invoice's header date** (2026-06-19, and two at 2026-06-30). No claim's `invoice_data` holds one. So the branch has never had an input that *differs* from the header — the only case it exists for — and cannot yet produce a match the header branch would not.
 
   Non-determinism visible again, net zero: two near-duplicate bulk emails swapped one $1428.10 invoice (8→9 and 10→9), cache total unchanged at 54, nothing lost. No matched claim lost its invoice.
 
@@ -47,7 +49,7 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 
 ## 5. Coordinate, deploy, verify
 
-- [ ] 5.1 In `vet-info-request-chase/tasks.md`: mark 6.3 absorbed here, and 5.6 superseded by the Monday job (its daily-nudge folding is no longer the plan).
+- [x] 5.1 In `vet-info-request-chase/tasks.md`: mark 6.3 absorbed here, and 5.6 superseded by the Monday job (its daily-nudge folding is no longer the plan). Done 2026-07-31, three days late — found by a trail audit, not by the checklist.
 - [x] 5.2 Deploy from the `deploy` worktree with `./scripts/deploy.ps1` and confirm `/health`.
 - [x] 5.3 Verify live, read-only from the host (ADR-0018): claim #8's chip reads `Vet: consult notes needed`, and `nudge_unanswered_vet_requests` invoked by hand produces exactly one line — #8, Aari, Kings Vet `info@kingsvet.com.au`, `Consultation notes dated 18/05/2026`, with days outstanding and days left. Record what it actually printed.
 - [x] 5.4 Confirm the Monday job is registered on the live scheduler (job id `vet-request-nudge`, next run a Monday) rather than assuming the cron string is right.
