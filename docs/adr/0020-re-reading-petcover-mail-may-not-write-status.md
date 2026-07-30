@@ -72,3 +72,20 @@ The rule, now implemented (`claim_status.treatment_date`):
 - With no invoice attached, it falls back to the transaction date **and says so**: the nudge prints `treated <date>` or `treated <date>, assumed = charge date`. An assumed anchor is visible rather than silently equated with a known one.
 
 **Deliberately not changed, and unresolved:** `claim_status._policy_year_key` still derives the excess/cap policy year from the transaction date. It is the same question — which date is a claim's true anchor — applied to money rather than to a deadline, and moving it would shift settlement expectations. It also touches the already-recorded, still-undecided disagreement about closed policy years in `dashboard-visit-ledger`. Tracked in `openspec/BACKLOG.md`; not decided here, and not quietly aligned.
+
+## Amendment (2026-07-30) — Decision 1 is now partly implemented, and partly not implementable as written
+
+`claim-state-from-event-log` Phase 1 shipped and deployed (`1f49871+deploy`). It changes what Decision 1 above can mean, in two directions, so the "not yet implemented" note in Consequences is superseded rather than merely satisfied.
+
+**Implemented, but by a different mechanism than this ADR proposed.** Decision 1 said status stays "owned solely by the forward-only live path", with a re-read suppressing status writes as a special case. That special case no longer exists and is no longer needed: `claim_status.apply_event` is now the only writer of `vet_claims.status`, and it consults a declared transition table on *every* write, re-read or not. A re-read appends its events and the table decides. The suppression became a property of the machine instead of a rule about one code path — which is strictly better, because it also covers the paths nobody thought to suppress.
+
+**Not implementable as written, for half the incident.** This ADR's Context treats all four of the 2026-07-27 regressions as one failure. They are two:
+
+- Claims #6 and #7 moved `settled` → `acknowledged`. That pair is undeclared, so `apply_event` now refuses it, flags the claim naming both states, and keeps the event as evidence. Covered.
+- Claim #22 moved `sent` → `below_excess` and claim #18 `below_excess` → `acknowledged`. **Both are legal transitions and must stay legal** — `below_excess` is non-terminal by decision, the invoice being retained. What was wrong was that the event reached the wrong claim. A state machine cannot refuse a legal move on the grounds that it was misrouted; refusal is not the right instrument for a routing fault.
+
+So the second half has **no demonstrated guard**. `_already_recorded` is the obvious candidate and this ADR already records it as tried and insufficient — its `(email, claim, event)` key deduplicates correctly and says nothing about whether the claim was the right one. Reference/Sr routing precedence is the other candidate and has never been tested against a replay of misrouted mail.
+
+**Consequence accepted:** a re-read whose event is a legal move applied to the wrong claim would still be applied today, and would look entirely legitimate to the machine. This is recorded in `openspec/BACKLOG.md` with the two ways it could close — demonstrate which mechanism rejects it, or decide that Phase 2's `revert_state` is the intended remedy and this is an undo problem rather than a prevention one. It is deliberately not being closed by tightening the transition table, which would make the table lie about the lifecycle to compensate for a different subsystem's bug.
+
+**Correction to this ADR's own framing:** phrases like "the four live misclassifications" were carried into `README.md`, the change's delta spec, `design.md` and a `claim_status.py` docstring, all asserting a guarantee that covers two of the four. Found by an `eval-change` run on 2026-07-30 and corrected in each; noted here because this ADR is where the four-as-one framing started.

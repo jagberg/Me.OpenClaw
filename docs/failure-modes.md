@@ -20,6 +20,9 @@ Built 2026-07-29 because answering "have we seen this before?" required an agent
 | Two fixtures could never reach their assertion and had been failing for four commits, unrun because root `CLAUDE.md` names only `test_core.py` | `d3bab87` | `eval-change` preflight rows 3-4 run **both** suites; axis 2(c) and 2(e) |
 | Adding a fourth model to the fallback chain made a negative test silently pass, because the test hardcoded the three-model set | `3cb9b15` | Test now derives the set from `_FALLBACK_MODELS`; `eval-change` axis 2(b) |
 | "Tested" conflated with "exercised against reality" — `split_between_pets` unit-tested, never run on a real bill | BACKLOG | `eval-change` axis 2(f) and 3(c) |
+| A test that asserts its own input: `for target in targets: assert target in TRANSITIONS[from_state]` where `targets` **is** that set. True of any table including an empty one; 0 of 42 pairs actually checked, and a task ticked on it | `1f49871`; eval 2026-07-30 | Rewritten to drive every pair through `apply_event`; **mutation-checked** — refusing a legal pair now fails the suite. `eval-change` axis 2(a) found it |
+| A test named for a case it never constructs — "survives an illegal one" injected only legal events, so the fold's skip-and-continue was asserted by nothing. Mutating it to `break` left the whole suite green | `1f49871`; eval 2026-07-30 | Now asserts the pair is illegal before relying on it, and the mutation fails. `eval-change` axis 2(c) |
+| A measurement whose two sides come from the same source: the 19→0 shadow count. The backfill copies `status` into `detail`, the fold reads it back exempt from the table, and stripping backfill events projects `pending_match` for all 22 — so a projection ignoring every real event scores identically | BACKLOG; eval 2026-07-30 | `eval-change` axis 3(a). **No general check** — the axis brief catches it by asking what each side derives from |
 
 ## Real data versus assumptions
 
@@ -48,6 +51,9 @@ Built 2026-07-29 because answering "have we seen this before?" required an agent
 | A safety property silently downgraded from scope-enforced to convention-enforced: Gmail scope became `compose`, which grants send | `1c6c270` | `eval-change` axis 5(d) |
 | Verification recorded as complete when partial — including a correction that itself needed a correction | BACKLOG (ADR-0018 entries) | `eval-change` axis 4(d) |
 | Scope grew inside `tasks.md` without being declared in `proposal.md` | `8b70915` | `eval-change` axis 4(f) |
+| A design doc contradicting **itself**, with the dangerous half winning: Decision 1 listed `state_backfilled` as stateless, Decision 8 had it carry the claim's status. Stateless wins in a fold, so the backfill would have moved nothing and Phase 2 would then have reset 19 claims | `8e1f852`; `design.md` Decision 1 correction | **No check yet.** Found by implementing it. `eval-change` axes 1 and 4 compare docs against *code*, not a doc against itself |
+| A correction applied to the verification record but not to the artifacts that outlive it — `tasks.md` 1.3 was right on 2026-07-29 while the delta spec, `design.md` Decision 3 and `README` still asserted the withdrawn claim. The delta is what `sync` copies into the baseline | `1f49871`; eval 2026-07-30 | `eval-change` axis 1(A) and 4(a). Rule: correct the delta spec first, since it is the only one that becomes permanent |
+| A guard reporting a different thing than it acts on — the phantom-DB check printed `os.environ["DATABASE_PATH"]` after the dotenv load, displaying the container path while opening `C:\data\openclaw.db` | `1f49871`; eval 2026-07-30 | Guard now resolves the path the way the connection does. **Its own weakness is stated in the docstring**: only the row-count condition actually fires |
 
 ## Operational
 

@@ -544,11 +544,17 @@ def _claim_for_sr(submission_claims: list) -> object:
 def _already_recorded(claim_id: int | None, event_type: str, email_id: str | None) -> bool:
     """Has this exact (email, claim, event) already been logged?
 
-    Makes re-reading Petcover mail safe, which is what lets a classifier fix be
-    applied to mail already in `processed_emails` — the reason the four live
-    misclassifications found 2026-07-27 would otherwise stay wrong forever.
-    Without this, a re-read appends duplicate events AND re-runs the status/flag
-    write, which would resurrect a settlement mismatch Justin had dismissed."""
+    Stops a re-read appending duplicate events and re-running the status/flag
+    write, which would resurrect a settlement mismatch Justin had dismissed. That
+    is what lets a classifier fix be applied to mail already in `processed_emails`.
+
+    It does NOT make re-reading safe in general, and an earlier version of this
+    docstring said it did. ADR-0020 records that event-level idempotency was tried
+    against the real DB for the 2026-07-27 incident and did not help, because the
+    problem was never duplicate events — it was a correctly-deduplicated event
+    reaching the wrong claim. Two of the four claims that moved that day moved
+    through transitions that are legal and that this guard does not see. Nothing
+    demonstrably prevents that case today; see `openspec/BACKLOG.md`."""
     if email_id is None:
         return False  # manual events (confirm_resolved, dismiss) have no email
     with db.get_connection() as conn:

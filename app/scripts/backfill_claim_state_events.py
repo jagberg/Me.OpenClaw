@@ -53,7 +53,15 @@ def _refuse_phantom_db() -> None:
     The first version of this guard printed `os.environ["DATABASE_PATH"]` *after*
     the dotenv load, so it displayed `/data/openclaw.db` while opening the phantom —
     a guard that could not detect the failure it guarded. Resolve the path the way
-    the connection does, then require it to exist and to hold the real corpus."""
+    the connection does, then require it to exist and to hold the real corpus.
+
+    Known weakness, stated rather than left to be discovered: of the two conditions
+    below, only `claims < 10` actually fired when this was tested on 2026-07-30.
+    The phantom had acquired a `telegram_messages` table by then, so the table check
+    passed. The row-count threshold is therefore doing all the work, and it stops
+    discriminating if the phantom ever accumulates ten claims. A durable check would
+    compare against something the phantom cannot forge — a known claim id, or the
+    container path itself — and that has not been built."""
     from openclaw import config
 
     path = Path(config.DATABASE_PATH)
