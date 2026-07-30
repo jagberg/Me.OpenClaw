@@ -23,6 +23,14 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 - [x] 3.2 Add `invoice_matching.find_visit_by_date(iso_date)`: match claims' `invoice_data` first (invoice date **or** any line-item date), then `email_extractions`. Return every match (claim id where one exists, merchant, invoice number, amount) — never a nearest-date fallback.
 - [x] 3.3 Add an optional per-item `date` to the extraction schema (null when the document doesn't state one) and to `find_visit_by_date`'s matching.
 - [x] 3.4 Clear `email_extractions` as one deliberate step, stating the count re-extracted (14 rows as of 2026-07-28) — it spends tokens against the daily budget (ADR-0017), and a failed extraction isn't cached so a partial run resumes. Ask before running it live.
+
+  **Run 2026-07-31, container-side, and the result is negative.** `app/scripts/reextract_item_dates.py --apply` (committed `6034028` — until then the instruction pointed at a script that existed only in a session scratchpad). Backup `/data/openclaw.db.bak-pre-item-dates-20260731`. 14 cached, **11 replaced, 3 kept, 0 failed** — the 3 kept are vision-sourced rows where text extraction returns nothing, protected by the keep-if-empty rule.
+
+  **Zero new line-item dates: 3 before, 3 after.** Eleven emails re-extracted with the prompt that explicitly asks for a per-item date and the model returned none. The premise behind this task — that the dates were there and the cache was stale — is false. The invoices do not print per-line-item dates. This does not "unblock" line-item matching; it establishes that it has no real input.
+
+  Non-determinism visible again, net zero: two near-duplicate bulk emails swapped one $1428.10 invoice (8→9 and 10→9), cache total unchanged at 54, nothing lost. No matched claim lost its invoice.
+
+  Earlier attempts on 2026-07-28 failed all 14 on a Groq 403. That was never a standing block — the same container succeeded at 21:15 and 21:34 on 2026-07-30 and 403'd at 22:04. Groq access from here **flaps**; the 3-day success rates were 24/235 `follow_up_extraction`, 18/60 `invoice_extraction`, 21/37 `chat`. Nothing to wait for, just a window to catch. Since all four `_FALLBACK_MODELS` are one provider, the chain retries into the same wall (BACKLOG standing gap).
 - [x] 3.5 Test with the real data: `18/05/2026` resolves to Kings Vet invoice `1000229`, $351.50, claim **#6** — while the request itself stays on claim **#8**. Assert the two are reported as different claims, since that is the whole point.
 - [x] 3.6 Test: a date only in the extraction cache resolves with no claim id; an unmatched date reports "visit unknown"; two invoices sharing a date report both; a line-item date matches even when the invoice's header date differs.
 - [ ] 3.7 Test the wording never presents the resolved invoice as the requested document.
@@ -67,7 +75,7 @@ Please note we cannot process`) returned `"Please note"` as the requested docume
 
 **Trap found while verifying, now in root `CLAUDE.md` and BACKLOG:** a host-side `db.get_connection()` resolves `DATABASE_PATH=/data/openclaw.db` (the container path, from `app/.env`) to `C:\data\openclaw.db` — a real file holding 2 stale claims. The first run of this resolver returned `[]` for a date the live DB certainly holds. Quiet wrong answers, not a loud failure.
 
-**Not built yet**: task 3.4 (clear the 14 cached extractions so line-item dates are actually populated — approved token spend, not yet run), group 4 (the Monday nudge), 5 (deploy + live verify), 6 (docs). Line-item date matching is implemented and unit-tested but **no stored invoice carries an item date yet**, so it cannot fire on real data until 3.4 runs.
+**Not built yet**: group 4 (the Monday nudge), 5 (deploy + live verify), 6 (docs). Line-item date matching is implemented and unit-tested. **Superseded 2026-07-31:** task 3.4 has now run, and re-extraction produced zero new item dates (3 before, 3 after, 11 emails re-extracted). It cannot fire on real data at all — not pending a re-extraction, but because these invoices do not print per-item dates. See BACKLOG.
 
 ### Live verification, groups 4-5 (2026-07-28, `4e99b4d+deploy`)
 
@@ -87,7 +95,7 @@ Dashboard chip for #8 now reads **`Vet: consult notes needed`**. Cron job `nudge
 
 **A regression this change introduced was caught by that dry run**, before it wrote to the live DB: the refactored ask pattern had dropped the original's consumption of the letter's filler, so two vet cover notes yielded `information in order for us to review the` and `for us to review the claim Consult notes dated` as the document to chase. Fixed in `719009f`, with the two real phrasings quoted at the pattern and a minimum-length guard for a stray `the`. The lesson is the project's existing one: the dry run against real mail is what found it, not the unit tests, which were passing throughout.
 
-**Still not done:** task 3.4 (clear the 14 cached extractions so line-item dates populate — approved, deliberately not run at the tail of a long session because the next tick re-extracts and could alter matching for the 3 `pending_match` claims) and group 6 (docs: amend ADR-0020/0021, README, module CLAUDE.md, BACKLOG). Line-item date matching remains implemented and unit-tested but **cannot fire on real data** until 3.4 runs.
+**Still not done:** group 6 (docs: amend ADR-0020/0021, README, module CLAUDE.md, BACKLOG). Line-item date matching remains implemented and unit-tested. **Superseded 2026-07-31:** 3.4 ran and returned no item dates, so it cannot fire on real data full stop.
 
 ### Task 3.4: blocked, then done (2026-07-28)
 

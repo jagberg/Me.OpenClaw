@@ -153,12 +153,23 @@ Gemini credentials already exist and are already used for vision OCR (ADR-0010),
 
 Not resolved here: **why** Groq is blocking this egress. That is a network/account question for Justin (VPN, ISP address reputation, or a region block), and no code change fixes it.
 
-### Re-extracting the cached invoices to pick up line-item dates is still owed
-*Blocked since 2026-07-28. Capability: `invoice-matching`. Task 3.4 of `vet-request-document-and-monday-nudge`.*
+### Line-item date matching has no instance in the real data, and re-extraction proved it
+*Done 2026-07-31, result negative. Capability: `invoice-matching`. Closes task 3.4 of `vet-request-document-and-monday-nudge`; opens the question below.*
 
-The extraction prompts now request a per-line-item date, and the 14 cached extractions must be re-run to populate it (approved token spend). The attempt on 2026-07-28 failed all 14 on the Groq 403 above. **No data changed and no tokens were consumed** — the script replaces a row only when the fresh extraction is non-empty, precisely so a vision-sourced row is never overwritten with nothing, and a backup was taken first (`/data/openclaw.db.bak-pre-item-dates-20260728`).
+The re-extraction is **run**. `app/scripts/reextract_item_dates.py --apply`, container-side, backup at `/data/openclaw.db.bak-pre-item-dates-20260731`: 14 cached extractions, 11 replaced, 3 kept, 0 failed.
 
-Re-run `reextract_item_dates.py --apply` inside the container once the provider is reachable. Until then, line-item date matching is implemented and unit-tested but **cannot fire on real data**: `find_visit_by_date` matches invoice header dates only, which is exactly the case Justin raised (a consult on the 18th billed on an invoice dated the 30th).
+**It produced zero new line-item dates — 3 before, 3 after.** Eleven emails re-extracted successfully with the prompt that explicitly asks for a per-item date, and the model returned none. The blocker was never the provider outage; the real invoices simply do not print per-line-item dates. The three that exist were already there, across two emails.
+
+So `find_visit_by_date`'s line-item branch is implemented, unit-tested, and **has never had a real input and now demonstrably has none**. The case Justin raised — a consult on the 18th billed on an invoice dated the 30th — is real, but these documents do not carry the evidence needed to resolve it that way.
+
+**The open question this replaces the old one with:** should the line-item branch stay? Three options, none obviously right, and it is a judgement call rather than a fact to look up.
+- *Keep it.* Costs nothing at runtime, and a future vet's format may print item dates. But it is untestable against reality and reads as a working capability on the dashboard and in the nudge.
+- *Remove it.* Smallest honest code. Loses nothing today and can be rebuilt from git if a format ever appears.
+- *Keep it and say so.* Leave the branch, and have the surfaces state that a date resolved from an invoice header is the header's, not the line item's — which is the actual guarantee.
+
+Not decided here. Related: the same run showed the documented extraction non-determinism again — two near-duplicate bulk emails swapped one $1428.10 invoice between them (8→9 and 10→9), net zero across the cache, nothing lost.
+
+Also surfaced and **not investigated**: claims #2, #9 and #10 all cite `matched_email_id = 19ede14fc87ee781`, which has no row in `email_extractions` at all. Pre-existing, unrelated to this run (cache totals unchanged, that id untouched). Worth finding out whether those matches came from the vision path or from a cache row that was later lost.
 
 ### Which date anchors a claim — the deadline says treatment, the excess math still says the charge
 *Open since 2026-07-29. Capabilities: `settlement-validation`, `dashboard-visit-ledger`. Follows the ADR-0020 correction of the same date.*
