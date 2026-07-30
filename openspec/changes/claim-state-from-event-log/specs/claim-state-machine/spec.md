@@ -24,14 +24,14 @@ The permitted transitions SHALL be declared in one place as data. A transition n
 
 #### Scenario: The 2026-07-27 regressions the table cannot refuse
 - **WHEN** `sent`→`below_excess` (claim #22) or `below_excess`→`acknowledged` (claim #18) is applied
-- **THEN** each is **permitted**, because both are ordinary forward moves — `below_excess` is non-terminal by decision, the invoice being retained — and what was wrong on 2026-07-27 was the routing and the replay, not the transition. Those two are guarded by event idempotency and reference/Sr routing precedence, not by this table, and the system SHALL NOT claim otherwise
+- **THEN** each is **permitted**, because both are ordinary forward moves — `below_excess` is non-terminal by decision, the invoice being retained — and what was wrong on 2026-07-27 was the routing and the replay, not the transition. This table is not their guard, and **no other mechanism has been shown to be one**: ADR-0020 records event-level idempotency as tried against the real DB for this incident and found insufficient, and reference/Sr routing precedence has never been tested against a replay of misrouted mail. The system SHALL NOT claim these two are guarded until one is demonstrated
 
 #### Scenario: A state a claim is already in
 - **WHEN** a transition targets the state the claim already holds and that self-transition is declared legal (a re-match after a split)
 - **THEN** it is applied normally
 
 ### Requirement: Some events change no state
-An event type SHALL be classified as state-changing or stateless, as data rather than as a condition inside a writer. A stateless event SHALL be recorded and SHALL NOT move the claim's state.
+An event type SHALL be classified as data rather than as a condition inside a writer, into exactly one of three kinds. **State-changing**: names one fixed target state, applied only if the transition is declared. **Stateless**: recorded, and SHALL NOT move the claim's state. **Backfill**: names a per-event target read from the event's own detail, and is exempt from the transition table because it asserts a state the log has no path to — it exists to give a claim whose transitions predate the log a history the projection can fold. An event type belonging to no kind SHALL be refused and the claim flagged, never treated as stateless by default.
 
 #### Scenario: An unclassifiable reply
 - **WHEN** a Petcover reply cannot be classified

@@ -89,3 +89,18 @@ So the second half has **no demonstrated guard**. `_already_recorded` is the obv
 **Consequence accepted:** a re-read whose event is a legal move applied to the wrong claim would still be applied today, and would look entirely legitimate to the machine. This is recorded in `openspec/BACKLOG.md` with the two ways it could close — demonstrate which mechanism rejects it, or decide that Phase 2's `revert_state` is the intended remedy and this is an undo problem rather than a prevention one. It is deliberately not being closed by tightening the transition table, which would make the table lie about the lifecycle to compensate for a different subsystem's bug.
 
 **Correction to this ADR's own framing:** phrases like "the four live misclassifications" were carried into `README.md`, the change's delta spec, `design.md` and a `claim_status.py` docstring, all asserting a guarantee that covers two of the four. Found by an `eval-change` run on 2026-07-30 and corrected in each; noted here because this ADR is where the four-as-one framing started.
+
+## Amendment (2026-07-31) — the correction claimed above was itself incomplete
+
+The 2026-07-30 amendment ends: *"phrases like 'the four live misclassifications' were carried into `README.md`, the change's delta spec, `design.md` and a `claim_status.py` docstring, all asserting a guarantee that covers two of the four … and corrected in each."*
+
+**"Corrected in each" was false when written.** A second `eval-change` run on 2026-07-31 found the retracted guarantee still standing in two of the four:
+
+- `openspec/changes/claim-state-from-event-log/specs/claim-state-machine/spec.md` — *"Those two are guarded by event idempotency and reference/Sr routing precedence … and the system SHALL NOT claim otherwise"*. This is the artifact `sync` copies into the baseline, so it was the one place the error would have become permanent.
+- `design.md` Decision 3's correction paragraph — which retracted the claim in its opening sentence and restated it in its conclusion.
+
+The retraction had reached `tasks.md`, `README.md`, the `claim_status.py` docstring and the *sibling* delta (`claim-status-tracking`), and the commit message asserted "the delta spec" singular, which was true of the one edited and false of the one that mattered.
+
+Both are now corrected to state the actual position: those two transitions have **no demonstrated guard**, tracked in `openspec/BACKLOG.md`.
+
+**Why this is worth an amendment rather than a quiet edit.** The same commit that left the delta spec wrong (`b0583ed`) added a row to `docs/failure-modes.md` naming this exact rule — *"correct the delta spec first, since it is the only one that becomes permanent"*. Writing the rule and breaking it in one commit is the more useful record than a clean correction would have been: a claim of completeness ("corrected in each") is itself a factual claim, and it went into an accepted ADR unverified. Enumerate the sites and check them off; do not assert coverage from memory.

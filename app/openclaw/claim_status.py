@@ -606,6 +606,20 @@ def _record_event(claim_id: int | None, event_type: str, email_id: str | None, d
         return cur.lastrowid
 
 
+def transition_allowed(current: str | None, event_type: str) -> bool:
+    """Would `apply_event` move a claim at `current` on this event type?
+
+    For callers that must destroy something *before* the state write and would
+    otherwise leave a claim half-changed — `invoice_matching.unmatch` wipes the
+    invoice, and a refusal after that wipe strands a submitted claim with no
+    invoice and its old status. Asking first keeps the table the only authority;
+    duplicating the lookup at the call site is how the convention rotted before.
+
+    A stateless or backfill event answers False: neither is a transition."""
+    target = STATE_EVENTS.get(event_type)
+    return target is not None and target in TRANSITIONS.get(current, frozenset())
+
+
 def apply_event(claim_id: int, event_type: str, detail: dict | None = None, email_id: str | None = None) -> dict:
     """The only writer of `vet_claims.status`.
 

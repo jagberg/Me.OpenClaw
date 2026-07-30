@@ -958,7 +958,14 @@ def resolve_split_proposal(proposal_id: int, chosen_claim_id: int) -> dict:
 def unmatch(claim_id: int) -> dict:
     """Rejects a wrong invoice match: remembers the rejected email so the
     matcher won't re-grab it, then resets the claim to 'pending_match' so the
-    next pipeline run searches Gmail again. Shared by the Telegram button."""
+    next pipeline run searches Gmail again. Shared by the Telegram button.
+
+    Refuses outright once the claim has been submitted. The wipe below is
+    destructive and used to run unconditionally, paired with an unconditional
+    `status = 'pending_match'` write; routing that write through `apply_event`
+    means a claim at `sent`/`acknowledged`/`settled` has it *refused* — which
+    left the invoice destroyed and the claim stranded in its old state. Ask the
+    table before destroying anything, not after."""
     now = datetime.now(timezone.utc).isoformat()
     with db.get_connection() as conn:
         claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
@@ -966,6 +973,12 @@ def unmatch(claim_id: int) -> dict:
             return {"ok": False, "message": f"No claim #{claim_id} found."}
         if not claim["matched_email_id"]:
             return {"ok": False, "message": f"Claim #{claim_id} has no matched invoice to reject."}
+        if not claim_status.transition_allowed(claim["status"], "unmatched"):
+            return {
+                "ok": False,
+                "message": f"Claim #{claim_id} is already {claim['status']} — its invoice can't be "
+                "rejected now without stranding the submission. Correct it on the dashboard instead.",
+            }
         rejected = json.loads(claim["rejected_email_ids"]) if claim["rejected_email_ids"] else []
         if claim["matched_email_id"] not in rejected:
             rejected.append(claim["matched_email_id"])

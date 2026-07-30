@@ -4195,6 +4195,59 @@ def test_the_projection_skips_a_reverted_event_and_survives_an_illegal_one():
     assert claim_status.project_state(claim) == "settled"
 
 
+def test_unmatching_a_submitted_claim_destroys_nothing():
+    """Regression: routing the status write through `apply_event` turned an
+    unconditional reset into a refusable one, while the wipe above it stayed
+    unconditional. Unmatching a `sent` claim therefore nulled `invoice_data`,
+    `matched_email_id` and `flag`, had its status write refused, and left the
+    claim submitted with no invoice. Reachable from the Telegram unmatch button;
+    no test called `unmatch` at all. Found by eval 2026-07-31."""
+    import json as _json
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        submitted = _insert_claim(conn, aari, "2026-06-01", status="sent",
+                                  invoice_data=_json.dumps({"amount": 120.0}))
+        conn.execute("UPDATE vet_claims SET matched_email_id = 'email-x' WHERE id = ?", (submitted,))
+
+    result = invoice_matching.unmatch(submitted)
+    assert result["ok"] is False, "a submitted claim's invoice must not be rejectable"
+    row = _claim_row(submitted)
+    assert row["status"] == "sent"
+    assert row["invoice_data"] is not None, "the invoice was destroyed by a refused reset"
+    assert row["matched_email_id"] == "email-x"
+
+    # The ordinary path still works: from `matched`, unmatched -> pending_match
+    # is a declared transition, so the wipe and the state change both happen.
+    with db.get_connection() as conn:
+        matched = _insert_claim(conn, aari, "2026-06-02", status="matched",
+                                invoice_data=_json.dumps({"amount": 99.0}), amount=-99.0,
+                                merchant="UNMATCH VET")
+        conn.execute("UPDATE vet_claims SET matched_email_id = 'email-y' WHERE id = ?", (matched,))
+    assert invoice_matching.unmatch(matched)["ok"] is True
+    row = _claim_row(matched)
+    assert row["status"] == "pending_match" and row["invoice_data"] is None
+
+
+def test_health_reports_a_broken_projection_instead_of_500ing():
+    """`/health` is the one URL you check to find out whether anything is wrong,
+    and it also carries `polling_alive`. An unguarded fold call turned a
+    malformed event detail into a 500 that hid both. It must degrade to a visible
+    marker — and never to `0`, which reads as healthy on the figure gating
+    Phase 2."""
+    from openclaw import main as main_module
+
+    original = claim_status.state_projection_disagreements
+    try:
+        claim_status.state_projection_disagreements = lambda: (_ for _ in ()).throw(ValueError("bad detail"))
+        value = main_module._disagreement_count()
+    finally:
+        claim_status.state_projection_disagreements = original
+    assert isinstance(value, str) and "unavailable" in value, value
+    assert value != 0 and value != "0"
+
+
 def test_the_shadow_comparison_reports_without_repairing_anything():
     """A comparison that fixes what it measures has measured nothing. Phase 1's
     whole value is that the two sources are compared, not reconciled."""

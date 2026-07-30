@@ -115,6 +115,18 @@ def basic_status(request: Request):
     )
 
 
+def _disagreement_count():
+    """The shadow count, or a visible marker if the fold itself is broken.
+
+    Never a number when it failed: reporting 0 for "could not compute" would
+    read as healthy, and this figure is what gates Phase 2."""
+    try:
+        return len(claim_status.state_projection_disagreements())
+    except Exception as exc:
+        logger.warning("health: state projection failed: %s", exc, exc_info=True)
+        return f"unavailable: {type(exc).__name__}"
+
+
 @app.get("/health")
 def health():
     """One URL that answers "is the bot actually listening?". Probing Telegram's
@@ -123,9 +135,12 @@ def health():
         "app_version": config.APP_VERSION,
         "polling_alive": telegram_bot.polling_alive(),
         # Shadow mode (Phase 1): claims whose stored status differs from what
-        # their own event log projects. Expected non-zero until the backfill;
-        # must be zero for a week of ticks before the projection gets authority.
-        "state_projection_disagreements": len(claim_status.state_projection_disagreements()),
+        # their own event log projects. `pipeline.compare_state_projection`
+        # guards the identical call and this one did not, so a malformed detail
+        # in the fold turned the whole endpoint into a 500 — taking
+        # `polling_alive` down with it, on the one URL you check to find out
+        # whether anything is wrong. Reports the failure as a value instead.
+        "state_projection_disagreements": _disagreement_count(),
         **message_log.stats(),
     }
 
