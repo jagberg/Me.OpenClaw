@@ -62,8 +62,17 @@ Phase 1 (groups 1–4) changes no behaviour and is shippable on its own. Phase 2
   Resolved by making the backfill event a **third category**: `BACKFILL_EVENT`, in neither set, state-bearing but with a per-claim target read from `detail["status"]`, and exempt from `TRANSITIONS` because it *asserts* a state the log has no path to rather than transitioning to one. It is the only exemption in the machine. A backfill naming an undeclared status is refused rather than seeded, in both `apply_event` and the fold. Decision 1 in `design.md` carries a dated correction.
 
 - [x] 6.2 Dry-run it, print the per-claim diff, and check it against 5.5's list — anything backfilled that 5.5 did not predict is a projection bug, not a backfill case. **Dry run names exactly 5.5's nineteen claims, no more and no fewer.** Then exercised for real against a `src.backup()` copy in the scratchpad (never the live file): wrote 19 events, `state_projection_disagreements` went 19 -> **0**, and an immediate second run reported 0 needing backfill. Also fixed here: the script printed an em-dash, which the cp1252 console renders as a replacement character — a clean run read like a failure.
-- [ ] 6.3 Run it **inside the container** (`docker exec`), backup first, snapshot before/after (ADR-0018). Ask before running.
-- [ ] 6.4 Confirm the disagreement count is zero afterwards, and stays zero across a week of ticks. **Do not proceed to group 7 until it does.**
+- [x] 6.3 Run it **inside the container** (`docker exec`), backup first, snapshot before/after (ADR-0018). Ask before running. **Run 2026-07-30 against the live DB, on `8e1f852+deploy`.**
+
+  Backup: `/data/openclaw.db.bak-pre-statebackfill` (2,289,664 bytes), taken container-side via `src.backup(dst)` from a read-only open — never a host-side write (ADR-0018).
+
+  The image ships `openclaw/` only, so `scripts/` is not in the container. The audited script was `docker cp`'d in and removed afterwards, rather than retyping an inline equivalent — an improvised one-liner is not the thing that was dry-run and reviewed.
+
+  Container dry run found the same 19, from `DATABASE_PATH=/data/openclaw.db`. Applied: `wrote 19 event(s); disagreements now: 0`.
+
+  **Diffed the backup against the live DB afterwards, and the backfill touched no `vet_claims` row at all** — `flag`, `status` and `updated_at` changed on *none* of the 22 claims, flags stayed at 10, and `claim_status_events` went 23 -> 42 with exactly 19 `state_backfilled` rows. That is the strongest available evidence that the backfill added history without rewriting any, which is what Decision 8 requires. (`updated_at` being untouched is the incidental proof: the script only INSERTs events.)
+
+- [ ] 6.4 Confirm the disagreement count is zero afterwards, and stays zero across a week of ticks. **Do not proceed to group 7 until it does.** — `/health` reads `"state_projection_disagreements": 0` immediately after the backfill (2026-07-30). **The week has not elapsed**; this stays open until it has. What would reopen it: any claim moving through a path whose event the writers still fail to append, which is precisely what the remaining days are for. Check `/health` and the WARNING lines in the container log before ticking.
 
 ## 7. Reversion, timeline and authority (Phase 2)
 
