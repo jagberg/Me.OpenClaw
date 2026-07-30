@@ -45,7 +45,7 @@ This is a state machine whose transition table doesn't exist anywhere. Justin's 
 
 - Code: `claim_status.py` (`apply_event`, the transition table, the projection, `revert_state`), `invoice_matching.py` (3 write sites), `claim_forms.py` (2 write sites), `pipeline.py` (shadow-mode comparison on the tick), `main.py` + `templates/` (timeline, revert control), `telegram_bot.py` (timeline + revert callback).
 - Data: **no schema change.** `claim_status_events` already has `claim_id`, `event_type`, `raw_email_id`, `detail`, `created_at`; new event types are values, not columns, and `state_reverted` names its target in `detail`.
-- **Backfill, one-off:** each of the 23 existing claims needs a synthetic event for the state it is in now, or the projection would regress every one of them to `pending_match`. Container-side, backed up, dry-run diff reviewed — the same procedure the 2026-07-28 repair used.
+- **Backfill, one-off:** each existing claim needs a synthetic event for the state it is in now, or the projection would regress every one of them to `pending_match`. Container-side, backed up, dry-run diff reviewed — the same procedure the 2026-07-28 repair used.
 - Tests: the transition table (every legal and illegal pair), the projection over real event sequences from the live log, reversion (including reverting a reversion), shadow-mode disagreement detection, and the four claims the re-read regressed as an explicit regression fixture.
 - Docs: an ADR (this completes ADR-0008 rather than reversing it; records why not a state-machine library and why not full event sourcing), `README.md`, `app/openclaw/CLAUDE.md`.
 - No third-party calls, no LLM, no new dependency.

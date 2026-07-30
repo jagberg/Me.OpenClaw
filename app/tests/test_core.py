@@ -3895,13 +3895,38 @@ def test_detach_reference_returns_a_claim_to_the_correlation_pool():
 
 def test_every_declared_transition_is_legal_and_the_terminals_are_dead_ends():
     """The table is the rule, so the table itself gets asserted: every declared
-    pair must be legal by `apply_event`'s own predicate, and the two terminal
-    states must have no way out at all (ADR-0011: a later letter reusing a
-    thread's reference must never reopen a closed claim)."""
+    pair must actually be applied by `apply_event`, and the two terminal states
+    must have no way out at all (ADR-0011: a later letter reusing a thread's
+    reference must never reopen a closed claim).
+
+    This test used to assert `target in TRANSITIONS[from_state]` while iterating
+    that same set — `x in S for x in S`, true of any table including an empty one,
+    and it never called `apply_event` despite the docstring saying so. Zero of the
+    42 declared pairs were discriminatingly checked. Found by eval 2026-07-30."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+
+    checked = 0
     for from_state, targets in claim_status.TRANSITIONS.items():
+        if from_state is None:
+            continue  # the notional creation step; nothing folds through it
         for target in targets:
-            assert target in claim_status.TRANSITIONS[from_state], f"{from_state} -> {target}"
             assert target in claim_status.TRANSITIONS, f"{target} is a target with no row of its own"
+            # Drive it through the real writer: put a claim in `from_state`, fire the
+            # event that names `target`, and require the state to actually move.
+            event_type = next(e for e, t in claim_status.STATE_EVENTS.items() if t == target)
+            with db.get_connection() as conn:
+                # One claim per pair, each on its own transaction: bank_transactions
+                # is UNIQUE on (date, amount, merchant).
+                claim = _insert_claim(conn, aari, "2026-06-01", status=from_state,
+                                      amount=-50.0 - checked, merchant=f"PAIR VET {checked}")
+            outcome = claim_status.apply_event(claim, event_type, {})
+            assert outcome["applied"] is True, f"{from_state} -> {target} is declared but was refused"
+            assert _claim_row(claim)["status"] == target, f"{from_state} -> {target} did not write the state"
+            checked += 1
+    assert checked == sum(len(t) for s, t in claim_status.TRANSITIONS.items() if s is not None)
+    assert checked >= 40, f"only {checked} pairs exercised — the table shrank unnoticed"
     assert claim_status.TRANSITIONS["settled"] == frozenset()
     assert claim_status.TRANSITIONS["declined"] == frozenset()
     assert claim_status.TRANSITIONS[None] == frozenset({"pending_match"}), "a new claim starts nowhere else"
@@ -4150,14 +4175,23 @@ def test_the_projection_skips_a_reverted_event_and_survives_an_illegal_one():
         )
         # An event that is illegal from the replayed state must be skipped without
         # costing us the rest of the fold — so a legal one after it still applies.
-        for event_type in ("approved", "settled"):
+        # `matched` is the illegal one: TRANSITIONS["sent"] does not contain it, and
+        # a claim never goes back to matched once submitted. `approved` and
+        # `settled` after it are both legal and must still land.
+        #
+        # The earlier version of this test injected `approved` then `settled` and
+        # called `approved` the illegal one — but `sent` allows `approved`, so no
+        # illegal event was ever present. Mutating `_fold` to `break` on the first
+        # illegal event left the whole suite green. Found by eval 2026-07-30.
+        for event_type in ("matched", "approved", "settled"):
             conn.execute(
                 "INSERT INTO claim_status_events (claim_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
                 (claim, event_type, "{}", datetime.now(timezone.utc).isoformat()),
             )
-    # sent -> (ack reverted) -> approved is illegal from `sent`? No: sent allows
-    # approved. `settled` then follows from approved. The reverted ack is simply
-    # not there, and the claim still lands where its remaining events put it.
+    assert "matched" not in claim_status.TRANSITIONS["sent"], "fixture assumes this pair is illegal"
+    # The reverted ack is simply not there; the illegal `matched` is skipped; the
+    # two legal events after it still apply. A fold that aborted on the illegal
+    # event would stop at `sent`.
     assert claim_status.project_state(claim) == "settled"
 
 

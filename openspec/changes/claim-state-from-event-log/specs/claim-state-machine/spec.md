@@ -18,9 +18,13 @@ The permitted transitions SHALL be declared in one place as data. A transition n
 - **WHEN** an `acknowledged` event correlates to a claim already `settled`
 - **THEN** the event is recorded, the claim stays `settled`, and it is flagged naming both states
 
-#### Scenario: The four transitions that regressed live
-- **WHEN** the transitions `settled`→`acknowledged`, `below_excess`→`acknowledged`, and `sent`→`below_excess`-by-misroute are attempted
-- **THEN** each is refused, matching the incident of 2026-07-27 where all four were applied and required a restore from backup
+#### Scenario: The 2026-07-27 regression the table can refuse
+- **WHEN** an `acknowledged` event is applied to a claim already `settled`, as happened to claims #6 and #7 on 2026-07-27
+- **THEN** it is refused
+
+#### Scenario: The 2026-07-27 regressions the table cannot refuse
+- **WHEN** `sent`→`below_excess` (claim #22) or `below_excess`→`acknowledged` (claim #18) is applied
+- **THEN** each is **permitted**, because both are ordinary forward moves — `below_excess` is non-terminal by decision, the invoice being retained — and what was wrong on 2026-07-27 was the routing and the replay, not the transition. Those two are guarded by event idempotency and reference/Sr routing precedence, not by this table, and the system SHALL NOT claim otherwise
 
 #### Scenario: A state a claim is already in
 - **WHEN** a transition targets the state the claim already holds and that self-transition is declared legal (a re-match after a split)

@@ -664,10 +664,22 @@ def apply_event(claim_id: int, event_type: str, detail: dict | None = None, emai
 
 
 def _flag_claim(claim_id: int, reason: str) -> None:
+    """Appends to the claim's flag rather than replacing it.
+
+    One flag column carries everything Justin must act on, and `pipeline` builds
+    the inline keyboard and picks the review PDF by matching *substrings* of it —
+    so overwriting "possible additional invoice" silently removes his wrong-invoice
+    button. A refusal is exactly the case where another flag is likely to be
+    present already (a later letter reusing a settled thread's reference). Same
+    concatenating shape `claim_forms` uses for the split shortfall."""
     with db.get_connection() as conn:
+        existing = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        current = existing["flag"] if existing else None
+        if current and reason in current:
+            return  # already said; re-stating it on every tick is noise
         conn.execute(
             "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ?",
-            (reason, datetime.now(timezone.utc).isoformat(), claim_id),
+            (f"{current}; {reason}" if current else reason, datetime.now(timezone.utc).isoformat(), claim_id),
         )
 
 

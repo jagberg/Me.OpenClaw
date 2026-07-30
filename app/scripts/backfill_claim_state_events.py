@@ -42,6 +42,36 @@ from openclaw import claim_status, db  # noqa: E402
 REASON = "transition predates the event log"
 
 
+def _refuse_phantom_db() -> None:
+    """Stop rather than report a confident wrong plan from the wrong database.
+
+    `app/.env` sets `DATABASE_PATH=/data/openclaw.db` — the *container* path — and
+    `config` loads `.env` from cwd. Run from the host, this script therefore opens
+    `C:\\data\\openclaw.db`: a real file, created 2026-07-22, holding two stale
+    claims. It does not error; it prints a clean-looking plan about the wrong data.
+
+    The first version of this guard printed `os.environ["DATABASE_PATH"]` *after*
+    the dotenv load, so it displayed `/data/openclaw.db` while opening the phantom —
+    a guard that could not detect the failure it guarded. Resolve the path the way
+    the connection does, then require it to exist and to hold the real corpus."""
+    from openclaw import config
+
+    path = Path(config.DATABASE_PATH)
+    print(f"database: {path}")
+    if not path.exists():
+        raise SystemExit(f"REFUSED: {path} does not exist. Run this inside the container.")
+    with db.get_connection() as conn:
+        claims = conn.execute("SELECT COUNT(*) FROM vet_claims").fetchone()[0]
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "telegram_messages" not in tables or claims < 10:
+        raise SystemExit(
+            f"REFUSED: {path} holds {claims} claims and "
+            f"{'no' if 'telegram_messages' not in tables else 'a'} telegram_messages table - "
+            "this looks like the phantom C:\\data\\openclaw.db, not the live database. "
+            "Run this inside the container (docker exec), never from the host."
+        )
+
+
 def plan() -> list[dict]:
     """One row per claim needing a backfill. Reads only."""
     rows = []
@@ -99,8 +129,8 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="write the events (container-side only)")
     args = parser.parse_args()
 
+    _refuse_phantom_db()
     rows = plan()
-    print(f"DATABASE_PATH={os.environ.get('DATABASE_PATH', '(config default)')}")
     print(f"{len(rows)} claim(s) need a backfill\n")
     for row in rows:
         note = "  [already backfilled]" if row["already_backfilled"] else ""
@@ -113,8 +143,10 @@ def main() -> int:
         print("\nDRY RUN - nothing written. Re-run with --apply inside the container, after a backup.")
         return 0
 
-    # `state_backfilled` is stateless, so the events change no status; the point is
-    # that the fold can now reach where the claim already is.
+    # These INSERTs write no status themselves; the point is that the fold can now
+    # reach where the claim already is. (`state_backfilled` is NOT stateless — it
+    # seeds the state it names. An earlier version of this comment said it was,
+    # which is the pre-fix premise that would have made this whole script a no-op.)
     written = apply(rows)
     remaining = claim_status.state_projection_disagreements()
     print(f"\nwrote {written} event(s); disagreements now: {len(remaining)}")

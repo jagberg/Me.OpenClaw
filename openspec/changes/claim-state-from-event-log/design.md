@@ -3,7 +3,7 @@
 The claim lifecycle has twelve states and no transition table. What exists instead:
 
 - `claim_status_events` — append-only, one row per insurer reply or Justin action. Correct as far as it goes (ADR-0008).
-- `vet_claims.status` — a mutable column written by seven statements across `invoice_matching`, `claim_forms` and `claim_status`. Six of the seven append nothing.
+- `vet_claims.status` — a mutable column written by nine statements across `invoice_matching`, `claim_forms` and `claim_status` (seven UPDATEs plus two INSERTs that create a claim already `matched`). All but one append nothing.
 - `TERMINAL_STATUSES`, `CLOSED_STATUSES`, `AWAITING_REPLY_STATUSES` — three tuples consulted by *some* call sites. Not a rule; a convention.
 
 Two live incidents define the requirements:
@@ -104,7 +104,9 @@ Callers stop writing `status` themselves. `process_reply` keeps its routing and 
 
 Derived from what the code actually does today, not from what a lifecycle diagram would suggest: `matched → matched` and `drafted → matched` both exist because `split_between_pets` resets a draft, and `below_excess` is deliberately non-terminal.
 
-Every pair not in this table is illegal, including the four the re-read performed. Those four become an explicit regression fixture.
+Every pair not in this table is illegal.
+
+**Correction, 2026-07-30 (found by eval).** This paragraph originally read "including the four the re-read performed. Those four become an explicit regression fixture", which the table two rows above contradicts: `sent` lists `below_excess`, and `below_excess` lists `acknowledged`. Only `settled`→`acknowledged` (claims #6 and #7) is this table's to refuse. Claim #22's `sent`→`below_excess` and claim #18's `below_excess`→`acknowledged` are ordinary forward moves — `below_excess` is non-terminal by the decision recorded in this very table. What was wrong with those two on 2026-07-27 was the routing and the replay, not the transition, so their guard is event idempotency plus reference/Sr precedence. `tasks.md` 1.3 recorded this correctly on 2026-07-29; the correction did not reach this decision or the delta spec until the eval found them still asserting it.
 
 ### 4. `status` is a projection, and the column is its cache.
 
@@ -139,7 +141,7 @@ The last time a state-writing change went to the live DB without a comparison st
 
 ### 8. Backfill preserves real history and synthesizes only what is missing.
 
-For each of the 23 existing claims: project over its existing events. If the projection already equals the stored status, do nothing — the history is genuine and stays untouched. If it disagrees (every claim whose state we caused, since those transitions were never recorded), append one `state_backfilled` event carrying the current status, timestamped at the claim's `updated_at`, with `detail = {"backfilled": true, "reason": "transition predates the event log"}`.
+For each existing claim (22 at the time of writing): project over its existing events. If the projection already equals the stored status, do nothing — the history is genuine and stays untouched. If it disagrees (every claim whose state we caused, since those transitions were never recorded), append one `state_backfilled` event carrying the current status, timestamped at the claim's `updated_at`, with `detail = {"backfilled": true, "reason": "transition predates the event log"}`.
 
 Container-side, backup first, dry-run diff reviewed, preconditions asserted — the procedure the 2026-07-28 repair established.
 
@@ -156,7 +158,7 @@ Container-side, backup first, dry-run diff reviewed, preconditions asserted — 
 
 1. Phase 1: `apply_event`, the transition table, the projection, all seven writers routed through it, shadow comparison on the tick, `/health` count. No behaviour change.
 2. Deploy; watch the disagreement count for a week of ticks.
-3. Backfill the 23 claims, container-side, backup + dry-run diff.
+3. Backfill the disagreeing claims, container-side, backup + dry-run diff.
 4. Phase 2: projection becomes authoritative; add the timeline view and the revert control.
 5. Absorb `vet-info-request-chase` group 0: a re-read now appends events and lets the projection decide, so "a re-read may not write status" needs no separate rule.
 

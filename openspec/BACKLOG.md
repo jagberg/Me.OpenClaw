@@ -170,3 +170,23 @@ Re-run `reextract_item_dates.py --apply` inside the container once the provider 
 Left alone on purpose: changing it moves expected-reimbursement figures and settlement-mismatch flags, and it compounds the *already recorded, still undecided* disagreement about closed policy years in `openspec/specs/dashboard-visit-ledger/spec.md` ("Known inconsistency — closed policy years"). Two open questions about the same anchor should be decided together, by Justin, not resolved one at a time by whoever is editing.
 
 Concrete case to reason about when it is decided: Aari's policy anniversary is 09-23, so a treatment on 19 Jun charged 06/07 sits in the same policy year either way. A treatment in mid-September charged in early October would not.
+
+### A legal transition applied to the wrong claim has no demonstrated guard
+*Open since 2026-07-30. Capability: `claim-state-machine`. Found by the `eval-change` run on `claim-state-from-event-log`; ADR-0020's Decision 1 stays open on it.*
+
+The transition table refuses `settled`→`acknowledged`, which is what walked claims #6 and #7 backwards on 2026-07-27. It does **not** refuse the other two moves from that incident, and it should not: #22's `sent`→`below_excess` and #18's `below_excess`→`acknowledged` are ordinary forward moves, because `below_excess` is non-terminal by decision (the invoice is retained). What was wrong with those two was that the event reached the wrong claim.
+
+The state machine cannot be their guard, and nothing else has been shown to be one. `_already_recorded` is the obvious candidate, but ADR-0020 records that event-level idempotency was tried against the real DB for this exact incident and **did not help** — the problem was never duplicate events. Reference/Sr routing precedence is the other candidate and has never been tested against a replay of misrouted mail.
+
+So: a re-read whose event is a *legal* move applied to the *wrong* claim would still be applied today, silently and legitimately as far as the machine is concerned. `tasks.md` 1.3 briefly asserted idempotency covered this; that assertion was withdrawn on 2026-07-30 rather than left standing.
+
+What would close it: a test that replays real misrouted mail against a claim whose state legally accepts the event, and demonstrates which mechanism rejects it — or, if none does, a decision that Phase 2's `revert_state` is the intended remedy and this is an undo problem rather than a prevention one.
+
+### The 19→0 shadow measurement could not discriminate, so the machine is still unproven live
+*Open since 2026-07-30. Capability: `claim-state-machine`. Gates task 6.4 and Phase 2.*
+
+`state_projection_disagreements` read 19 before the backfill and 0 after, and both numbers are real — but neither tested the state machine. Strip the `state_backfilled` events from the live log and re-fold: **all 22 claims project `pending_match`**, because no claim's log holds the `matched`/`drafted`/`sent` events that would advance a fold. A projection that ignored every real event outright produces the identical 19. And the 0 is arithmetically forced: the backfill copies `vet_claims.status` into `detail["status"]`, and the fold reads it back exempt from `TRANSITIONS` — both sides of the comparison are the same column.
+
+Nothing live has yet exercised the transition table, event ordering, or the illegal-event skip. Only the seed and the copy-back have. `apply_event`'s `BACKFILL_EVENT` branch has never run at all, because the script raw-`INSERT`s.
+
+This does not mean the machine is wrong — the unit tests cover it, and claims #2 and #8 folded `backfill`→`approved`→`settled` correctly on 2026-07-30T08:45, which is the first live fold that could have disagreed. It means 6.4's week of zero is a much weaker signal than it reads as, and should be judged on **claims that transition during the week**, not on the count staying at zero.

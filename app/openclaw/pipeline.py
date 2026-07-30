@@ -815,7 +815,16 @@ def compare_state_projection() -> list[dict]:
     cannot fix a projection bug. Reads only, writes nothing; the whole point of
     the phase is that the two sources are compared rather than assumed equal.
     Before the backfill a non-zero count is expected."""
-    disagreements = claim_status.state_projection_disagreements()
+    try:
+        disagreements = claim_status.state_projection_disagreements()
+    except Exception:
+        # This is diagnostic-only code that runs BEFORE the Gmail check and before
+        # `notify_claim_states` — the sole push channel for the flags `apply_event`
+        # writes. Unguarded, a malformed `detail` in the fold would kill the whole
+        # tick and take delivery of its own refusals with it: an observer able to
+        # break what it observes. WARNING, not ERROR: Justin cannot fix a fold bug.
+        logger.warning("state projection: comparison failed, skipping it this tick", exc_info=True)
+        return []
     if disagreements:
         logger.warning(
             "state projection: %d claim(s) disagree with the stored status: %s",
