@@ -46,6 +46,8 @@ Telegram + dashboard ── every state change, question and blocker lands as a
 
 The whole pipeline runs on an APScheduler tick (default 15 min) inside one FastAPI process (ADR-0006). A failure on one claim flags that claim and moves on — a tick is never lost to one bad email (visible failures are a hard rule).
 
+The lifecycle above is a **declared state machine**, not a column anyone may write. Every legal move is in one transition table, and `claim_status.apply_event` is the only thing that writes a claim's state: it records the event first, then applies it if the table allows the move — and if it doesn't, the state stays put and the claim is flagged naming both states, with the event kept as evidence. So a claim's history is a fact on record rather than something to reconstruct: re-reading an old acknowledgement can no longer walk a settled claim backwards, which it did to four claims in July 2026. Each tick folds every claim's events and compares the result against the stored status; `/health` publishes the disagreement count, and it should read zero. Reverting a state change, and the timeline view that would show it, are not built yet.
+
 ## How matching works
 
 For each unmatched vet charge, `invoice_matching`:
