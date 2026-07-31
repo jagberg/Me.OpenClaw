@@ -4155,29 +4155,24 @@ def test_a_claim_whose_transitions_predate_the_log_projects_to_its_birth_state()
     assert [d["claim_id"] for d in claim_status.state_projection_disagreements()] == [claim]
 
 
-def test_the_projection_skips_a_reverted_event_and_survives_an_illegal_one():
+def test_the_projection_survives_an_illegal_event():
     _fresh_db()
     with db.get_connection() as conn:
         claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="pending_match")
     for event_type in ("matched", "drafted", "sent", "acknowledged"):
         claim_status.apply_event(claim, event_type, {})
     with db.get_connection() as conn:
-        ack_id = conn.execute(
-            "SELECT id FROM claim_status_events WHERE claim_id = ? AND event_type = 'acknowledged'", (claim,)
-        ).fetchone()["id"]
-        # Written by hand: revert_state is Phase 2 (task 7.1). The projection has
-        # to ignore reverted events from the start or the phases can't be split.
-        import json as _json
-        conn.execute(
-            "INSERT INTO claim_status_events (claim_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
-            (claim, "state_reverted", _json.dumps({"reverts_event_id": ack_id, "reason": "misrouted"}),
-             datetime.now(timezone.utc).isoformat()),
-        )
+        # This test also covered reverted events until 2026-07-31. `state_reverted`
+        # was never written by anything — zero rows live, and apply_event could not
+        # produce one — so the fold's skip and the event type both went with the
+        # retro. Rebuild the coverage alongside `revert_state` (Phase 2, task 7.1).
+        #
         # An event that is illegal from the replayed state must be skipped without
         # costing us the rest of the fold — so a legal one after it still applies.
-        # `matched` is the illegal one: TRANSITIONS["sent"] does not contain it, and
-        # a claim never goes back to matched once submitted. `approved` and
-        # `settled` after it are both legal and must still land.
+        # `matched` is the illegal one: the fold is at `acknowledged` by here and
+        # TRANSITIONS["acknowledged"] does not contain it, because a claim never
+        # goes back to matched once submitted. `approved` and `settled` after it
+        # are both legal from `acknowledged` and must still land.
         #
         # The earlier version of this test injected `approved` then `settled` and
         # called `approved` the illegal one — but `sent` allows `approved`, so no
@@ -4188,10 +4183,10 @@ def test_the_projection_skips_a_reverted_event_and_survives_an_illegal_one():
                 "INSERT INTO claim_status_events (claim_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
                 (claim, event_type, "{}", datetime.now(timezone.utc).isoformat()),
             )
-    assert "matched" not in claim_status.TRANSITIONS["sent"], "fixture assumes this pair is illegal"
-    # The reverted ack is simply not there; the illegal `matched` is skipped; the
-    # two legal events after it still apply. A fold that aborted on the illegal
-    # event would stop at `sent`.
+    assert "matched" not in claim_status.TRANSITIONS["acknowledged"], \
+        "fixture assumes this pair is illegal"
+    # The illegal `matched` is skipped; the two legal events after it still apply.
+    # A fold that aborted on the illegal event would stop at `acknowledged`.
     assert claim_status.project_state(claim) == "settled"
 
 

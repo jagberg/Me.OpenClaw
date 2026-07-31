@@ -149,7 +149,6 @@ STATELESS_EVENTS = frozenset({
     "confirmed_resolved",
     "mismatch_dismissed",
     "reference_detached",
-    "state_reverted",
 })
 
 # The third category, and it exists because `design.md` contradicts itself: Decision
@@ -462,14 +461,14 @@ def find_claim_by_reference_and_sr(reference: str, sr: int) -> list:
         ).fetchall()
 
 
-def find_claims_by_reference(reference: str, include_terminal: bool = False) -> list:
+def find_claims_by_reference(reference: str) -> list:
     """Claims sharing a Petcover reference are one Condition Thread (the ref is
     reused for the life of the condition). A reference-only event touches the
     thread's non-terminal claims only — settled/declined claims are finished and
     a later reference-reuse letter must never reopen them."""
     with db.get_connection() as conn:
         rows = conn.execute(f"{_CLAIM_SELECT} WHERE vc.petcover_reference = ?", (reference,)).fetchall()
-    return rows if include_terminal else [r for r in rows if r["status"] not in TERMINAL_STATUSES]
+    return [r for r in rows if r["status"] not in TERMINAL_STATUSES]
 
 
 def _submission_key(claim) -> str:
@@ -712,28 +711,16 @@ def _flag_claim(claim_id: int, reason: str) -> None:
 CREATED_STATE = "pending_match"
 
 
-def _reverted_event_ids(rows) -> set[int]:
-    """Ids that a `state_reverted` event points at.
-
-    One level only: reverting a reversion is Phase 2 (task 7.1), and until
-    `revert_state` exists nothing writes these at all. Stated rather than left
-    implicit, because a half-implemented fold is worse than an absent one."""
-    reverted = set()
-    for row in rows:
-        if row["event_type"] != "state_reverted":
-            continue
-        target = json.loads(row["detail"] or "{}").get("reverts_event_id")
-        if target is not None:
-            reverted.add(int(target))
-    return reverted
-
-
+# Reversion is Phase 2 (task 7.1). The fold used to skip events named by a
+# `state_reverted` event, but nothing ever wrote one — the live log holds zero,
+# and `apply_event` could not produce one because the type was stateless. Removed
+# 2026-07-31 with the type itself, so an attempt to revert now hits the unknown-
+# event-type refusal and flags the claim instead of being silently recorded and
+# ignored. Rebuild both together when `revert_state` lands, and note the fold has
+# to handle reverting a reversion at that point, which this never did.
 def _fold(rows) -> str:
     state = CREATED_STATE
-    reverted = _reverted_event_ids(rows)
     for row in rows:
-        if row["id"] in reverted:
-            continue
         if row["event_type"] == BACKFILL_EVENT:
             # A seed, not a transition — see BACKFILL_EVENT. Ignored if it names a
             # status nobody declared, rather than seeding the fold with nonsense.

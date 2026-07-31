@@ -112,6 +112,8 @@ Every pair not in this table is illegal.
 
 `project_state(claim_id)` folds the claim's events in `created_at, id` order: skip reverted events, skip stateless ones, apply state events subject to the table. The result is the claim's state.
 
+> **As shipped (2026-07-31):** the reverted-event skip is *not* present. It was built, found never to have fired — nothing wrote `state_reverted`, so the branch was unreachable — and removed by the retro along with the event type. The design above is still the Phase 2 target; task 7.1 restores the skip alongside `revert_state`. ADR-0022's amendment has the reasoning.
+
 The column keeps being written by `apply_event` — so reads, indexes and `WHERE status IN (...)` filters are untouched — but it is now *derivable*, which is the point: a disagreement between column and projection is a detectable defect rather than an invisible one.
 
 Alternative: drop the column and compute on read. Rejected — forty readers, several SQL filters, and a per-row fold on every dashboard render, to fix a problem that a comparison already catches.

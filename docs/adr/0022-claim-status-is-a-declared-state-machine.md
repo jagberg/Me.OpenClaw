@@ -61,3 +61,33 @@ Limitations, recorded because none of them is obvious from the code:
 - **Reversion handling is one level deep.** `_reverted_event_ids` does not yet handle reverting a reversion; nothing writes `state_reverted` at all until Phase 2.
 
 Supersedes nothing. **Completes ADR-0008** — that ADR made the log authoritative as a record; this one makes it authoritative as a *state*. Relates to ADR-0011 (terminal states), ADR-0015 (why WARNING), ADR-0018 (the backfill is a container-side write), ADR-0020 (which of its decisions this implements, and which it shows unimplementable as written), and ADR-0021 (the vocabulary is unchanged; only who may write the state changed).
+
+## Amendment (2026-07-31) — the reversion skip is removed until Phase 2 builds it
+
+A whole-codebase retrospective looking for unearned complexity found this ADR's
+last consequence to be understating the case. `_reverted_event_ids` was not merely
+"one level deep": it was **inert**. `state_reverted` appeared in exactly three
+places — the `STATELESS_EVENTS` set, that function's own equality check, and one
+hand-written `INSERT` in a test. The live log holds zero rows of it, and
+`apply_event` could not have produced one, because a stateless event type is
+recorded and nothing more. So the fold's skip could never fire against real data.
+
+Both are removed: the function, and `state_reverted` from `STATELESS_EVENTS`.
+
+This changes behaviour in one direction, deliberately. With the type undeclared,
+an attempt to append a reversion now lands on `apply_event`'s unknown-event-type
+branch — refused, and the claim flagged naming the event id — instead of being
+silently recorded and silently ignored. Phase 2 is not built; asking for a revert
+today is a defect, and the repo's rule is that failures are visible.
+
+Decision 4 above says the fold skips "reverted and stateless" events. Until
+task 7.1 lands, read that as stateless only.
+
+**Trade-off accepted:** task 7.1 now has to restore the fold's skip alongside
+`revert_state`, rather than finding it already in place — its own wording claimed
+"the projection already ignores reverted events", which is corrected in that file.
+That is a few lines of re-work in exchange for deleting a branch that has never
+executed and could not be tested against anything real. It also removes the trap
+where Phase 2's author trusts a skip that was never exercised: the one-level-only
+limitation named above was real, and rebuilding deliberately is the moment to
+handle reverting a reversion, which the deleted version never did.
