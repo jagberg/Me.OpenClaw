@@ -41,6 +41,12 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
 
 Lifted out of `openspec/BACKLOG.md` on 2026-07-31: the question is decided and the code is shipped, so it is no longer open work, and BACKLOG holds only what is. Kept here in full because the *reasoning* is the part worth recovering — the conclusion alone is already in the code.
 
+**Correction to how this was reported (added by the trail audit, same day).** The central fact below — that the three line-item dates on file each equal their own invoice's header date — was **not discovered by the re-extraction**. It was already recorded in `docs/failure-modes.md` on 2026-07-29 (`256f6ae`, row: *"A capability shipped whose premise has no instance in the real data (3 line-item dates found, all equal to their invoice header date)"*), sourced from `9096b5e`. It was reported two days later as a new finding, then overstated as "no real input at all", then corrected back to the wording already on file.
+
+What the 2026-07-31 run *did* establish, and what was genuinely unknown before it: that re-extracting all 14 cached emails with the corrected prompt yields **no additional** item dates — so the shortfall is the documents, not the stale cache. That was worth the tokens. The rediscovery was not.
+
+The process failure is the point: `docs/failure-modes.md` exists precisely to answer "have we seen this before?" without a repo sweep, and it was not consulted before spending tokens and reporting a discovery. An index nobody reads is a sweep nobody saved.
+
 The re-extraction is **run**. `app/scripts/reextract_item_dates.py --apply`, container-side, backup at `/data/openclaw.db.bak-pre-item-dates-20260731`: 14 cached extractions, 11 replaced, 3 kept, 0 failed.
 
 **It produced zero new line-item dates — 3 before, 3 after.** Eleven emails re-extracted successfully with the prompt that explicitly asks for a per-item date, and the model returned none new.
