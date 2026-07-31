@@ -493,7 +493,8 @@ def _invoice_dates(invoice: dict) -> set[str]:
     header alone would not have given. Kept because the underlying case is real
     and a future vet may print item dates; reported honestly via `_date_source`
     because claiming a precision the documents don't support is how the
-    treatment-vs-charge bug happened. BACKLOG records the decision."""
+    treatment-vs-charge bug happened. The decision, its trade-off and the two
+    rejected options are recorded in `openspec/changes/vet-request-document-and-monday-nudge/tasks.md` section 3b."""
     dates = {invoice.get("date")} | {item.get("date") for item in (invoice.get("items") or [])}
     return {d for d in dates if d}
 

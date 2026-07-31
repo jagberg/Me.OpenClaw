@@ -35,7 +35,34 @@ Scope note: this absorbs `vet-info-request-chase` task 6.3 (extract the requeste
   Earlier attempts on 2026-07-28 failed all 14 on a Groq 403. That was never a standing block — the same container succeeded at 21:15 and 21:34 on 2026-07-30 and 403'd at 22:04. Groq access from here **flaps**; the 3-day success rates were 24/235 `follow_up_extraction`, 18/60 `invoice_extraction`, 21/37 `chat`. Nothing to wait for, just a window to catch. Since all four `_FALLBACK_MODELS` are one provider, the chain retries into the same wall (BACKLOG standing gap).
 - [x] 3.5 Test with the real data: `18/05/2026` resolves to Kings Vet invoice `1000229`, $351.50, claim **#6** — while the request itself stays on claim **#8**. Assert the two are reported as different claims, since that is the whole point.
 - [x] 3.6 Test: a date only in the extraction cache resolves with no claim id; an unmatched date reports "visit unknown"; two invoices sharing a date report both; a line-item date matches even when the invoice's header date differs.
-- [ ] 3.7 Test the wording never presents the resolved invoice as the requested document.
+- [x] 3.7 Test the wording never presents the resolved invoice as the requested document. Covered by `test_a_resolved_visit_says_which_date_actually_matched`, which asserts the chase line names *what matched* (`matched on its invoice date` / `matched on its line item`) — the resolved invoice identifies the visit and is never presented as the document Petcover asked for.
+
+## 3b. What the line-item branch is actually worth (decided 2026-07-31)
+
+Lifted out of `openspec/BACKLOG.md` on 2026-07-31: the question is decided and the code is shipped, so it is no longer open work, and BACKLOG holds only what is. Kept here in full because the *reasoning* is the part worth recovering — the conclusion alone is already in the code.
+
+The re-extraction is **run**. `app/scripts/reextract_item_dates.py --apply`, container-side, backup at `/data/openclaw.db.bak-pre-item-dates-20260731`: 14 cached extractions, 11 replaced, 3 kept, 0 failed.
+
+**It produced zero new line-item dates — 3 before, 3 after.** Eleven emails re-extracted successfully with the prompt that explicitly asks for a per-item date, and the model returned none new.
+
+Three item dates do exist, across two emails — **and every one of them is identical to its own invoice's header date** (`2026-06-19` on an invoice dated 2026-06-19; two items dated `2026-06-30` on an invoice dated 2026-06-30). No claim's stored `invoice_data` carries an item date at all. So the precise statement is not "there is no input" but the sharper one: **the branch's premise — that an item date can *differ* from the header date — has zero instances.** The line-item branch cannot produce a match the header branch would not already produce. (Same shape as the treatment-vs-charge bug: two candidate values that coincide in every row held, so nothing discriminates them.)
+
+So `find_visit_by_date`'s line-item branch is implemented, unit-tested, and **has never had an input that differs from the header date** — the only case it exists for. The case Justin raised — a consult on the 18th billed on an invoice dated the 30th — is real, but these documents do not carry the evidence needed to resolve it that way.
+
+**DECIDED 2026-07-31 (Justin): keep the branch, and make the surfaces state what actually matched.** `find_visit_by_date` now returns `matched_on` (`invoice date` or `line item`) per hit, and the chase message reads `invoice 1000229 (claim #6, matched on its invoice date)`.
+
+Reasoning: the underlying case is real and recurring — a consult on the 18th billed on an invoice dated the 30th — so deleting the machinery would throw away the recognition of it, and it costs nothing at runtime. But implying the system pinpointed a treatment date when it matched an invoice *header* is exactly the shape of the treatment-vs-charge bug: two dates that looked interchangeable, quietly weren't, and every document agreed with every other document for a day. **Trade-off accepted:** a slightly longer chase line, and a branch that stays untested against reality until some vet prints per-item dates.
+
+Verified against the live data on a read-only copy: the motivating case, `18/05/2026`, resolves to invoice 1000229 on claim #6 **via the invoice's own header date** — 1000229 is itself dated 18 May. So the line-item branch was never needed even for the case that prompted it, which is the opposite of what was assumed when it was built.
+
+Rejected: *delete it* (smallest honest code, but loses the shape of a real recurring problem, and it is rebuildable only if someone remembers it existed); *keep it silently* (reads on the dashboard and in the nudge as a working capability that has never once fired).
+- *Keep it.* Costs nothing at runtime, and a future vet's format may print item dates. But it is untestable against reality and reads as a working capability on the dashboard and in the nudge.
+- *Remove it.* Smallest honest code. Loses nothing today and can be rebuilt from git if a format ever appears.
+- *Keep it and say so.* Leave the branch, and have the surfaces state that a date resolved from an invoice header is the header's, not the line item's — which is the actual guarantee.
+
+Not decided here. Related: the same run showed the documented extraction non-determinism again — two near-duplicate bulk emails swapped one $1428.10 invoice between them (8→9 and 10→9), net zero across the cache, nothing lost.
+
+Also surfaced and **not investigated**: claims #2, #9 and #10 all cite `matched_email_id = 19ede14fc87ee781`, which has no row in `email_extractions` at all. Pre-existing, unrelated to this run (cache totals unchanged, that id untouched). Worth finding out whether those matches came from the vision path or from a cache row that was later lost.
 
 ## 4. The Monday nudge
 
