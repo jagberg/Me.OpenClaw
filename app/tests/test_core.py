@@ -4195,6 +4195,42 @@ def test_the_projection_skips_a_reverted_event_and_survives_an_illegal_one():
     assert claim_status.project_state(claim) == "settled"
 
 
+def test_a_resolved_visit_says_which_date_actually_matched():
+    """Option 3 from the BACKLOG: the line-item branch stays, but nothing may
+    imply it pinpointed the treatment. Across 54 held invoices only three line
+    items carry a date and each equals its own invoice's header date, so a match
+    is almost always the header's — a weaker fact than the consult's own date,
+    and the only one the documents support."""
+    import json as _json
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        header = _insert_claim(conn, aari, "2026-05-30", amount=-351.50, merchant="KINGS VET",
+                               invoice_data=_json.dumps({
+                                   "date": "2026-05-30", "amount": 351.50, "invoice_number": "1000229",
+                                   "items": [{"description": "Consult", "amount": 95.0}]}))
+        item = _insert_claim(conn, aari, "2026-05-31", amount=-120.0, merchant="OTHER VET",
+                             invoice_data=_json.dumps({
+                                 "date": "2026-05-31", "amount": 120.0, "invoice_number": "2000111",
+                                 "items": [{"description": "Consult", "amount": 60.0, "date": "2026-05-18"}]}))
+
+    on_header = invoice_matching.find_visit_by_date("2026-05-30")
+    assert [h["claim_id"] for h in on_header] == [header]
+    assert on_header[0]["matched_on"] == "invoice date"
+
+    # The case the branch exists for, which no held document has produced: an
+    # item dated earlier than the invoice that bills it.
+    on_item = invoice_matching.find_visit_by_date("2026-05-18")
+    assert [h["claim_id"] for h in on_item] == [item]
+    assert on_item[0]["matched_on"] == "line item", "the stronger claim, and only when earned"
+
+    from openclaw import pipeline
+
+    assert "matched on its invoice date" in pipeline._visit_line(invoice_matching, "2026-05-30")
+    assert "matched on its line item" in pipeline._visit_line(invoice_matching, "2026-05-18")
+
+
 def test_unmatching_a_submitted_claim_destroys_nothing():
     """Regression: routing the status write through `apply_event` turned an
     unconditional reset into a refusable one, while the wipe above it stayed

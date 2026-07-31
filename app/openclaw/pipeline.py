@@ -575,7 +575,13 @@ def _visit_line(invoice_matching, requested_date: str | None) -> str:
     visit is usually on a DIFFERENT claim from the one the letter is about (live:
     the request sits on claim #8, a 2 April charge, and the date is claim #6's
     invoice 1000229 — a later visit for the same condition). Says so explicitly,
-    because the invoice identifies the visit and is NOT the document requested."""
+    because the invoice identifies the visit and is NOT the document requested.
+
+    Also says WHAT matched. An invoice's own date is not necessarily the date of
+    the treatment on it, so "invoice 1000229 matched on its invoice date" is a
+    weaker claim than pinpointing the consult — and it is the only claim the held
+    documents support: no line item on file carries a date that differs from its
+    invoice's own. Stating the weaker thing is the point (see `_invoice_dates`)."""
     if not requested_date:
         return "visit: no date stated in the letter"
     hits = invoice_matching.find_visit_by_date(requested_date)
@@ -585,7 +591,8 @@ def _visit_line(invoice_matching, requested_date: str | None) -> str:
     for h in hits:
         who = f"claim #{h['claim_id']}" if h["claim_id"] else "no claim on file"
         number = f"invoice {h['invoice_number']}" if h["invoice_number"] else "invoice number unknown"
-        parts.append(f"{number} ({who})")
+        how = h.get("matched_on") or "invoice date"
+        parts.append(f"{number} ({who}, matched on its {how})")
     return f"visit: {requested_date} — " + ", ".join(parts)
 
 

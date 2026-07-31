@@ -483,12 +483,28 @@ def _invoice_dates(invoice: dict) -> set[str]:
 
     An invoice's header date is not always the date of the treatment on it — a
     statement can bill several visits, so a consult on the 18th can sit on an
-    invoice dated the 30th. Line-item dates were dropped by extraction until
-    2026-07-28 (41 stored items, none with a date), so most held invoices answer
-    on their header date alone; that is a gap in the data, not in this function.
-    """
+    invoice dated the 30th.
+
+    **The line-item half has never once mattered, and the surfaces say so.**
+    Extraction dropped item dates until 2026-07-28; the cache was re-extracted on
+    2026-07-31 with a prompt that asks for them explicitly, and it returned none
+    new. Of 54 held invoices, three line items carry a date and **each equals its
+    own invoice's header date**. So this function has never returned a date the
+    header alone would not have given. Kept because the underlying case is real
+    and a future vet may print item dates; reported honestly via `_date_source`
+    because claiming a precision the documents don't support is how the
+    treatment-vs-charge bug happened. BACKLOG records the decision."""
     dates = {invoice.get("date")} | {item.get("date") for item in (invoice.get("items") or [])}
     return {d for d in dates if d}
+
+
+def _date_source(invoice: dict, iso_date: str) -> str:
+    """How this invoice matched the date — what the chase message is allowed to
+    claim. The header is the stronger statement when both agree, which so far is
+    every case that has ever occurred."""
+    if invoice.get("date") == iso_date:
+        return "invoice date"
+    return "line item"
 
 
 def find_visit_by_date(iso_date: str) -> list[dict]:
@@ -527,6 +543,7 @@ def find_visit_by_date(iso_date: str) -> list[dict]:
                     "invoice_number": invoice.get("invoice_number"),
                     "amount": invoice.get("amount"),
                     "date": iso_date,
+                    "matched_on": _date_source(invoice, iso_date),
                 })
         if found:
             return found
@@ -540,6 +557,7 @@ def find_visit_by_date(iso_date: str) -> list[dict]:
                         "invoice_number": invoice.get("invoice_number"),
                         "amount": invoice.get("amount"),
                         "date": iso_date,
+                        "matched_on": _date_source(invoice, iso_date),
                         "email_id": row["message_id"],
                     })
     return found

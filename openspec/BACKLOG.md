@@ -153,7 +153,7 @@ Gemini credentials already exist and are already used for vision OCR (ADR-0010),
 
 Not resolved here: **why** Groq is blocking this egress. That is a network/account question for Justin (VPN, ISP address reputation, or a region block), and no code change fixes it.
 
-### Line-item date matching has no instance in the real data, and re-extraction proved it
+### Line-item date matching has no instance in the real data — decided: keep it, and say what matched
 *Done 2026-07-31, result negative. Capability: `invoice-matching`. Closes task 3.4 of `vet-request-document-and-monday-nudge`; opens the question below.*
 
 The re-extraction is **run**. `app/scripts/reextract_item_dates.py --apply`, container-side, backup at `/data/openclaw.db.bak-pre-item-dates-20260731`: 14 cached extractions, 11 replaced, 3 kept, 0 failed.
@@ -164,7 +164,13 @@ Three item dates do exist, across two emails — **and every one of them is iden
 
 So `find_visit_by_date`'s line-item branch is implemented, unit-tested, and **has never had an input that differs from the header date** — the only case it exists for. The case Justin raised — a consult on the 18th billed on an invoice dated the 30th — is real, but these documents do not carry the evidence needed to resolve it that way.
 
-**The open question this replaces the old one with:** should the line-item branch stay? Three options, none obviously right, and it is a judgement call rather than a fact to look up.
+**DECIDED 2026-07-31 (Justin): keep the branch, and make the surfaces state what actually matched.** `find_visit_by_date` now returns `matched_on` (`invoice date` or `line item`) per hit, and the chase message reads `invoice 1000229 (claim #6, matched on its invoice date)`.
+
+Reasoning: the underlying case is real and recurring — a consult on the 18th billed on an invoice dated the 30th — so deleting the machinery would throw away the recognition of it, and it costs nothing at runtime. But implying the system pinpointed a treatment date when it matched an invoice *header* is exactly the shape of the treatment-vs-charge bug: two dates that looked interchangeable, quietly weren't, and every document agreed with every other document for a day. **Trade-off accepted:** a slightly longer chase line, and a branch that stays untested against reality until some vet prints per-item dates.
+
+Verified against the live data on a read-only copy: the motivating case, `18/05/2026`, resolves to invoice 1000229 on claim #6 **via the invoice's own header date** — 1000229 is itself dated 18 May. So the line-item branch was never needed even for the case that prompted it, which is the opposite of what was assumed when it was built.
+
+Rejected: *delete it* (smallest honest code, but loses the shape of a real recurring problem, and it is rebuildable only if someone remembers it existed); *keep it silently* (reads on the dashboard and in the nudge as a working capability that has never once fired).
 - *Keep it.* Costs nothing at runtime, and a future vet's format may print item dates. But it is untestable against reality and reads as a working capability on the dashboard and in the nudge.
 - *Remove it.* Smallest honest code. Loses nothing today and can be rebuilt from git if a format ever appears.
 - *Keep it and say so.* Leave the branch, and have the surfaces state that a date resolved from an invoice header is the header's, not the line item's — which is the actual guarantee.
