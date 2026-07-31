@@ -8,3 +8,8 @@ token.json
 credentials.json
 *.log
 docker-compose.override.yml
+
+# understand-anything scratch (final graph artifacts are tracked, working dirs are not)
+.ua/.trash-*/
+.ua/intermediate/
+.ua/tmp/
