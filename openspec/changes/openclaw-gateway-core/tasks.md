@@ -201,6 +201,8 @@ Do not start until phase 4 has run one full claim lifecycle on real data.
     -> 200, and the reply lands back in the chat
   ```
 
+  **Corroborated from both ends.** The reply Justin received reads `CHAIN OK / command: /mark 7 sent / app status: 200 / app said: {"ok":true,"route":"echo","correlation_id":"tg-mark-x","client_host":"127.0.0.1"}`, and the Python process independently logged `ECHO HIT correlation=tg-mark-x`. The same id, minted once inside the plugin, observed on both sides of the hop — two independent observation points rather than one, which is what distinguishes this from every earlier result in this change that turned out to be a misread.
+
   **The evidence is a correlation id, not a screenshot.** The Python side logged `ECHO HIT correlation=tg-mark-x`. That id is minted inside the plugin's own handler (`tg-${name}-${messageId}`) and exists nowhere else, so the request cannot have come from anything but a plugin-dispatched command. A tap arrives at the gateway as `Inbound message … (direct, 12 chars)` — `/mark 7 sent` is exactly 12 characters — and is routed onward to the plugin's command.
 
   The Python half used the **real** `internal_api` guard rather than a stub: correct secret → 200, wrong secret and missing secret → `{"error":"rejected"}`. Reproduce by standing up `internal_api.router` plus one echo route on `:8977` against a scratchpad DB copy, pointing the plugin at `host.docker.internal:8977`.
