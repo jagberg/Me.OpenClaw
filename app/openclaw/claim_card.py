@@ -104,12 +104,16 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _vet_name(merchant: str) -> str:
-    """NetBank descriptors are SHOUTY and long ("THE SHIRE VETERINARY CARINGBAH
-    NSW"). Title-case only the all-caps ones — a descriptor that already has
-    mixed case ("MediPaws Sydney") is the vet's real styling, and .title()
-    would flatten it."""
-    name = merchant or ""
-    return _clip(name.title() if name.isupper() else name, 24)
+    """Delegates to the one vet vocabulary — see `vet_names.py`.
+
+    Kept as a name here because `telegram_bot` already calls it, so both the
+    cards and the text messages pick up an alias from one edit. Length was never
+    the interesting problem: `BANKSTOWN VET PEAKHURST NSW` fits, and still does
+    not tell Justin it is Boundary Road Vet.
+    """
+    from . import vet_names
+
+    return vet_names.display(merchant, limit=24)
 
 
 def _group_by_month(rows: list[dict]) -> list[tuple]:

@@ -4824,6 +4824,41 @@ def test_a_failing_mcp_tool_reports_to_the_model_not_the_transport():
     assert "claim_detail" in bad_args["result"]["content"][0]["text"], bad_args
 
 
+def test_vet_aliases_resolve_the_ambiguous_descriptors_not_just_the_long_ones():
+    """Length was never the interesting problem. `BANKSTOWN VET PEAKHURST NSW`
+    fits a card row and still does not tell Justin it is Boundary Road Vet —
+    and that line is what he reads to decide which invoice he is looking at.
+
+    Substring matching, not equality: bank descriptors drift (a terminal is
+    replaced, a suburb is added), and this project has been bitten by exactly
+    that kind of silent drift."""
+    from openclaw import claim_card, vet_names
+
+    # Every descriptor actually present in the live DB, 2026-08-02.
+    live = {
+        "BANKSTOWN VET PEAKHURST NSW": "Boundary Rd Vet",
+        "THE SHIRE VETERINARY CARINGBAH NSW": "The Shire Vet",
+        "Kings Vet KINGSGROVE NSW": "Kings Vet",
+        "MediPaws Sydney Leichhardt NSW": "MediPaws Leichhardt",
+        "SAH INNER WEST PTY LT Stanmore NSW": "SAH Inner West",
+    }
+    for descriptor, expected in live.items():
+        assert vet_names.display(descriptor) == expected, descriptor
+        # The card path must agree — it is the same vocabulary, not a copy.
+        assert claim_card._vet_name(descriptor) == expected, descriptor
+
+    # Drift: a descriptor whose tail moved still resolves.
+    assert vet_names.display("BANKSTOWN VET SOMEWHERE ELSE NSW") == "Boundary Rd Vet"
+
+    # An unmapped vet degrades to long, never to wrong. Title-case the shouty
+    # ones; leave a vet's own mixed-case styling alone.
+    assert vet_names.display("NEW CLINIC PTY LTD") == "New Clinic Pty Ltd"
+    assert vet_names.display("VetLove Newtown") == "VetLove Newtown"
+    assert vet_names.display("") == "" and vet_names.display(None) == ""
+    clipped = vet_names.display("A VERY LONG UNMAPPED VETERINARY PRACTICE NAME", limit=24)
+    assert len(clipped) <= 24 and clipped.endswith("…"), clipped
+
+
 def _scratch() -> str:
     """A throwaway directory. The outbox tests must never touch a real one."""
     return tempfile.mkdtemp(prefix="openclaw-outbox-")
