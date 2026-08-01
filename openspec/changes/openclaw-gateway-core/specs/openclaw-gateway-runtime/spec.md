@@ -35,7 +35,9 @@ The size of a single agent turn SHALL be measured against a declared ceiling bef
 
 The ceiling SHALL be asserted against the platform's **itemised** report of what composes a turn, not against a single total. A total hides which component grew, and a component regressing while the total stays under budget is the failure this is meant to catch.
 
-Measured 2026-08-01 on a stock gateway with a fresh session key: 22,810 prompt tokens for a one-word message, composed of 31,972 chars of tool schemas, 33,774 chars of system prompt (14,341 of it injected workspace markdown files), and 4,206 chars of skills. Disabling 44 of 45 plugins does not reduce it, because plugins are not what fills the turn. The turn is therefore mostly content the deployment chooses — a tool allowlist, the workspace files it ships, and the skills it enables — and a provider whose per-minute limit sits below the result cannot serve the agent at all.
+Measured 2026-08-01 with a fresh session key. A **stock** gateway turn is 22,810 prompt tokens for a one-word message — 31,972 chars of tool schemas, 33,774 chars of system prompt (14,341 of it injected workspace markdown), 4,206 chars of skills. The **configured** turn, with the shipped workspace files and a tool allowlist, is **5,355**. Disabling 44 of 45 plugins changes neither, because plugins are not what fills a turn.
+
+The turn is therefore mostly content the deployment chooses, and the ceiling is met by configuration rather than by provider selection. What does not move is the core system prompt, 18,536 chars (~4.6k tokens) — the irreducible floor beneath any budget set here.
 
 #### Scenario: Turn exceeds the model's limit
 - **WHEN** a measured turn is larger than the configured model's per-request or per-minute ceiling
