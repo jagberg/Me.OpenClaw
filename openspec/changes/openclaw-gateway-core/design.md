@@ -380,3 +380,14 @@ Append-only. Material decision changes only — findings live in `tasks.md`.
 - **This platform fails silently** — seven distinct modes measured. Success responses and inspection output are not evidence. The seventh, found 2026-08-01: a command button over 58 bytes is deleted from the keyboard, and if it was the only one the message arrives with no keyboard at all, `ok: true`.
 - **No ADRs written yet.** Tasks 8.1–8.6 plan them; the plugin-centric architecture, the no-MCP-for-deterministic rule and the command-not-callback mechanism all qualify as decisions that would surprise a newcomer. Until those exist, this document is the only record — which is a gap, not a design.
 - **Unrecorded intent:** whether the `.env` divergence between checkout and worktree was ever deliberate is still unknown, and was not invented here.
+
+## 2026-08-01 — Four decisions taken by Justin, in one sitting
+
+**Decision:** D3 stays open pending a capture; cards get an A/B on the phone; the agent's provider is decided by measurement after the cuts; the bot menu keeps the app's commands plus `/status` and `/models`.
+**Reasoning:** Each was put to him with a recommendation and he took three differently from the recommendation, which is the point of asking.
+- **Gate ownership (D3) — "hold until I've seen it."** Declining to settle it on my reasoning, consistent with his instruction on 11.2. The capture comes first, the decision after. Recorded as deliberately unresolved rather than defaulted.
+- **Cards — "send me both."** He rejected both my recommendation (text) and the status quo (images) in favour of the comparison 11.3 originally asked for. So 11.3 stays a live task, not a judgement call.
+- **Provider — cut first, then measure.** Took the recommendation. The cuts happen because the isolation boundary wants them anyway; whether Groq then fits its 12k TPM is a number nobody has yet.
+- **Command menu — the app's five plus `/status` and `/models`.** Between my "prune to ours only" and accepting all 61: he wants to diagnose the gateway from the phone without a terminal. Worth noting because it slightly weakens 13.1's framing — the menu is not purely a cost, two of the gateway's commands are wanted.
+**Trade-off accepted:** Two of the four defer work rather than remove it. The card A/B needs a real rendered PNG from real claim data, and the D3 capture needs a native approval prompt driven end to end — both are more work than a default would have been, and both were chosen anyway.
+**Supersedes:** n/a. D3 remains flagged as unresolved in `claims-mcp-surface`, `conversational-agent` and above.
