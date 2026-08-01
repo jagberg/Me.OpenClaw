@@ -33,15 +33,36 @@ Rationale: a button carrying `action.type: "command"` invokes a **native** slash
 ### Requirement: Agent turn size stays within the configured model's limits
 The size of a single agent turn SHALL be measured against a declared ceiling before the system is considered deployable, and the deploy SHALL fail when it exceeds the configured model's per-request limit.
 
-Measured 2026-08-01: a stock turn is ~29,000 tokens, and disabling 44 of 45 plugins did not reduce it — the bulk is the core agent prompt, core tools and skills. A provider whose per-minute limit is below that cannot serve the agent at all, and this is not a tuning problem.
+The ceiling SHALL be asserted against the platform's **itemised** report of what composes a turn, not against a single total. A total hides which component grew, and a component regressing while the total stays under budget is the failure this is meant to catch.
+
+Measured 2026-08-01 on a stock gateway with a fresh session key: 22,810 prompt tokens for a one-word message, composed of 31,972 chars of tool schemas, 33,774 chars of system prompt (14,341 of it injected workspace markdown files), and 4,206 chars of skills. Disabling 44 of 45 plugins does not reduce it, because plugins are not what fills the turn. The turn is therefore mostly content the deployment chooses — a tool allowlist, the workspace files it ships, and the skills it enables — and a provider whose per-minute limit sits below the result cannot serve the agent at all.
 
 #### Scenario: Turn exceeds the model's limit
 - **WHEN** a measured turn is larger than the configured model's per-request or per-minute ceiling
 - **THEN** the deploy fails and names both numbers, rather than deferring the failure to the first real message
 
+#### Scenario: One component regresses
+- **WHEN** the tool schemas, injected workspace files or enabled skills grow beyond their declared shares
+- **THEN** the deploy fails naming that component, even if the overall total is still within budget
+
 #### Scenario: Measurement uses a clean session
 - **WHEN** turn size is measured
 - **THEN** a fresh session key is used, because an existing session's accumulated history is counted in the request and produces a reading that measures conversation rather than surface
+
+### Requirement: The agent's workspace files are shipped, versioned, and carry no enforcement
+The markdown files the gateway injects into every turn — `IDENTITY.md`, `USER.md`, `SOUL.md`, `AGENTS.md` and the rest — SHALL be authored in the repository, deployed into the agent workspace, and versioned with the application. `BOOTSTRAP.md` SHALL be absent and automatic re-seeding SHALL be disabled, so an upgrade cannot restore the template versions.
+
+These files are prompt content. No guarantee that must hold SHALL depend on them: the harness refusals, the proposal gate and the no-send rule live in code. Their content is limited to matters whose worst failure is awkwardness — tone, how the user is addressed, the `#id` convention, and supplied context.
+
+Rationale: left with the seeded templates, the stock agent opened by interviewing the user about its own name, species and "vibe" across three consecutive messages before it would answer anything, and in the same conversation asserted it had checked email in a runtime holding no mail credential. The first is why the files must be shipped complete; the second is why nothing enforceable may be written into them.
+
+#### Scenario: A fresh workspace is deployed
+- **WHEN** the gateway starts with an empty agent workspace
+- **THEN** the shipped files are present, no bootstrap interview occurs, and the first message is answered on its merits
+
+#### Scenario: An upgrade re-seeds the templates
+- **WHEN** a platform upgrade would rewrite the workspace files
+- **THEN** re-seeding is disabled and the shipped versions survive, or the deploy fails
 
 ### Requirement: The app reaches Telegram through gateway actions, not the Bot API
 Unattended outbound messages — claim notifications, cards, PDF alerts, nudges — SHALL be emitted by calling the gateway's send/edit actions, and SHALL NOT call the Telegram Bot API directly.
