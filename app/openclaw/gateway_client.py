@@ -179,6 +179,26 @@ def send_file(target: str, path: str, caption: str = "", buttons: list[dict] | N
                 correlation=correlation, runner=runner)
 
 
+def send_card(target: str, image: bytes, caption: str = "", buttons: list[dict] | None = None,
+              correlation: str | None = None, runner=None, stem: str = "card") -> dict:
+    """Send a rendered Pillow card.
+
+    Callers keep handing over **bytes**, exactly as they do to
+    `telegram_bot.send_photo_sync` today. The file-on-disk step is an artefact
+    of the gateway CLI wanting a path, and of that path having to live inside
+    the gateway's own media roots — neither of which is a caller's problem.
+    Keeping the signature is also what keeps the cutover diff small.
+
+    A publish failure raises before anything is sent, so a card that could not
+    be written never looks like one that was delivered.
+    """
+    from . import media_outbox
+
+    path = media_outbox.publish(image, ".png", stem)
+    return send_file(target, path, caption=caption, buttons=buttons,
+                     correlation=correlation, runner=runner)
+
+
 def edit_message(target: str, message_id: str, text: str, correlation: str | None = None,
                  runner=None) -> dict:
     """Append a tap's result.

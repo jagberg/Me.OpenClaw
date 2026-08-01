@@ -4824,6 +4824,97 @@ def test_a_failing_mcp_tool_reports_to_the_model_not_the_transport():
     assert "claim_detail" in bad_args["result"]["content"][0]["text"], bad_args
 
 
+def _scratch() -> str:
+    """A throwaway directory. The outbox tests must never touch a real one."""
+    return tempfile.mkdtemp(prefix="openclaw-outbox-")
+
+
+def test_a_card_is_published_under_the_path_the_gateway_can_actually_read():
+    """14.2 — one file, two path spaces, and handing over the wrong one fails
+    with `Local media path is not under an allowed directory`: an error that
+    reads like a permissions problem and is really a namespace one.
+
+    The gateway's media allowlist is a fixed set of roots and `/tmp` is not
+    among them (14.1/14.4), so the app's own path is never sendable."""
+    from openclaw import config, gateway_client, media_outbox
+
+    _fresh_db()
+    outbox = Path(_scratch()) / "outbox"
+    before = (config.MEDIA_OUTBOX_DIR, config.MEDIA_OUTBOX_GATEWAY_DIR)
+    try:
+        config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = str(outbox)
+        config.MEDIA_OUTBOX_GATEWAY_DIR = media_outbox.config.MEDIA_OUTBOX_GATEWAY_DIR = "/home/node/.openclaw/media"
+
+        seen, run = _capture_argv()
+        gateway_client.send_card("42", b"\x89PNG-not-really", caption="Claim #7", runner=run)
+
+        argv = seen[0]
+        sent = argv[argv.index("--media") + 1]
+        # The gateway's namespace, never the app's. Returning the app path would
+        # be refused by the platform, silently to anyone reading our own logs.
+        assert sent.startswith("/home/node/.openclaw/media/"), sent
+        assert str(outbox) not in sent, sent
+
+        written = list(outbox.glob("card-*.png"))
+        assert len(written) == 1 and written[0].read_bytes() == b"\x89PNG-not-really"
+        # Not the claim id: these names sit in a directory the gateway can read.
+        assert Path(sent).name == written[0].name
+        assert not list(outbox.glob("*.part")), "a partial write was left behind"
+    finally:
+        config.MEDIA_OUTBOX_DIR, config.MEDIA_OUTBOX_GATEWAY_DIR = before
+        media_outbox.config.MEDIA_OUTBOX_DIR, media_outbox.config.MEDIA_OUTBOX_GATEWAY_DIR = before
+
+
+def test_an_unwritable_outbox_fails_before_anything_is_sent():
+    """A card that could not be written must never look like one delivered."""
+    from openclaw import config, gateway_client, media_outbox
+
+    _fresh_db()
+    before = config.MEDIA_OUTBOX_DIR
+    try:
+        # A path under an existing FILE cannot be created as a directory.
+        blocker = Path(_scratch()) / "not-a-dir"
+        blocker.write_text("x", encoding="utf-8")
+        config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = str(blocker / "outbox")
+
+        seen, run = _capture_argv()
+        try:
+            gateway_client.send_card("42", b"png", runner=run)
+        except media_outbox.OutboxError:
+            pass
+        else:
+            raise AssertionError("an unpublishable card reported success")
+        assert not seen, "the CLI was invoked for a card that was never written"
+    finally:
+        config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = before
+
+
+def test_the_outbox_sweeps_its_own_expired_files():
+    """Nothing reads these back — Telegram keeps its own copy once delivered.
+    Swept on publish rather than on a timer: publishing is the only event that
+    matters, and a directory nobody writes to needs no tidying."""
+    import time as _time
+
+    from openclaw import config, media_outbox
+
+    outbox = Path(_scratch()) / "outbox-sweep"
+    before = config.MEDIA_OUTBOX_DIR
+    try:
+        config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = str(outbox)
+        outbox.mkdir(parents=True, exist_ok=True)
+        stale, fresh = outbox / "card-old.png", outbox / "card-new.png"
+        stale.write_bytes(b"old")
+        fresh.write_bytes(b"new")
+        old_enough = _time.time() - media_outbox.TTL_SECONDS - 60
+        os.utime(stale, (old_enough, old_enough))
+
+        media_outbox.publish(b"png")
+        assert not stale.exists(), "an expired card was left in the outbox"
+        assert fresh.exists(), "a live card was swept"
+    finally:
+        config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = before
+
+
 def test_the_plugin_report_is_per_boot_and_never_persisted():
     """19b.6's evidence. An unregistered command in a button is not an error —
     it reaches the agent as a chat turn and spends tokens (16.8, measured live

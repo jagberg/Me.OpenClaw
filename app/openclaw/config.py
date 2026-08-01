@@ -115,6 +115,17 @@ OPENCLAW_CHANNEL = os.environ.get("OPENCLAW_CHANNEL", "telegram")
 # each row, and two runtimes mean two versions. Conflating them makes the
 # dataset lie about which deploy handled a message (ADR-0014).
 GATEWAY_VERSION = os.environ.get("GATEWAY_VERSION", "")
+# The media outbox: one shared volume, two path spaces for the same file. The
+# app writes to the first, and must hand the gateway the second — the gateway's
+# media allowlist is a fixed set of roots, and a path outside them is refused
+# with an error that reads like a permissions problem (media_outbox.py).
+#
+# These are the ONLY bytes that cross the container boundary. Widening either to
+# reach `app/data` would undo the isolation the whole design rests on.
+MEDIA_OUTBOX_DIR = os.environ.get("MEDIA_OUTBOX_DIR", "/data/outbox")
+MEDIA_OUTBOX_GATEWAY_DIR = os.environ.get(
+    "MEDIA_OUTBOX_GATEWAY_DIR", "/home/node/.openclaw/media"
+)
 
 # Twice-daily Google Drive DB backup (drive_backup.py). Folder ID is from
 # https://drive.google.com/drive/folders/1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2
