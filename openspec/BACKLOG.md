@@ -211,3 +211,25 @@ unconditionally or only when unacknowledged; whether it reuses the claims
 notification path or gets its own; and what happens to reminders that came due
 while the gateway was down (gateway cron runs missed jobs at startup, capped at
 five per restart — see tasks 11.4).
+
+## The baseline references a capability that does not exist (found 2026-08-01)
+
+`openspec/specs/task-capture/spec.md` points at a capability named
+`task-telegram-surface` — "Full detail in the `task-telegram-surface`
+capability." There is no such capability among the 18 in `openspec/specs/`.
+The only other reference is in `openspec/changes/telegram-agent-reach/`, an
+unarchived change.
+
+**Not fixed in `openclaw-gateway-core`** (Justin, 2026-08-01). It is pre-existing
+baseline rot created by another change's incomplete sync, and pulling it into the
+gateway diff would be tidying someone else's unfinished work into unrelated
+scope.
+
+Two possibilities, and whoever picks this up should check which before acting:
+`telegram-agent-reach` may be about to create the capability, in which case this
+is an ordering problem between two open changes and resolves itself on archive.
+Or that change stalled and the reference is permanently dangling, in which case
+the fix is to create the capability or drop the sentence.
+
+Worth doing before the next archive either way — a baseline that references
+missing capabilities gets less trustworthy each time it is read and believed.
