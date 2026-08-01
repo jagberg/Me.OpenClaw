@@ -138,7 +138,18 @@ Do not start until phase 4 has run one full claim lifecycle on real data.
 
 **DECIDED (Justin, 2026-08-01): the gateway runs in its own Docker container** — chosen for *isolation and to build trust in it*, not for deployment tidiness. That reason is stronger than the one I offered and it changes what the container must look like: containment is the point, so the boundary is the feature. Remaining integration details deliberately left open to decide together.
 
-- [ ] 7.0a The gateway container gets **no bind mount to `app/data`** and no `DATABASE_PATH`. This is `gmail-isolation-boundary` enforced by the container boundary rather than by configuration — the Gmail token, the SQLite file and the invoice PDFs are simply not on its filesystem. The strongest form of D4, and the isolation reason is why.
+- [x] **7.0a / 7.0c / 7.1 / 7.2 / 7.3 / 7.4 BUILT 2026-08-02.** `docker-compose.yml` gains the gateway service; `scripts/deploy.ps1` brings up both runtimes, stamps and reports both versions, and treats a partial start as a failure; `scripts/gateway_preflight.py` runs the config assertions and fails the deploy. Compose validates.
+
+  **The isolation decisions are enforced by the file, not by discipline.** No `env_file` on the gateway, no bind mount to `app/data`, no Docker socket, its own named volume for state. The only path between the containers is a `media_outbox` volume, mounted read-only into `<stateDir>/media` because the media allowlist is a fixed set of roots and ignores mounts it does not know about (14.4).
+
+  **A fixed subnet (`172.28.0.0/24`) with static addresses**, because `INTERNAL_API_ALLOW_HOSTS` matches exactly rather than by CIDR and a bridge address is otherwise dynamic. Recorded with how little it buys: the shared secret is the boundary, and 16.2 showed the allowlist cannot distinguish the gateway from any other host process when traffic arrives via `host.docker.internal`. Over a compose network it can, which is why the plugin uses the service name.
+
+  **Found while wiring it: the gateway's secrets cannot come from `app/.env`.** Compose variable interpolation reads a root `.env` or the shell; `env_file:` only populates a container's environment and does not feed `${...}`. Giving the gateway `env_file: ./app/.env` would hand it the Gmail credential and `DATABASE_PATH` — the exact thing 7.0a forbids. So the gateway's three values live in a root `.env` (`.env.example` committed, `.env` gitignored at any level). The separation is the boundary rather than a workaround: nobody can point the gateway at the app's secrets without noticing they are duplicating them.
+
+  Consequence worth naming: `INTERNAL_API_SECRET` now exists in **two** files that must agree, which is the divergence hazard this repo already has once. It fails loudly — a mismatch means the plugin's boot report is rejected, `/health.gateway_plugin` stays empty, and the preflight fails the deploy naming it. Nothing half-working reaches Justin's phone.
+
+  **7.4:** `GATEWAY_VERSION` is read from the running image by `deploy.ps1` and surfaced on `/health` beside `app_version`, never into it. `telegram_messages.app_version` keeps meaning "the Python code that handled this row".
+- [ ] 7.0a-orig The gateway container gets **no bind mount to `app/data`** and no `DATABASE_PATH`. This is `gmail-isolation-boundary` enforced by the container boundary rather than by configuration — the Gmail token, the SQLite file and the invoice PDFs are simply not on its filesystem. The strongest form of D4, and the isolation reason is why.
 - [ ] 7.0b Set `INTERNAL_API_ALLOW_HOSTS` to the Docker bridge subnet the gateway actually arrives from. The loopback default works in neither deployment shape; the shared secret remains the real auth.
 - [ ] 7.0c Give the gateway container its own named volume for gateway state, and decide whether it joins `db_backup`'s scope. Its state directory currently sits outside every backup.
 
@@ -561,12 +572,42 @@ Everything in this section exists because it was discovered the hard way on 2026
 
 A config check, not a test suite. Each assertion below corresponds to something that was found silently wrong.
 
+**BUILT AND RUN AGAINST THE LIVE SPIKE, 2026-08-02.** Nine checks. Real output:
+
+```
+FAIL  boundary plugins disabled      phone-control is not explicitly disabled in config; LOADED AND RUNNING: ['phone-control']
+PASS  access policy
+PASS  media outbox narrow            default roots
+PASS  gmail-isolation-boundary
+PASS  gateway menu scopes unchanged
+PASS  model serves a turn            llama-3.3-70b-versatile answered
+PASS  turn size under ceiling        4884 tokens; toolSchemaChars=1422, workspaceFileChars=6508, skillChars=0
+```
+
+The `phone-control` FAIL is real — the spike never disabled it, and the check found a boundary plugin loaded and running that nobody had noticed in a day of working in that container. First thing the preflight caught, before it had a deploy to guard.
+
+**Three of my own assumptions were wrong and the CLI said so.** Recording them because each would have shipped as a check that could never pass:
+- `openclaw config get` **requires a dot path**; there is no whole-config dump. A bare `config get --json` exits *Missing required argument "path"*.
+- **`openclaw command run` does not exist** — *"Unknown command: openclaw command"*. See 19b.6 below; this changed what that check can honestly assert.
+- The menu-scope check grepped one line, and `TELEGRAM_COMMAND_MENU_SCOPES` spans several. It reported `['default']` and a scope change that had not happened. **A false FAIL erodes a preflight as fast as a false PASS**, and this one would have fired on every deploy until someone stopped believing the output.
+
+Two structural notes: `check_boundary_plugins` reads config **and** `health.plugins.loaded`, because Telegram auto-enables itself without writing config (13.2), so the enabled set is partly implicit; and the turn check asserts the **itemised** report, per 17.9 — a component regressing under a passing total is the failure it exists to catch.
+
 - [ ] 19b.1 **Agent turn size under a declared ceiling.** Measure with `openclaw agent --agent <id> --session-key <fresh> --message hi` and assert the result is under the configured model's per-minute limit. **Must use a fresh session key** — an accumulated session measures conversation history, not surface, and produced two false readings before this was caught.
 - [ ] 19b.2 **The model can actually serve a turn.** A model id that config accepts can still fail at runtime with `model_not_found` (Groq did, before a custom provider entry existed). Assert one real turn completes.
 - [ ] 19b.3 **Boundary plugins are disabled**: `browser`, `file-transfer`, and anything else granting filesystem, shell or browser reach. An upgrade re-enabling one must fail the deploy, not pass quietly.
 - [ ] 19b.4 **Access configuration**: `channels.telegram.dmPolicy == "allowlist"`, `allowFrom` non-empty, `commands.ownerAllowFrom` non-empty. Default is `pairing`, which hands unknown senders a live pairing code and the command to socially-engineer approval.
 - [ ] 19b.5 **The gateway holds no Gmail credential** and no Google key with a Gmail scope, and has no mount that can reach `app/data`.
-- [ ] 19b.6 **Every command a button can emit is registered.** Assert each one responds — not that `plugins list` reports it, since those fields come from a persisted registry that goes stale silently and reported `commands: []` for a working command. Enumerate from the button-building code so a new button cannot ship unasserted. This is the whole guard: an unregistered command does not fail, it becomes a model turn (16.8, measured live).
+- [x] 19b.6 **PARTLY BUILT, and the shortfall is stated rather than papered over.** Original: *Assert each one responds — not that `plugins list` reports it, since those fields come from a persisted registry that goes stale silently and reported `commands: []` for a working command. Enumerate from the button-building code so a new button cannot ship unasserted.*
+
+  **The task asks for each command to be invoked, and there is no way to do that.** `openclaw command run` does not exist; the only real dispatch path is a Telegram tap, and a deploy script must not fake one against Justin's chat.
+
+  What is asserted instead: the plugin POSTs `/internal/plugin/hello` at boot with the command list `api.registerCommand` actually accepted, the app holds it **in memory**, `/health.gateway_plugin` exposes it, and the preflight compares it against `gateway_client.BUTTON_COMMANDS`. That is a runtime signal from inside the registration call — stronger than reading the persisted registry (18.6), weaker than a tap. A plugin that loaded without running never reports, so the check fails rather than passing quietly, which covers 18.7's two silent gates.
+
+  In-memory is the load-bearing part: persisting the report would recreate exactly the failure that makes `plugins list` useless. A restart of either runtime must empty it.
+
+  **Still open:** an actual invocation. Its natural home is 4.11's live verification, where a real tap happens anyway — noted there rather than left as a false tick here.
+- [x] 19b.1–19b.5, 19b.7 **BUILT.** See the section header for the live run and for the three assumptions the CLI corrected.
 - [ ] 19b.7 **Media outbox path is allowlisted** and is a narrow directory, not `app/data`.
 
 ### 19c. Documented, not tested — record where a test is impossible

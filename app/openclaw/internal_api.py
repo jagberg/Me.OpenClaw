@@ -14,6 +14,7 @@ guarantee. A rejected request is logged loudly: a rejection that looked like
 import logging
 import threading
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
@@ -133,6 +134,65 @@ def _endpoint(route: str, fn):
 router.post("/tick")(_endpoint("tick", lambda: pipeline.run_once()))
 router.post("/ingest")(_endpoint("ingest", lambda: gmail_ingest.poll_once()))
 router.post("/nudge")(_endpoint("nudge", lambda: pipeline.nudge_stale_actions()))
+
+
+# What the in-gateway plugin reported it registered, this boot.
+#
+# **In-memory on purpose.** The one thing this must describe is the plugin that
+# is running right now. Persisting it would recreate precisely the failure that
+# makes `plugins list` useless — it reads a saved registry that goes stale
+# silently and reported `commands: []` for commands that demonstrably worked
+# (18.6). A restart of either runtime must empty this, so an absent report reads
+# as "the plugin has not run", which is the state the deploy has to catch.
+#
+# Why it exists at all: an unregistered command in a button is not an error. It
+# reaches the agent as a chat turn and spends tokens — measured live, three
+# times, in Justin's chat (16.8). Both of a plugin's enablement gates fail
+# silently (18.7), so "it loaded" is not evidence that it ran.
+_plugin_report: dict = {}
+
+
+@router.post("/plugin/hello")
+async def plugin_hello(
+    request: Request,
+    x_openclaw_secret: str | None = Header(default=None),
+    x_correlation_id: str | None = Header(default=None),
+):
+    """The plugin says, at boot, what `api.registerCommand` actually accepted.
+
+    Self-reported, and that limit is stated rather than hidden: this is a
+    runtime signal from inside the registration call, which is stronger than
+    reading a registry and weaker than a real tap. A tap cannot be faked by a
+    deploy script against Justin's chat, so this is the best available.
+    """
+    correlation = _correlation_id(x_correlation_id)
+    rejected = _guard(request, x_openclaw_secret, "plugin/hello", correlation)
+    if rejected is not None:
+        return rejected
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    commands = sorted({str(c).lstrip("/") for c in (body.get("commands") or [])})
+    _plugin_report.clear()
+    _plugin_report.update({
+        "plugin": body.get("plugin") or "unknown",
+        "version": body.get("version"),
+        "commands": commands,
+        "reported_at": datetime.now(timezone.utc).isoformat(),
+    })
+    # INFO, not DEBUG: this line is how you tell a plugin that ran from one that
+    # loaded and did nothing, and the difference is a whole broken tap path.
+    logger.info("gateway plugin %s registered %s correlation=%s",
+                _plugin_report["plugin"], commands or "NOTHING", correlation)
+    return {"status": "ok", "route": "plugin/hello", "correlation_id": correlation,
+            "commands": commands}
+
+
+def plugin_report() -> dict:
+    """For `/health`. Empty means the plugin has not reported since this boot."""
+    return dict(_plugin_report)
 
 
 @router.post("/telegram/event")

@@ -1,4 +1,9 @@
-# Deploy OpenClaw, stamping the image with the commit it was built from.
+# Deploy OpenClaw: two runtimes, two versions, one command.
+#
+# `app` owns the claims domain, the database and Gmail. `gateway` owns Telegram,
+# agent sessions and cron. Both come up here, both report their health, and a
+# partial start is a FAILURE rather than a success -- one runtime up and the
+# other down is the state that looks fine and silently does half the job.
 #
 # Every Telegram message logged to telegram_messages carries APP_VERSION, so a
 # behaviour change can be attributed to a specific deploy. Building with a bare
@@ -6,22 +11,96 @@
 #
 # Run from the worktree you deploy from (see root CLAUDE.md).
 
+param(
+    # The preflight spends one real agent turn against a live provider budget.
+    # Worth it on a real deploy; skip it when redeploying repeatedly.
+    [switch]$SkipPreflight,
+    [switch]$SkipTurnCheck
+)
+
 $ErrorActionPreference = "Stop"
+
+# The gateway's secrets live in the ROOT .env, not app/.env -- see .env.example
+# for why that separation is the isolation boundary rather than an annoyance.
+# Compose interpolation reads this file; `env_file:` does not feed `${...}`.
+if (-not (Test-Path ".env")) {
+    throw "No root .env. Copy .env.example to .env and fill in the gateway's three values."
+}
 
 $sha = (git rev-parse --short HEAD).Trim()
 $branch = (git rev-parse --abbrev-ref HEAD).Trim()
 
-# A dirty tree means the running image doesn't match any commit — mark it so the
+# A dirty tree means the running image doesn't match any commit -- mark it so the
 # message log doesn't claim otherwise.
 $dirty = ""
 if ((git status --porcelain) -ne $null) { $dirty = "-dirty" }
 
 $env:APP_VERSION = "$sha+$branch$dirty"
-Write-Host "Deploying APP_VERSION=$($env:APP_VERSION)"
+
+# The gateway is a pulled image, not a build, so its version is whatever the tag
+# resolves to. Read it rather than assume it: "latest" moved twice during the
+# swap work, and an upgrade is exactly what re-enables a boundary plugin.
+docker compose pull gateway 2>&1 | Out-Null
+$env:GATEWAY_VERSION = (docker compose run --rm --no-deps --entrypoint sh gateway -lc "node openclaw.mjs --version" 2>$null | Select-Object -Last 1)
+if (-not $env:GATEWAY_VERSION) { $env:GATEWAY_VERSION = "unknown" }
+
+Write-Host "Deploying"
+Write-Host "  APP_VERSION     = $($env:APP_VERSION)"
+Write-Host "  GATEWAY_VERSION = $($env:GATEWAY_VERSION)"
 
 docker compose up -d --build
 if ($LASTEXITCODE -ne 0) { throw "docker compose failed with exit code $LASTEXITCODE" }
 
-Start-Sleep -Seconds 12
-Write-Host "`n--- /health ---"
-Invoke-RestMethod -Uri "http://localhost:8000/health" -TimeoutSec 20 | ConvertTo-Json
+Start-Sleep -Seconds 15
+
+# --- health, per runtime, and a partial start is a failure --------------------
+
+$failures = @()
+
+Write-Host "`n--- app /health ---"
+try {
+    $appHealth = Invoke-RestMethod -Uri "http://localhost:8000/health" -TimeoutSec 20
+    $appHealth | ConvertTo-Json -Depth 4
+} catch {
+    $failures += "app: /health unreachable ($($_.Exception.Message))"
+    Write-Host "UNREACHABLE"
+}
+
+Write-Host "`n--- gateway health ---"
+try {
+    $raw = docker compose exec -T gateway node openclaw.mjs health --json
+    if ($LASTEXITCODE -ne 0) { throw "health exited $LASTEXITCODE" }
+    $gwHealth = $raw | ConvertFrom-Json
+    # `ok` alone is not enough. The Telegram channel can be configured, enabled
+    # and not running, which is the dead-updater failure ADR-0015 was written
+    # for -- it just moved runtimes.
+    $tg = $gwHealth.channels.telegram
+    Write-Host "  ok=$($gwHealth.ok)  plugins=$($gwHealth.plugins.loaded -join ',')"
+    Write-Host "  telegram: running=$($tg.running) connected=$($tg.connected) lastError=$($tg.lastError)"
+    if (-not $gwHealth.ok) { $failures += "gateway: health reports not ok" }
+    if ($gwHealth.plugins.errors.Count -gt 0) { $failures += "gateway: plugin errors $($gwHealth.plugins.errors -join ',')" }
+    if ($tg -and -not $tg.running) { $failures += "gateway: the Telegram channel is not running" }
+} catch {
+    $failures += "gateway: health unreachable ($($_.Exception.Message))"
+    Write-Host "UNREACHABLE"
+}
+
+if ($failures.Count -gt 0) {
+    Write-Host "`nDEPLOY FAILED -- one runtime is down while the other is up:"
+    $failures | ForEach-Object { Write-Host "  - $_" }
+    throw "partial start"
+}
+
+# --- preflight: the config assertions no app-side test can make ---------------
+
+if ($SkipPreflight) {
+    Write-Host "`nPREFLIGHT SKIPPED -- the config assertions did not run. This is a gap, not a pass."
+} else {
+    Write-Host "`n--- gateway preflight ---"
+    $preflightArgs = @("scripts/gateway_preflight.py", "--session-key", "preflight-$(Get-Date -UFormat %s)")
+    if ($SkipTurnCheck) { $preflightArgs += "--skip-turn" }
+    & ./app/.venv/Scripts/python.exe @preflightArgs
+    if ($LASTEXITCODE -ne 0) { throw "gateway preflight failed -- see the FAIL lines above" }
+}
+
+Write-Host "`nDeployed. app=$($env:APP_VERSION) gateway=$($env:GATEWAY_VERSION)"

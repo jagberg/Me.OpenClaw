@@ -1,3 +1,7 @@
+# Two runtimes as of the gateway swap. `app` owns the claims domain, the
+# database and Gmail. `gateway` owns Telegram, agent sessions and cron. The
+# boundary between them is this file as much as it is any code: what the gateway
+# cannot see, it cannot leak (ADR-0024).
 services:
   app:
     build:
@@ -12,8 +16,83 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
+    networks:
+      openclaw:
+        ipv4_address: 172.28.0.10
     volumes:
       # Bind the real data dir (DB + Gmail token/credentials). Single source of
       # truth shared with the main checkout; the feature worktree ships new code
       # only, never its own copy of the data. ponytail: one data dir, not two.
       - C:/code/Me.OpenClaw/app/data:/data
+      # The media outbox: rendered claim cards and review PDFs on their way to
+      # Telegram. Narrow on purpose (14.2) — the gateway refuses to send media
+      # from a path outside its own allowlist, and those roots are fixed (14.4).
+      # This is the ONE path between the two containers, and it must never grow
+      # into a general mount of app/data.
+      - media_outbox:/data/outbox
+
+  gateway:
+    image: ghcr.io/openclaw/openclaw:latest
+    restart: unless-stopped
+    # DELIBERATE ABSENCES, each one load-bearing (7.0a, ADR-0024):
+    #   - no env_file. The gateway gets no Gmail credential, no Google key and
+    #     no DATABASE_PATH. gmail-isolation-boundary enforced by the container
+    #     boundary rather than by configuration, which is its strongest form.
+    #   - no bind mount to app/data. The SQLite file, the OAuth token and the
+    #     invoice PDFs are simply not on its filesystem. A read-write open from
+    #     the wrong side deleted the WAL sidecars once and took the app down for
+    #     51 minutes (2026-07-25); this makes that impossible rather than merely
+    #     forbidden.
+    #   - no Docker socket.
+    environment:
+      # The gateway holds the bot token. Nothing else does — two pollers on one
+      # token is a 409 Conflict, which is why the cutover is atomic.
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:?the gateway owns the bot token}"
+      # It refuses to bind without auth and defaults to 0.0.0.0 in a container.
+      # A good default: it fails closed.
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN:?gateway refuses to bind unauthenticated}"
+      # How the plugin reaches the app. The service name, NOT
+      # host.docker.internal: that resolves through the host and NATs the source
+      # address to loopback, which is what made INTERNAL_API_ALLOW_HOSTS useless
+      # during the spike (16.2).
+      CLAIMS_APP_URL: "http://app:8000"
+      CLAIMS_INTERNAL_SECRET: "${INTERNAL_API_SECRET:?the internal surface refuses every request without it}"
+    ports:
+      # Loopback only. The image declares no EXPOSE, so this has to be explicit.
+      - "127.0.0.1:18789:18789"
+    networks:
+      openclaw:
+        ipv4_address: 172.28.0.20
+    volumes:
+      # Its own state, and only its own: config, sessions, the agent workspace
+      # and the Telegram ingress spool. Named rather than bound, so nothing on
+      # the host filesystem is reachable by accident.
+      - gateway_state:/home/node/.openclaw
+      # The read side of the outbox, mounted at <stateDir>/media because the
+      # media allowlist is a fixed set of roots and ignores mounts it does not
+      # know about. Anywhere else fails with a path error that reads like a
+      # permissions problem (14.4). Read-only: the gateway sends these, it does
+      # not write them.
+      - media_outbox:/home/node/.openclaw/media:ro
+    depends_on:
+      - app
+
+networks:
+  openclaw:
+    # A fixed subnet so the app can allowlist the gateway by address.
+    # INTERNAL_API_ALLOW_HOSTS matches exactly, not by CIDR, and a bridge
+    # address is otherwise assigned dynamically. Worth being explicit about how
+    # little this buys: the shared secret is the real boundary. The spike showed
+    # the allowlist cannot even distinguish the gateway from any other host
+    # process when traffic arrives via host.docker.internal (16.2). Over this
+    # network it can, which is the reason to use service names rather than the
+    # host gateway address.
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  # Outside every backup today. 7.0c decides whether it joins db_backup's scope;
+  # until then, losing it costs the agent's session history, not claim state.
+  gateway_state:
+  media_outbox:

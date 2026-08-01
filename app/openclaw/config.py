@@ -109,6 +109,12 @@ OPENCLAW_CLI_TIMEOUT_SECONDS = _int_env("OPENCLAW_CLI_TIMEOUT_SECONDS", 30)
 # second channel is a design decision (the authorization check is Telegram
 # username-based and has no equivalent elsewhere), not an env change.
 OPENCLAW_CHANNEL = os.environ.get("OPENCLAW_CHANNEL", "telegram")
+# The gateway's own version, stamped by scripts/deploy.ps1 and surfaced on
+# /health. It must never be written into `telegram_messages.app_version`: that
+# column exists so the message log is a dataset keyed to the code that produced
+# each row, and two runtimes mean two versions. Conflating them makes the
+# dataset lie about which deploy handled a message (ADR-0014).
+GATEWAY_VERSION = os.environ.get("GATEWAY_VERSION", "")
 
 # Twice-daily Google Drive DB backup (drive_backup.py). Folder ID is from
 # https://drive.google.com/drive/folders/1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2

@@ -4824,6 +4824,34 @@ def test_a_failing_mcp_tool_reports_to_the_model_not_the_transport():
     assert "claim_detail" in bad_args["result"]["content"][0]["text"], bad_args
 
 
+def test_the_plugin_report_is_per_boot_and_never_persisted():
+    """19b.6's evidence. An unregistered command in a button is not an error —
+    it reaches the agent as a chat turn and spends tokens (16.8, measured live
+    three times in Justin's chat). Both plugin enablement gates fail silently
+    (18.7), so "it loaded" proves nothing.
+
+    In-memory on purpose: persisting it would recreate the exact failure that
+    makes `plugins list` useless — a saved registry that goes stale and reported
+    `commands: []` for commands that worked (18.6)."""
+    from openclaw import gateway_client, internal_api
+
+    internal_api._plugin_report.clear()
+    assert internal_api.plugin_report() == {}, "an absent report must read as 'the plugin has not run'"
+
+    internal_api._plugin_report.update({"plugin": "claims", "commands": ["mark", "pet"]})
+    assert internal_api.plugin_report()["commands"] == ["mark", "pet"]
+    # A copy, not the live dict — /health must not hand out something a caller
+    # can mutate into a passing report.
+    internal_api.plugin_report()["commands"] = []
+    assert internal_api.plugin_report()["commands"] == ["mark", "pet"]
+    internal_api._plugin_report.clear()
+
+    # The declared button commands are the preflight's input. If this list and
+    # the card-building code ever diverge, a button ships unasserted.
+    assert gateway_client.BUTTON_COMMANDS, "the preflight has nothing to assert"
+    assert all(not c.startswith("/") for c in gateway_client.BUTTON_COMMANDS), gateway_client.BUTTON_COMMANDS
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
