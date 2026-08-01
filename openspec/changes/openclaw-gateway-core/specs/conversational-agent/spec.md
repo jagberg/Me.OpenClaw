@@ -24,7 +24,9 @@ Pending app-side free-text flows SHALL take precedence over the agent turn. Beca
 ### Requirement: Act on claims with confirm-before-commit
 The agent SHALL be able to perform the same mutations the slash commands expose (mark sent, set condition, assign pet, mark resolved, split between pets), but every mutation MUST be presented as a confirmation with an inline confirm button and MUST NOT commit until the user taps confirm. The agent MUST NOT describe a proposed action as done.
 
-The proposal gate SHALL be a property of the MCP server rather than of the agent's prompt or configuration: a `propose_*` tool records a pending action and returns a confirmation, and the commit happens only on the confirm callback path inside the app. This preserves the existing guarantee that the gate is a harness property, not a behaviour the model is trusted to observe — see `claims-mcp-surface`.
+The proposal gate SHALL be a property of code rather than of the agent's prompt or configuration: a `propose_*` tool records a pending action and returns a confirmation, and the commit happens only on the confirm path inside the app. This preserves the existing guarantee that the gate is a harness property, not a behaviour the model is trusted to observe.
+
+**Which component owns the gate is unresolved** — the confirm tap is now a `command` button handled by the plugin and `/internal`, so the commit executes in Python and not in the MCP server as originally written. Same open question as `claims-mcp-surface` and design D3; the invariant holds under either placement.
 
 Every act tool SHALL accept an explicit claim id, and that id SHALL be how a target is named whenever one is known — the pet/reference/merchant filters exist for when it is not. A tool MUST NOT be left with no way to name the claim under discussion: with none available the model fabricated argument values from the schema's own description text (live, 2026-07-27).
 

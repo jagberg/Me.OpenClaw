@@ -203,6 +203,15 @@ Found 2026-08-01 while reconciling the specs with D2's correction. Four of these
 
 - [ ] 17.1 **Hard blocker, not a tuning issue.** A single agent turn on a stock gateway measured **23,438–23,513 tokens** against Groq free tier's **12,000 TPM**. Verbatim: `413 Request too large ... on tokens per minute (TPM): Limit 12000, Requested 23438`. This is not exhaustion after heavy use — one turn is ~2x the per-minute ceiling, so it can **never** succeed no matter how long you wait. For comparison this repo's own chat request is ~2.6k tokens (`config.py`): **the gateway agent's turn is ~9x larger**.
 - [ ] 17.2 **Justin's D8 instinct was righter than my answer.** He asked whether MCP would burn tokens; I said the tool inventory is a per-turn tax but framed it as manageable. Measured, the default surface alone breaks the provider this project standardises on. The cause is everything shipped on every turn: 45 loaded plugins' tool schemas plus **61 registered slash commands**. Adding claims tools makes it worse, not better.
+- [x] 17.7 **MEASURED: plugins are NOT the lever. The floor is ~29k tokens.** Using Groq's `413 ... Requested N` as a measuring instrument via `openclaw agent --agent main --session-key <fresh>`:
+  | Surface | Fresh session | Requested tokens |
+  |---|---|---|
+  | 45 plugins, 61 commands | no (accumulated) | 22,560 |
+  | 1 plugin (`plugins.allow`) | no (accumulated) | 30,159 |
+  | 1 plugin (`plugins.allow`) | **yes** | **28,991** |
+  Cutting 44 plugins did **not** reduce the turn — a minimal surface measured *higher* than the full one. The bulk is the core agent prompt, core tools and skills (doctor reports 14 eligible), none of which `plugins.allow` touches. **Conclusion: Groq free tier's 12k TPM cannot run the OpenClaw agent, and no amount of plugin pruning changes that.** Gemini handles it comfortably (1M context) and is what the spike now uses.
+  **Method note, twice-learned:** the first two rows are contaminated by session history — `agent:main:main` accumulates turns, so the numbers measure conversation, not surface. Always pass a fresh `--session-key`. Reporting "disabling plugins made it worse" from row 2 would have been a false finding.
+- [ ] 17.8 If Groq is still wanted for the agent, the untested lever is `agents.defaults.contextPruning.tools.allow` (a tool allowlist) plus reducing skills — not plugins. Only worth pursuing if Gemini is rejected.
 - [ ] 17.3 **7.6 gains a second, harder justification.** Pinning the plugin set was a security requirement (`gmail-isolation-boundary`); it is now also a **feasibility** requirement. Measure tokens per turn after disabling unused plugins and pruning the command surface, and treat "turn size under the provider's TPM" as an acceptance criterion with a number, not an aspiration.
 - [ ] 17.4 Decide the provider for the agent against that number, not against preference. Options: cut the surface until Groq's 12k TPM fits; use a provider with a higher TPM; or accept a paid tier. Note this is **per-minute**, a different constraint from ADR-0017's per-day budget — both now apply.
 - [ ] 17.5 **Observed failover behaviour, relevant to ADR-0017 and D8.** OpenClaw retried the *same* model 3 times (10s/20s/30s backoff) then surfaced `decision=candidate_failed reason=rate_limit next=none`. Correct shape for a per-minute limit, and it confirms the gateway classifies Groq 429/413s as `rate_limit`. Two notes: with one model configured there is nothing to fall through to, and retrying a `413 request too large` is futile by construction — the request size never changes, so all 4 attempts were unsatisfiable.
@@ -254,6 +263,36 @@ Baseline to hold: `telegram_messages` (raw payload + `app_version` + `processed_
 - [ ] 9.7 Preserve ADR-0015 alerting levels across the swap, and add a dead-channel alert if 7.7 finds the gateway's supervision quieter than the old restart-on-dead-updater.
 - [ ] 9.8 Verify no log line, alert, or error message carries a secret, a bank detail, or `.env` content — the new internal endpoint and the CLI stderr capture are both new places one could leak.
 - [ ] 9.9 Write down the one thing that does get quieter: chat-side LLM calls leaving `llm_calls`. Named in the llm-backend spec; it must also be in the docs, not just the spec.
+
+## 19. Non-functional regression tests — the learnings must not rot
+
+Everything in this section exists because it was discovered the hard way on 2026-08-01. They split by what can be checked hermetically and what needs a live gateway; **both halves are required**, because the interesting failures here are configuration and budget, which no unit test can see.
+
+### 19a. Hermetic — `app/tests/test_core.py`, no gateway present
+
+- [ ] 19a.1 **Presentation payload shape.** Assert `gateway_client` emits buttons at `presentation.blocks[{type:"buttons"}]` and never at the top level. Five sends were silently discarded for this, each returning `ok:true` with a real message id. Assert the exact nesting, not just "buttons present".
+- [ ] 19a.2 **Never trust `ok`.** Assert `gateway_client` treats a success response with a dropped presentation as a failure where detectable, and that no code path infers "rendered" from "sent". This is the guard against the platform's defining hazard.
+- [ ] 19a.3 **Tool-inventory budget.** Assert the MCP inventory count stays at or under a declared maximum. Every tool schema ships on every chat turn; an unbounded inventory is a silent per-turn cost increase. Failing loudly on tool #N+1 is the point.
+- [ ] 19a.4 **Command payload length.** Assert every generated button command string stays under the transport limit, using the longest real case (a condition selection). Fail with the offending string, since Justin has accepted trimming to fit.
+- [ ] 19a.5 **One outbound seam.** Already implemented — keep `test_nothing_outside_gateway_client_shells_out_to_the_gateway` and extend it if a second transport appears.
+- [ ] 19a.6 **`#id` on every outbound claim message** across the gateway path, including button labels and command strings.
+- [ ] 19a.7 **Tool inventory contains no filesystem, shell, browser, mailbox-search or secret-returning tool** (the `gmail-isolation-boundary` enforcement, currently task 2.3 — cross-referenced here so the NFR set is complete in one place).
+
+### 19b. Live preflight — `scripts/gateway_preflight.py`, run by `deploy.ps1`, fails the deploy
+
+A config check, not a test suite. Each assertion below corresponds to something that was found silently wrong.
+
+- [ ] 19b.1 **Agent turn size under a declared ceiling.** Measure with `openclaw agent --agent <id> --session-key <fresh> --message hi` and assert the result is under the configured model's per-minute limit. **Must use a fresh session key** — an accumulated session measures conversation history, not surface, and produced two false readings before this was caught.
+- [ ] 19b.2 **The model can actually serve a turn.** A model id that config accepts can still fail at runtime with `model_not_found` (Groq did, before a custom provider entry existed). Assert one real turn completes.
+- [ ] 19b.3 **Boundary plugins are disabled**: `browser`, `file-transfer`, and anything else granting filesystem, shell or browser reach. An upgrade re-enabling one must fail the deploy, not pass quietly.
+- [ ] 19b.4 **Access configuration**: `channels.telegram.dmPolicy == "allowlist"`, `allowFrom` non-empty, `commands.ownerAllowFrom` non-empty. Default is `pairing`, which hands unknown senders a live pairing code and the command to socially-engineer approval.
+- [ ] 19b.5 **The gateway holds no Gmail credential** and no Google key with a Gmail scope, and has no mount that can reach `app/data`.
+- [ ] 19b.6 **The plugin actually registered.** Assert its commands respond, not that `plugins list` reports them — those fields come from a persisted registry that goes stale silently and reported `commands: []` for a working command.
+- [ ] 19b.7 **Media outbox path is allowlisted** and is a narrow directory, not `app/data`.
+
+### 19c. Documented, not tested — record where a test is impossible
+
+- [ ] 19c.1 State plainly in the deploy docs which of the above cannot be asserted and why, so the gap is visible rather than assumed covered. A checklist that silently omits an unverifiable item reads as full coverage.
 
 ## 10. Test coverage
 

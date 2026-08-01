@@ -99,6 +99,25 @@ The guarantee SHALL be verified across both runtimes: `send()` absent from `app/
 
 ## ADDED Requirements
 
+### Requirement: Buttons are command actions, and a tap never involves a model
+Every interactive button SHALL carry `action.type: "command"` naming a slash command the in-gateway plugin has registered. Callback actions SHALL NOT be used for the card interface.
+
+Verified 2026-08-01: a `command` button dispatches through core's native command path and a plugin-registered command executes and replies. A `callback` action's value is wrapped by `buildTelegramOpaqueCallbackData` before reaching Telegram, so the raw value never survives and the namespace resolver cannot match it — the opaque form exists for a plugin's own send-and-decode round trip, not for values supplied from outside.
+
+Consequence worth stating: this makes the entire tap path deterministic. No token is interpreted, no model runs, and the existing command surface (`/mark`, `/pet`, `/resolve`) becomes the button target rather than needing a parallel callback vocabulary.
+
+#### Scenario: Tap resolves a claim
+- **WHEN** the user taps a tap-to-resolve button on an actions card
+- **THEN** the named slash command runs through the plugin and applies the change, with no model invoked
+
+#### Scenario: Command string exceeds the transport limit
+- **WHEN** a button's command string would exceed the payload limit
+- **THEN** the failure is caught before send and names the offending string, rather than the button silently arriving without an action
+
+#### Scenario: Presentation payload is malformed
+- **WHEN** a message's button payload does not match the platform's presentation contract
+- **THEN** it is rejected before sending, because the platform discards a malformed presentation silently and still returns success with a real message id
+
 ### Requirement: The card interface is preserved feature-for-feature
 Every element of the existing Telegram interface SHALL survive the transport change: Pillow-rendered claim-history and actions-summary cards sent as photos, inline keyboards on both text and photo messages, one-tap condition and pet buttons, tap-to-resolve action cards, "Wrong invoice", Confirm buttons on proposals, paging, and the PDF review alerts.
 

@@ -13,6 +13,36 @@ Two processes cannot long-poll one bot token — Telegram answers the second pol
 - **WHEN** the swap is complete
 - **THEN** `pipeline`, `claim_status`, `invoice_matching`, `claim_forms`, `vet_detection` and `gmail_client` are unchanged in behaviour and still owned by Python
 
+### Requirement: An in-gateway plugin owns the app's command surface
+A plugin running inside the gateway SHALL register the app's slash commands (`/mark`, `/pet`, `/resolve` and the rest) via the plugin API, and its command handlers SHALL do no claims work themselves — each forwards to the app's `/internal` endpoints.
+
+Rationale: a button carrying `action.type: "command"` invokes a **native** slash command through core's command path. The app's commands are not native to the gateway, so something must register them; that is the plugin's job and the reason it exists. It does not own outbound rendering.
+
+#### Scenario: A button tap runs a claim command
+- **WHEN** the user taps a button whose action is the command `/mark 7 sent`
+- **THEN** the plugin's registered handler runs, calls `/internal`, and the existing claim logic applies the change — with no model involved at any point
+
+#### Scenario: The plugin carries no domain logic
+- **WHEN** the plugin's source is inspected
+- **THEN** it contains no claim rules, no status transitions and no Gmail access — only registration and forwarding
+
+#### Scenario: Registration is proven, not assumed
+- **WHEN** the deploy completes
+- **THEN** a registered command is invoked end to end and must respond; the plugin listing's own report of its commands SHALL NOT be accepted as evidence, because that data comes from a persisted registry that goes stale silently
+
+### Requirement: Agent turn size stays within the configured model's limits
+The size of a single agent turn SHALL be measured against a declared ceiling before the system is considered deployable, and the deploy SHALL fail when it exceeds the configured model's per-request limit.
+
+Measured 2026-08-01: a stock turn is ~29,000 tokens, and disabling 44 of 45 plugins did not reduce it — the bulk is the core agent prompt, core tools and skills. A provider whose per-minute limit is below that cannot serve the agent at all, and this is not a tuning problem.
+
+#### Scenario: Turn exceeds the model's limit
+- **WHEN** a measured turn is larger than the configured model's per-request or per-minute ceiling
+- **THEN** the deploy fails and names both numbers, rather than deferring the failure to the first real message
+
+#### Scenario: Measurement uses a clean session
+- **WHEN** turn size is measured
+- **THEN** a fresh session key is used, because an existing session's accumulated history is counted in the request and produces a reading that measures conversation rather than surface
+
 ### Requirement: The app reaches Telegram through gateway actions, not the Bot API
 Unattended outbound messages — claim notifications, cards, PDF alerts, nudges — SHALL be emitted by calling the gateway's send/edit actions, and SHALL NOT call the Telegram Bot API directly.
 
@@ -23,6 +53,19 @@ Unattended outbound messages — claim notifications, cards, PDF alerts, nudges 
 #### Scenario: Gateway is down when a notification is due
 - **WHEN** a send is attempted and the gateway is unreachable
 - **THEN** the failure is recorded with a human-readable reason and surfaced, never swallowed, consistent with the project's failure-visibility rule
+
+### Requirement: Configuration that can silently regress is asserted at deploy
+The deploy SHALL assert, against the running gateway, that: the boundary plugins (`browser`, `file-transfer`, and any other granting filesystem, shell or browser reach) are disabled; `channels.telegram.dmPolicy` is `allowlist` with a non-empty `allowFrom`; `commands.ownerAllowFrom` is non-empty; the gateway holds no Gmail credential and no mount reaching `app/data`; and the media outbox directory is narrow.
+
+Rationale: every item here was found silently wrong during the 2026-08-01 spike. Each is configuration rather than code, so no test in the app's suite can see it, and each fails without an error — an unset `dmPolicy` hands unknown senders a live pairing code; an upgrade can re-enable `browser` with no signal.
+
+#### Scenario: A boundary plugin is re-enabled by an upgrade
+- **WHEN** the gateway is upgraded and `browser` returns to the enabled set
+- **THEN** the deploy fails naming the plugin, rather than starting successfully
+
+#### Scenario: Access policy left at its default
+- **WHEN** `dmPolicy` is `pairing` rather than `allowlist`
+- **THEN** the deploy fails, because unknown senders would receive a pairing code and instructions to obtain approval
 
 ### Requirement: Each runtime degrades visibly and independently
 Neither runtime's absence SHALL cause the other to fail silently. If the gateway is down, the pipeline SHALL continue matching, drafting and recording state, queueing what it could not deliver. If the Python app is down, the gateway SHALL report the tool surface as unavailable rather than answering from the model's own knowledge.
