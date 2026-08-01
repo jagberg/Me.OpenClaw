@@ -312,6 +312,8 @@ No callbacks, no opaque tokens, no interactive handlers, no LLM. Verified end to
 
 Each phase is independently shippable and leaves the system working. The old transport is retired last, and only after the UI is proven.
 
+**Annotated 2026-08-01 — this plan is build order; the two slices (8.11) are release order, and they are not the same cut.** The slice boundary falls **inside phase 2**: the MCP read tools ship in slice 1 because they are exercisable with no channel bound, while the proposals and the confirm gate ship in slice 2 because a gate needs a real tap. Everything from phase 3 down is slice 2. The phases below are unchanged and still describe the order to build in.
+
 **Phase 0 — spikes (no production change).** Answer the four unknowns: buttons on photos; caption edit; Groq daily-exhaustion classification; whether the gateway can be pinned to a single authorized username. Any negative answer changes the plan before code is written.
 
 **Phase 1 — MCP server, read-only, alongside everything.** Python MCP server with the read tools; registered with the gateway; no channel bound to the gateway, so Telegram is untouched and there is no 409 risk. Agent reachable via its own surface for testing. Existing bot fully live.
@@ -443,3 +445,15 @@ Append-only. Material decision changes only — findings live in `tasks.md`.
 **Trade-off accepted:** none — this closes the single largest unverified assumption (8.8's fourth bucket, which had exactly one entry). What it does *not* prove is claim logic behind the endpoint; the spike deliberately used an echo route, because the domain is already covered by the existing suite and the untested part was the transport.
 **Supersedes:** n/a.
 **Found along the way:** `INTERNAL_API_ALLOW_HOSTS` cannot distinguish the gateway container from any other host process — Docker NATs container calls to `127.0.0.1` — so the shared secret is carrying the boundary alone, and the comment in `internal_api.py` calling the allowlist "defence in depth" overstates it.
+
+## 2026-08-01 — The change ships in two slices (Justin)
+**Decision:** Split at the cutover. Slice 1 is everything true while the Python app still owns Telegram — internal transport, MCP read tools, the two-container deploy, the plugin with its commands registered, the preflight, the hermetic suite, and the whole decision trail. Slice 2 is the cutover and what depends on it — the confirm gate, the transport swap, cron, deletion, and the conversation consequences. Each archives and syncs its own requirements. Full assignment in `tasks.md` 8.11.
+**Reasoning:** The cutover is atomic — one bot token, one poller — but nothing before it is. Holding ~180 tasks un-synced makes the baseline rot, which is the failure `openspec/specs/` exists to prevent, and it puts work that is finished and provable in the same release as the one step that cannot be half-done. Deferred until 16.2 closed on Justin's explicit condition that nothing be unknown when the slicing was decided.
+**Trade-off accepted:** Two changes to keep coherent, and a decision trail split at its densest point. `claims-mcp-surface` and `openclaw-gateway-runtime` straddle the boundary and split by requirement rather than staying whole — accepted, because the alternative drags proven work into the risky day. Slice 2 references slice 1's decisions rather than copying them; a copied trail diverges.
+**Supersedes:** the Migration Plan's implied single release. The phases themselves stand — the slice boundary falls **inside** phase 2, which is why the plan is annotated rather than rewritten.
+
+## 2026-08-01 — Rejected: three or four slices
+**Decision:** Not adopted.
+**Reasoning:** A four-slice plan was drafted — foundations, gateway-alongside, cutover, agent — and it does isolate the risky day more tightly. Justin took two. Recorded because the finer split will look obviously better to someone reading only the risk argument, and the counter-argument is not in the risk column: each archive costs a full spec sync, and four syncs of a baseline this size is more places for the baseline to go wrong than the extra isolation buys back.
+**Trade-off accepted:** Slice 1 is large — roughly 60 open tasks — and a problem found late in it delays everything behind it.
+**Supersedes:** n/a.

@@ -2,6 +2,8 @@
 
 Sections 9 (logging parity) and 10 (test coverage) are **cross-cutting**: they interleave with 1–7 rather than following them. A task in 1–7 is not done until its logging and test counterparts are.
 
+**This change ships in two slices (8.11, Justin, 2026-08-01).** Slice 1 is everything that can be true while the Python app still owns Telegram: sections 0, 1, 2, 7, 8, 11, 13 (except 13.1c), 14–19. Slice 2 is the cutover and what depends on it: sections 3, 4, 5, 6, 12, 13.1c. Sections 9 and 10 split by the same rule. The directory split happens at slice 1's archive (8.14), not now — until then this file holds both.
+
 ## 0. Spikes — answer before writing production code
 
 Any negative answer changes the plan. Record the actual answer next to each task, not just a tick.
@@ -175,7 +177,7 @@ Do not start until phase 4 has run one full claim lifecycle on real data.
   **Asserted from documentation only, and still unproven:** that the in-gateway plugin can register the app's commands via `api.registerCommand` in a way a `command` button reaches. The claims-spike plugin proved a plugin *can* register a working command; it has not proved the full `/mark 7 sent` → `/internal` → claim-logic path. **This is the single largest unverified assumption in the design**, and 16.2 is where it gets settled.
 
   **Not verified and not verifiable here:** anything about behaviour under Justin's real message volume, concurrent taps, or a gateway restart mid-handler. The replay guarantees (ADR-0014) are carried forward on the strength of the existing implementation, not re-proved against the new transport.
-- [ ] 8.9 Sync the delta specs into `openspec/specs/` before archiving. **Now five modified and three new**, not four and three — `task-capture` was added 2026-08-01, see below.
+- [ ] 8.9 Sync the delta specs into `openspec/specs/` before archiving. **Now five modified and three new**, not four and three — `task-capture` was added 2026-08-01, see below. **Runs twice, once per slice** — 8.11 assigns every capability and, where one straddles, every requirement.
 
   **Deliberately not done yet, and that is correct.** `openspec/specs/` is the *current-state* baseline and this change is 56 of 181 tasks. Syncing now would assert the system already does things nobody has built. The CLAUDE.md warning is about not forgetting this at archive, not doing it early.
 
@@ -183,7 +185,41 @@ Do not start until phase 4 has run one full claim lifecycle on real data.
   - **`task-capture` was affected and had no delta.** Its confirm-before-commit requirement *is* the D3 gate, which split by origin, and it referenced the old `telegram_bot._execute_action` location. Delta written now, on Justin's call, while the reasoning is fresh — the alternative was rediscovering it months later during the sync itself.
   - **The baseline already references a capability that does not exist** — `task-telegram-surface`, from `task-capture`. Pre-existing, created by another change's incomplete sync. Justin's call: note it, fix elsewhere. Logged in `openspec/BACKLOG.md` with the two possibilities and which to check first.
   - **A delta stated a wrong reason**, corrected in place: `reminder-scheduling` claimed cron has no `misfire_grace_time` equivalent. It has `planStartupCatchup`. The app-side sweep is still required, but because cron guarantees the *invocation* fires and not that the *app processed it* — and someone reading the old reason would reasonably have deleted the sweep on discovering catch-up.
-- [ ] 8.11 **Decide whether this change archives whole or in slices — after the section-0 spikes close** (Justin, 2026-08-01). 181 tasks is a lot to hold un-synced. The cutover itself is atomic (one bot token, one poller), but the work before it is not: the internal API, the MCP surface and the preflight could ship and archive ahead of the transport swap, shrinking what has to be right on the day. Not decided now because slicing sensibly is easier once nothing is unknown.
+- [x] 8.11 **DECIDED (Justin, 2026-08-01): two slices.** Taken after 16.2 closed the last spike, which was his stated condition — slicing sensibly needed nothing left unknown. Original text: *Decide whether this change archives whole or in slices — after the section-0 spikes close. 181 tasks is a lot to hold un-synced. The cutover itself is atomic (one bot token, one poller), but the work before it is not: the internal API, the MCP surface and the preflight could ship and archive ahead of the transport swap, shrinking what has to be right on the day.*
+
+  **The boundary rule, and it is the only one that matters.** A task is **slice 1** if it can ship while the Python app still owns Telegram exactly as it does today. A task is **slice 2** if it is only true once the gateway holds the bot token. Not "is it hard" or "is it related" — a slice archives by syncing its deltas into the current-state baseline, so the test is whether the requirement is *true* after that slice ships. A requirement that would describe a system nobody has built yet cannot be in slice 1, however finished its code is.
+
+  **Slice 1 — "both runtimes up, the app still owns Telegram."**
+  Sections **0** (spikes, closed), **1** (internal transport), **2** (MCP read tools), **7** (deploy, isolation, plugin pinning), **8** (docs and trail), **11** (fit audit, closed), **13** except 13.1c, **14** (media outbox), **15**, **16**, **17**, **18**, **19a**, **19b**, **19c**, plus the items in 9 and 10 that do not depend on the gateway carrying traffic.
+  It ends with: two containers deployed, the gateway holding no bot token and no channel bound, the plugin loaded with its commands registered, the MCP read tools answering, the preflight failing a bad deploy, and the hermetic suite green. Telegram behaviour is bit-for-bit what it is today.
+
+  **Slice 2 — "the cutover and everything downstream."**
+  Sections **3** (proposals and the confirm gate), **4** (cutover), **5** (scheduling), **6** (deletion), **12** (consequences of conversation bypassing the app), **13.1c** (the per-chat command menu), and the remainder of 9 and 10.
+
+  **Two placements that are not obvious and are deliberate:**
+  - **MCP read tools are slice 1; the confirm gate is slice 2.** Read tools are exercisable through `openclaw agent` with no channel bound, so the requirement is true the moment they are registered. The gate needs a real tap on a real button, which needs the gateway polling. This splits `claims-mcp-surface` across both slices rather than holding it whole — worth the awkwardness, because holding it would drag the read tools into the risky day for no reason.
+  - **13.1c is slice 2 even though the mechanism is proven.** Writing `BotCommandScopeChat` only means anything for a bot the gateway is driving. Verified live (see 13.1c), but its *requirement* is false until cutover.
+
+  **How `openclaw-gateway-runtime`'s ten requirements split** — six become true at slice 1, four at slice 2. Recorded now because this is the reasoning that will be expensive to reconstruct at archive time:
+  | Slice 1 | Slice 2 |
+  |---|---|
+  | In-gateway plugin owns the command surface | Gateway owns channel transport (sole poller) |
+  | Agent turn size within the model's limits | The app reaches Telegram through gateway actions |
+  | Workspace files shipped, versioned, unenforcing | Each runtime degrades visibly and independently |
+  | Config that can silently regress asserted at deploy | Scheduled work runs from gateway cron |
+  | Version stamping survives the second runtime | |
+  | Deploy remains a single documented command | |
+
+  `gmail-isolation-boundary` goes whole into slice 1 — the container boundary and the tool-inventory assertion both hold there. `telegram-bot`, `conversational-agent`, `llm-backend`, `reminder-scheduling` and `task-capture` go whole into slice 2; every one of them describes behaviour that only exists after the swap.
+
+  **What this costs, stated plainly.** Two changes to keep coherent instead of one, and a decision trail split across two directories at the point where it is densest. The mitigation is that slice 1 carries the trail — the spikes, the eight silent-failure modes, the token measurements, the ADRs — and slice 2 references it rather than restating it.
+
+  **The directory split happens at slice 1's archive, not now** (see 8.14). Doing it early would mean maintaining two `tasks.md` files through the remaining build for no benefit; the assignment above is the part that needed deciding while the reasoning was fresh.
+- [ ] 8.14 **Added by 8.11 — the mechanics of the split, to be done when slice 1's tasks are complete and not before.**
+  - This change (`openclaw-gateway-core`) becomes **slice 1**. Narrow its `proposal.md` scope statement to match, keeping the full reasoning; do not rewrite history to pretend it was always scoped this way.
+  - Carve slice 2 into a new change — working name `openclaw-telegram-cutover` — moving sections 3, 4, 5, 6, 12, 13.1c and the deferred 9/10 items across, along with the five whole capability deltas and the four `openclaw-gateway-runtime` requirements named above.
+  - Slice 2's `design.md` references this one's decisions (D1–D12, ADR-0023/0024/0025) rather than copying them. A copied decision trail diverges.
+  - 8.9's sync then runs **twice**, once per archive, each syncing only that slice's requirements.
 - [x] 8.12 **The agent workspace files need no capability of their own** (Justin, 2026-08-01). `openclaw-gateway-runtime` already requires them shipped from the repo, versioned with the app, and carrying no enforceable rule; a separate capability would restate that. Recorded so the question is not reopened as an oversight.
 
 ## 16. Rework forced by D10 (the CLI cannot send interactive messages)
