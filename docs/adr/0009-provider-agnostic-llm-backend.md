@@ -47,3 +47,35 @@ The reasoning built on the wrong claim survives anyway: this ADR's Negative/Risk
 ## Notes
 
 Classification and Petcover reference extraction remain regex/keyword on purpose (quota discipline) — chat and extraction are the only LLM users.
+
+---
+
+## Addendum — 2026-08-01: the gateway takes chat; Groq survives a scare
+
+The conversational loop moves to the OpenClaw gateway (ADR-0024), which does its
+own model resolution. This ADR's decision is unchanged for `extract()` and
+`extract_vision()`; what follows is where the boundary now falls.
+
+**Groq stays the default, but nearly did not.** A stock gateway turn measured
+22,810 prompt tokens against Groq free tier's 12,000 tokens per minute — a
+per-request impossibility, not exhaustion. It was recorded for most of a day as
+a hard blocker, on the strength of a total read off a `413` error. Itemised, the
+turn was three-quarters content the deployment chooses; trimmed, it is 3,865.
+See ADR-0023. The lesson is the method, not the number: a total tells you that
+you are over a limit and never what to cut.
+
+**What the gateway covers:** chat turn model selection, and failover between
+configured candidates.
+
+**What `llm.py` keeps:** `extract()` and `extract_vision()`, including ADR-0017's
+per-model daily walk. These are the calls that actually exhaust a daily budget —
+batch extraction over a mailbox — and the gateway never sees them.
+
+**The gap, accepted:** the gateway classifies every quota failure as
+`rate_limit` and treats it as *transient*, re-probing the same model during
+cooldown (`shouldAllowCooldownProbeForReason`). Groq's ceiling is per day, per
+model, so waiting cannot help and only moving to another model's budget does.
+Chat therefore spends three futile retries per exhausted-day turn before moving
+on. Mitigated by configuring a multi-model chain so `next=none` becomes
+`next=<model B>`; not eliminated. This is a regression against ADR-0017 for the
+chat path only, recorded rather than left to be discovered.

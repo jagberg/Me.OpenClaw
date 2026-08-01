@@ -195,3 +195,19 @@ The native indicator is strictly more informative — receipt **plus** work-in-p
 **Decided for now: keep the ack.** It is cheap, it is already specified (`telegram-bot`: "Every incoming message is acknowledged immediately"), and removing it during a transport swap would confuse a real regression with an intended change.
 
 What would close it: after cutover, confirm the typing indicator fires on the paths that matter — an LLM chat turn, and a tap whose handler is slow — then decide whether the reaction is redundant. If it is, this removes a requirement and its code rather than adding any. Note the two are not equivalent for **taps**: a button press may show no typing indicator at all, which is exactly the case the ack was added for.
+
+## Reminders should push, now that a push channel exists (opened 2026-08-01)
+
+ADR-0003 chose dashboard-only reminder delivery because no push channel existed.
+That reason expired — Telegram has been live for months, and the gateway swap
+(ADR-0024) brings cron and multi-channel push with it.
+
+Deliberately **not** folded into `openclaw-gateway-core` (Justin, 2026-08-01):
+independent of the transport swap, and near-trivial once the gateway is in
+place, so including it would add scope without reducing work.
+
+What a change here would need to settle: whether a due reminder pushes
+unconditionally or only when unacknowledged; whether it reuses the claims
+notification path or gets its own; and what happens to reminders that came due
+while the gateway was down (gateway cron runs missed jobs at startup, capped at
+five per restart — see tasks 11.4).

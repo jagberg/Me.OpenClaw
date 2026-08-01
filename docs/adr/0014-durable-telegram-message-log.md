@@ -79,3 +79,24 @@ Replay is now a background task created after polling starts, with a module-leve
 **Trade-off accepted:** the app can serve HTTP and accept *new* updates while older queued ones are still being replayed, so the two can interleave. That is safe under the at-least-once contract this ADR already imposes (every replayable mutation must be idempotent) and it was already possible anyway — polling starts before replay either way.
 
 **Caveat, unchanged by this:** a row that carries an `error` is refused by `mark_processed`, so a genuinely crashed update stays in the queue and replays on **every** restart until `MESSAGE_QUEUE_TTL_HOURS` expires it. Update `176928775` (the edited message that crashed the text handler) did exactly that across two deploys on 2026-07-27 — one LLM turn and one Telegram message each time. Intended, but worth knowing before wondering why a restart re-answers an old question.
+
+---
+
+## Addendum — 2026-08-01: retained deliberately under the gateway
+
+The gateway keeps its own message records, so this table was put to the
+fit-the-architecture audit and **kept** — decided by Justin, not defaulted.
+
+The deciding reason is the one the gateway cannot cover: `telegram_messages` is
+an RL training dataset keyed to *this app's* version. A general-purpose gateway
+has no reason to store raw payloads stamped with `app_version`. The audit-trail
+and replay jobs may well be duplicated by the gateway; that duplication is
+accepted rather than investigated, because the dataset job alone justifies the
+table.
+
+Unchanged under the new transport: `record_inbound` still writes **before** the
+handler runs, so a crash mid-handler leaves the row unprocessed and replayable,
+and every outbound path writes too. Version stamping gains a wrinkle — two
+runtimes means two versions, and the gateway's must be recorded separately
+rather than displacing `app_version`, or the dataset lies about which code
+produced a row.
