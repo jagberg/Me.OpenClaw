@@ -26,8 +26,9 @@ Applying it is not a one-off. Several things this repo built have native counter
 | `telegram_messages` | **Keep — decided, closed** | Owner decision: the training-dataset job is real and intended. Audit/replay duplication with the gateway is accepted, not investigated. |
 | Confirm gate (D3) | **Open — unblocked, undecided** | The capture is done (11.2): a plugin approval's title and description are free text, so it *can* render a full outcome. That removes native-vs-bespoke as the axis and leaves the real question — the text must be composed by code from the claim row, never by the model. Justin's call. |
 | Pillow claim cards | **Keep — decided, closed** | Both sent to the real chat with the same 12 live claims; Justin chose the card (11.3). Month subtotals, status pills and a layout that does not truncate on a phone. Makes the shared media outbox mandatory. |
-| `tasks.py` / `reminders.py` | **Open — unexamined** | 11.4. |
-| `llm.py` fallback chain | **Open — depends on 0.4** | 11.5. |
+| `tasks.py` / `reminders.py` | **Split — decided, measured** | `reminders.py` replaced by `cron --at`, whose startup catch-up covers the `misfire_grace_time=None` behaviour its comment calls out. `tasks.py` kept for provenance — `source_message_id`, `outcome_at`, and rows beside the claims (11.4). |
+| `llm.py` fallback chain | **Split — decided, measured** | Extraction and vision keep the per-model daily walk; chat delegates. The gateway has one `rate_limit` bucket and treats it as transient, so ADR-0017's per-day distinction is lost for chat — accepted, with a multi-model chain to recover the cross-model move (11.5). |
+| Telegram command menu | **Own the per-chat scope** | The gateway writes only `default` and `all_group_chats`; Telegram resolves per-chat first. Verified live — Justin's menu now shows five (13.1c). |
 
 The principle cuts both ways: `telegram_messages` is kept *against* the native option because a specific, stated need outweighs it — which is the test working, not an exception to it.
 
