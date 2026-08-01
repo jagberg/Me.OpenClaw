@@ -54,7 +54,12 @@ EXPECTED_MENU_SCOPES = {"default", "all_group_chats"}
 
 # Anything here in the gateway's environment or config is a boundary breach.
 # The Gmail token and the database live on the app's side of the wall.
-FORBIDDEN_GATEWAY_KEYS = ("GMAIL", "GOOGLE_APPLICATION", "DATABASE_PATH", "GOOGLE_CLIENT_SECRET")
+# Widened 2026-08-02 after the check PASSED on a container holding GOOGLE_API_KEY
+# and GEMINI_API_KEY. 19b.5 says "no Google key with a Gmail scope", and a bare
+# GOOGLE_API_KEY cannot be shown to lack one from outside -- the gateway's agent
+# runs on Groq, so any Google credential here is both unnecessary and the same
+# credential family as the Gmail token this boundary exists to keep out.
+FORBIDDEN_GATEWAY_KEYS = ("GMAIL", "GOOGLE", "GEMINI", "DATABASE_PATH")
 
 
 class Result:
@@ -320,7 +325,28 @@ def check_button_commands(gw: Gateway, app_health: dict | None, commands: tuple)
     missing = sorted(set(commands) - registered)
     if missing:
         return result.fail(f"not registered, so a tap on these becomes a model turn: {missing}")
-    return result.ok(f"{len(registered)} reported by the plugin at boot")
+
+    # The report proves the plugin RAN. It cannot prove the plugin OWNS the
+    # names: `registerCommand` neither throws nor returns a failure on
+    # collision, and the gateway logs it asynchronously about a second later.
+    # Observed 2026-08-02 with a second plugin loaded — the boot report claimed
+    # all five while three had actually been refused. Reading the log is the
+    # only place that failure is visible.
+    code, log, _ = gw.shell("cat /tmp/openclaw/openclaw-*.log 2>/dev/null | grep -i 'command registration failed' | tail -20")
+    if code != 0:
+        return result.skip("registered, but the gateway log was unreadable so collisions are UNVERIFIED")
+    # The log file is JSON per line, so the command name arrives as \"mark\"
+    # rather than "mark". Matching the unescaped form found nothing and the
+    # check PASSED over three real collisions -- caught only by going and
+    # reading the file rather than believing the green line. Unescape first.
+    log = log.replace('\\"', '"')
+    stolen = sorted({name for name in commands if f'"{name}"' in log})
+    if stolen:
+        return result.fail(
+            f"registration was REFUSED for {stolen} - another plugin owns those names, and the "
+            "plugin's own boot report cannot see it. Taps on them run someone else's handler"
+        )
+    return result.ok(f"{len(registered)} reported, no collisions in the gateway log")
 
 
 def main() -> int:
