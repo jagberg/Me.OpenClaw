@@ -4299,9 +4299,261 @@ def test_the_shadow_comparison_reports_without_repairing_anything():
     assert after["status"] == "settled" and after["flag"] == before["flag"], "the comparison wrote something"
 
 
+# --- OpenClaw gateway: the internal surface and the outbound seam -------------
+# Tested at the function level rather than through fastapi's TestClient on
+# purpose: TestClient needs httpx, and adding a test-only dependency to reach
+# code that is already directly callable buys nothing. The suite must also pass
+# with no gateway installed, which is why every send test injects a runner.
+
+
+class _FakeRequest:
+    def __init__(self, host="127.0.0.1"):
+        self.client = type("c", (), {"host": host})()
+
+
+def _with_secret(secret, allow=None):
+    """Set the internal-API config and hand back a restore callable."""
+    from openclaw import config as cfg
+
+    before = (cfg.INTERNAL_API_SECRET, cfg.INTERNAL_API_ALLOW_HOSTS)
+    cfg.INTERNAL_API_SECRET = secret
+    if allow is not None:
+        cfg.INTERNAL_API_ALLOW_HOSTS = allow
+
+    def restore():
+        cfg.INTERNAL_API_SECRET, cfg.INTERNAL_API_ALLOW_HOSTS = before
+
+    return restore
+
+
+def test_internal_surface_refuses_when_no_secret_is_configured():
+    """An unset secret is a misconfiguration, not a permission. Defaulting to
+    allow would make the whole surface public the first time someone forgot the
+    env var."""
+    from openclaw import internal_api
+
+    restore = _with_secret("")
+    try:
+        reason = internal_api._authorized(_FakeRequest(), "anything")
+        assert reason and "not configured" in reason, reason
+    finally:
+        restore()
+
+
+def test_internal_surface_rejects_a_bad_or_missing_secret():
+    from openclaw import internal_api
+
+    restore = _with_secret("s3cret")
+    try:
+        assert internal_api._authorized(_FakeRequest(), "wrong") == "bad or missing secret"
+        assert internal_api._authorized(_FakeRequest(), None) == "bad or missing secret"
+        assert internal_api._authorized(_FakeRequest(), "s3cret") is None
+    finally:
+        restore()
+
+
+def test_internal_surface_rejects_a_host_outside_the_allowlist():
+    """Defence in depth — the secret is the real auth, but a correct secret from
+    an unexpected host is still worth refusing and logging."""
+    from openclaw import internal_api
+
+    restore = _with_secret("s3cret", allow={"127.0.0.1"})
+    try:
+        reason = internal_api._authorized(_FakeRequest(host="10.1.2.3"), "s3cret")
+        assert reason and "not in allowlist" in reason, reason
+        assert internal_api._authorized(_FakeRequest(host="127.0.0.1"), "s3cret") is None
+    finally:
+        restore()
+
+
+def test_two_concurrent_ticks_never_both_run():
+    """Two pipeline.run_once calls against one database would draft the same
+    claims into two Gmail drafts — two Petcover submissions for one set of
+    invoices. APScheduler refused an overlapping run for free (max_instances
+    defaults to 1, unset everywhere here); gateway cron does not, so this is a
+    guarantee being rebuilt rather than a new one."""
+    import threading
+
+    from openclaw import internal_api
+
+    entered = []
+    release = threading.Event()
+
+    def _slow():
+        entered.append(1)
+        release.wait(5)
+        return "done"
+
+    outcomes = []
+    first = threading.Thread(target=lambda: outcomes.append(internal_api.run_exclusive("tick", _slow)))
+    first.start()
+    for _ in range(500):  # wait for the first tick to actually hold the lock
+        if entered:
+            break
+        time.sleep(0.01)
+    assert entered, "the first tick never started"
+
+    assert internal_api.run_exclusive("tick", _slow) == (False, None), "a second tick entered the body"
+    assert len(entered) == 1, entered
+
+    release.set()
+    first.join(5)
+    assert outcomes == [(True, "done")], outcomes
+
+    # Released, so the next invocation after the first finishes does run.
+    assert internal_api.run_exclusive("tick", lambda: "second") == (True, "second")
+
+
+def test_different_jobs_do_not_block_each_other():
+    """The lock is per job name — a running tick must not stop the nudge."""
+    import threading
+
+    from openclaw import internal_api
+
+    held = threading.Event()
+    release = threading.Event()
+    t = threading.Thread(target=lambda: internal_api.run_exclusive(
+        "tick", lambda: (held.set(), release.wait(5))))
+    t.start()
+    try:
+        assert held.wait(5), "the tick never took its lock"
+        assert internal_api.run_exclusive("nudge", lambda: "ok") == (True, "ok")
+    finally:
+        release.set()
+        t.join(5)
+
+
+def test_nothing_outside_gateway_client_shells_out_to_the_gateway():
+    """The LoggedBot rule, carried to the new transport: one seam, or the message
+    log stops being complete. A bypassing caller sends the message and writes no
+    row, and a missing row is indistinguishable from a message never sent.
+
+    This is the guard the module map rates as only *partial* for LoggedBot —
+    nothing there stops a second `telegram.Bot` being constructed."""
+    src = Path(__file__).resolve().parent.parent / "openclaw"
+    offenders = []
+    for path in sorted(src.glob("*.py")):
+        if path.name == "gateway_client.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        # `config.OPENCLAW_CLI`, not bare `OPENCLAW_CLI` — config.py is where the
+        # setting is DEFINED, and naming a setting is not reaching the gateway.
+        for marker in ("import subprocess", "from subprocess", "config.OPENCLAW_CLI"):
+            if marker in text:
+                offenders.append(f"{path.name}: {marker}")
+    assert not offenders, (
+        "these reach the gateway outside the logged seam, so their messages "
+        f"would never land in telegram_messages: {offenders}"
+    )
+
+
+def test_correlation_id_is_minted_when_the_caller_supplies_none():
+    """An event crosses two runtimes now. Without a shared id a failure halfway
+    is untraceable in either log."""
+    from openclaw import internal_api
+
+    assert internal_api._correlation_id("abc123") == "abc123"
+    assert internal_api._correlation_id("  ") .startswith("int-")
+    assert internal_api._correlation_id(None).startswith("int-")
+    assert internal_api._correlation_id(None) != internal_api._correlation_id(None)
+
+
+def _ok_runner(stdout='{"ok": true}'):
+    def run(argv, **kwargs):
+        return type("p", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    return run
+
+
+def test_gateway_send_failure_carries_the_stderr_reason():
+    """A send that did not happen must never look like one that did, and an exit
+    code alone is useless for diagnosis."""
+    from openclaw import gateway_client
+
+    def run(argv, **kwargs):
+        return type("p", (), {"returncode": 2, "stdout": "", "stderr": "chat not found"})()
+
+    try:
+        gateway_client.send_message("42", "hello #7", runner=run)
+    except gateway_client.GatewaySendError as exc:
+        assert "exit 2" in str(exc) and "chat not found" in str(exc), str(exc)
+    else:
+        raise AssertionError("a failed send did not raise")
+
+
+def test_the_suite_runs_with_no_gateway_installed():
+    """Hermetic: no daemon, no CLI on PATH. A missing binary is a named failure,
+    not a stack trace from subprocess."""
+    from openclaw import gateway_client
+
+    def run(argv, **kwargs):
+        raise FileNotFoundError(argv[0])
+
+    try:
+        gateway_client.send_message("42", "hello", runner=run)
+    except gateway_client.GatewaySendError as exc:
+        assert "not found" in str(exc), str(exc)
+    else:
+        raise AssertionError("a missing gateway CLI did not raise")
+
+
+def test_every_gateway_send_lands_in_the_message_log():
+    """The LoggedBot guarantee, carried over: nothing reaches the channel without
+    a telegram_messages row. This is the seam that keeps the log trustworthy."""
+    from openclaw import gateway_client, message_log
+
+    _fresh_db()
+    before = message_log.stats()["total"]
+    gateway_client.send_message("42", "Claim #7 needs a condition", runner=_ok_runner())
+    gateway_client.send_file("42", "/tmp/card.png", caption="Claim #7", runner=_ok_runner())
+    gateway_client.edit_message("42", "9", caption="Claim #7 — done", runner=_ok_runner())
+    assert message_log.stats()["total"] == before + 3, message_log.stats()
+
+
+def test_gateway_edit_takes_exactly_one_of_text_or_caption():
+    """A message carrying a PDF or a rendered card has no text — editing text on
+    one is what used to crash on exactly the alerts that most need feedback."""
+    from openclaw import gateway_client
+
+    for kwargs in ({}, {"text": "a", "caption": "b"}):
+        try:
+            gateway_client.edit_message("42", "9", runner=_ok_runner(), **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"edit_message accepted an ambiguous target: {kwargs}")
+
+
+def test_a_react_failure_does_not_break_the_handler():
+    """The ack exists so a slow handler does not feel dead. Losing the ack is
+    strictly better than losing the handler."""
+    from openclaw import gateway_client
+
+    def run(argv, **kwargs):
+        return type("p", (), {"returncode": 1, "stdout": "", "stderr": "rate limited"})()
+
+    _fresh_db()
+    assert gateway_client.react("42", "9", runner=run) is False
+    assert gateway_client.react("42", "9", runner=_ok_runner()) is True
+
+
+def test_a_non_json_success_is_not_treated_as_a_failed_send():
+    """Raising here would let a caller retry a message that already went out."""
+    from openclaw import gateway_client, message_log
+
+    # _fresh_db() deliberately leaves telegram_messages alone (it is the RL
+    # dataset), so count relatively — an absolute total depends on test order.
+    _fresh_db()
+    before = message_log.stats()["total"]
+    assert gateway_client.send_message("42", "hi", runner=_ok_runner(stdout="sent")) == {}
+    assert message_log.stats()["total"] == before + 1
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()
             print(f"{name} OK")
     print("ALL TESTS PASSED")
+
+

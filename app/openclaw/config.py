@@ -82,6 +82,29 @@ OWNER_BANK_ACCOUNT_NUMBER = os.environ.get("OWNER_BANK_ACCOUNT_NUMBER", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USERNAME = os.environ.get("TELEGRAM_USERNAME", "jagberg")
 
+# The OpenClaw gateway's side of the house. The gateway owns the bot token and
+# the agent loop; this app owns the claims domain and calls out to it. Two
+# deliberate absences here: no Gmail credential and no Google key of any kind
+# belongs to the gateway (gmail-isolation-boundary), and the gateway is never
+# given DATABASE_PATH — a read-write open from the wrong side deleted the WAL
+# sidecars once and took the whole app down.
+#
+# Shared secret for the /internal routes the gateway calls (cron + the event
+# bridge). Blank means the surface refuses every request rather than running
+# open: an unset secret is a misconfiguration, not a permission.
+INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET", "")
+# Host allowlist for those routes — defence in depth, the secret is the actual
+# auth. Default is loopback only. A gateway running in its own compose service
+# is NOT loopback, so that deployment has to widen this deliberately.
+INTERNAL_API_ALLOW_HOSTS = {
+    h.strip() for h in os.environ.get("INTERNAL_API_ALLOW_HOSTS", "127.0.0.1,::1").split(",") if h.strip()
+}
+# How outbound Telegram messages leave once the gateway owns the token. Every
+# send goes through gateway_client so there is one logged seam — the same reason
+# every send goes through LoggedBot today.
+OPENCLAW_CLI = os.environ.get("OPENCLAW_CLI", "openclaw")
+OPENCLAW_CLI_TIMEOUT_SECONDS = _int_env("OPENCLAW_CLI_TIMEOUT_SECONDS", 30)
+
 # Twice-daily Google Drive DB backup (drive_backup.py). Folder ID is from
 # https://drive.google.com/drive/folders/1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2
 DRIVE_BACKUP_FOLDER_ID = os.environ.get("DRIVE_BACKUP_FOLDER_ID", "1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2")

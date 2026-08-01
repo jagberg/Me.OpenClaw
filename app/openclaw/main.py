@@ -13,6 +13,7 @@ from . import (
     config,
     db,
     gmail_ingest,
+    internal_api,
     message_log,
     netbank_csv,
     pipeline,
@@ -64,6 +65,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+# The gateway's entry point into this app: cron invocations and (later) inbound
+# channel events. Secret-guarded, loopback by default — see internal_api.
+app.include_router(internal_api.router)
 
 
 @app.get("/")
