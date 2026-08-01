@@ -684,9 +684,9 @@ def test_edited_message_is_handled_and_logged_not_crashed():
     update = _edited_reply_to_card_update()
 
     assert update.message is None, "the fixture must be a genuine edit, not a new message"
-    assert message_log._describe(update) == (
+    assert message_log._describe(update.to_dict()) == (
         "text", "edit: This is actually split between echo and Aari. Aari cost was $35 out of this"
-    ), message_log._describe(update)
+    ), message_log._describe(update.to_dict())
     assert telegram_bot._replied_to_claim_id(update.effective_message) == 1
 
     acked, replies, seen = [], [], {}
@@ -4506,22 +4506,8 @@ def test_every_gateway_send_lands_in_the_message_log():
     before = message_log.stats()["total"]
     gateway_client.send_message("42", "Claim #7 needs a condition", runner=_ok_runner())
     gateway_client.send_file("42", "/tmp/card.png", caption="Claim #7", runner=_ok_runner())
-    gateway_client.edit_message("42", "9", caption="Claim #7 — done", runner=_ok_runner())
+    gateway_client.edit_message("42", "9", "Claim #7 — done", runner=_ok_runner())
     assert message_log.stats()["total"] == before + 3, message_log.stats()
-
-
-def test_gateway_edit_takes_exactly_one_of_text_or_caption():
-    """A message carrying a PDF or a rendered card has no text — editing text on
-    one is what used to crash on exactly the alerts that most need feedback."""
-    from openclaw import gateway_client
-
-    for kwargs in ({}, {"text": "a", "caption": "b"}):
-        try:
-            gateway_client.edit_message("42", "9", runner=_ok_runner(), **kwargs)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"edit_message accepted an ambiguous target: {kwargs}")
 
 
 def test_a_react_failure_does_not_break_the_handler():
@@ -4547,6 +4533,185 @@ def test_a_non_json_success_is_not_treated_as_a_failed_send():
     before = message_log.stats()["total"]
     assert gateway_client.send_message("42", "hi", runner=_ok_runner(stdout="sent")) == {}
     assert message_log.stats()["total"] == before + 1
+
+
+def _capture_argv():
+    """Record the argv a gateway_client call builds, without running anything."""
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append(argv)
+        return type("p", (), {"returncode": 0, "stdout": '{"ok": true}', "stderr": ""})()
+
+    return seen, run
+
+
+def test_gateway_argv_uses_the_flags_the_cli_actually_has():
+    """19a — the first version of gateway_client guessed every flag and got every
+    flag wrong: --chat, --text, --file, --caption, --buttons. None exist. The CLI
+    accepts none of them, but the failure that matters is subtler than a crash:
+    a wrong *presentation* is discarded silently with ok:true and a real message
+    id, so there is no signal to notice.
+
+    Verified against `openclaw message <sub> --help` on gateway 2026.6.34. This
+    test exists so the next person to guess is stopped by a red suite."""
+    from openclaw import gateway_client
+
+    _fresh_db()
+    invented = {"--chat", "--text", "--file", "--caption", "--buttons"}
+
+    seen, run = _capture_argv()
+    gateway_client.send_message("42", "hello #7", runner=run)
+    gateway_client.send_file("42", "/data/card.png", caption="Claim #7", runner=run)
+    gateway_client.edit_message("42", "9", "Claim #7 — done", runner=run)
+    gateway_client.react("42", "9", runner=run)
+
+    for argv in seen:
+        assert not invented & set(argv), f"invented flag in {argv}"
+        assert argv[1] == "message" and "--channel" in argv and "--target" in argv, argv
+        assert argv[-1] == "--json", argv
+
+    send, media, edit, react = seen
+    assert "--message" in send and send[send.index("--message") + 1] == "hello #7"
+    # With --media set, --message IS the caption. The CLI's own help says
+    # --message is "required unless --media is set"; there is no caption flag.
+    assert "--media" in media and media[media.index("--message") + 1] == "Claim #7"
+    assert "--message-id" in edit and "--message" in edit
+    assert "--message-id" in react and "--emoji" in react
+
+
+def test_buttons_are_nested_in_a_blocks_array_never_at_the_top_level():
+    """19a.1 — five real sends were discarded for putting `buttons` at the top of
+    the presentation. Every one returned ok:true with a message id.
+
+    Checked against the platform's own normalizeMessagePresentation, which
+    returns undefined for the top-level shape and echoes this one back. Assert
+    the exact nesting, not merely that buttons are present somewhere."""
+    from openclaw import gateway_client
+
+    _fresh_db()
+    seen, run = _capture_argv()
+    gateway_client.send_message(
+        "42", "Claim #7", buttons=[{"label": "Mark sent", "command": "/mark 7 sent"}], runner=run)
+
+    import json as _json
+
+    payload = _json.loads(seen[0][seen[0].index("--presentation") + 1])
+    assert "buttons" not in payload, f"top-level buttons are silently discarded: {payload}"
+    assert payload == {"blocks": [{"type": "buttons", "buttons": [
+        {"label": "Mark sent", "action": {"type": "command", "command": "/mark 7 sent"}}]}]}, payload
+
+
+def test_a_button_command_over_the_byte_budget_is_refused_not_sent():
+    """19a.4 — Telegram caps callback_data at 64 bytes and the gateway spends 6
+    on a `tgcmd:` prefix. At 59 the button is filtered out, its row is dropped,
+    and a message whose only row was dropped arrives with NO keyboard — ok:true,
+    real message id, no error. Measured live at the boundary.
+
+    Count UTF-8 bytes, not characters: a non-ASCII pet name costs more than one
+    byte each and would walk past a len() check."""
+    from openclaw import gateway_client
+
+    _fresh_db()
+    budget = gateway_client.COMMAND_CALLBACK_BUDGET_BYTES
+    assert budget == 58, budget
+
+    seen, run = _capture_argv()
+    gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": "/" + "a" * (budget - 1)}],
+                                runner=run)
+    assert len(seen) == 1, "a command exactly at the budget must still send"
+
+    for command in ("/" + "a" * budget, "/mark 7 " + "é" * 30):
+        try:
+            gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": command}],
+                                        runner=run)
+        except gateway_client.PresentationError as exc:
+            assert "byte" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"an over-budget command was sent and its button lost: {command!r}")
+    assert len(seen) == 1, "an over-budget send reached the CLI"
+
+
+def test_a_label_less_button_costs_every_button_on_the_message():
+    """19a.2 — verified against the shipped normalizer: one button with no label
+    makes it return undefined for the WHOLE presentation, so a single bad button
+    silently strips the keyboard off the message. Refuse instead."""
+    from openclaw import gateway_client
+
+    _fresh_db()
+    seen, run = _capture_argv()
+    for bad in ({"command": "/mark 7 sent"}, {"label": "  ", "command": "/mark 7 sent"},
+                {"label": "Mark", "command": "mark 7 sent"}):
+        try:
+            gateway_client.send_message("42", "x", buttons=[bad], runner=run)
+        except gateway_client.PresentationError:
+            pass
+        else:
+            raise AssertionError(f"a presentation the platform would discard was sent: {bad}")
+    assert not seen, "a payload that would be discarded reached the CLI"
+
+
+def test_the_telegram_tee_writes_the_same_row_shape_the_old_transport_did():
+    """1.4 / 12.1 — after the cutover the app never sees a PTB Update, but the
+    dataset must not change meaning halfway through. Same `kind` vocabulary,
+    same raw payload, same app_version, whichever transport delivered it."""
+    from openclaw import config, internal_api, message_log
+
+    _fresh_db()
+    body = {"update_id": 77001, "update": {"message": {"text": "/mark 7 sent"}}}
+    assert internal_api.record_event(body, "corr-1")["status"] == "ok"
+    # A redelivery is not an error and must not double-count the dataset.
+    assert internal_api.record_event(body, "corr-2")["status"] == "duplicate"
+
+    with db.get_connection() as conn:
+        row = dict(conn.execute(
+            "SELECT kind, summary, payload, app_version, direction, processed_at "
+            "FROM telegram_messages WHERE update_id = 77001").fetchone())
+    assert row["kind"] == "command" and row["summary"] == "/mark 7 sent", row
+    assert row["direction"] == "in" and row["app_version"] == config.APP_VERSION, row
+    # Written before anything handles it — that unset processed_at IS the replay
+    # queue, and it is why a crash mid-handler does not lose the message.
+    assert row["processed_at"] is None, row
+    assert "/mark 7 sent" in row["payload"], row["payload"]
+    assert message_log.stats()["queued"] >= 1
+
+
+def test_the_telegram_tee_refuses_an_event_with_no_update_id():
+    """No id means no dedupe key and no way to settle the row, so every
+    redelivery would silently grow the dataset."""
+    from openclaw import internal_api
+
+    _fresh_db()
+    assert internal_api.record_event({"update": {}}, "corr-3").status_code == 400
+    # The tee is guarded by the same secret as every other internal route — it
+    # carries raw message content, so an open one leaks the conversation.
+    restore = _with_secret("s3cret", allow={"127.0.0.1"})
+    try:
+        assert internal_api._guard(_FakeRequest(), "wrong", "telegram/event", "c") is not None
+        assert internal_api._guard(_FakeRequest(host="10.0.0.9"), "s3cret", "telegram/event", "c") is not None
+        assert internal_api._guard(_FakeRequest(), "s3cret", "telegram/event", "c") is None
+    finally:
+        restore()
+
+
+def test_one_classifier_describes_both_transports():
+    """The gateway delivers dicts and PTB delivered objects. Two classifiers
+    would drift, and the drift would only show up months later in the dataset —
+    an edit once logged as kind `other` with an empty summary for exactly this
+    kind of reason (2026-07-27)."""
+    from openclaw import message_log
+
+    cases = [
+        ({"message": {"text": "/mark 7 sent"}}, ("command", "/mark 7 sent")),
+        ({"message": {"text": "hello"}}, ("text", "hello")),
+        ({"edited_message": {"text": "actually $35"}}, ("text", "edit: actually $35")),
+        ({"callback_query": {"data": "sent:7"}}, ("tap", "sent:7")),
+        ({"message": {"document": {"file_id": "x"}}}, ("non_text", "<document>")),
+        ({"message": {"photo": [{"file_id": "x"}]}}, ("non_text", "<photo>")),
+        ({}, ("other", "")),
+    ]
+    for raw, expected in cases:
+        assert message_log._describe(raw) == expected, (raw, message_log._describe(raw))
 
 
 if __name__ == "__main__":

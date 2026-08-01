@@ -8,6 +8,14 @@ builds the CLI invocation, one place that logs, one place that fails loudly.
 
 Anything that shells out to the gateway directly bypasses the message log, in
 exactly the way a bare `telegram.Bot` does today.
+
+**Every flag here was verified against `openclaw message <sub> --help` on
+2026-08-01** (gateway 2026.6.34), and the button payload against the platform's
+own `normalizeMessagePresentation`. That matters because the first version of
+this module guessed all of them and got all of them wrong: `--chat`, `--text`,
+`--file`, `--caption` and `--buttons` do not exist. The platform discards a
+malformed presentation *silently* and still returns `ok: true` with a real
+message id, so nothing about a wrong payload announces itself.
 """
 
 import json
@@ -18,28 +26,81 @@ from . import config, message_log
 
 logger = logging.getLogger(__name__)
 
+# Telegram's callback_data ceiling is 64 bytes; the gateway prefixes a command
+# button's data with "tgcmd:" (6 bytes), leaving 58 for the command string
+# itself. Overflow is NOT an error: sanitizeTelegramCallbackData returns
+# undefined, the button is filtered out of its row, an empty row is dropped, and
+# a message whose only row was dropped arrives with no keyboard at all. Measured
+# live at the boundary — 58 renders, 59 vanishes, both reporting success.
+COMMAND_CALLBACK_BUDGET_BYTES = 58
+
 
 class GatewaySendError(RuntimeError):
     """A send that did not happen. Raised, never swallowed."""
 
 
-def _argv(action: str, chat: str, args: list[str]) -> list[str]:
+class PresentationError(ValueError):
+    """A payload the platform would have discarded without telling us.
+
+    Every condition raised here was checked against the shipped normalizer
+    rather than inferred. They are raised because the alternative is a message
+    that arrives looking deliberate with its buttons missing.
+    """
+
+
+def build_buttons(buttons: list[dict]) -> dict:
+    """Turn `[{"label": ..., "command": ...}]` into a valid presentation.
+
+    ponytail: callers never hand-write presentation JSON. Five sends were
+    silently discarded for putting `buttons` at the top level instead of inside
+    `blocks`, and the normalizer returns `undefined` for that shape — so the
+    nesting lives in exactly one place, with the failures that produce
+    `undefined` turned into exceptions here.
+    """
+    controls = []
+    for button in buttons:
+        label = (button.get("label") or "").strip()
+        command = (button.get("command") or "").strip()
+        if not label:
+            # Verified: a single label-less button makes the normalizer return
+            # undefined for the WHOLE presentation, so one bad button costs
+            # every button on the message.
+            raise PresentationError(f"button has no label: {button!r}")
+        if not command.startswith("/"):
+            raise PresentationError(f"button command must be a slash command, got {command!r}")
+        size = len(command.encode("utf-8"))
+        if size > COMMAND_CALLBACK_BUDGET_BYTES:
+            # Bytes, not characters: a non-ASCII pet or condition name costs
+            # more than one byte each and would slip past a len() check.
+            raise PresentationError(
+                f"button command is {size} UTF-8 bytes, over the "
+                f"{COMMAND_CALLBACK_BUDGET_BYTES}-byte budget: {command!r}"
+            )
+        controls.append({"label": label, "action": {"type": "command", "command": command}})
+    return {"blocks": [{"type": "buttons", "buttons": controls}]}
+
+
+def _argv(action: str, target: str, args: list[str]) -> list[str]:
     """Build the gateway CLI invocation.
 
-    ponytail: every command shape lives in this one function on purpose. The
-    exact flags are UNVERIFIED until spike 0.2/0.3 runs against a real gateway
-    (`openclaw message send` exists; its flag names are not yet confirmed), so
-    when the spike answers, this is the only place that changes.
+    ponytail: every command shape lives in this one function on purpose, which
+    is what made correcting the guessed flag names a single edit.
     """
-    return [config.OPENCLAW_CLI, "message", action, "--chat", str(chat), *args, "--json"]
+    return [
+        config.OPENCLAW_CLI, "message", action,
+        "--channel", config.OPENCLAW_CHANNEL,
+        "--target", str(target),
+        *args,
+        "--json",
+    ]
 
 
-def _run(action: str, chat: str, args: list[str], *, kind: str, summary: str,
+def _run(action: str, target: str, args: list[str], *, kind: str, summary: str,
          payload: dict, correlation: str | None = None, runner=None) -> dict:
-    argv = _argv(action, chat, args)
+    argv = _argv(action, target, args)
     # Never log argv wholesale — a caption can carry claim detail and the CLI
     # may grow a token flag. Log the action, not the payload.
-    logger.info("gateway %s chat=%s correlation=%s", action, chat, correlation)
+    logger.info("gateway %s target=%s correlation=%s", action, target, correlation)
     run = runner or subprocess.run
     try:
         completed = run(argv, capture_output=True, text=True, timeout=config.OPENCLAW_CLI_TIMEOUT_SECONDS)
@@ -68,53 +129,67 @@ def _run(action: str, chat: str, args: list[str], *, kind: str, summary: str,
         return {}
 
 
-def send_message(chat: str, text: str, buttons: list | None = None, correlation: str | None = None,
-                 runner=None) -> dict:
-    args = ["--text", text]
+def send_message(target: str, text: str, buttons: list[dict] | None = None,
+                 correlation: str | None = None, runner=None) -> dict:
+    """Plain text, optionally with command buttons.
+
+    All renderable content goes in `--message`. It cannot go in a presentation
+    `text` block: `action-runtime.ts` computes the presentation's text only when
+    no explicit content was supplied, and the CLI refuses a send with neither.
+    So through this path a presentation carries buttons and nothing else, and
+    text blocks would be dropped with no error (found live 2026-08-01).
+    """
+    args = ["--message", text]
     if buttons:
-        args += ["--buttons", json.dumps(buttons)]
-    return _run("send", chat, args, kind="text", summary=text,
+        args += ["--presentation", json.dumps(build_buttons(buttons))]
+    return _run("send", target, args, kind="text", summary=text,
                 payload={"text": text, "buttons": buttons}, correlation=correlation, runner=runner)
 
 
-def send_file(chat: str, path: str, caption: str = "", buttons: list | None = None,
+def send_file(target: str, path: str, caption: str = "", buttons: list[dict] | None = None,
               correlation: str | None = None, runner=None) -> dict:
     """Photos (rendered cards) and documents (review PDFs) take the same path.
 
-    Whether buttons can ride a media message at all is spike 0.2 and it BLOCKS
-    the cutover — the card interface is not negotiable.
+    There is no `--caption` flag. With `--media` set, `--message` *is* the
+    caption — verified from the CLI's own help, which marks `--message` required
+    "unless --media is set". Buttons on a media message were the blocking spike
+    and they render (0.2).
     """
-    args = ["--file", path]
+    args = ["--media", path]
     if caption:
-        args += ["--caption", caption]
+        args += ["--message", caption]
     if buttons:
-        args += ["--buttons", json.dumps(buttons)]
-    return _run("send", chat, args, kind="file", summary=caption or path,
+        args += ["--presentation", json.dumps(build_buttons(buttons))]
+    return _run("send", target, args, kind="file", summary=caption or path,
                 payload={"file": path, "caption": caption, "buttons": buttons},
                 correlation=correlation, runner=runner)
 
 
-def edit_message(chat: str, message_id: str, text: str | None = None, caption: str | None = None,
-                 buttons: list | None = None, correlation: str | None = None, runner=None) -> dict:
+def edit_message(target: str, message_id: str, text: str, correlation: str | None = None,
+                 runner=None) -> dict:
     """Append a tap's result.
 
-    Exactly one of text/caption applies: a message carrying a document or photo
-    has no text, and editing text on one is what used to crash on precisely the
-    review alerts that most need feedback. Caption editing through the gateway
-    is spike 0.3.
+    **This takes text only, and that is a platform limit, not an oversight.**
+    The `editMessage` *action* accepts a caption and picks `editMode: "caption"`
+    when given one — but the CLI exposes no `--caption` flag, so every edit from
+    here takes `editMode: "auto"`, which calls `editMessageText` first and falls
+    back to `editMessageCaption` only after Telegram rejects it.
+
+    Consequence to expect rather than fix: editing a photo or document caption
+    works, and writes `[telegram] editMessage failed: ... there is no text in
+    the message to edit` into the *gateway's* log on every success. Since the
+    Pillow cards were kept (11.3), that is the normal path for every tap result.
+    A caption edit that genuinely fails looks identical in that log. Recorded in
+    the deploy docs as an accepted gap; the fix, if it is ever worth one, is to
+    move media edits into the in-gateway plugin, which calls the API directly.
     """
-    if (text is None) == (caption is None):
-        raise ValueError("edit_message takes exactly one of text or caption")
-    args = ["--message", str(message_id)]
-    args += ["--text", text] if text is not None else ["--caption", caption]
-    if buttons is not None:
-        args += ["--buttons", json.dumps(buttons)]
-    return _run("edit", chat, args, kind="edit", summary=(text if text is not None else caption),
-                payload={"message_id": message_id, "text": text, "caption": caption},
+    args = ["--message-id", str(message_id), "--message", text]
+    return _run("edit", target, args, kind="edit", summary=text,
+                payload={"message_id": message_id, "text": text},
                 correlation=correlation, runner=runner)
 
 
-def react(chat: str, message_id: str, emoji: str = "👍", correlation: str | None = None,
+def react(target: str, message_id: str, emoji: str = "👍", correlation: str | None = None,
           runner=None) -> bool:
     """The immediate acknowledgement. A failure here must never break the handler.
 
@@ -123,7 +198,7 @@ def react(chat: str, message_id: str, emoji: str = "👍", correlation: str | No
     strictly better than losing the handler.
     """
     try:
-        _run("react", chat, ["--message", str(message_id), "--emoji", emoji],
+        _run("react", target, ["--message-id", str(message_id), "--emoji", emoji],
              kind="react", summary=emoji, payload={"message_id": message_id, "emoji": emoji},
              correlation=correlation, runner=runner)
         return True

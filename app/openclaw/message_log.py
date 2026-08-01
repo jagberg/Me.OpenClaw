@@ -34,25 +34,33 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _describe(update) -> tuple[str, str]:
-    """(kind, summary) for a human skimming the log or a query filtering it."""
-    if getattr(update, "callback_query", None) is not None:
-        return "tap", (update.callback_query.data or "")[:_SUMMARY_LIMIT]
-    # effective_message, not .message: an edit arrives as `edited_message` and
-    # left .message None, so Justin's correction ("Aari cost was $35 out of
-    # this", 2026-07-27) logged as kind `other` with an empty summary — the one
-    # message that mattered was the one the log couldn't show.
-    message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+def _describe(update: dict) -> tuple[str, str]:
+    """(kind, summary) for a human skimming the log or a query filtering it.
+
+    Takes the raw update **as a dict**, not as a python-telegram-bot object.
+    Two transports now write inbound rows — PTB today, the gateway's plugin
+    after the cutover — and the dataset is only comparable across the swap if
+    one classifier produces both. A dict is the shape they have in common.
+    """
+    if update.get("callback_query") is not None:
+        return "tap", (update["callback_query"].get("data") or "")[:_SUMMARY_LIMIT]
+    # `edited_message` first: an edit arrives with `message` absent, so Justin's
+    # correction ("Aari cost was $35 out of this", 2026-07-27) logged as kind
+    # `other` with an empty summary — the one message that mattered was the one
+    # the log couldn't show.
+    edited = update.get("edited_message")
+    message = edited or update.get("message")
     if message is not None:
         # Marked, not given its own kind: it is a text message for every query
         # that filters on kind, and the marker says it replaced earlier words.
-        prefix = "edit: " if getattr(update, "edited_message", None) is not None else ""
-        text = message.text or ""
+        prefix = "edit: " if edited is not None else ""
+        text = message.get("text") or ""
         if text.startswith("/"):
             return "command", f"{prefix}{text}"[:_SUMMARY_LIMIT]
         if text:
             return "text", f"{prefix}{text}"[:_SUMMARY_LIMIT]
-        return "non_text", f"<{'document' if message.document else 'photo' if message.photo else 'other'}>"
+        media = "document" if message.get("document") else "photo" if message.get("photo") else "other"
+        return "non_text", f"<{media}>"
     return "other", ""
 
 
@@ -63,12 +71,33 @@ def record_inbound(update) -> int | None:
     update_id = getattr(update, "update_id", None)
     if update_id is None:
         return None
-    kind, summary = _describe(update)
     try:
-        payload = json.dumps(update.to_dict(), default=str)
+        raw = update.to_dict()
+        payload = json.dumps(raw, default=str)
     except Exception:  # noqa: BLE001 — a payload we can't serialise must not block the handler
         logger.warning("could not serialise update %s for the log", update_id)
-        payload = "{}"
+        raw, payload = {}, "{}"
+    return record_inbound_raw(update_id, raw, payload=payload)
+
+
+def record_inbound_raw(update_id: int | str, raw: dict, payload: str | None = None) -> int | str | None:
+    """The actual writer. Same row, same dedupe, whichever transport delivered it.
+
+    The gateway path calls this directly: after the cutover the app never sees a
+    python-telegram-bot `Update`, but the row it writes must be
+    indistinguishable from the ones written before — same `kind` vocabulary,
+    same raw payload, same `app_version`. A dataset whose columns changed
+    meaning halfway through is worse than one with a gap in it.
+    """
+    if update_id is None:
+        return None
+    if payload is None:
+        try:
+            payload = json.dumps(raw, default=str)
+        except Exception:  # noqa: BLE001 — never block the caller over a log row
+            logger.warning("could not serialise update %s for the log", update_id)
+            raw, payload = {}, "{}"
+    kind, summary = _describe(raw or {})
     with db.get_connection() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO telegram_messages "

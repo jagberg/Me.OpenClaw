@@ -18,7 +18,7 @@ import uuid
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
 
-from . import config, gmail_ingest, pipeline
+from . import config, gmail_ingest, message_log, pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -133,3 +133,74 @@ def _endpoint(route: str, fn):
 router.post("/tick")(_endpoint("tick", lambda: pipeline.run_once()))
 router.post("/ingest")(_endpoint("ingest", lambda: gmail_ingest.poll_once()))
 router.post("/nudge")(_endpoint("nudge", lambda: pipeline.nudge_stale_actions()))
+
+
+@router.post("/telegram/event")
+async def telegram_event(
+    request: Request,
+    x_openclaw_secret: str | None = Header(default=None),
+    x_correlation_id: str | None = Header(default=None),
+):
+    """The logging tee. A copy of every inbound message, for the log only.
+
+    **This is not a bridge, and the distinction is the whole design.** The
+    gateway's agent is the message processor; nothing here dispatches a handler,
+    and the app does not act on what arrives. What it does is keep
+    `telegram_messages` complete — otherwise the training dataset Justin kept
+    the table for (ADR-0014, and his explicit "hard keep" on 2026-08-01) narrows
+    to callbacks and outbound, which is the half he did not ask for.
+
+    It deliberately does NOT use `run_exclusive`: a write-and-return has no
+    overlap hazard, and serialising the tee behind a lock would let a slow
+    write hold up the gateway's delivery loop.
+
+    Failure posture: a tee that cannot write must say so and must not pretend.
+    It returns 500 rather than swallowing, because a silently missing row is
+    indistinguishable from a message that never arrived — which is the exact
+    ambiguity the table exists to remove.
+    """
+    correlation = _correlation_id(x_correlation_id)
+    rejected = _guard(request, x_openclaw_secret, "telegram/event", correlation)
+    if rejected is not None:
+        return rejected
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — a malformed body is the caller's bug, and it is not ours to guess at
+        logger.warning("internal telegram/event got an unparseable body correlation=%s", correlation)
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    return record_event(body, correlation)
+
+
+def record_event(body: dict, correlation: str):
+    """The tee's whole body of work, separated from the HTTP plumbing.
+
+    ponytail: split out so the suite can exercise it directly. The rest of this
+    module's tests call functions rather than routes for the same reason —
+    fastapi's TestClient pulls in httpx, and a test-only dependency to reach
+    code that is already callable buys nothing.
+    """
+    update_id = body.get("update_id")
+    raw = body.get("update") or {}
+    if update_id is None:
+        # Without an id there is no dedupe key and no way to settle the row, so
+        # the log would silently accumulate duplicates on every redelivery.
+        logger.warning("internal telegram/event has no update_id correlation=%s", correlation)
+        return JSONResponse({"error": "update_id required"}, status_code=400)
+
+    logger.info("internal telegram/event starting correlation=%s update_id=%s", correlation, update_id)
+    try:
+        recorded = message_log.record_inbound_raw(update_id, raw)
+    except Exception as exc:
+        logger.error("internal telegram/event failed correlation=%s: %s", correlation, exc, exc_info=True)
+        return JSONResponse(
+            {"status": "error", "route": "telegram/event", "correlation_id": correlation,
+             "reason": str(exc)},
+            status_code=500,
+        )
+    # `duplicate` is not an error — Telegram redelivers, and the gateway's own
+    # spool may replay. Say which happened rather than reporting a bare ok, so a
+    # redelivery storm is visible in the log instead of looking like traffic.
+    status = "ok" if recorded is not None else "duplicate"
+    logger.info("internal telegram/event %s correlation=%s update_id=%s", status, correlation, update_id)
+    return {"status": status, "route": "telegram/event", "correlation_id": correlation,
+            "update_id": update_id}

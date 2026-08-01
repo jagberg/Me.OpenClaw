@@ -104,6 +104,11 @@ INTERNAL_API_ALLOW_HOSTS = {
 # every send goes through LoggedBot today.
 OPENCLAW_CLI = os.environ.get("OPENCLAW_CLI", "openclaw")
 OPENCLAW_CLI_TIMEOUT_SECONDS = _int_env("OPENCLAW_CLI_TIMEOUT_SECONDS", 30)
+# The CLI is multi-channel and defaults to nothing, so every invocation must
+# name its channel. Configurable only because the flag takes a value; adding a
+# second channel is a design decision (the authorization check is Telegram
+# username-based and has no equivalent elsewhere), not an env change.
+OPENCLAW_CHANNEL = os.environ.get("OPENCLAW_CHANNEL", "telegram")
 
 # Twice-daily Google Drive DB backup (drive_backup.py). Folder ID is from
 # https://drive.google.com/drive/folders/1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2
