@@ -32,7 +32,7 @@ v1 surfaces due reminders and open tasks on a small FastAPI-served local dashboa
 
 ---
 
-## Addendum — 2026-08-01: the original reason has expired; the decision has not been retaken
+## Amendment (2026-08-01) — the original reason has expired; the decision has not been retaken
 
 This ADR's reasoning was that no push channel existed. **That is no longer
 true.** Telegram has been a live outbound channel since the bot shipped, and

@@ -50,7 +50,7 @@ Classification and Petcover reference extraction remain regex/keyword on purpose
 
 ---
 
-## Addendum — 2026-08-01: the gateway takes chat; Groq survives a scare
+## Amendment (2026-08-01) — the gateway takes chat; Groq survives a scare
 
 The conversational loop moves to the OpenClaw gateway (ADR-0024), which does its
 own model resolution. This ADR's decision is unchanged for `extract()` and

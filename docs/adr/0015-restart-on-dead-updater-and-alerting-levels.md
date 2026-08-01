@@ -92,7 +92,7 @@ Note the one honest signal: `/health` itself would have failed, because `message
 
 ---
 
-## Addendum — 2026-08-01: supervision moves, alerting levels do not
+## Amendment (2026-08-01) — supervision moves, alerting levels do not
 
 The restart-on-dead-updater mechanism described here supervises a
 `python-telegram-bot` updater that no longer exists — the gateway polls, and the

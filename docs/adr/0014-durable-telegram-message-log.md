@@ -82,7 +82,7 @@ Replay is now a background task created after polling starts, with a module-leve
 
 ---
 
-## Addendum — 2026-08-01: retained deliberately under the gateway
+## Amendment (2026-08-01) — retained deliberately under the gateway
 
 The gateway keeps its own message records, so this table was put to the
 fit-the-architecture audit and **kept** — decided by Justin, not defaulted.

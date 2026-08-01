@@ -79,7 +79,7 @@ Generalisable lesson: adding a fallback path adds every *behavioural* difference
 
 ---
 
-## Addendum — 2026-08-01: this ADR is untouched by the gateway's token work, and that is the point
+## Amendment (2026-08-01) — untouched by the gateway's token work, and that is the point
 
 The agent's per-turn size was cut from 22,810 tokens to 3,865 (ADR-0023). That
 addresses Groq's **per-minute** ceiling of 12,000 TPM. It does nothing whatever

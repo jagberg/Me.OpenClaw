@@ -38,7 +38,7 @@ Core service is Python + FastAPI (dashboard/HTTP) + APScheduler with a SQLite jo
 
 ---
 
-## Addendum — 2026-08-01: the "single Docker Compose service" half is superseded
+## Amendment (2026-08-01) — the "single Docker Compose service" half is superseded
 
 **Superseded by:** ADR-0024. **Still holds:** Python, FastAPI, SQLite and the
 claims domain — none of that moves.
