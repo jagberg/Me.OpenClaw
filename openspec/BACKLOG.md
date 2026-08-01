@@ -183,3 +183,15 @@ What would close it: a test that replays real misrouted mail against a claim who
 Nothing live has yet exercised the transition table, event ordering, or the illegal-event skip. Only the seed and the copy-back have. `apply_event`'s `BACKFILL_EVENT` branch has never run at all, because the script raw-`INSERT`s.
 
 This does not mean the machine is wrong — the unit tests cover it, and claims #2 and #8 folded `backfill`→`approved`→`settled` correctly on 2026-07-30T08:45, which is the first live fold that could have disagreed. It means 6.4's week of zero is a much weaker signal than it reads as, and should be judged on **claims that transition during the week**, not on the count staying at zero.
+
+
+### Should the 👍 acknowledgement survive the gateway's native typing indicator?
+*Open since 2026-08-01. Capability: `telegram-bot`. Raised by Justin while spiking OpenClaw; deferred deliberately, not forgotten.*
+
+The 👍 reaction exists for one reason: a slow handler (an LLM turn) made the bot feel dead, so every inbound message is reacted to before its handler runs. Seeing the gateway live, Justin's own words: *"I liked that I could see the bot change to show typing … that's what I was after by the thumbs up, but this is better because it shows its working in the background."*
+
+The native indicator is strictly more informative — receipt **plus** work-in-progress, and it clears by itself when the reply lands. The 👍 only ever signalled receipt.
+
+**Decided for now: keep the ack.** It is cheap, it is already specified (`telegram-bot`: "Every incoming message is acknowledged immediately"), and removing it during a transport swap would confuse a real regression with an intended change.
+
+What would close it: after cutover, confirm the typing indicator fires on the paths that matter — an LLM chat turn, and a tap whose handler is slow — then decide whether the reaction is redundant. If it is, this removes a requirement and its code rather than adding any. Note the two are not equivalent for **taps**: a button press may show no typing indicator at all, which is exactly the case the ack was added for.
