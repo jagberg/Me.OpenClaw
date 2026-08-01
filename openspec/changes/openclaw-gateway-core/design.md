@@ -385,7 +385,7 @@ Append-only. Material decision changes only — findings live in `tasks.md`.
 
 ## Known limitations, recorded up front
 
-- **A plugin is still required** — not for outbound rendering, but to register the app's slash commands. `command` actions invoke *native* commands, and `/mark` is not one.
+- **A plugin is still required** — not for outbound rendering, but to register the app's slash commands. `command` actions invoke *native* commands, and `/mark` is not one. **Verified end to end 2026-08-01 (16.2)**: a real tap ran the plugin's `/mark` handler, which reached the Python app over HTTP and replied. D12's central claim is no longer an assumption.
 - **A `command` button is deterministic only while its command is registered.** Measured 2026-08-01: an unregistered command in a button is not an error and not a no-op — it is delivered to the agent as a chat turn. So the guarantee "a tap never involves a model" rests on a deploy-time assertion, not on the mechanism itself. If that assertion is ever skipped, the failure mode is a commit token being read by an LLM.
 - **The stock agent will introduce itself before it will work.** Its default bootstrap interviews the user about its own name, species and vibe, and on first contact it claimed to have checked email it has no credential for. Both must be dealt with in configuration; neither is something this design chose.
 - ~~**The token blocker is unsolved.** 23.5k per turn against Groq's 12k TPM. Until the surface is cut, the agent cannot run on the provider this project standardises on.~~ **Resolved 2026-08-01** — the surface was cut, 22,810 → 5,355. See the changelog entry below. Struck rather than deleted because "unsolved" stood for most of a day and the reasoning that made it look permanent is worth keeping.
@@ -436,3 +436,10 @@ Append-only. Material decision changes only — findings live in `tasks.md`.
 **Trade-off accepted:** The plugin must re-apply on start, and a future gateway version that claims the chat scope would silently take the menu back. Preflight asserts the gateway's scope list is still the two it writes today.
 **Supersedes:** 13.1's "keep five plus /status and /models", which was unconfigurable, and 13.1c's framing of the choice as accept-or-fight.
 **Unverified:** read from source and Telegram's documented precedence. Not yet done live.
+
+## 2026-08-01 — D12 verified end to end
+**Decision:** No change — D12 stands as written.
+**Reasoning:** 16.2 drove a real tap through the whole chain: `command` button → core's native command path → a plugin handler registered with `api.registerCommand` → HTTP to the Python app with the real `internal_api` guard → 200 → reply in the chat. The evidence is a correlation id minted inside the plugin handler and appearing in the Python log, which nothing else could have produced.
+**Trade-off accepted:** none — this closes the single largest unverified assumption (8.8's fourth bucket, which had exactly one entry). What it does *not* prove is claim logic behind the endpoint; the spike deliberately used an echo route, because the domain is already covered by the existing suite and the untested part was the transport.
+**Supersedes:** n/a.
+**Found along the way:** `INTERNAL_API_ALLOW_HOSTS` cannot distinguish the gateway container from any other host process — Docker NATs container calls to `127.0.0.1` — so the shared secret is carrying the boundary alone, and the comment in `internal_api.py` calling the allowlist "defence in depth" overstates it.

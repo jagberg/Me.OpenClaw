@@ -30,6 +30,10 @@ Rationale: a button carrying `action.type: "command"` invokes a **native** slash
 - **WHEN** the deploy completes
 - **THEN** a registered command is invoked end to end and must respond; the plugin listing's own report of its commands SHALL NOT be accepted as evidence, because that data comes from a persisted registry that goes stale silently
 
+#### Scenario: The proof is observable from the app side
+- **WHEN** the end-to-end check runs
+- **THEN** the app records a positive marker carrying an identifier the plugin minted, so a working path and an absent one cannot look alike — a check that logs only failures cannot distinguish success from silence
+
 ### Requirement: Agent turn size stays within the configured model's limits
 The size of a single agent turn SHALL be measured against a declared ceiling before the system is considered deployable, and the deploy SHALL fail when it exceeds the configured model's per-request limit.
 

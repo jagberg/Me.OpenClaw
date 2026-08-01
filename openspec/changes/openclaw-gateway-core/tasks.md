@@ -189,7 +189,28 @@ Do not start until phase 4 has run one full claim lifecycle on real data.
 ## 16. Rework forced by D10 (the CLI cannot send interactive messages)
 
 - [ ] 16.1 ~~Supersede `gateway_client`'s role~~ **— void, D10 retracted.** `gateway_client` keeps the full outbound role including cards with buttons. Fix its `_argv`/presentation construction to emit `presentation.blocks[{type:"buttons"}]`, and add a test asserting the payload passes the platform normalizer rather than asserting our own shape. Original text: It stays valid for plain text and media and for caption edits; it CANNOT carry buttons. Every notify path that renders a card with buttons moves to the plugin. Keep the module and its one-seam logging property; narrow its documented scope.
-- [ ] 16.2 **Plugin spike, replaces further CLI round-trips.** Minimal OpenClaw plugin that (a) registers an HTTP route, (b) renders a message with two inline buttons via the interactive path, (c) registers an interactive handler and proves a tap is claimed. Confirms or refutes D10 in one go and simultaneously answers 0.9, 0.10 and 13.x.
+- [x] 16.2 **CONFIRMED END TO END, 2026-08-01. D12 holds. This was the largest unverified assumption in the design and it is now verified.**
+
+  Proven chain, with a real tap by Justin on a real phone:
+
+  ```
+  button {action.type:"command", command:"/mark 7 sent"}
+    -> core native command path
+    -> plugin handler registered via api.registerCommand("mark")
+    -> HTTP POST to the Python app, X-OpenClaw-Secret + X-Correlation-Id
+    -> 200, and the reply lands back in the chat
+  ```
+
+  **The evidence is a correlation id, not a screenshot.** The Python side logged `ECHO HIT correlation=tg-mark-x`. That id is minted inside the plugin's own handler (`tg-${name}-${messageId}`) and exists nowhere else, so the request cannot have come from anything but a plugin-dispatched command. A tap arrives at the gateway as `Inbound message … (direct, 12 chars)` — `/mark 7 sent` is exactly 12 characters — and is routed onward to the plugin's command.
+
+  The Python half used the **real** `internal_api` guard rather than a stub: correct secret → 200, wrong secret and missing secret → `{"error":"rejected"}`. Reproduce by standing up `internal_api.router` plus one echo route on `:8977` against a scratchpad DB copy, pointing the plugin at `host.docker.internal:8977`.
+
+  **Three findings that fall out of it:**
+  - **`INTERNAL_API_ALLOW_HOSTS` is weaker than the code's comment claims.** `client_host` reads `127.0.0.1` even for calls originating in the container — Docker Desktop NATs them to loopback — so the allowlist cannot distinguish the gateway from any other process on the host. It blocks off-host callers and nothing finer. **The shared secret carries essentially the whole boundary**, which makes 19b's assertion that the secret is set and non-blank more load-bearing than it looked. Amend the comment in `internal_api.py` when 1.x is built.
+  - **`ctx.messageId` is not populated** in a command handler — the correlation id came through as `tg-mark-x`, the fallback. Correlation across the gateway→app hop (9.1) needs its id from somewhere else; find the field that survives before designing on it.
+  - **`registerInteractiveHandler` returns `undefined`**, logged on every earlier boot. Consistent with 16.9 and now moot, since the card interface uses no callbacks.
+
+  **Method note, and it cost a round trip.** My first instrumentation logged only *rejections* — the echo route skipped `_run()`, which is what logs successes, and uvicorn was at `log_level="warning"` besides. A working tap and no tap looked identical, and Justin's first tap **had** in fact worked; I simply could not see it. Exactly the failure my own rule names. Instrument the success path before concluding anything from a quiet log.
 - [x] 16.3 **ANSWERED live 2026-08-01. `command` works; `callback` is inert without a plugin.**
   - Tapping a `{"action":{"type":"command","command":"/status"}}` button **invoked the slash command** and the gateway replied. Deterministic, no model in the path, no plugin required.
   - Tapping `{"action":{"type":"callback","value":"reject:7"}}` with nothing registered did **nothing at all** — no reply, no error, no log.
