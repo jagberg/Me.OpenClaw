@@ -84,7 +84,7 @@ The integration is deliberately two one-directional seams rather than one bidire
 
 **Decision: split by origin.** A card tap and a chat-confirm tap are handled differently — the card tap goes button → plugin → `/internal` → Python, and a chat-initiated proposal is committed inside the MCP server. I recommended a single Python commit path; Justin chose the split.
 
-Both satisfy the invariant that a commit is never a tool return value, which is why this was a decision rather than a deduction. The trade-off accepted is **two components that can write a claim change**, so the gate exists in two places and must not drift between them. Consequences to hold:
+Both satisfy the invariant that a commit is never a tool return value, which is why this was a decision rather than a deduction. The trade-off accepted is **two entry points that can reach the commit**, so the gate is exercised in two places and must not drift between them. **Correction, same day:** I first described this to Justin as "two components", which overstated it — the MCP server is the Python app's own MCP surface, one process and one codebase, so both paths can call the same commit function. The choice is therefore safer than it was presented when he made it. Recorded rather than quietly fixed, because a decision taken on a description deserves to have that description corrected in the open. Consequences to hold:
 - Both paths compose their confirmation text **by code from the claim row about to change** — never from the model's account of its own intent (11.2). This is the real safeguard, and it is identical in both designs.
 - The two-pets refusal and the no-amounts split refusal must be enforced in the MCP server, since it now commits (`claims-mcp-surface`).
 - A regression test must prove neither path can commit without a confirm, independently. One test covering "the" gate is no longer sufficient.
@@ -426,7 +426,7 @@ Append-only. Material decision changes only — findings live in `tasks.md`.
 ## 2026-08-01 — The proposal gate is split by origin (Justin)
 **Decision:** Card taps commit in Python behind `/internal`; chat-initiated proposals commit in the MCP server.
 **Reasoning:** Justin's, against my recommendation of a single Python path. The chat flow stays self-contained — a proposal made and committed in the same component, with no hop through `/internal` for something the agent already had in hand.
-**Trade-off accepted:** Two components can write a claim change, so the gate lives in two places and can drift. Mitigated by testing each path's gate independently rather than testing "the" gate once, and by requiring both to compose their confirmation text from the claim row rather than from the model.
+**Trade-off accepted:** Two entry points reach the commit, so the gate is exercised in two places and can drift. Smaller than first described — both are inside the Python app, so they share a commit function; see the correction in D3. Mitigated by testing each path's gate independently rather than testing "the" gate once, and by requiring both to compose their confirmation text from the claim row rather than from the model.
 **Supersedes:** the CONTRADICTION FLAGGED state in D3, `claims-mcp-surface` and `conversational-agent`. All three should now read as decided.
 
 ## 2026-08-01 — The app owns Telegram's per-chat command scope

@@ -44,7 +44,9 @@ The gate SHALL be a property of code, not of the agent's configuration or prompt
 
 **RESOLVED by Justin, 2026-08-01: split by origin.** A confirm tap on a **card** is a `command` button → plugin → `/internal`, committing in Python and never touching MCP. A confirm tap on a **chat-initiated** proposal commits inside the MCP server. Both satisfy the invariant that a commit is never a tool return value; the split was chosen so the chat flow stays self-contained.
 
-Because the MCP server now commits, two things follow that would not under a single Python path: the harness refusals below are enforced here and not merely mirrored here, and the gate must be tested on this path **independently** of the `/internal` path. A single test of "the" gate no longer covers the system.
+**The split is smaller than "two components" suggests, and this correction matters because the decision was taken on the looser description.** The MCP server *is* the Python app's MCP surface — the same process, the same modules. So both paths commit inside Python; what differs is the entry point, `/internal` over HTTP versus an MCP confirm call. Both can and SHALL call the same commit function, which makes the divergence risk a matter of discipline in one codebase rather than of keeping two services in step.
+
+What still follows: the harness refusals below are enforced here and not merely mirrored here, and the gate SHALL be tested on this path **independently** of the `/internal` path. A single test of "the" gate no longer covers the system, because two entry points can reach the commit and only one of them is exercised by a card tap.
 
 #### Scenario: Mutation requested
 - **WHEN** the agent calls a `propose_*` tool
