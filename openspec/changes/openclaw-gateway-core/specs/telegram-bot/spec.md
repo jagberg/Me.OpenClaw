@@ -59,6 +59,8 @@ Appending a result to a tapped message SHALL edit the caption when the message c
 
 Messages carrying a PDF have no `text`, so editing text crashes on exactly the review alerts that most need feedback. The same split applies to rendered card images, which are photos and likewise carry a caption rather than text.
 
+The caption SHALL be named explicitly on the edit rather than left to the platform's text-first fallback. Verified live 2026-08-01: the fallback succeeds on a document, but only after a rejected `editMessageText` call that is logged as `editMessage failed` — on the successful path. A log line reading as a failure every time a tap succeeds is how a real failure stops being visible, which the project's failure-visibility rule exists to prevent.
+
 #### Scenario: Tap on a PDF review alert
 - **WHEN** a button is tapped on a message that carries a document
 - **THEN** the result is appended to the caption, not the text
@@ -67,9 +69,9 @@ Messages carrying a PDF have no `text`, so editing text crashes on exactly the r
 - **WHEN** a button is tapped on a photo card
 - **THEN** the result is appended to that card's caption
 
-#### Scenario: Caption editing unsupported by the action
-- **WHEN** the gateway's edit action cannot target a caption
-- **THEN** the result is delivered as a reply to the card rather than lost, and the shortfall is recorded
+#### Scenario: A successful media edit logs no failure
+- **WHEN** a caption edit on a document or photo succeeds
+- **THEN** no failed edit attempt precedes it and nothing resembling an error is logged, because the caption was named rather than discovered by fallback
 
 ### Requirement: An edited message is handled, not dropped
 An edit SHALL be handled on the same path as a new message, whatever shape the gateway delivers it in, and the message log SHALL record it with a truthful kind and summary rather than an empty `other` row.
@@ -110,9 +112,17 @@ Consequence worth stating: this makes the entire tap path deterministic. No toke
 - **WHEN** the user taps a tap-to-resolve button on an actions card
 - **THEN** the named slash command runs through the plugin and applies the change, with no model invoked
 
+A command string SHALL be at most **58 UTF-8 bytes**, and this SHALL be checked before send. The limit is Telegram's 64-byte `callback_data` ceiling less the platform's 6-byte `tgcmd:` prefix, and it is measured in bytes rather than characters. Buttons SHALL continue to name their target by id or index rather than by text, which keeps the longest real command near 46 bytes.
+
+Rationale for checking rather than trusting: an over-long command is not rejected and does not produce a dead button. The platform drops the button from its row, drops the row if it is then empty, and sends a message with no keyboard — returning success with a real message id.
+
 #### Scenario: Command string exceeds the transport limit
-- **WHEN** a button's command string would exceed the payload limit
-- **THEN** the failure is caught before send and names the offending string, rather than the button silently arriving without an action
+- **WHEN** a button's command string would exceed 58 UTF-8 bytes
+- **THEN** the failure is caught before send and names the offending string, rather than the button silently vanishing from the keyboard
+
+#### Scenario: The limit is counted in bytes
+- **WHEN** a command carries a non-ASCII pet or condition name
+- **THEN** the check measures its encoded byte length, not its character count
 
 #### Scenario: Presentation payload is malformed
 - **WHEN** a message's button payload does not match the platform's presentation contract

@@ -357,6 +357,13 @@ Append-only. Material decision changes only — findings live in `tasks.md`.
 **Reasoning:** Verified end to end. `callback` values are wrapped by `buildTelegramOpaqueCallbackData` before reaching Telegram, so the namespace resolver never sees them — they only work for a plugin's own send-and-decode round trip.
 **Trade-off accepted:** Every tap must be expressible as a command string, subject to a payload limit not yet measured (18.5). Justin has accepted trimming to fit.
 **Supersedes:** D2, D9, D10, D11.
+**Amended 2026-08-01 (18.5), the limit is now measured:** 58 UTF-8 bytes — Telegram's 64-byte `callback_data` ceiling less the platform's 6-byte `tgcmd:` prefix. No trimming is needed for anything currently built: the longest realistic command is ~46 bytes because buttons already carry ids and indices rather than text. The trade-off that actually bites is not length, it is **how overflow presents**: the button is dropped from the keyboard with no error and `ok: true`, so the failure looks like a rendering bug rather than a payload one. The constraint is therefore a test (19a), not a style rule.
+
+## 2026-08-01 — Media edits pass `caption` explicitly rather than relying on the fallback
+**Decision:** `gateway_client.edit_message` sends the `caption` parameter whenever the target message carries media, instead of sending only `content` and letting the platform's `auto` mode work it out.
+**Reasoning:** `auto` does work — a document caption edits correctly, verified live. But it works by calling `editMessageText` first, catching Telegram's `400 there is no text in the message to edit`, and retrying as a caption edit. The failed attempt is logged as `[telegram] editMessage failed: ...` on the **successful** path. Every tap on a PDF review alert or a rendered card would write an error-shaped line, which is precisely how a genuine edit failure stops being noticeable. Secondary: the fallback is a regex over an English Telegram error string; passing `caption` does not depend on it.
+**Trade-off accepted:** `gateway_client` must know whether the message it is editing carries media. It already tracks this — the existing code chose caption-vs-text for the same reason under the old transport — so the cost is carrying that flag through, not discovering it.
+**Supersedes:** n/a — resolves the open scenario "Caption editing unsupported by the action", which turns out not to be the case.
 
 ## 2026-08-01 — D10 written and retracted the same day
 **Decision:** Retracted "the CLI cannot send interactive messages; the integration must be a plugin".
@@ -368,6 +375,6 @@ Append-only. Material decision changes only — findings live in `tasks.md`.
 
 - **A plugin is still required** — not for outbound rendering, but to register the app's slash commands. `command` actions invoke *native* commands, and `/mark` is not one.
 - **The token blocker is unsolved.** 23.5k per turn against Groq's 12k TPM. Until the surface is cut, the agent cannot run on the provider this project standardises on.
-- **This platform fails silently** — six distinct modes measured. Success responses and inspection output are not evidence.
+- **This platform fails silently** — seven distinct modes measured. Success responses and inspection output are not evidence. The seventh, found 2026-08-01: a command button over 58 bytes is deleted from the keyboard, and if it was the only one the message arrives with no keyboard at all, `ok: true`.
 - **No ADRs written yet.** Tasks 8.1–8.6 plan them; the plugin-centric architecture, the no-MCP-for-deterministic rule and the command-not-callback mechanism all qualify as decisions that would surprise a newcomer. Until those exist, this document is the only record — which is a gap, not a design.
 - **Unrecorded intent:** whether the `.env` divergence between checkout and worktree was ever deliberate is still unknown, and was not invented here.
