@@ -24,8 +24,8 @@ Applying it is not a one-off. Several things this repo built have native counter
 | Bespoke thing | Verdict | Basis |
 |---|---|---|
 | `telegram_messages` | **Keep — decided, closed** | Owner decision: the training-dataset job is real and intended. Audit/replay duplication with the gateway is accepted, not investigated. |
-| Confirm gate (D3) | **Open — capture then decide** | Not to be settled on my reasoning. Capture what native approval actually shows for a real claim, then Justin chooses (11.2). |
-| Pillow claim cards | **Open — compare live** | Send both a rendered card and a native table to the real chat; he picks (11.3). May be pre-empted by whether tables carry per-row buttons (11.3a). |
+| Confirm gate (D3) | **Open — unblocked, undecided** | The capture is done (11.2): a plugin approval's title and description are free text, so it *can* render a full outcome. That removes native-vs-bespoke as the axis and leaves the real question — the text must be composed by code from the claim row, never by the model. Justin's call. |
+| Pillow claim cards | **Keep — decided, closed** | Both sent to the real chat with the same 12 live claims; Justin chose the card (11.3). Month subtotals, status pills and a layout that does not truncate on a phone. Makes the shared media outbox mandatory. |
 | `tasks.py` / `reminders.py` | **Open — unexamined** | 11.4. |
 | `llm.py` fallback chain | **Open — depends on 0.4** | 11.5. |
 
@@ -402,3 +402,11 @@ Append-only. Material decision changes only — findings live in `tasks.md`.
 **Trade-off accepted:** ~6,600 tokens of headroom for the entire claims tool inventory, which is a real constraint — the platform's own 32 tools were five times that. It also means the tool allowlist is now load-bearing for two unrelated reasons at once: `gmail-isolation-boundary` needs it for security, and the provider needs it for feasibility. A change made for one reason can silently break the other, so 19b must assert both.
 **Supersedes:** the blocker framing in 17.1/17.2, and 17.7's "~29k floor". Kept in place, marked, as the record of a wrong measurement method.
 **Caveat recorded up front:** measured with a one-tool stand-in allowlist and no claims tools present. The floor that did not move is the core system prompt at 18,536 chars (~4.6k tokens); that is the real irreducible cost.
+
+
+## 2026-08-01 — The Pillow cards are kept, on inspection
+**Decision:** Claim history and actions views stay rendered PNGs. The native markdown table is rejected.
+**Reasoning:** Justin compared both on his phone with the same 12 live claims. The card carries month grouping with subtotals, status pills, and a fixed layout; the table had to clip the vet name to 12 characters to fit a phone's width. This is the guiding principle producing a *keep* — the bespoke thing carried the burden of proof rather than being grandfathered.
+**Trade-off accepted:** The shared media outbox stops being one option among three and becomes mandatory, because every view is now a file that must reach the gateway inside its own allowlisted media root. Caption editing likewise stops being an edge case: every tap result lands on a photo caption, so `gateway_client` must name `caption` explicitly.
+**Supersedes:** the "Open — compare live" row in the guiding-principle table.
+**Caveat recorded:** the first B rendered its heading and buttons and silently dropped its table. Justin noticed; had he not, A would have won against an empty comparison. A live A/B on this platform is only meaningful once B is confirmed visible.
