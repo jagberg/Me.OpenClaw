@@ -80,7 +80,18 @@ The integration is deliberately two one-directional seams rather than one bidire
 
 *Alternatives considered.* The gateway's OpenAI-compatible `/v1/chat/completions` — wrong direction, that is for consuming an agent, not for a tool answering one. `POST /api/v1/admin/rpc` — documented as a default-off plugin route; the CLI is the documented path and does not require opening an admin surface. A second bot token for the app's own sends — rejected: two bots means two chat threads and the card interface stops being one place. Putting logic in the Node plugin — rejected: it would create a second place where claims decisions live, which is exactly the drift the "thin adapter" requirement has always guarded against.
 
-### D3 — The proposal gate moves from `telegram_bot._execute_action` into the MCP server (CONTRADICTION FLAGGED — unresolved)
+### D3 — The proposal gate: split by origin (DECIDED by Justin, 2026-08-01)
+
+**Decision: split by origin.** A card tap and a chat-confirm tap are handled differently — the card tap goes button → plugin → `/internal` → Python, and a chat-initiated proposal is committed inside the MCP server. I recommended a single Python commit path; Justin chose the split.
+
+Both satisfy the invariant that a commit is never a tool return value, which is why this was a decision rather than a deduction. The trade-off accepted is **two components that can write a claim change**, so the gate exists in two places and must not drift between them. Consequences to hold:
+- Both paths compose their confirmation text **by code from the claim row about to change** — never from the model's account of its own intent (11.2). This is the real safeguard, and it is identical in both designs.
+- The two-pets refusal and the no-amounts split refusal must be enforced in the MCP server, since it now commits (`claims-mcp-surface`).
+- A regression test must prove neither path can commit without a confirm, independently. One test covering "the" gate is no longer sufficient.
+
+The contradiction flagged below is resolved by this decision. Original heading and reasoning kept verbatim.
+
+### D3 (original) — The proposal gate moves from `telegram_bot._execute_action` into the MCP server (CONTRADICTION FLAGGED — resolved 2026-08-01 by the decision above)
 
 **This contradicts D12 and Justin's 2026-08-01 decision that deterministic calls do not use MCP.** D3 places *the* commit gate in the MCP server. Under D12 a confirm tap is a `command` button → plugin → `/internal`, which never touches MCP, so the commit path for a tapped confirmation is Python behind `/internal`, not the MCP server. The chat-initiated half (a `propose_*` tool returning a confirmation) may still be MCP's.
 
@@ -410,3 +421,17 @@ Append-only. Material decision changes only — findings live in `tasks.md`.
 **Trade-off accepted:** The shared media outbox stops being one option among three and becomes mandatory, because every view is now a file that must reach the gateway inside its own allowlisted media root. Caption editing likewise stops being an edge case: every tap result lands on a photo caption, so `gateway_client` must name `caption` explicitly.
 **Supersedes:** the "Open — compare live" row in the guiding-principle table.
 **Caveat recorded:** the first B rendered its heading and buttons and silently dropped its table. Justin noticed; had he not, A would have won against an empty comparison. A live A/B on this platform is only meaningful once B is confirmed visible.
+
+
+## 2026-08-01 — The proposal gate is split by origin (Justin)
+**Decision:** Card taps commit in Python behind `/internal`; chat-initiated proposals commit in the MCP server.
+**Reasoning:** Justin's, against my recommendation of a single Python path. The chat flow stays self-contained — a proposal made and committed in the same component, with no hop through `/internal` for something the agent already had in hand.
+**Trade-off accepted:** Two components can write a claim change, so the gate lives in two places and can drift. Mitigated by testing each path's gate independently rather than testing "the" gate once, and by requiring both to compose their confirmation text from the claim row rather than from the model.
+**Supersedes:** the CONTRADICTION FLAGGED state in D3, `claims-mcp-surface` and `conversational-agent`. All three should now read as decided.
+
+## 2026-08-01 — The app owns Telegram's per-chat command scope
+**Decision:** The in-gateway plugin registers the app's five commands into `BotCommandScopeChat` for Justin's chat.
+**Reasoning:** The gateway writes only `default` and `all_group_chats`, and deletes only those two. Telegram resolves per-chat before all-private-chats before default, so the per-chat layer is free. Writing it gives Justin a five-command menu without overwriting anything the gateway owns, and the other ~60 stay callable because visibility and callability are decoupled. This is the platform's documented layering used as intended — the guiding principle satisfied, not strained.
+**Trade-off accepted:** The plugin must re-apply on start, and a future gateway version that claims the chat scope would silently take the menu back. Preflight asserts the gateway's scope list is still the two it writes today.
+**Supersedes:** 13.1's "keep five plus /status and /models", which was unconfigurable, and 13.1c's framing of the choice as accept-or-fight.
+**Unverified:** read from source and Telegram's documented precedence. Not yet done live.

@@ -42,7 +42,9 @@ Read tools SHALL return current state directly. Every mutating capability SHALL 
 
 The gate SHALL be a property of code, not of the agent's configuration or prompt. This preserves today's guarantee, which lives in `telegram_bot._execute_action` and is explicitly *not* a behaviour the model is trusted to observe.
 
-**CONTRADICTION FLAGGED — unresolved.** This requirement originally said the gate is a property of *the MCP server*. Under the decision that deterministic calls do not use MCP, a confirm **tap** is a `command` button → plugin → `/internal`, so the commit executes in Python behind `/internal` and never touches MCP. The chat-initiated half — a `propose_*` tool returning a confirmation — may still be MCP's. Both readings satisfy the invariant that a commit can never be a tool return value, so which component owns the gate is a decision to make rather than absorb. Tracked against design D3 and task 11.2; do not treat either placement as settled.
+**RESOLVED by Justin, 2026-08-01: split by origin.** A confirm tap on a **card** is a `command` button → plugin → `/internal`, committing in Python and never touching MCP. A confirm tap on a **chat-initiated** proposal commits inside the MCP server. Both satisfy the invariant that a commit is never a tool return value; the split was chosen so the chat flow stays self-contained.
+
+Because the MCP server now commits, two things follow that would not under a single Python path: the harness refusals below are enforced here and not merely mirrored here, and the gate must be tested on this path **independently** of the `/internal` path. A single test of "the" gate no longer covers the system.
 
 #### Scenario: Mutation requested
 - **WHEN** the agent calls a `propose_*` tool
