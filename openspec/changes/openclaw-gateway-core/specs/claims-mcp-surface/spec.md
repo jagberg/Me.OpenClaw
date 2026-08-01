@@ -16,7 +16,9 @@ Decided by Justin, 2026-08-01: no MCP for deterministic calls. A tap is a `comma
 ### Requirement: The tool inventory has a declared budget
 The number of tools SHALL be bounded by a declared maximum, and exceeding it SHALL fail the test suite rather than silently increasing the cost of every conversational turn.
 
-Rationale: tool schemas ship on every request. This repo's own chat turn is ~2.6k tokens with its current tools; the gateway's stock turn measured ~29k. Inventory size is therefore a recurring per-turn cost, not a one-off, and "keep it small" without a number is not enforceable.
+The maximum SHALL be derived from the configured provider's per-request limit less the measured cost of everything else in a turn, not chosen by judgement.
+
+Rationale: tool schemas ship on every request, so inventory size is a recurring per-turn cost. Measured 2026-08-01: a trimmed turn with no claims tools is 5,355 tokens against Groq free tier's 12,000 per minute, leaving roughly 6,600 tokens for the entire claims inventory. That is the budget. For scale, the platform's own stock inventory of 32 tools was 31,972 chars — about five times the headroom available — so the constraint is real and a plausible-looking inventory can breach it.
 
 #### Scenario: A tool is added beyond the budget
 - **WHEN** a new tool takes the inventory past its declared maximum

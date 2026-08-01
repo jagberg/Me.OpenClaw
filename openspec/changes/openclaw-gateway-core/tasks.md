@@ -260,7 +260,24 @@ Found 2026-08-01 while reconciling the specs with D2's correction. Four of these
   - **Skills (4,206 chars).** Thirteen loaded, zero relevant. `meme-maker` and `weather` are on every claims turn.
 
   Two mechanical notes: `bootstrapMaxChars` is 20,000 per file and 60,000 total, so workspace files are capped but nowhere near it; and `systemPromptReport` names every contributor with its size, so **19b.1 should assert the itemised report rather than a single total** — a regression in one component is invisible in a sum.
-- [ ] 17.8 If Groq is still wanted for the agent, the lever is `agents.defaults.contextPruning.tools.allow` (a tool allowlist) plus reducing skills and replacing `AGENTS.md` — not plugins. **Promoted from "untested fallback" to the main lever by 17.9**, which shows those three are ~75% of the turn. Whether the remainder fits Groq's 12k TPM is still unmeasured; make the cuts, then re-measure before deciding the provider.
+- [x] 17.8 **CUTS MADE AND MEASURED 2026-08-01. 22,810 → 5,355 tokens. Groq is viable after all.**
+
+  | Step | Prompt tokens | Tool schema chars | Workspace file chars |
+  |---|---:|---:|---:|
+  | Stock | 22,810 | 31,972 (32 tools) | 14,341 (7 files) |
+  | + authored workspace files | 20,616 | 31,972 | 6,508 (6 files) |
+  | + tool allowlist | **5,355** | **304 (1 tool)** | 6,508 |
+
+  The config key is **`tools.allow`** at the top level, not `agents.defaults.tools.allow` (rejected: `Unrecognized key: "tools"`) and not the `agents.defaults.contextPruning.tools.allow` the earlier note guessed at. Restart required. `alsoAllow` adds to the active profile; `allow` replaces it — `allow` is the one that cuts.
+
+  **This overturns 17.1 and 17.2's conclusion.** Groq free tier's 12,000 TPM was recorded as a hard blocker that no pruning could clear. A trimmed turn is 5,355, leaving **~6,600 tokens of headroom** — which is the real budget for 19a.3, replacing "a declared maximum" with a number derived from the provider's limit rather than from taste.
+
+  **Caveats, all load-bearing:**
+  - Measured with `tools.allow = ["read"]` as a stand-in for "a short list". `read` is a filesystem tool and `gmail-isolation-boundary` forbids it; the shipped allowlist is the claims MCP tools instead. The 304 chars it contributed are noise, but the *shape* of the result would not change.
+  - No claims tools existed at measurement time. The headroom is what they must fit inside, not free space.
+  - 13 skills still contribute 4,206 chars, none of them relevant (`meme-maker`, `weather`, `notion`, `clawhub`…). Roughly another 1k tokens available, untaken.
+  - The core system prompt is 18,536 chars and did not move. That is the actual floor, and it is ~4.6k tokens.
+- [ ] 17.10 Disable the 13 irrelevant skills (~4,206 chars, ~1k tokens). Untaken because the tool allowlist already cleared the provider ceiling; do it anyway before adding claims tools, since the headroom is what they compete for.
 - [ ] 17.3 **7.6 gains a second, harder justification.** Pinning the plugin set was a security requirement (`gmail-isolation-boundary`); it is now also a **feasibility** requirement. Measure tokens per turn after disabling unused plugins and pruning the command surface, and treat "turn size under the provider's TPM" as an acceptance criterion with a number, not an aspiration.
 - [ ] 17.4 **DECIDED by Justin, 2026-08-01: make the cuts, then measure, then choose — do not choose now.** The cuts (17.8/17.9) happen regardless because `gmail-isolation-boundary` wants the same tool allowlist. Groq stays the preference if the trimmed turn fits 12k TPM; Gemini is the fallback; a paid tier is the last resort even though he has said cost is covered. Decide the provider for the agent against that number, not against preference. Options: cut the surface until Groq's 12k TPM fits; use a provider with a higher TPM; or accept a paid tier. Note this is **per-minute**, a different constraint from ADR-0017's per-day budget — both now apply.
 - [ ] 17.5 **Observed failover behaviour, relevant to ADR-0017 and D8.** OpenClaw retried the *same* model 3 times (10s/20s/30s backoff) then surfaced `decision=candidate_failed reason=rate_limit next=none`. Correct shape for a per-minute limit, and it confirms the gateway classifies Groq 429/413s as `rate_limit`. Two notes: with one model configured there is nothing to fall through to, and retrying a `413 request too large` is futile by construction — the request size never changes, so all 4 attempts were unsatisfiable.
