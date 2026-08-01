@@ -108,9 +108,21 @@ Verified 2026-08-01: a `command` button dispatches through core's native command
 
 Consequence worth stating: this makes the entire tap path deterministic. No token is interpreted, no model runs, and the existing command surface (`/mark`, `/pet`, `/resolve`) becomes the button target rather than needing a parallel callback vocabulary.
 
+A button's determinism depends on its command being **registered**. Every command string a button can emit SHALL be asserted registered at deploy, and any message reaching the agent that parses as one of the app's command strings SHALL be refused as an error rather than answered.
+
+Rationale, measured live 2026-08-01: a button carrying `/ping` — a command nothing had registered — did not error and did not no-op. It was delivered to the agent as a chat turn, which replied conversationally and spent tokens. A typo, a plugin that failed one of its two silent load gates, or a command renamed on one side is therefore enough to route `/mark 7 sent` through a model as free text, which is the one path this design exists to prevent.
+
 #### Scenario: Tap resolves a claim
 - **WHEN** the user taps a tap-to-resolve button on an actions card
 - **THEN** the named slash command runs through the plugin and applies the change, with no model invoked
+
+#### Scenario: A button names an unregistered command
+- **WHEN** a button's command is not registered by the plugin
+- **THEN** the deploy fails naming that command, because at runtime the tap would silently become a model turn instead of an error
+
+#### Scenario: A command string reaches the agent
+- **WHEN** the agent receives a turn whose text parses as one of the app's command strings
+- **THEN** it is refused and reported as a broken deterministic path, and no claim data is read or changed on the strength of it
 
 A command string SHALL be at most **58 UTF-8 bytes**, and this SHALL be checked before send. The limit is Telegram's 64-byte `callback_data` ceiling less the platform's 6-byte `tgcmd:` prefix, and it is measured in bytes rather than characters. Buttons SHALL continue to name their target by id or index rather than by text, which keeps the longest real command near 46 bytes.
 
