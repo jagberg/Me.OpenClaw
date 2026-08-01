@@ -511,7 +511,11 @@ Justin's principle (2026-08-01): the solution fits OpenClaw, not the reverse. Ke
   Original text: Native approval buttons vs the MCP-side confirm gate (D3). **Justin, 2026-08-01: decide after seeing it — do not choose on my reasoning.** So this is now a capture task, not an analysis task: install the gateway, drive a real mutation on a real claim, and bring back what its approval prompt *actually says on the phone*. The question it must answer: can the prompt show a full rendered outcome ("assign Aari to claim #7, Echo gets $28"), or only a tool name? If only a tool name, a wrong claim chosen by the model would be invisible at the moment of approval. Present the capture, then he decides. **Blocks treating D3 as decided.**
 - [x] 11.3 **DECIDED by Justin, 2026-08-01 after seeing both on his phone: KEEP the Pillow cards.** Same 12 claims from the live history, rendered by `claim_card.render` and sent as a photo, against the identical rows as a markdown table. He chose A.
 
-  This is the fit-the-architecture principle producing a *keep*, which is the outcome that needs recording most — the burden of proof was on the bespoke thing and it carried it on inspection, not on argument. What the card does that the table cannot: month grouping with per-month subtotals, coloured status pills, and a fixed layout that does not reflow or truncate on a phone. The table had to clip the vet name to 12 characters to fit; the card shows it in full.
+  This is the fit-the-architecture principle producing a *keep*, which is the outcome that needs recording most — the burden of proof was on the bespoke thing and it carried it on inspection, not on argument. What the card does that the table cannot: month grouping with per-month subtotals, coloured status pills, and a fixed layout that does not reflow on a phone. ~~The table had to clip the vet name to 12 characters to fit; the card shows it in full.~~
+
+**CORRECTION 2026-08-02 — the last sentence was wrong, and the decision still stands without it.** A real card rendered during the 14.2 probe shows `SAH INNER WEST PTY LT S…` and `MediPaws Sydney Leichha…`: the card truncates too, just at roughly twice the width. "Shows it in full" was an overstatement of a real but smaller advantage.
+
+Flagged rather than quietly edited, because the *reason* recorded for a decision is the thing future readers rely on. Nobody would reopen "keep the cards" over this — month grouping, per-month subtotals and status pills are untouched, and Justin chose A on sight — but somebody might one day reject a text rendering on the strength of a claim that is not true. The honest version: **the card gives more room for a vet name, not unlimited room.**
 
   **Consequences, several of which stop being optional:**
   - **14.2's shared media outbox is now required.** Every history and actions view is a PNG that must reach the gateway from the Python container, and the media allowlist (14.4) means it must land inside one of the gateway's own roots — `<stateDir>/media`. This was the leading option; it is now the only one.
@@ -631,7 +635,15 @@ Two structural notes: `check_boundary_plugins` reads config **and** `health.plug
 
   In-memory is the load-bearing part: persisting the report would recreate exactly the failure that makes `plugins list` useless. A restart of either runtime must empty it.
 
-  **Still open:** an actual invocation. Its natural home is 4.11's live verification, where a real tap happens anyway — noted there rather than left as a false tick here.
+  **CLOSED 2026-08-02 by a real tap — the residual did not have to wait for 4.11.** Justin tapped the `Mark #7 sent` button on the 14.2 probe card and got back, in the chat:
+
+  ```
+  /mark failed (404). {"detail":"Not Found"}
+  ```
+
+  That single line proves the entire chain with the **shipped** plugin rather than the spike, and against the **real** `/internal` surface rather than an echo route: button → core's native command path → `claims` plugin handler → HTTP POST to the app → the app's genuine 404 for an endpoint slice 2 has not built → rendered back into Telegram. 16.2 proved the mechanism; this proves the artefact.
+
+  It also proves the **failure-visibility** rule survives the new transport, which nothing had tested. The 404 arrived verbatim, attributed to `/mark`, with its status code. Not swallowed, not a silent no-op, not a cheerful acknowledgement of something that did not happen — which is exactly what the handler was written to do and exactly what could not be verified without a tap.
 - [x] 19b.1–19b.5, 19b.7 **BUILT.** See the section header for the live run and for the three assumptions the CLI corrected.
 - [ ] 19b.7 **Media outbox path is allowlisted** and is a narrow directory, not `app/data`.
 
