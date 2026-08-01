@@ -4714,6 +4714,116 @@ def test_one_classifier_describes_both_transports():
         assert message_log._describe(raw) == expected, (raw, message_log._describe(raw))
 
 
+# --- the MCP read surface -----------------------------------------------------
+
+
+def test_mcp_inventory_has_no_dangerous_tool():
+    """2.3 / 19a.7 — this test IS the gmail-isolation-boundary enforcement.
+
+    The stock gateway agent asserted it had checked email in a runtime with no
+    mail credential, so prompt-level discipline demonstrably does not hold this
+    line. The inventory is written by hand precisely so it can be asserted."""
+    from openclaw import mcp_server
+
+    offenders = []
+    for name in mcp_server.TOOL_NAMES:
+        for bad in mcp_server.FORBIDDEN_TOOL_SUBSTRINGS:
+            if bad in name:
+                offenders.append(f"{name} contains {bad!r}")
+    assert not offenders, offenders
+
+    # No mutation reachable, whatever the inventory says. `_impls` is built from
+    # the chat agent's implementations, which include every propose_* function;
+    # only names listed in TOOLS are selected out of it.
+    impls = mcp_server._impls()
+    assert set(impls) == set(mcp_server.TOOL_NAMES), (set(impls) ^ set(mcp_server.TOOL_NAMES))
+    assert not [n for n in impls if n.startswith("propose_")], list(impls)
+
+
+def test_mcp_inventory_is_enumerated_and_within_its_token_budget():
+    """2.2 / 19a.3 — every schema here ships in EVERY agent turn. A trimmed turn
+    is 3,865 tokens against Groq's 12,000 TPM, so the inventory has a real
+    budget rather than a taste. Failing loudly on tool #N+1 is the point.
+
+    No dynamic or wildcard registration: a tool that can only arrive by being
+    written into TOOLS is a tool that can be counted."""
+    import json as _json
+
+    from openclaw import mcp_server
+
+    assert len(mcp_server.TOOLS) <= 12, f"{len(mcp_server.TOOLS)} tools — re-measure the turn before raising this"
+    schema_chars = len(_json.dumps(mcp_server.TOOLS))
+    # ~8,100 tokens of headroom were measured after the 17.8/17.10 cuts. At the
+    # usual ~4 chars/token this ceiling is roughly a quarter of it, which leaves
+    # room for the answers themselves.
+    assert schema_chars <= 8000, f"tool schemas are {schema_chars} chars; they ship on every turn"
+    for tool in mcp_server.TOOLS:
+        assert tool["name"] and tool["description"] and "inputSchema" in tool, tool
+
+
+def test_mcp_speaks_enough_of_the_protocol_to_be_probed():
+    """2.5's hermetic half. The live half needs the gateway and is a preflight
+    assertion; this one catches the shape breaking without one."""
+    from openclaw import mcp_server
+
+    init = mcp_server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                "params": {"protocolVersion": "2025-06-18"}})
+    assert init["result"]["protocolVersion"] == "2025-06-18", init
+    assert init["result"]["capabilities"]["tools"] is not None, init
+    # The instructions must say what this surface CANNOT do. The absence of a
+    # mailbox has to be stated, not inferred from an inventory nobody reads.
+    assert "READ ONLY" in init["result"]["instructions"], init["result"]["instructions"]
+
+    listed = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    assert [t["name"] for t in listed["result"]["tools"]] == mcp_server.TOOL_NAMES
+
+    # A notification gets no response at all — returning one is a protocol
+    # violation, and the client is entitled to treat it as a broken server.
+    assert mcp_server.dispatch({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+    assert mcp_server.dispatch({"jsonrpc": "2.0", "id": 3, "method": "nonsense"})["error"]["code"] == -32601
+
+
+def test_mcp_turn_context_reads_the_pets_live():
+    """2.4 — the pet list is a DB read at call time, never baked into agent
+    config. The model invented 'Whiskers' and 'Fluffy' when left to guess, and a
+    list written into a workspace file is correct until a pet is added and then
+    wrong silently. This is why the shipped USER.md deliberately has none."""
+    from datetime import datetime, timezone
+
+    from openclaw import mcp_server
+
+    _fresh_db()
+    out = mcp_server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "turn_context", "arguments": {}}})
+    text = out["result"]["content"][0]["text"]
+    assert out["result"]["isError"] is False, out
+    assert "Aari" in text and "Echo" in text, text
+    assert datetime.now(timezone.utc).date().isoformat() in text, text
+
+    with db.get_connection() as conn:
+        conn.execute("INSERT INTO pets (name, insurer) VALUES ('Bandit', 'Petcover')")
+    later = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                 "params": {"name": "turn_context", "arguments": {}}})
+    assert "Bandit" in later["result"]["content"][0]["text"], "the pet list was cached, not read"
+
+
+def test_a_failing_mcp_tool_reports_to_the_model_not_the_transport():
+    """A tool failure the model can see is one it can recover from or report. A
+    JSON-RPC error ends the turn with nothing said, which is the silent no-op
+    the project's rules forbid."""
+    from openclaw import mcp_server
+
+    _fresh_db()
+    missing = mcp_server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "no_such_tool", "arguments": {}}})
+    assert missing["result"]["isError"] is True and "error" not in missing, missing
+
+    bad_args = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                    "params": {"name": "claim_detail", "arguments": {"nope": 1}}})
+    assert bad_args["result"]["isError"] is True, bad_args
+    assert "claim_detail" in bad_args["result"]["content"][0]["text"], bad_args
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

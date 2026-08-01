@@ -14,6 +14,7 @@ from . import (
     db,
     gmail_ingest,
     internal_api,
+    mcp_server,
     message_log,
     netbank_csv,
     pipeline,
@@ -68,6 +69,10 @@ app = FastAPI(lifespan=lifespan)
 # The gateway's entry point into this app: cron invocations and (later) inbound
 # channel events. Secret-guarded, loopback by default — see internal_api.
 app.include_router(internal_api.router)
+# The other half of the split: deterministic work arrives at /internal, and a
+# typed question arrives here as MCP tool calls. Read only, same shared secret —
+# the answers name pets, vets and amounts, so an open endpoint leaks the history.
+app.include_router(mcp_server.router)
 
 
 @app.get("/")

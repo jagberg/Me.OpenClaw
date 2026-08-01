@@ -58,12 +58,35 @@ Any negative answer changes the plan. Record the actual answer next to each task
 
 ## 2. MCP server — read tools
 
-- [ ] 2.1 Add the Python MCP server module exposing read tools only: claim list, claim detail, pending actions (via `claim_status.pending_actions()`), pet list, status events.
-- [ ] 2.2 Enumerate the inventory in one place so it can be asserted; no dynamic or wildcard registration.
-- [ ] 2.3 Assert in the smoke suite that the inventory contains no filesystem, shell, browser, mailbox-search or secret-returning tool. This test is the enforcement of `gmail-isolation-boundary`.
-- [ ] 2.4 Supply the real pet list and today's date as turn context read from the DB at call time, not baked into agent config.
-- [ ] 2.5 Register with `openclaw mcp set`, confirm the tools appear in the agent's inventory, and verify a read question answers correctly against the live DB (read-only copy per the project's host-access rule).
-- [ ] 2.6 Verify that with the Python app stopped, the agent reports the claims service unavailable and asserts no claim facts.
+- [x] 2.1 **BUILT 2026-08-01 — `app/openclaw/mcp_server.py`, seven read tools, mounted at `/mcp`.** `turn_context`, `query_claims`, `pending_actions`, `claim_detail`, `claim_history`, `submissions_awaiting_reply`, `list_tasks`. Every implementation is reused from `agent._build_impls` rather than restated — `pending_actions` in particular shares its derivation with the `/actions` cards specifically so chat and cards cannot disagree, and a second copy here would be the fifth instance of the bug this codebase keeps making.
+
+  **Hand-rolled JSON-RPC, not the official SDK, and the reason is a hard conflict rather than a preference.** `pip install mcp` pulls `mcp` 2.0.0 → starlette 1.3.1; this app pins `fastapi==0.115.6`, which requires `starlette<0.42`. `pip check` went red on the spot. It also drags in opentelemetry, jsonschema, httpx2, pyjwt and pywin32 — into the one container whose small surface is part of the security argument. Reverted, venv restored, `pip check` clean. Streamable HTTP minus the stream is a JSON-RPC POST endpoint, which is what this is: `initialize`, `ping`, `tools/list`, `tools/call`, notifications answered with 202, and `GET /mcp` answered 405 because nothing here pushes.
+- [x] 2.2 **Enumerated in `TOOLS`, no dynamic or wildcard registration.** `_impls()` selects out of the chat agent's implementations *by name from `TOOLS`*, so a `propose_*` function existing in the same dict cannot be reached — asserted, not argued.
+- [x] 2.3 **`test_mcp_inventory_has_no_dangerous_tool`.** Substring tripwire over the inventory (`file`, `shell`, `exec`, `browser`, `mail`, `secret`, `send`, `sql`, …) plus an assertion that the reachable implementation set equals `TOOL_NAMES` exactly and contains no `propose_*`. This test is the `gmail-isolation-boundary` enforcement; 13.4 is why it cannot be relaxed to prompt discipline.
+- [x] 2.4 **`turn_context` reads pets and today's date from the DB per call.** Asserted by inserting a pet mid-test and requiring the next call to see it — a cached list would pass a naive test and be wrong the day a pet is added. This is why the shipped `USER.md` deliberately carries no pet list.
+- [x] 2.5 **REGISTERED AND PROBED LIVE 2026-08-01, then driven end to end on Groq.**
+
+  ```
+  openclaw mcp add claims --url http://host.docker.internal:8978/mcp \
+    --transport streamable-http --header X-OpenClaw-Secret=...
+  openclaw mcp probe claims   ->  "- claims: 7 tools"
+  ```
+
+  `mcp probe` opens a real MCP connection, so this is the product's own validator agreeing with the hand-rolled server rather than our own test agreeing with itself. The server log shows the exact handshake: `POST 200` (initialize) → `POST 202` (`notifications/initialized`) → `GET 405` (the client tries to open a stream, is refused, carries on) → `POST 200` (`tools/list`).
+
+  **Then a real turn.** `--message "What is waiting on me right now?"` on `groq/llama-3.3-70b-versatile`, against a scratchpad copy of the live DB: the agent called the tools and answered with real pets, real vets and the BLOCKED marker that `pending_actions` emits. **First end-to-end agent turn on the provider this project standardises on.**
+
+  Four things fall out of it:
+  - **MCP tools are named `<server>__<tool>`** — `claims__query_claims`, and so on. `tools.allow` matches those names and accepts `claims__*`. Two allowlists written from the bare names (`query_claims`) failed with *"No callable tools remain after resolving explicit tool allowlist"*. Not guessable; read off `systemPromptReport.tools.entries`.
+  - **Turn size with the real inventory: 4,934 prompt tokens**, tools contributing 1,172 schema chars across 7 entries. Against Groq's 12,000 TPM that is ~7,000 tokens of headroom, and it *confirms* rather than merely predicts ADR-0023's budget — the earlier ~8,100 figure was measured with a stand-in tool. The inventory is cheap; the floor is the core prompt.
+  - **The reply carried no claim `#id`s**, though `INSTRUCTIONS` demands them in as many words. A hard-won UI rule stated as prompt text did not hold on its first live turn. Consequence for 19a.6: it can assert the *tool output* carries ids (it does), but it cannot assert the model repeats them — that needs `AGENTS.md` reinforcement and a live check, not a hermetic test. Same lesson as 13.4, on a rule that is ours rather than the platform's.
+  - Operational: **Gemini's free tier was exhausted** by the measurement turns mid-session (`429 ... exceeded your current quota`). 17.6 recorded this hazard for the shared Groq key; it applies to Gemini too, and Gemini is the only vision-capable backend (ADR-0010).
+- [x] 2.6 **VERIFIED 2026-08-01 — it fails closed, and harder than the spec describes.** With the Python app stopped, no `claims__*` tool registers, so `tools.allow: ["claims__*"]` resolves to an empty set and the gateway refuses the turn outright: *"No callable tools remain after resolving explicit tool allowlist … Fix the allowlist or enable the plugin that registers the requested tool."* No claim facts are asserted, because no answer is produced at all.
+
+  A second probe with one unrelated tool left allowed (`memory_search`) got a turn that reported a tool unavailable and still asserted no claim facts. One turn is weak evidence for a model's behaviour, but the *structural* result is strong: the tools genuinely disappear when the app is down, so there is nothing for the model to answer from.
+
+  **Gap, and it belongs in slice 1:** the user sees a raw `GatewayClientRequestError: … No callable tools remain …` in Telegram. The requirement says the reply should *state the claims service is unavailable*. Fail-closed is the right posture and must not be softened into a fallback that answers anyway — what is missing is the sentence. Fix belongs in the plugin, which can map that error to a human one. Added as 2.7.
+- [ ] 2.7 **Added by 2.6.** Map the gateway's empty-allowlist error to a human sentence before it reaches the chat. Must not become a fallback that answers the question anyway — the whole value of the current behaviour is that no claim fact can be produced when the source of truth is unreachable.
 
 ## 3. MCP server — proposals and the confirm gate
 
