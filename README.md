@@ -80,6 +80,7 @@ For each unmatched vet charge, `invoice_matching`:
 | **OpenAI** (optional, `gpt-4o-mini`) | Paid fallback provider — only if `LLM_PROVIDER=openai` | Same as Groq | `OPENAI_API_KEY` |
 | **Telegram Bot API** | Notifications, questions with tap-buttons, document (PDF) review messages, 👍 receipt acks, free-chat queries | Claim summaries (amounts, dates, vet names, pet names), invoice PDFs for review | `TELEGRAM_BOT_TOKEN`; single authorized username |
 | **Google Drive** (via `db_backup`) | SQLite DB backup | The database file | Same Google OAuth |
+| **OpenClaw gateway** *(not yet — see "In flight" below)* | Will own Telegram transport, the chat agent loop, model routing and cron | Same claim summaries the Bot API already carries; **no Gmail credential and no database access, deliberately** | Runs locally in Docker; holds `TELEGRAM_BOT_TOKEN` once the swap happens |
 
 Every LLM call is rate-limited and logged to the `llm_calls` table (provider, purpose, latency, error). No other network calls exist; the bank is never contacted.
 
@@ -106,9 +107,19 @@ Production runs in Docker via `./scripts/deploy.ps1`, which stamps the image wit
 
 Tests: `cd app && .venv/Scripts/python tests/test_core.py` — assert-based, no pytest, fully hermetic (all LLM keys force-blanked, vision calls stubbed; tests never spend API tokens).
 
+## In flight: the OpenClaw gateway swap
+
+Nothing below has changed yet — this section exists so the gap between the docs and the plan is visible rather than discovered.
+
+`openspec/changes/openclaw-gateway-core` replaces the hand-rolled transport, chat loop and scheduler with **OpenClaw the product** (an unrelated local-first gateway daemon; the repo has shared its name since inception and never depended on it). After the swap there are two runtimes: the gateway owns the Telegram token, polling, the agent loop, model routing and cron; this app keeps claims, Gmail, SQLite and the dashboard, reached over a secret-guarded `/internal` surface and an enumerated MCP tool inventory.
+
+Already merged and inert until then: `internal_api.py`, `gateway_client.py`, and `app/gateway-workspace/` (the agent's prompt files). Everything else runs exactly as documented above.
+
+Read ADR-0024 (why the domain is not ported), ADR-0025 (where the proposal gate lives) and ADR-0023 (why the agent's tool allowlist is load-bearing for both security and cost) before touching any of it.
+
 ## Docs
 
 - `CLAUDE.md` (root) — hard rules + hard-won domain knowledge for AI-assisted sessions; `app/openclaw/CLAUDE.md` — module map.
-- `docs/adr/` — architecture decisions. Start with 0006 (service boundary), 0007 (ceiling matching), 0008 (status event log), 0009 (LLM backends), 0010 (vision OCR). For the Telegram side: 0014 (durable message log + replay queue) and 0015 (restart on a dead updater; what ERROR means).
+- `docs/adr/` — architecture decisions. Start with 0006 (service boundary), 0007 (ceiling matching), 0008 (status event log), 0009 (LLM backends), 0010 (vision OCR). For the Telegram side: 0014 (durable message log + replay queue) and 0015 (restart on a dead updater; what ERROR means). For the gateway swap: 0023 (tool allowlist), 0024 (gateway as shell), 0025 (proposal gate). Several older ADRs carry dated addenda from the swap rather than edits — 0002, 0003, 0009, 0014, 0015, 0017.
 - `docs/prd/` — original product requirements.
 - `openspec/changes/` — spec-driven change history; each change's `tasks.md` records what was verified against real data.

@@ -132,8 +132,37 @@ Do not start until phase 4 has run one full claim lifecycle on real data.
 - [x] 8.4 **Addenda appended to ADR-0014 and ADR-0015.** 0014: kept deliberately, dataset job is the deciding reason, two runtimes mean two versions. 0015: supervision moves to the container boundary but the dead-channel *guarantee* must not go with it, and the alerting levels are unchanged — already threatened once by the platform logging a failure on every successful caption edit. Amend ADR-0014/0015: `telegram_messages` retained and why; where dead-channel supervision now lives.
 - [x] 8.5 **Addendum appended to ADR-0002.** Only the "single Docker Compose service" half is superseded; Python/FastAPI/SQLite stand. Names the three costs — two configs, two versions, a deploy that can half-succeed — and records APScheduler's displacement. Amend ADR-0002: the stack is now two runtimes. Supersede the reasoning, do not delete it.
 - [x] 8.6 **Done: ADR-0003 addendum + BACKLOG entry.** The addendum says the original reason has expired and that nobody has retaken the decision, so it is flagged rather than superseded — nothing has replaced it. **DECIDED (Justin, 2026-08-01): reminders-and-push is a separate change after this one, unless it turns out to make sense to do now.** My read is that it does not: it is independent of the transport swap and becomes trivial once the gateway exists, so folding it in buys nothing but scope. Record against ADR-0003 that its original reason (no push channel existed) has expired, so the next reader sees a live question rather than a settled decision — and open a BACKLOG entry so it is not lost.
-- [ ] 8.7 Update root `CLAUDE.md`, `app/openclaw/CLAUDE.md` module map, `CONTEXT.md` and `README.md`: new module boundaries, the two-runtime deploy, the internal endpoint, and the tool-inventory boundary.
-- [ ] 8.8 Record in this file what was verified **live** versus only coded, per the project's working-style rule.
+- [x] 8.7 **Done 2026-08-01, and written as current-state plus in-flight rather than as though the swap had happened** — the same trap as 8.9. `README.md` gains an "In flight" section saying plainly that nothing below it has changed, a gateway row in the third-party table marked *not yet*, and the new ADRs in Docs. `CONTEXT.md` gains three vocabulary entries, the first of which is the **name collision** — after the swap "OpenClaw is down" means two different outages, so the doc that governs language is where that belongs. The module map gains `gateway-workspace/*.md` (not code, injected every turn, nothing enforceable in them) and marks `telegram_bot.py` as slated for deletion but live and unchanged until the atomic cutover. Root `CLAUDE.md` gains the six things that cost a day each and cannot be recovered from the product's prose. Original: Update root `CLAUDE.md`, `app/openclaw/CLAUDE.md` module map, `CONTEXT.md` and `README.md`: new module boundaries, the two-runtime deploy, the internal endpoint, and the tool-inventory boundary.
+- [x] 8.8 **Live versus coded, as of 2026-08-01.** The project's rule is that a plausible assumption is worth nothing until real data breaks it or fails to; this section says which side of that line each claim sits on, so a reader does not inherit confidence nobody earned.
+
+  **Verified live against the running gateway and Justin's real Telegram** — these were done, observed, and in several cases photographed:
+  - A `command` button dispatches through core's command path and a plugin-registered command runs. A `callback` action injected from outside is discarded.
+  - An **unregistered** command in a button reaches the agent as a chat turn and spends tokens — three of them, in Justin's chat, from the `/ping` probes.
+  - The 58-byte command budget: 58 renders both buttons, 59 renders one, no error either way. Confirmed on his screen.
+  - A document (PDF) caption edits correctly, and the default path logs `editMessage failed` on the successful edit.
+  - A presentation's `text`/`context` blocks never render through the CLI — Justin reported the missing table before I noticed it.
+  - Media sends are refused from `/tmp` and accepted from `<stateDir>/media`; the allowlist is a default, not something configured here.
+  - Turn size: 22,810 stock → 20,616 with authored workspace files → 5,355 with a tool allowlist → 3,865 with skills removed. Every reading with a fresh session key.
+  - Groq works as a custom OpenAI-compatible provider; a config-valid model id can still fail at runtime with `model_not_found`.
+  - `dmPolicy` default hands an unrecognised sender a live pairing code (Justin saw it first).
+  - `BotCommandScopeChat` overrides the gateway's default-scope menu — set, read back, and confirmed on his phone as five entries.
+  - The stock agent interviews the user about its own name before working, and claimed to have checked mail in a runtime holding no mail credential.
+
+  **Read from the product's shipped source, not executed** — high confidence, but a different kind:
+  - `editMode: "auto"` tries `editMessageText` first and falls back on an English error string (`network-errors.ts:275`).
+  - `sanitizeTelegramCallbackData` returns `undefined` over 64 bytes and the button is filtered out (`approval-callback-data.ts:21`).
+  - The presentation contract has five block types and no table (`normalizePresentationBlock`).
+  - Plugin approvals take free-text `title`/`description`; exec approvals are a fixed template (`approval-view-model`).
+  - `commands.native` gates plugin commands too (`bot-native-commands.ts:1056`) — which is why the menu is all-or-nothing.
+  - Gateway cron runs missed jobs at startup, capped at 5 per restart, agent jobs deferred two minutes (`planStartupCatchup`).
+  - The failover classifier has one `rate_limit` bucket and treats it as transient (`model-fallback-*.js:46`).
+  - The media allowlist roots (`buildMediaLocalRoots`), and that `localRoots: "any"` disables the check entirely.
+
+  **Coded and hermetically tested, but never run against the gateway:** `internal_api.py` (secret guard, per-job lock, correlation ids), `gateway_client.py` (argv construction, `record_outbound`, exit-code capture). The CLI flag names inside `_argv` are the specific risk — they are one function precisely because they were unverified when written, and several sibling assumptions in this change have since been wrong.
+
+  **Asserted from documentation only, and still unproven:** that the in-gateway plugin can register the app's commands via `api.registerCommand` in a way a `command` button reaches. The claims-spike plugin proved a plugin *can* register a working command; it has not proved the full `/mark 7 sent` → `/internal` → claim-logic path. **This is the single largest unverified assumption in the design**, and 16.2 is where it gets settled.
+
+  **Not verified and not verifiable here:** anything about behaviour under Justin's real message volume, concurrent taps, or a gateway restart mid-handler. The replay guarantees (ADR-0014) are carried forward on the strength of the existing implementation, not re-proved against the new transport.
 - [ ] 8.9 Sync the delta specs into `openspec/specs/` before archiving. **Now five modified and three new**, not four and three — `task-capture` was added 2026-08-01, see below.
 
   **Deliberately not done yet, and that is correct.** `openspec/specs/` is the *current-state* baseline and this change is 56 of 181 tasks. Syncing now would assert the system already does things nobody has built. The CLAUDE.md warning is about not forgetting this at archive, not doing it early.

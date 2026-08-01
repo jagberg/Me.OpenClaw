@@ -36,6 +36,21 @@ Personal assistant for Justin: task/reminder capture from Gmail, plus a vet-insu
 - Gmail OAuth token expires periodically (testing-app 7-day limit) — recovery: `python scripts/gmail_auth.py` (opens browser, Justin must click Allow).
 - Live DB schema changes need a manual `ALTER TABLE` against `app/data/openclaw.db` — `CREATE TABLE IF NOT EXISTS` in `db.py` won't touch existing tables.
 
+## The OpenClaw gateway swap (in flight — `openspec/changes/openclaw-gateway-core`)
+
+**Not built yet.** The app runs exactly as the rest of this file describes. `internal_api.py`, `gateway_client.py` and `app/gateway-workspace/` are merged and inert. Read ADR-0024/0025/0023 before working on it.
+
+**The name is a collision.** This repo has been called OpenClaw since inception and never depended on OpenClaw the product. After the swap, "OpenClaw is down" means two possible outages — say **the gateway** or **the app**.
+
+These cost a day each to learn and are not recoverable from the product's prose:
+
+- **The platform fails silently in eight measured ways**, and `ok: true` with a real message id is not evidence of anything. The worst is *partial*: through the CLI a valid presentation renders its buttons and silently drops its `text`/`context` blocks, so the message arrives looking deliberate. Put body text in `--message`; presentation is for buttons only. (Plugin path differs — it can omit explicit content and keep text blocks.)
+- **A `command` button is deterministic only while its command is registered.** An unregistered one is not an error — it reaches the agent as a chat turn and spends tokens. So "a tap never involves a model" rests on a deploy-time assertion, not on the mechanism.
+- **58 UTF-8 bytes** is the command-button budget (Telegram's 64 less a `tgcmd:` prefix). Overflow deletes the button from the keyboard with no error. Buttons carry ids and indices, never free text.
+- **Measure token composition, never a total.** `openclaw agent --json` returns a `systemPromptReport` itemising the turn. Two wrong conclusions ("hard blocker", "~29k floor") came from reading totals off a `413`. Itemised and trimmed: 22,810 → 3,865. Always use a **fresh `--session-key`** — an existing session measures conversation, not surface.
+- **The Telegram command menu can be owned per chat.** The gateway writes only the `default` and `all_group_chats` scopes, and Telegram resolves `BotCommandScopeChat` first — so writing that scope gives a five-command menu without touching anything the gateway owns. Verified live 2026-08-01.
+- **Never diagnose a plugin from `plugins list`** — those fields come from a persisted registry that goes stale silently and reported `commands: []` for working commands. Test the behaviour.
+
 ## Working style
 
 - Verify against real data before declaring anything correct or broken — this project's history is a string of plausible assumptions broken by real emails/PDFs/CSVs. Test hypotheses on the real DB/Gmail (read-only) first.
