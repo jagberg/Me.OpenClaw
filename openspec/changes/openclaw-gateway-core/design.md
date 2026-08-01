@@ -58,7 +58,9 @@ The gateway owns the edges; Python owns the middle. `pipeline.run_once` is uncha
 
 *Alternatives considered.* Porting the domain to TypeScript as an OpenClaw plugin — rejected: it discards the one asset that is genuinely hard to rebuild, and the stack is Python-shaped (`pypdf` for invoice segmentation, Pillow for cards, `google-api-python-client`, SQLite). Running the claims service as a subprocess of the gateway — rejected: it makes the domain's lifecycle depend on the gateway's, and the pipeline must keep advancing claim state when the gateway is down.
 
-### D2 — Two seams: MCP inbound for the agent, CLI outbound for the app
+### D2 — Two seams: MCP inbound for the agent, CLI outbound for the app (SUPERSEDED 2026-08-01 by D12)
+
+**Superseded by:** D12. **Why it changed:** the outbound seam was proved able to carry buttons after all, and the inbound seam collapsed to `command` actions — no callback bridge. Reasoning kept verbatim below because it is the record of what the corrections were correcting.
 
 The integration is deliberately two one-directional seams rather than one bidirectional protocol.
 
@@ -78,7 +80,11 @@ The integration is deliberately two one-directional seams rather than one bidire
 
 *Alternatives considered.* The gateway's OpenAI-compatible `/v1/chat/completions` — wrong direction, that is for consuming an agent, not for a tool answering one. `POST /api/v1/admin/rpc` — documented as a default-off plugin route; the CLI is the documented path and does not require opening an admin surface. A second bot token for the app's own sends — rejected: two bots means two chat threads and the card interface stops being one place. Putting logic in the Node plugin — rejected: it would create a second place where claims decisions live, which is exactly the drift the "thin adapter" requirement has always guarded against.
 
-### D3 — The proposal gate moves from `telegram_bot._execute_action` into the MCP server
+### D3 — The proposal gate moves from `telegram_bot._execute_action` into the MCP server (CONTRADICTION FLAGGED — unresolved)
+
+**This contradicts D12 and Justin's 2026-08-01 decision that deterministic calls do not use MCP.** D3 places *the* commit gate in the MCP server. Under D12 a confirm tap is a `command` button → plugin → `/internal`, which never touches MCP, so the commit path for a tapped confirmation is Python behind `/internal`, not the MCP server. The chat-initiated half (a `propose_*` tool returning a confirmation) may still be MCP's.
+
+Not resolved here on purpose: the invariant Justin called non-negotiable is *"a commit can never be a tool return value"*, and both readings satisfy it. Which component owns the gate is a real decision that needs making rather than absorbing. Feeds 11.2 and the section-3 rewrite.
 
 Today the gate is a harness property, explicitly *not* a behaviour the model is trusted to observe. That property must survive a general-purpose agent runtime, so it moves down rather than out: `propose_*` tools write a pending action and return a confirmation; the commit lives on the confirm-callback path in Python. A tool call can never itself be a commit.
 
@@ -152,7 +158,9 @@ So the question resolves to: is the agent worth having? `conversational-agent` i
 
 *Alternative considered — no agent tools at all; the agent answers only from what a command already produced.* Rejected: it makes every question a command Justin has to know, which is the interface the chat agent was built to replace.
 
-### D9 — What "conversation never reaches the app" actually costs (found while updating the specs, 2026-08-01)
+### D9 — What "conversation never reaches the app" actually costs (SUPERSEDED 2026-08-01 by D12)
+
+**Superseded by:** D12. **Why it changed:** D9 reasoned about consequences of a callback-claiming bridge that D12 removes. **Still live and NOT superseded:** the D7/D2 collision it found (the app cannot log conversation it never sees) survives as task 12.1, and the pending-free-text-flow problem survives as 12.2.
 
 D2's correction is right, but it was written as a scope reduction and it is not only that. If inbound conversational messages go straight to the agent and only *callbacks* are claimed by the plugin, then five things the app does today have no path. Four are solvable; the first is a direct collision between two decisions taken an hour apart.
 
@@ -209,7 +217,9 @@ Buttons are unquestionably a first-class feature — `button-types.ts` maps `lab
 
 **Method correction.** Three wrong conclusions today (raw-event forwarding, media paths, buttons) all came from deriving the integration from documentation prose and from this repo's existing shape. Each was settled in seconds by reading `/app/dist` inside the container. For the remainder of this work the shipped code is the source of truth, and `--dry-run` is the way to check a payload rather than sending and asking Justin to look.
 
-### D11 — The corrected architecture, built only from what was measured (2026-08-01)
+### D11 — The corrected architecture, built only from what was measured (SUPERSEDED 2026-08-01 by D12)
+
+**Superseded by:** D12, hours later. **Why it changed:** D11 still assumed callback actions were the mechanism for taps; measurement showed callback values are opaquely re-encoded and unusable from outside a plugin.
 
 Everything below was verified against a running gateway or read out of `/app/dist`. Where something is still inferred it says so.
 
@@ -312,3 +322,52 @@ Each phase is independently shippable and leaves the system working. The old tra
 - **Which model for the agent, and does the chain need verifying against the real tool schema?** ADR-0017 requires end-to-end verification of every model in a chain before it is relied on. That requirement should apply to the gateway's chain too, but it is now configured outside this repo.
 - **Where does the agent's own session history live, and is it backed up?** `db_backup.py` covers the SQLite database. The gateway's state directory is currently outside any backup.
 - **Do additional channels re-open authorization?** The single-authorized-user check is username-based. On WhatsApp or Signal there is no Telegram username, so enabling a second channel needs a different identity rule — worth knowing before someone turns one on casually.
+
+
+## Changelog
+
+Append-only. Material decision changes only — findings live in `tasks.md`.
+
+## 2026-08-01 — Gateway is the shell; domain stays Python
+**Decision:** Adopt the OpenClaw gateway for transport, sessions, model routing and cron; keep the claims domain in Python untouched.
+**Reasoning:** ~2312 of 8689 lines are a hand-rolled equivalent of the gateway's edges, with four ADRs existing only to document their failure modes. The ~5300 lines of domain logic were derived from real emails, PDFs and CSVs over a year and are the asset.
+**Trade-off accepted:** Two runtimes, two configs, and a second update surface on a deploy that already has a `.env` divergence problem.
+**Supersedes:** n/a.
+
+## 2026-08-01 — Fit the OpenClaw architecture, don't bend it (Justin)
+**Decision:** Where the gateway does something natively, use its version; keep bespoke only where losing it costs something real.
+**Reasoning:** Stated as a constraint to settle future arguments in advance. It immediately caught D2 using an agent gateway as a dumb pipe.
+**Trade-off accepted:** Several working, well-understood components go up for re-litigation (tasks §11), and some will be replaced by less familiar native equivalents.
+**Supersedes:** n/a.
+
+## 2026-08-01 — `telegram_messages` is kept (Justin)
+**Decision:** Retain the table even where the gateway duplicates parts of it. Closed; not reopenable on fit-the-architecture grounds.
+**Reasoning:** Asked directly, Justin confirmed the raw-payload training dataset is real and intended. The gateway is unlikely to store raw payloads tagged with *this app's* version.
+**Trade-off accepted:** Accepted duplication of the audit-trail and replay jobs, uninvestigated. Also forces task 12.1 — a logging tee — since the app otherwise never sees conversation it must log.
+**Supersedes:** the open audit item 11.1.
+
+## 2026-08-01 — No MCP for deterministic calls (Justin)
+**Decision:** Deterministic paths — taps, commands, unattended notifications — never involve MCP. It survives only as the conversational agent's read/propose surface.
+**Reasoning:** Justin's concern about token cost, which measurement vindicated: every tool schema ships on every chat turn, and the default surface alone is 23.5k tokens against Groq's 12k TPM.
+**Trade-off accepted:** Two mechanisms rather than one — plugin commands for deterministic work, MCP for conversation. Leaves the D3 gate-ownership question unresolved (flagged above).
+**Supersedes:** the parts of D2/D3 that routed deterministic work through MCP.
+
+## 2026-08-01 — Buttons are `command` actions, not callbacks (D12)
+**Decision:** Every button carries `action.type: "command"` invoking a plugin-registered slash command.
+**Reasoning:** Verified end to end. `callback` values are wrapped by `buildTelegramOpaqueCallbackData` before reaching Telegram, so the namespace resolver never sees them — they only work for a plugin's own send-and-decode round trip.
+**Trade-off accepted:** Every tap must be expressible as a command string, subject to a payload limit not yet measured (18.5). Justin has accepted trimming to fit.
+**Supersedes:** D2, D9, D10, D11.
+
+## 2026-08-01 — D10 written and retracted the same day
+**Decision:** Retracted "the CLI cannot send interactive messages; the integration must be a plugin".
+**Reasoning:** The five failed button attempts were one malformed payload — `buttons` at the top level of `presentation` instead of inside `blocks[{type:"buttons"}]`. The platform's own `normalizeMessagePresentation` rejects that shape and the send API returns `ok:true` regardless.
+**Trade-off accepted:** None; it was simply wrong. Kept in place rather than deleted as the record of a wrong turn.
+**Supersedes:** itself.
+
+## Known limitations, recorded up front
+
+- **A plugin is still required** — not for outbound rendering, but to register the app's slash commands. `command` actions invoke *native* commands, and `/mark` is not one.
+- **The token blocker is unsolved.** 23.5k per turn against Groq's 12k TPM. Until the surface is cut, the agent cannot run on the provider this project standardises on.
+- **This platform fails silently** — six distinct modes measured. Success responses and inspection output are not evidence.
+- **No ADRs written yet.** Tasks 8.1–8.6 plan them; the plugin-centric architecture, the no-MCP-for-deterministic rule and the command-not-callback mechanism all qualify as decisions that would surprise a newcomer. Until those exist, this document is the only record — which is a gap, not a design.
+- **Unrecorded intent:** whether the `.env` divergence between checkout and worktree was ever deliberate is still unknown, and was not invented here.
