@@ -802,6 +802,52 @@ async def stop_polling() -> None:
     _application = None
 
 
+def react_sync(chat_id, message_id, emoji: str = "👍") -> bool:
+    """The PTB half of `notify.ack`. Same throwaway-loop pattern as the senders.
+
+    Returns whether it landed and never raises: the ack exists so a slow
+    handler does not feel dead, and losing it is strictly better than losing
+    the handler.
+    """
+    if not config.TELEGRAM_BOT_TOKEN:
+        return False
+
+    async def _react() -> None:
+        bot = LoggedBot(token=config.TELEGRAM_BOT_TOKEN)
+        await bot.set_message_reaction(chat_id=int(chat_id), message_id=int(message_id),
+                                       reaction=emoji)
+
+    try:
+        asyncio.run(_react())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not add %s reaction ack: %s", emoji, exc)
+        return False
+    return True
+
+
+def edit_message_sync(chat_id, message_id, text: str) -> None:
+    """The PTB half of `notify.append_result`.
+
+    Text first, caption second — a keyboard message may be plain text OR a
+    document with a caption (merge and review alerts carry the PDF), and
+    `edit_message_text` raises on the latter. Raising out of here is correct:
+    `notify.append_result` catches it and falls back to a plain reply, so the
+    result still reaches Justin.
+    """
+    if not config.TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+
+    async def _edit() -> None:
+        bot = LoggedBot(token=config.TELEGRAM_BOT_TOKEN)
+        try:
+            await bot.edit_message_text(chat_id=int(chat_id), message_id=int(message_id), text=text)
+        except Exception:
+            await bot.edit_message_caption(chat_id=int(chat_id), message_id=int(message_id),
+                                           caption=text[:1024])
+
+    asyncio.run(_edit())
+
+
 def send_document_sync(caption: str, document: bytes, filename: str, reply_markup=None) -> None:
     """Outbound document push (e.g. the PDF invoice a review alert is about),
     same synchronous-caller pattern as send_message_sync. Telegram caps

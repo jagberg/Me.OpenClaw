@@ -128,3 +128,70 @@ def send_document(caption: str, document: bytes, filename: str,
         logger.error("outbound document dropped: %s", exc, exc_info=True)
         return False
     return True
+
+
+def ack(message_id, chat_id=None) -> bool:
+    """The 👍 on Justin's message, so a slow handler does not feel dead.
+
+    Task 4.7. Returns whether it landed and never raises — losing the ack is
+    strictly better than losing the handler, which is why every failure here is
+    a WARNING rather than an ERROR.
+
+    **Only the claim path can call this.** A `command` handler's context carries
+    no usable message id (16.2 — every correlation id came through with the `x`
+    fallback), so a tapped button gets no reaction. Its feedback is the reply
+    text instead, which is the same feedback it had before.
+    """
+    if message_id in (None, ""):
+        return False
+    target = _target() if chat_id is None else str(chat_id)
+    if target is None:
+        return False
+    try:
+        if using_gateway():
+            from . import gateway_client
+
+            return gateway_client.react(target, str(message_id))
+        from . import telegram_bot
+
+        return telegram_bot.react_sync(target, str(message_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ack failed for message %s: %s", message_id, exc)
+        return False
+
+
+def append_result(message_id, suffix: str, chat_id=None) -> bool:
+    """Append a tap's result to the message it was tapped on. Task 4.6.
+
+    **Text only, and that is a platform limit.** The CLI exposes no caption
+    flag, so an edit runs `editMode: "auto"` — `editMessageText` first, falling
+    back to `editMessageCaption` when Telegram rejects it. Since the cards are
+    Pillow images, the caption path is the normal one, and it writes
+    `editMessage failed: there is no text in the message to edit` into the
+    *gateway's* log on every success. A caption edit that genuinely failed looks
+    identical there. Accepted gap, recorded in `docs/gateway-deploy.md`.
+
+    **Falls back to a plain reply.** If the edit fails outright the result still
+    has to reach Justin — a tap whose outcome vanished is indistinguishable from
+    one that never registered, which is the failure ADR-0014 exists for. The
+    degradation is logged so a permanent fallback is visible rather than quietly
+    becoming the norm.
+    """
+    target = _target() if chat_id is None else str(chat_id)
+    if target is None:
+        return False
+    if message_id in (None, ""):
+        return send_text(suffix)
+    try:
+        if using_gateway():
+            from . import gateway_client
+
+            gateway_client.edit_message(target, str(message_id), suffix)
+        else:
+            from . import telegram_bot
+
+            telegram_bot.edit_message_sync(target, str(message_id), suffix)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("edit failed for message %s, falling back to a reply: %s", message_id, exc)
+        return send_text(suffix)

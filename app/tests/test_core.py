@@ -5174,6 +5174,67 @@ def test_a_confirm_with_a_junk_id_changes_nothing_and_says_so():
     assert _claim_count_snapshot() == before
 
 
+def test_a_tap_result_reaches_justin_even_when_the_edit_fails():
+    """4.6 — a tap whose outcome vanished is indistinguishable from one that
+    never registered, which is the failure ADR-0014 exists for. So the edit
+    falls back to a plain reply, and the degradation is logged rather than
+    quietly becoming the norm."""
+    from openclaw import notify
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        conn.execute("INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+                     "VALUES (?, ?, '2026-08-02T00:00:00Z')", (config.TELEGRAM_USERNAME, 4242))
+
+    replies = []
+    real_send, real_gw = notify.send_text, notify.using_gateway
+    notify.send_text = lambda text, buttons=None: replies.append(text) or True
+    notify.using_gateway = lambda: True
+    try:
+        from openclaw import gateway_client
+
+        real_edit = gateway_client.edit_message
+        gateway_client.edit_message = lambda *a, **k: (_ for _ in ()).throw(
+            gateway_client.GatewaySendError("exit 2: message not found"))
+        try:
+            assert notify.append_result("9", "✅ Claim #7 marked sent") is True
+            assert replies == ["✅ Claim #7 marked sent"], replies
+        finally:
+            gateway_client.edit_message = real_edit
+
+        # No message to edit at all — still says it, rather than dropping it.
+        replies.clear()
+        assert notify.append_result(None, "✅ done") is True
+        assert replies == ["✅ done"], replies
+    finally:
+        notify.send_text, notify.using_gateway = real_send, real_gw
+
+
+def test_a_failed_ack_never_costs_the_handler():
+    """4.7 — the ack exists so a slow answer does not feel dead. Losing it is
+    strictly better than losing the handler, so it returns a bool and never
+    raises, whatever the transport does."""
+    from openclaw import gateway_client, notify
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        conn.execute("INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+                     "VALUES (?, ?, '2026-08-02T00:00:00Z')", (config.TELEGRAM_USERNAME, 4242))
+
+    real_gw, real_react = notify.using_gateway, gateway_client.react
+    notify.using_gateway = lambda: True
+    try:
+        gateway_client.react = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("gateway gone"))
+        assert notify.ack("9") is False, "a broken reaction escaped as an exception"
+        gateway_client.react = lambda *a, **k: True
+        assert notify.ack("9") is True
+        # No message id is not a failure worth reporting — a command tap has none.
+        assert notify.ack(None) is False
+        assert notify.ack("") is False
+    finally:
+        notify.using_gateway, gateway_client.react = real_gw, real_react
+
+
 def test_a_pending_condition_flow_claims_the_next_typed_message_and_then_releases():
     """4.3 / 12.2 — the whole reason this flow exists. What Justin types is
     stored verbatim, with no model between his words and `condition_text`, which

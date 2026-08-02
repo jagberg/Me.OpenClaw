@@ -339,6 +339,12 @@ async def telegram_claim(
                 "claimed": False, "reason": "unauthorized"}
 
     chat_id = body.get("chat_id") or db.registered_chat_id()
+    # 👍 before deciding, not after: the ack exists so a slow answer does not
+    # feel dead, and whether a flow claims the message is irrelevant to that.
+    # It never raises, so a failed reaction cannot cost us the claim check.
+    from . import notify
+
+    notify.ack(body.get("message_id"), chat_id=chat_id)
     try:
         card = pending_flows.claim_text(chat_id, text)
     except Exception as exc:  # noqa: BLE001 — fail open, loudly

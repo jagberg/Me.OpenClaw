@@ -236,6 +236,10 @@ function registerPendingFlowClaim(api) {
             text,
             username: context.senderUsername ?? context.userName ?? context.username ?? null,
             chat_id: context.chatId ?? context.conversationId ?? null,
+            // The app acks with a reaction; it needs the id of the message it
+            // is reacting to. A command handler's context has no usable one
+            // (16.2), which is why the ack lives on this path and not there.
+            message_id: context.messageId ?? context.message?.id ?? null,
           },
           correlation,
         );
