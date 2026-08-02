@@ -5173,6 +5173,47 @@ def test_a_confirm_with_a_junk_id_changes_nothing_and_says_so():
     assert _claim_count_snapshot() == before
 
 
+def test_an_unattended_notification_with_no_registered_chat_says_so_and_sends_nothing():
+    """4.9's second half. Every outbound here is unattended — a pipeline tick on
+    cron, the daily nudge — so the only place a dropped one can surface is the
+    log, and it has to be at ERROR because the fix is a human action (`/start`).
+
+    Returns False rather than raising: a tick must not die because a
+    notification failed, and must never look like it sent one."""
+    from openclaw import notify
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM telegram_registrations")
+
+    sent = []
+    real = notify.using_gateway
+    notify.using_gateway = lambda: sent.append("reached transport") or False
+    try:
+        assert notify.send_text("claim #7 needs a condition") is False
+        assert notify.send_card("cap", b"png") is False
+        assert notify.send_document("cap", b"pdf", "x.pdf") is False
+    finally:
+        notify.using_gateway = real
+    assert sent == [], "an outbound with no target still reached the transport"
+
+
+def test_the_outbound_seam_follows_the_updater_flag():
+    """4.1 — the flag is the app updater's, so the transports are exact
+    opposites. Two pollers on one token is a 409, and the preflight fails the
+    deploy if both poll or neither does."""
+    from openclaw import config as _config, notify
+
+    before = _config.TELEGRAM_UPDATER_ENABLED
+    try:
+        _config.TELEGRAM_UPDATER_ENABLED = True
+        assert notify.using_gateway() is False, "the app polls, so the app sends"
+        _config.TELEGRAM_UPDATER_ENABLED = False
+        assert notify.using_gateway() is True, "the gateway polls, so the gateway sends"
+    finally:
+        _config.TELEGRAM_UPDATER_ENABLED = before
+
+
 def test_both_transports_run_the_same_command_logic():
     """4.1's real requirement. The updater flag stays on for a week after the
     cutover, so the PTB path and the gateway path run side by side — and a
