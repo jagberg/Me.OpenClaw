@@ -104,20 +104,28 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _vet_name(merchant: str) -> str:
-    """Delegates to the one vet vocabulary — see `vet_names.py`.
-
-    Kept as a name here because `telegram_bot` already calls it, so both the
-    cards and the text messages pick up an alias from one edit. Length was never
-    the interesting problem: `BANKSTOWN VET PEAKHURST NSW` fits, and still does
-    not tell Justin it is Boundary Road Vet.
-    """
-    from . import vet_names
-
-    return vet_names.display(merchant, limit=24)
+    """NetBank descriptors are SHOUTY and long ("THE SHIRE VETERINARY CARINGBAH
+    NSW"). Title-case only the all-caps ones — a descriptor that already has
+    mixed case ("MediPaws Sydney") is the vet's real styling, and .title()
+    would flatten it."""
+    name = merchant or ""
+    return _clip(name.title() if name.isupper() else name, 24)
 
 
 def _group_by_month(rows: list[dict]) -> list[tuple]:
-    """[(month label, month charge total, rows)] preserving newest-first order."""
+    """[(month label, month charge total, rows)] preserving the caller's order.
+
+    That order is **oldest first**, and it is a domain rule rather than a
+    presentation choice: a visit stops being claimable once it is a year old, so
+    the rows nearest the cutoff are the ones about to expire and they belong at
+    the top of page 1. `claim_status.history_rows` inverts `visit_ledger`'s
+    newest-first order deliberately to produce it, `pending_actions` sorts the
+    same way for the same reason, and the card prints "Oldest first — a visit is
+    unclaimable once a year old" in its own footer.
+
+    This docstring used to claim "newest-first", which was wrong and was the one
+    place in the codebase that invited someone to "fix" the order. Do not.
+    """
     groups = []
     for row in rows:
         key = row["date"][:7]
