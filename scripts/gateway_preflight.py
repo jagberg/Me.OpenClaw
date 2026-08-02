@@ -94,11 +94,13 @@ class Gateway:
         self.shell_prefix = shlex.split(shell_prefix)
 
     def run(self, *args: str, timeout: int = 120) -> tuple[int, str, str]:
-        proc = subprocess.run(self.prefix + list(args), capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(self.prefix + list(args), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
         return proc.returncode, proc.stdout or "", proc.stderr or ""
 
     def shell(self, script: str, timeout: int = 60) -> tuple[int, str, str]:
-        proc = subprocess.run(self.shell_prefix + [script], capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(self.shell_prefix + [script], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
         return proc.returncode, proc.stdout or "", proc.stderr or ""
 
     def json(self, *args: str, timeout: int = 120):
@@ -361,7 +363,7 @@ def check_button_commands(gw: Gateway, app_health: dict | None, commands: tuple)
     reported = (app_health.get("gateway_plugin") or {})
     if not reported:
         return result.fail(
-            "the plugin has not reported its commands — it may have loaded without running "
+            "the plugin has not reported its commands - it may have loaded without running "
             "(both enablement gates are silent), so every button tap would reach the model"
         )
     registered = set(reported.get("commands") or [])
