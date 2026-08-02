@@ -74,6 +74,18 @@ def build_buttons(buttons: list[dict]) -> dict:
             raise PresentationError(f"button has no label: {button!r}")
         if not command.startswith("/"):
             raise PresentationError(f"button command must be a slash command, got {command!r}")
+        verb = command[1:].split(" ", 1)[0]
+        if verb not in BUTTON_COMMANDS:
+            # `button_commands.py` says card-building code must draw from that
+            # tuple; until now nothing made it so. An undeclared verb is not an
+            # error at the gateway — it reaches the agent as a chat turn and
+            # spends tokens (measured live 2026-08-01), and the preflight only
+            # asserts the *declared* names are registered, so a button emitting
+            # anything else ships unasserted.
+            raise PresentationError(
+                f"button command {command!r} is not in BUTTON_COMMANDS {BUTTON_COMMANDS} — "
+                "the plugin registers only those, so this tap would reach the model"
+            )
         size = len(command.encode("utf-8"))
         if size > COMMAND_CALLBACK_BUDGET_BYTES:
             # Bytes, not characters: a non-ASCII pet or condition name costs

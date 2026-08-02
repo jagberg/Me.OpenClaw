@@ -4430,17 +4430,28 @@ def test_nothing_outside_gateway_client_shells_out_to_the_gateway():
 
     This is the guard the module map rates as only *partial* for LoggedBot —
     nothing there stops a second `telegram.Bot` being constructed."""
+    # `config.OPENCLAW_CLI`, not bare `OPENCLAW_CLI` — config.py is where the
+    # setting is DEFINED, and naming a setting is not reaching the gateway.
+    markers = ("import subprocess", "from subprocess", "config.OPENCLAW_CLI")
+
+    def hits(text):
+        return [m for m in markers if m in text]
+
+    # The scan gets its own guard: it reads production text, so a marker list
+    # that had drifted out of date would report a clean sweep forever.
+    assert hits("import subprocess\n"), "the scan misses a real bypass"
+    assert hits("from subprocess import run"), "the scan misses a real bypass"
+    assert hits("subprocess.run(config.OPENCLAW_CLI)"), "the scan misses a real bypass"
+    assert not hits('OPENCLAW_CLI = os.getenv("OPENCLAW_CLI", "openclaw")'), \
+        "config.py's own definition must not count as reaching the gateway"
+
     src = Path(__file__).resolve().parent.parent / "openclaw"
     offenders = []
     for path in sorted(src.glob("*.py")):
         if path.name == "gateway_client.py":
             continue
-        text = path.read_text(encoding="utf-8")
-        # `config.OPENCLAW_CLI`, not bare `OPENCLAW_CLI` — config.py is where the
-        # setting is DEFINED, and naming a setting is not reaching the gateway.
-        for marker in ("import subprocess", "from subprocess", "config.OPENCLAW_CLI"):
-            if marker in text:
-                offenders.append(f"{path.name}: {marker}")
+        for marker in hits(path.read_text(encoding="utf-8")):
+            offenders.append(f"{path.name}: {marker}")
     assert not offenders, (
         "these reach the gateway outside the logged seam, so their messages "
         f"would never land in telegram_messages: {offenders}"
@@ -4616,12 +4627,15 @@ def test_a_button_command_over_the_byte_budget_is_refused_not_sent():
     budget = gateway_client.COMMAND_CALLBACK_BUDGET_BYTES
     assert budget == 58, budget
 
+    # A real verb: an undeclared one is refused before the byte check now, and a
+    # fixture that trips the wrong guard measures the wrong thing.
+    pad = budget - len("/mark ")
     seen, run = _capture_argv()
-    gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": "/" + "a" * (budget - 1)}],
+    gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": "/mark " + "a" * pad}],
                                 runner=run)
     assert len(seen) == 1, "a command exactly at the budget must still send"
 
-    for command in ("/" + "a" * budget, "/mark 7 " + "é" * 30):
+    for command in ("/mark " + "a" * (pad + 1), "/mark 7 " + "é" * 30):
         try:
             gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": command}],
                                         runner=run)
@@ -4725,16 +4739,30 @@ def test_mcp_inventory_has_no_dangerous_tool():
     line. The inventory is written by hand precisely so it can be asserted."""
     from openclaw import mcp_server
 
-    offenders = []
-    for name in mcp_server.TOOL_NAMES:
-        for bad in mcp_server.FORBIDDEN_TOOL_SUBSTRINGS:
-            if bad in name:
-                offenders.append(f"{name} contains {bad!r}")
-    assert not offenders, offenders
+    def scan(names):
+        return [f"{name} contains {bad!r}"
+                for name in names for bad in mcp_server.FORBIDDEN_TOOL_SUBSTRINGS if bad in name]
 
-    # No mutation reachable, whatever the inventory says. `_impls` is built from
-    # the chat agent's implementations, which include every propose_* function;
-    # only names listed in TOOLS are selected out of it.
+    # The guard gets its own guard, the same way
+    # test_no_module_outside_claim_status_writes_the_status_column does: this
+    # scan iterates two production lists, so a tripwire that had stopped firing
+    # would pass forever and read exactly like a clean inventory. Both halves.
+    for dangerous in ("read_file", "search_mail", "get_secret", "run_shell", "send_draft"):
+        assert scan([dangerous]), f"the tripwire does not fire on {dangerous!r}"
+    assert not scan(["query_claims", "turn_context"]), "the tripwire fires on a safe name"
+
+    assert not scan(mcp_server.TOOL_NAMES), scan(mcp_server.TOOL_NAMES)
+
+    # No mutation reachable, whatever the inventory says. `_impls` selects BY
+    # NAME out of TOOL_NAMES, so set-equality and "no propose_*" hold by
+    # construction — they cannot fail. What discriminates is that there was
+    # something to filter: assert the agent dict really does carry mutations and
+    # the selection really does drop them. Without this the two asserts below
+    # would still pass if `_build_impls` returned an empty dict.
+    from openclaw import agent
+
+    droppable = [n for n in agent._build_impls([], "") if n.startswith("propose_")]
+    assert droppable, "the agent exposes no propose_* — this test would prove nothing"
     impls = mcp_server._impls()
     assert set(impls) == set(mcp_server.TOOL_NAMES), (set(impls) ^ set(mcp_server.TOOL_NAMES))
     assert not [n for n in impls if n.startswith("propose_")], list(impls)
@@ -4751,12 +4779,15 @@ def test_mcp_inventory_is_enumerated_and_within_its_token_budget():
 
     from openclaw import mcp_server
 
-    assert len(mcp_server.TOOLS) <= 12, f"{len(mcp_server.TOOLS)} tools — re-measure the turn before raising this"
+    # Ceilings sit just above the measured truth (7 tools, 2,405 chars), not at
+    # the theoretical headroom. They were 12 and 8,000, which let five tools and
+    # 3.3x the schema arrive with the suite still green — a budget nothing can
+    # exceed is not a budget. Slice 2's proposal tools WILL turn this red; that
+    # is the mechanism working, and the fix is to re-measure a real turn and
+    # raise both numbers deliberately, never to widen them ahead of the need.
+    assert len(mcp_server.TOOLS) <= 8, f"{len(mcp_server.TOOLS)} tools — re-measure the turn before raising this"
     schema_chars = len(_json.dumps(mcp_server.TOOLS))
-    # ~8,100 tokens of headroom were measured after the 17.8/17.10 cuts. At the
-    # usual ~4 chars/token this ceiling is roughly a quarter of it, which leaves
-    # room for the answers themselves.
-    assert schema_chars <= 8000, f"tool schemas are {schema_chars} chars; they ship on every turn"
+    assert schema_chars <= 3000, f"tool schemas are {schema_chars} chars; they ship on every turn"
     for tool in mcp_server.TOOLS:
         assert tool["name"] and tool["description"] and "inputSchema" in tool, tool
 
@@ -4775,7 +4806,21 @@ def test_mcp_speaks_enough_of_the_protocol_to_be_probed():
     assert "READ ONLY" in init["result"]["instructions"], init["result"]["instructions"]
 
     listed = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert [t["name"] for t in listed["result"]["tools"]] == mcp_server.TOOL_NAMES
+    served = [t["name"] for t in listed["result"]["tools"]]
+    # Frozen literal, not TOOL_NAMES: `dispatch` returns TOOLS and TOOL_NAMES is
+    # derived from TOOLS (mcp_server.py:102), so comparing the two asserted
+    # nothing any change could break. The inventory is the
+    # gmail-isolation-boundary surface and a per-turn token cost, so it changes
+    # by deliberate edit here or not at all.
+    assert served == ["turn_context", "query_claims", "pending_actions", "claim_detail",
+                      "claim_history", "submissions_awaiting_reply", "list_tasks"], served
+    # A client reads the schemas off this response, never off TOOLS.
+    assert all(t["inputSchema"]["type"] == "object" and t["description"]
+               for t in listed["result"]["tools"]), listed["result"]["tools"]
+    # `ping` is part of the probe the gateway runs; it was the one dispatch
+    # method with no assertion.
+    assert mcp_server.dispatch({"jsonrpc": "2.0", "id": 9, "method": "ping"}) == {
+        "jsonrpc": "2.0", "id": 9, "result": {}}
 
     # A notification gets no response at all — returning one is a protocol
     # violation, and the client is entitled to treat it as a broken server.
@@ -4937,10 +4982,54 @@ def test_the_plugin_report_is_per_boot_and_never_persisted():
     assert internal_api.plugin_report()["commands"] == ["mark", "pet"]
     internal_api._plugin_report.clear()
 
-    # The declared button commands are the preflight's input. If this list and
-    # the card-building code ever diverge, a button ships unasserted.
     assert gateway_client.BUTTON_COMMANDS, "the preflight has nothing to assert"
     assert all(not c.startswith("/") for c in gateway_client.BUTTON_COMMANDS), gateway_client.BUTTON_COMMANDS
+
+
+def test_the_plugin_registers_exactly_the_commands_a_button_may_emit():
+    """19a.4's missing half. `BUTTON_COMMANDS` had only two assertions on it —
+    non-empty, and slash-free — neither of which any rename could break, so the
+    tuple was decorative. It has two readers and both must agree with it:
+
+    * `gateway-plugin/index.js`, which registers the names inside the gateway;
+    * `gateway_client.build_buttons`, which is the only place a button is built.
+
+    The preflight compares the first pair at deploy time. That is the right place
+    for it — it reads the running gateway — but it means a rename went unnoticed
+    until someone deployed. This is the same check without the container.
+
+    A verb nobody registered is not an error at the gateway: the tap reaches the
+    agent as a chat turn and spends tokens (measured live 2026-08-01, three
+    `/ping` taps, three model replies)."""
+    import re as _re
+
+    from openclaw import gateway_client
+    from openclaw.button_commands import BUTTON_COMMANDS
+
+    plugin = (Path(__file__).resolve().parent.parent / "gateway-plugin" / "index.js").read_text(encoding="utf-8")
+    block = _re.search(r"const COMMANDS = \[(.*?)\];", plugin, _re.S)
+    assert block, "gateway-plugin/index.js no longer declares `const COMMANDS = [...]`"
+    registered = _re.findall(r'name:\s*"([^"]+)"', block.group(1))
+    assert registered, block.group(1)
+    assert registered == list(BUTTON_COMMANDS), (registered, BUTTON_COMMANDS)
+
+    # And the declaration is load-bearing rather than advisory: build_buttons
+    # refuses a verb outside it. `button_commands.py` already said card-building
+    # code must draw from the tuple; nothing made it so until now.
+    _fresh_db()
+    seen, run = _capture_argv()
+    for verb in BUTTON_COMMANDS:
+        gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": f"/{verb} 7"}], runner=run)
+    assert len(seen) == len(BUTTON_COMMANDS), "a declared command was refused"
+
+    for undeclared in ("/ping", "/status 7", "/markk 7 sent"):
+        try:
+            gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": undeclared}], runner=run)
+        except gateway_client.PresentationError as exc:
+            assert "BUTTON_COMMANDS" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"a button nobody registered was sent: {undeclared!r}")
+    assert len(seen) == len(BUTTON_COMMANDS), "an undeclared command reached the CLI"
 
 
 if __name__ == "__main__":
