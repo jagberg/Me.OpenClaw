@@ -348,3 +348,29 @@ out four times.
 codebase — `claim_status.py` 44 sites, `claim_forms.py` 31, `invoice_matching.py`
 30. A general data-access layer is a different proposal and would need its own
 change; do not let it ride in on this one.
+
+### ADR-0026 parked, and the privacy exposure that stays open (2026-08-03)
+
+Justin's call: leave ADR-0026 (LLM routes by purpose) at **proposed**. The
+routing shape is settled; the vision provider is not, and it is gated on two
+untested things in `docs/research/2026-08-02-free-llm-providers.md` — whether
+this account can obtain a Cerebras key, and whether any candidate's OCR holds up
+against a real scanned invoice from the corpus.
+
+**What parking accepts, stated plainly so it is not rediscovered as a surprise:**
+`extract_vision()` sends scanned vet invoices — name, address, pet names,
+itemised amounts — to Google's unpaid Gemini quota. Its terms, retrieved
+2026-08-02, say Google uses submitted content "to provide, improve, and develop"
+its models, that "human reviewers may read, annotate, and process your API input
+and output", and "Do not submit sensitive, confidential" data. Verified the same
+day: **Groq serves no vision model at all** (15 models, no `scout`, no
+`maverick`, no `-vl`), so there is no in-provider alternative to move to.
+
+Nothing is broken today and nothing is being done wrong by accident. This is a
+known exposure with a deliberate decision behind it, and the decision was to
+carry it until slice 2 ships rather than take on an unproven OCR path in the
+middle of a cutover — wrong OCR means a wrong claim amount sent to an insurer,
+which is the one purpose where a quality failure costs money rather than time.
+
+Revisit when: slice 2 is archived, or a Cerebras key becomes obtainable, or a
+vision-capable free tier appears whose terms do not permit human review.
