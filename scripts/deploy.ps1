@@ -87,11 +87,10 @@ $pluginSrc = (Resolve-Path "./app/gateway-plugin").Path.Replace('\', '/')
 # a string here failed twice -- a here-string arrived truncated with no error,
 # then a `node -e` had its quotes eaten and died on "Unexpected end of input".
 # Quoting through PowerShell -> docker -> sh is not worth defending.
-$scriptsSrc = (Resolve-Path "./scripts").Path.Replace('', '/')
+$scriptsSrc = (Resolve-Path "./scripts").Path.Replace('\', '/')
 $seedOut = docker compose run --rm --no-deps `
     -v "${pluginSrc}:/src:ro" -v "${scriptsSrc}:/seed:ro" `
     --entrypoint sh gateway /seed/gateway_seed.sh 2>&1 | Out-String
-$seedExit = $LASTEXITCODE
 $seedExit = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 if ($seedExit -ne 0) { throw "pre-boot seed failed ($seedExit) -- the gateway would not have started:`n$($seedOut.Trim())" }
