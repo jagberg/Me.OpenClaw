@@ -760,6 +760,14 @@ def _log_replay_outcome(task: asyncio.Task) -> None:
 
 async def start_polling() -> None:
     global _application
+    if not config.TELEGRAM_UPDATER_ENABLED:
+        # The cutover, and the whole point of the flag (task 4.1). Two pollers on
+        # one token is a `409 Conflict` from Telegram — measured 2026-08-03, when
+        # this check was missing and the gateway came up fighting the app for
+        # `getUpdates`. INFO, not WARNING: after the cutover this is the correct
+        # and expected state, and a WARNING here would cry wolf every boot.
+        logger.info("Telegram updater disabled (TELEGRAM_UPDATER_ENABLED=0) — the gateway owns the channel.")
+        return
     if not config.TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN not set — Telegram bot disabled.")
         return

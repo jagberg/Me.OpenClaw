@@ -5393,6 +5393,37 @@ def test_an_unattended_notification_with_no_registered_chat_says_so_and_sends_no
     assert sent == [], "an outbound with no target still reached the transport"
 
 
+def test_the_updater_flag_actually_stops_the_updater():
+    """The flag has to gate the *poller*, not just the outbound seam.
+
+    Found the hard way on 2026-08-03: `TELEGRAM_UPDATER_ENABLED` was added and
+    wired only into `notify`, so the cutover deploy handed the token to the
+    gateway while the app kept polling. Telegram answered
+    `Conflict: terminated by other getUpdates request` and the preflight failed
+    the deploy — which is the guard working, but the guard is not the fix.
+
+    A disabled updater must also read as *disabled* rather than *dead*, or
+    `_watchdog_telegram_polling` SIGTERMs the process on a loop."""
+    import asyncio as _asyncio
+
+    from openclaw import config as _config, telegram_bot
+
+    before_flag, before_app = _config.TELEGRAM_UPDATER_ENABLED, telegram_bot._application
+    built = []
+    real_build = telegram_bot.build_application
+    telegram_bot.build_application = lambda: built.append(1)
+    try:
+        _config.TELEGRAM_UPDATER_ENABLED = False
+        telegram_bot._application = None
+        _asyncio.run(telegram_bot.start_polling())
+        assert not built, "the updater was built with the flag off — two pollers, one token, 409"
+        # None, not False: the watchdog restarts the process on False.
+        assert telegram_bot.polling_alive() is None, telegram_bot.polling_alive()
+    finally:
+        telegram_bot.build_application = real_build
+        _config.TELEGRAM_UPDATER_ENABLED, telegram_bot._application = before_flag, before_app
+
+
 def test_the_outbound_seam_follows_the_updater_flag():
     """4.1 — the flag is the app updater's, so the transports are exact
     opposites. Two pollers on one token is a 409, and the preflight fails the
