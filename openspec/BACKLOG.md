@@ -299,3 +299,52 @@ names and itemised amounts. That is a boundary problem and it is live now.
 python-urllib's default User-Agent and 200 with any UA set. Not reproduced
 independently. If it holds it may explain the unexplained `403 Access denied` at
 `llm.py:139-142`. Ten minutes, and it is unrelated to the provider choice.
+
+## Split `mcp_server.py` into transport / protocol / tool-registry layers (PR #4 review, 2026-08-02)
+
+Justin's review comments on PR #4, `app/openclaw/mcp_server.py:126` and `:225` —
+*"This class is doing too much work"* and *"The mcp layer should be in its own
+file, following SOLID"*.
+
+**The concern is right; the wording needs one correction before anyone acts on
+it.** There is no class in the file, and the MCP layer *is* already its own file.
+What is actually mixed inside those 244 lines is three layers:
+
+1. **HTTP transport** — `mcp_endpoint`, the `POST`/`GET` routes, the auth guard,
+   batch handling, status codes.
+2. **JSON-RPC / MCP protocol** — `dispatch`, `_error`, `_result`, the method
+   table, protocol-version negotiation, notification handling.
+3. **Tool registry and invocation** — `TOOLS`, `TOOL_NAMES`, `_impls`,
+   `_call_tool`, `turn_context`.
+
+Splitting those three is the real request.
+
+**Deferred deliberately, and the timing is the argument.** Slice 2's section 3
+adds `propose_*` tools and the confirm gate to this exact file (tasks 3.1–3.7).
+That is roughly a 50% growth in a 244-line module, and it lands squarely in
+layer 3. Refactoring the layering now means doing it twice, or doing it against
+a shape that is about to change. **Do the split as the first task of section 3**,
+when the mutation surface arrives and the structure finally earns its keep.
+
+**Two constraints that must survive the split**, both currently resting on the
+file being one unit:
+
+- `test_mcp_inventory_has_no_dangerous_tool` and the tool-count budget assertion
+  read `TOOLS` / `TOOL_NAMES`. The inventory is the `gmail-isolation-boundary`
+  enforcement surface, so whichever module ends up owning it must stay the single
+  enumerated place — no dynamic registration, no second registry.
+- `_impls()` selects from `agent._build_impls` **by name from `TOOL_NAMES`**,
+  which is the only reason the `propose_*` functions in that same dict are
+  unreachable today. Once section 3 makes proposals legitimate, that filter stops
+  being the boundary and the split must not quietly drop it before its
+  replacement exists.
+
+**Already done from the same review** (commit on `feature/integration`): the raw
+`SELECT name FROM pets ORDER BY name` inside `turn_context` — the "data queries"
+half of the comment — collapsed into `db.list_pet_names()`. It had been written
+out four times.
+
+**Not in scope here, and much larger:** raw SQL is spread across the whole
+codebase — `claim_status.py` 44 sites, `claim_forms.py` 31, `invoice_matching.py`
+30. A general data-access layer is a different proposal and would need its own
+change; do not let it ride in on this one.

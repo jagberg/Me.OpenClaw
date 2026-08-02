@@ -267,6 +267,22 @@ def get_connection(path: str | None = None):
         conn.close()
 
 
+def list_pet_names() -> list[str]:
+    """The pets on file, alphabetical. THE reader — do not inline this query.
+
+    It was written out four times (three in `agent.py`, one in `mcp_server.py`),
+    which is the "second answer to the same question" shape this codebase has
+    been bitten by repeatedly. Collapsed here on review, 2026-08-02.
+
+    It matters more than a tidy-up because of what consumes it: this list is
+    what tells the model which pets exist. Left to guess, it invented 'Whiskers'
+    and 'Fluffy'. A copy that drifts does not fail loudly — it produces a
+    confident answer about a pet that is not there.
+    """
+    with get_connection() as conn:
+        return [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
+
+
 def get_non_vet_patterns() -> list[str]:
     """Lowercased merchant substrings that must never be classified as vet."""
     with get_connection() as conn:

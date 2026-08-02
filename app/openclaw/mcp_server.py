@@ -119,8 +119,7 @@ def turn_context() -> str:
     file would be correct until the day a pet is added, and then wrong silently
     — which is why the shipped `USER.md` deliberately omits it.
     """
-    with db.get_connection() as conn:
-        pets = [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
+    pets = db.list_pet_names()
     today = datetime.now(timezone.utc).date().isoformat()
     return (f"Today is {today}. The ONLY pets that exist: {', '.join(pets) if pets else '(none on file)'}. "
             "Resolve relative dates against today and state the range you used.")
