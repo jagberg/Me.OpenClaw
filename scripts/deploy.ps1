@@ -138,7 +138,12 @@ try {
     # deploy. Which runtime should be polling is direction-dependent, so it
     # belongs in the preflight's check_exactly_one_poller -- which fails on BOTH
     # polling (409 Conflict) and on neither (every message silently dropped).
-    if ($tg -and $tg.lastError) { $failures += "gateway: telegram lastError = $($tg.lastError)" }
+    # "not configured" is the CORRECT pre-cutover state, not a fault: the
+    # gateway deliberately holds no token, so the channel has nothing to
+    # configure itself from. Anything else is a real error.
+    if ($tg -and $tg.lastError -and $tg.lastError -ne "not configured") {
+        $failures += "gateway: telegram lastError = $($tg.lastError)"
+    }
 } catch {
     $failures += "gateway: health unreachable ($($_.Exception.Message))"
     Write-Host "UNREACHABLE"
