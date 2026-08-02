@@ -254,3 +254,48 @@ system tolerates gets skipped, and a skipped gate is worse than no gate.
 Slice 1 deliberately used `config validate` as the authoritative pre-boot check
 instead, since it exits non-zero on warnings and is the same validation the
 gateway runs at startup.
+
+## Route the LLM backend by purpose, and get vision off the unpaid Gemini quota (2026-08-02)
+
+Design settled in **ADR-0026** (status: *proposed*, not accepted). Survey and the
+numbers behind it: `docs/research/2026-08-02-free-llm-providers.md`.
+
+**Why it is open rather than done.** The routing shape is agreed; the vision
+provider is not, and picking it needs two things nobody has tested:
+
+1. Whether this account can obtain a **Cerebras** key. Its free tier was sold out
+   for this account on 2026-07-23 and has not been retried. Cerebras is the only
+   surveyed candidate that answers vision *and* the cross-provider gap in one
+   move, so this gates the recommendation.
+2. Whether any candidate's **OCR holds up against a real scanned invoice** from
+   the corpus — not a benchmark. Wrong OCR means a wrong amount on a claim sent
+   to an insurer. This is the one LLM purpose where a quality failure costs money
+   rather than patience.
+
+**Why it should not wait indefinitely.** Verified from Google's own terms on
+2026-08-02: the unpaid Gemini quota is used to "provide, improve, and develop"
+its models, "human reviewers may read, annotate, and process your API input and
+output", and it says "Do not submit sensitive, confidential" data. Every scanned
+vet invoice `extract_vision()` handles goes there, carrying name, address, pet
+names and itemised amounts. That is a boundary problem and it is live now.
+
+**The work, once the provider is chosen** (~40 lines, no call-site changes —
+`purpose` is already an argument on all five call sites):
+
+- `_PURPOSE_PROVIDER` map consulted by `_resolve()`, defaulting to
+  `config.LLM_PROVIDER` for any unmapped purpose.
+- `_client` module global becomes a dict keyed by base URL. **This is the
+  load-bearing change** — it is what currently makes a cross-provider chain
+  impossible, and it is why simply adding a second provider to config does not
+  fix the eval's single-point finding (axis 5c).
+- `_FALLBACK_MODELS` entries become `(provider, model)`.
+- Per-provider 429 classification. `_is_daily_budget_exhausted` matches
+  `"tokens per day"`/`"(tpd)"`, which is Groq-shaped; any other provider's body
+  produces a chain that never walks and never says so.
+- `_last_model_used` stops being a module global — with routing it goes from
+  stale to wrong, and it is how Justin learns he got a fallback.
+
+**Related, and cheap to check first:** one agent observed Groq returning 403 to
+python-urllib's default User-Agent and 200 with any UA set. Not reproduced
+independently. If it holds it may explain the unexplained `403 Access denied` at
+`llm.py:139-142`. Ten minutes, and it is unrelated to the provider choice.
