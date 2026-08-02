@@ -137,6 +137,9 @@ if ($changed) {
     Start-Sleep -Seconds 15
 }
 
+# --- apply the gateway's own configuration ------------------------------------
+& ./scripts/gateway_configure.ps1
+
 # --- preflight: the config assertions no app-side test can make ---------------
 
 if ($SkipPreflight) {

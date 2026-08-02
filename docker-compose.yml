@@ -93,6 +93,11 @@ services:
       # permissions problem (14.4). Read-only: the gateway sends these, it does
       # not write them.
       - media_outbox:/home/node/.openclaw/media:ro
+      # The plugin, read-only and straight from the repo, so it is versioned with
+      # the app rather than copied into a volume where a diff cannot see it. The
+      # gateway only ever reads a plugin directory. `plugins.load.paths` points
+      # here -- set by scripts/gateway_configure.ps1, not by hand.
+      - ./app/gateway-plugin:/opt/claims-plugin:ro
     depends_on:
       - app
 
