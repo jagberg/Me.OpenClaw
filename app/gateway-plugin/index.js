@@ -70,6 +70,9 @@ const COMMANDS = [
   { name: "dismiss", description: "Reviewed, dismiss the mismatch" },
   { name: "merge", description: "One invoice, one claim -- merge these charges" },
   { name: "reject", description: "Not the same invoice" },
+  // The per-item condition walk. `/item <n>` picks a prior condition,
+  // `/item type` waits for free text, `/item skip` marks it unclaimable.
+  { name: "item", description: "Answer the current invoice item" },
 ];
 
 async function callApp(route, body, correlationId) {
@@ -192,6 +195,66 @@ async function reportRegistration(names, logger) {
   }
 }
 
+
+/**
+ * Claim Justin's next typed message when a flow owns it (task 4.3 / 12.2).
+ *
+ * `before_dispatch` runs AFTER command routing and BEFORE the model -- the
+ * gateway's own words: "inspect or handle a message before model dispatch;
+ * first handler returning { handled: true } wins". That ordering is why it is
+ * the right hook and `inbound_claim` is not: a slash command must still work
+ * while a condition-entry flow is pending.
+ *
+ * THE DECISION IS NOT HERE. This asks the app and obeys. A plugin that decided
+ * for itself would be a second copy of "is a flow pending", and the whole point
+ * is that Justin's typed condition reaches `condition_text` verbatim with no
+ * model in between -- the field the hard rules forbid inferring.
+ *
+ * FAILS OPEN. Any error means not claimed, so the message reaches the agent
+ * rather than vanishing; a lost message is worse than a stray chat turn. The
+ * app logs the failure at ERROR on its side, because a flow that stopped
+ * claiming is a condition entry silently going to a model.
+ */
+function registerPendingFlowClaim(api) {
+  if (typeof api.registerHook !== "function") {
+    // Loud, not fatal. Without this the condition flow still works on the
+    // PTB path; after the cutover it would silently route to the agent.
+    api.logger?.error?.("claims: api.registerHook is unavailable -- typed condition entry will reach the model");
+    return;
+  }
+  api.registerHook(
+    "before_dispatch",
+    async (event) => {
+      const context = event?.context ?? {};
+      const text = context.text ?? context.message?.text ?? "";
+      if (!text || text.startsWith("/")) return {};
+      const correlation = correlationId("claim", context);
+      try {
+        const { status, text: body } = await callApp(
+          "telegram/claim",
+          {
+            text,
+            username: context.senderUsername ?? context.userName ?? context.username ?? null,
+            chat_id: context.chatId ?? context.conversationId ?? null,
+          },
+          correlation,
+        );
+        if (status >= 400) return {};
+        const answer = JSON.parse(body);
+        if (!answer?.claimed) return {};
+        return { handled: true, reply: { text: answer.reply || "" } };
+      } catch (err) {
+        api.logger?.error?.(`claims: pending-flow claim check failed, message passed to the agent: ${String(err)}`);
+        return {};
+      }
+    },
+    // Hook names are GLOBAL. A collision pushes an error diagnostic and returns
+    // without registering -- the same silent-ish class as registerCommand's --
+    // so the name is prefixed.
+    { name: "claims-pending-flow", description: "Route a typed reply to the claim flow that is waiting for it" },
+  );
+}
+
 export default definePluginEntry({
   id: "claims",
   name: "OpenClaw Claims",
@@ -226,6 +289,8 @@ export default definePluginEntry({
 
     // Deliberately not awaited — `register()` must stay synchronous or the
     // gateway discards every registration made above (0.7).
+    registerPendingFlowClaim(api);
+
     void claimCommandMenu(api.logger);
     void reportRegistration(registered, api.logger);
 

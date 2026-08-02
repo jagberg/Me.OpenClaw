@@ -213,6 +213,26 @@ CREATE TABLE IF NOT EXISTS pending_proposals (
 
 CREATE INDEX IF NOT EXISTS idx_pending_proposals_open
     ON pending_proposals(confirmed_at, created_at);
+
+-- A flow that owns Justin's next typed message: entering a condition free-hand,
+-- or walking a multi-item invoice one line at a time.
+-- Durable for the same reason pending_proposals is. These were two dicts keyed
+-- by chat id in `telegram_bot`, which was fine while one process owned the tap,
+-- the state and the reply. After the cutover the tap is at the gateway, the
+-- claim decision is an HTTP call, and the reply is a third hop — so a restart
+-- in between would silently hand a typed condition to the chat agent, and
+-- `condition_text` is a field the hard rules forbid inferring.
+-- One row per (chat, kind): a chat can have a condition and a split pending at
+-- once, which is what the in-memory version allowed.
+CREATE TABLE IF NOT EXISTS pending_flows (
+    chat_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    claim_id INTEGER,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, kind)
+);
 """
 
 # vet_claims columns added after the table's initial release — CREATE TABLE IF

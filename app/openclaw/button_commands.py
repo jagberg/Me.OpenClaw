@@ -17,4 +17,4 @@ unasserted.
 """
 
 BUTTON_COMMANDS = ("mark", "pet", "resolve", "history", "actions", "confirm",
-                   "unmatch", "invreq", "dismiss", "merge", "reject")
+                   "unmatch", "invreq", "dismiss", "merge", "reject", "item")

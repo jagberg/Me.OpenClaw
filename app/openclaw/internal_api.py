@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
 
-from . import config, gmail_ingest, message_log, pipeline
+from . import config, db, gmail_ingest, message_log, pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +293,72 @@ async def command(
     logger.info("command /%s cards=%s failed=%s correlation=%s", name, sent, len(failed), correlation)
     return {"status": "ok" if not failed else "partial", "route": f"command/{name}",
             "correlation_id": correlation, "result": text}
+
+
+@router.post("/telegram/claim")
+async def telegram_claim(
+    request: Request,
+    x_openclaw_secret: str | None = Header(default=None),
+    x_correlation_id: str | None = Header(default=None),
+):
+    """Does a pending flow own this message? The plugin asks; the app decides.
+
+    Reached from the plugin's `before_dispatch` hook, which runs after command
+    routing and before the model. A `claimed: true` answer means the plugin
+    returns `{ handled: true }` and the agent never sees the text — which is
+    the whole point: `condition_text` is a field the hard rules forbid
+    inferring, and the chat agent would cheerfully interpret the words.
+
+    The decision lives in Python, next to the data. A plugin that decided for
+    itself would be a second copy of "is a flow pending", and this codebase has
+    been bitten five times by second copies.
+
+    **Fails open, deliberately.** If this errors the answer is "not claimed",
+    so the message reaches the agent rather than vanishing. A lost message is
+    worse than an unnecessary chat turn — but the failure is logged at ERROR,
+    because a flow that stopped claiming is a condition entry silently going to
+    a model.
+    """
+    from . import pending_flows
+
+    correlation = _correlation_id(x_correlation_id)
+    rejected = _guard(request, x_openclaw_secret, "telegram/claim", correlation)
+    if rejected is not None:
+        return rejected
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    username, text = body.get("username"), body.get("text") or ""
+    if not commands_is_authorized(username):
+        # Not this app's user. Claim nothing and say so — the gateway can do
+        # what it likes with a stranger's message, but no flow of Justin's may
+        # consume it.
+        return {"status": "ok", "route": "telegram/claim", "correlation_id": correlation,
+                "claimed": False, "reason": "unauthorized"}
+
+    chat_id = body.get("chat_id") or db.registered_chat_id()
+    try:
+        card = pending_flows.claim_text(chat_id, text)
+    except Exception as exc:  # noqa: BLE001 — fail open, loudly
+        logger.error("pending-flow claim check failed correlation=%s: %s", correlation, exc, exc_info=True)
+        return {"status": "error", "route": "telegram/claim", "correlation_id": correlation,
+                "claimed": False, "reason": str(exc)}
+
+    if card is None:
+        return {"status": "ok", "route": "telegram/claim", "correlation_id": correlation,
+                "claimed": False}
+    logger.info("pending flow claimed a message correlation=%s", correlation)
+    return {"status": "ok", "route": "telegram/claim", "correlation_id": correlation,
+            "claimed": True, "reply": card.get("text") or card.get("prompt") or "",
+            "buttons": card.get("buttons") or []}
+
+
+def commands_is_authorized(username: str | None) -> bool:
+    from . import commands
+
+    return commands.is_authorized(username)
 
 
 @router.post("/telegram/event")

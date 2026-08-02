@@ -23,7 +23,7 @@ from telegram.ext import (
 )
 
 from . import (agent, claim_card, claim_forms, claim_status, commands, config, db,
-               invoice_matching, llm, message_log, proposals)
+               invoice_matching, llm, message_log, pending_flows, proposals)
 
 logger = logging.getLogger(__name__)
 
@@ -320,9 +320,9 @@ def _invoice_items(claim_id: int) -> list[dict]:
     return [{"description": s.strip(), "amount": None} for s in services.split(",")] if services else []
 
 
-# chat_id -> {claim_id, pet_id, items, idx, assigned, await_type} for the
-# per-item condition split. In-memory (same trade-off as _pending_condition).
-_pending_split: dict[int, dict] = {}
+# The per-item split and free-text condition flows live in `pending_flows`,
+# durably, because after the cutover the tap, the claim decision and the reply
+# are three separate requests. Two module dicts could not span that.
 
 
 def _item_keyboard(pet_id: int) -> InlineKeyboardMarkup:
@@ -335,27 +335,24 @@ def _item_keyboard(pet_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-async def _prompt_current_item(chat_id: int, bot) -> None:
-    state = _pending_split[chat_id]
-    item = state["items"][state["idx"]]
-    amt = f" (${float(item['amount']):.2f})" if item["amount"] is not None else ""
-    await bot.send_message(
-        chat_id=chat_id,
-        text=f"Item {state['idx'] + 1}/{len(state['items'])}: {item['description']}{amt}\nWhich condition?",
-        reply_markup=_item_keyboard(state["pet_id"]),
-    )
+async def _send_flow_card(chat_id: int, bot, card: dict | None) -> None:
+    """Render one pending-flow card on the PTB path.
 
-
-async def _record_and_advance(chat_id: int, condition: str | None, bot) -> None:
-    state = _pending_split[chat_id]
-    state["items"][state["idx"]]["condition"] = condition
-    state["idx"] += 1
-    if state["idx"] < len(state["items"]):
-        await _prompt_current_item(chat_id, bot)
-    else:
-        result = claim_forms.apply_item_conditions(state["claim_id"], state["items"])
-        _pending_split.pop(chat_id, None)
-        await bot.send_message(chat_id=chat_id, text=result["message"])
+    The card comes from `pending_flows`, which also answers the gateway's
+    `before_dispatch` hook — same words, same buttons, either transport. This
+    function is the rendering and nothing else.
+    """
+    if not card:
+        return
+    text = card.get("prompt") or card.get("text") or ""
+    if not text:
+        return
+    markup = None
+    if card.get("buttons"):
+        markup = _cmd_markup(card["buttons"])
+    elif card.get("force_reply"):
+        markup = ForceReply()
+    await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
 
 
 def wrong_invoice_button(claim_id: int) -> InlineKeyboardMarkup:
@@ -384,12 +381,10 @@ def pet_keyboard(claim_id: int) -> InlineKeyboardMarkup:
     )
 
 
-# chat_id -> claim_id awaiting a free-text condition reply. In-memory: a lost
-# entry (container restart) just means Justin taps the button again.
-_pending_condition: dict[int, int] = {}
-
 # token -> proposed action awaiting the user's Confirm tap (from the chat agent).
-# In-memory like _pending_condition: a lost entry (restart) just means re-asking.
+# In-memory: a lost entry (restart) just means re-asking. Unlike the pending
+# flows, this one dies with telegram_bot at the cutover -- chat proposals go
+# through `proposals` and its durable table (ADR-0027).
 _pending_actions: dict[str, dict] = {}
 
 
@@ -486,10 +481,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             result = claim_forms.set_condition_text(cid, conds[idx])
             await _append_result(query, f"✅ {result['message']}")
     elif data.startswith("condother:"):
-        _pending_condition[query.message.chat_id] = int(data.split(":", 1)[1])
+        started = pending_flows.start_condition(query.message.chat_id, int(data.split(":", 1)[1]))
         await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text="Reply to this message with the condition being claimed:",
+            text=started["prompt"],
             reply_markup=ForceReply(),
         )
     elif data.startswith("setpet:"):
@@ -521,25 +516,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not items or not pet or pet["pet_id"] is None:
             await context.bot.send_message(chat_id=query.message.chat_id, text="Can't split — no line items or pet.")
             return
-        _pending_split[query.message.chat_id] = {"claim_id": cid, "pet_id": pet["pet_id"], "items": items, "idx": 0}
-        await _prompt_current_item(query.message.chat_id, context.bot)
+        pending_flows.start_split(query.message.chat_id, cid, pet["pet_id"], items)
+        await _send_flow_card(query.message.chat_id, context.bot,
+                              pending_flows.item_prompt(query.message.chat_id))
     elif data == "siskip":
-        if query.message.chat_id in _pending_split:
-            await _record_and_advance(query.message.chat_id, None, context.bot)
+        await _send_flow_card(query.message.chat_id, context.bot,
+                              pending_flows.record_item(query.message.chat_id, None))
     elif data == "sitype":
-        state = _pending_split.get(query.message.chat_id)
-        if state:
-            state["await_type"] = True
-            await context.bot.send_message(
-                chat_id=query.message.chat_id, text="Reply with the condition for this item:", reply_markup=ForceReply()
-            )
+        card = pending_flows.await_typed_item(query.message.chat_id)
+        await context.bot.send_message(chat_id=query.message.chat_id,
+                                       text=card.get("prompt") or card.get("text", ""),
+                                       reply_markup=ForceReply() if card.get("force_reply") else None)
     elif data.startswith("si:"):
-        state = _pending_split.get(query.message.chat_id)
-        if state:
-            conds = prior_conditions(state["pet_id"])
+        flow = pending_flows.get(query.message.chat_id, pending_flows.SPLIT)
+        if flow:
+            conds = prior_conditions(flow["state"]["pet_id"])
             idx = int(data.split(":", 1)[1])
             if 0 <= idx < len(conds):
-                await _record_and_advance(query.message.chat_id, conds[idx], context.bot)
+                await _send_flow_card(query.message.chat_id, context.bot,
+                                      pending_flows.record_item(query.message.chat_id, conds[idx]))
     elif data.startswith("act:"):
         proposal = _pending_actions.pop(data.split(":", 1)[1], None)
         if proposal is None:
@@ -635,16 +630,13 @@ async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # correction Justin had just made.
     message = update.effective_message
     text = message.text.strip()
-    # A typed condition for the current item in a split flow takes priority.
-    split = _pending_split.get(chat_id)
-    if split and split.get("await_type"):
-        split["await_type"] = False
-        await _record_and_advance(chat_id, text, context.bot)
-        return
-    claim_id = _pending_condition.pop(chat_id, None)
-    if claim_id is not None:
-        result = claim_forms.set_condition_text(claim_id, text)
-        await message.reply_text(result["message"])
+    # Does a pending flow own this message? One decision, in `pending_flows`,
+    # shared with the gateway's `before_dispatch` hook — a second copy of "is a
+    # flow pending" is how the two transports would come to disagree about
+    # whether the agent sees a typed condition.
+    card = pending_flows.claim_text(chat_id, text)
+    if card is not None:
+        await _send_flow_card(chat_id, context.bot, card)
         return
     # No pending typed-reply flow owns this message — treat it as free-form chat.
     await _handle_chat(update)

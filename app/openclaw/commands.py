@@ -378,6 +378,17 @@ def actions_cards() -> list[dict]:
 # --- dispatch ----------------------------------------------------------------
 
 
+def username_chat(username: str | None):
+    """The chat a command's flow state belongs to.
+
+    One user, one chat, so the registered chat id is the key — and it is the
+    same key the tap path and the notify path already use. Taking it from the
+    command's own context instead would give the gateway path a different key
+    from the PTB path for the same conversation.
+    """
+    return db.registered_chat_id()
+
+
 def _claim_id_and_rest(args: str) -> tuple[int | None, str]:
     head, _, rest = args.strip().partition(" ")
     try:
@@ -418,6 +429,26 @@ def dispatch(name: str, args: str, username: str | None) -> dict:
         return {"text": "", "cards": actions_cards()}
 
     claim_id, rest = _claim_id_and_rest(args)
+    if name == "item":
+        from . import pending_flows
+
+        word = args.strip().lower()
+        if word == "type":
+            return {"text": "", "cards": [pending_flows.await_typed_item(username_chat(username))]}
+        if word == "skip":
+            return {"text": "", "cards": [pending_flows.record_item(username_chat(username), None)]}
+        flow = pending_flows.get(username_chat(username), pending_flows.SPLIT)
+        if flow is None:
+            return {"text": "No item flow is in progress. Tap the split button again.", "cards": []}
+        try:
+            index = int(word)
+        except ValueError:
+            return {"text": "Usage: /item <n> | /item type | /item skip", "cards": []}
+        conditions = prior_conditions(flow["state"]["pet_id"])
+        if not 0 <= index < len(conditions):
+            return {"text": f"No prior condition #{index}.", "cards": []}
+        return {"text": "", "cards": [pending_flows.record_item(username_chat(username), conditions[index])]}
+
     if name in ("merge", "reject"):
         if claim_id is None:
             return {"text": f"/{name} needs a proposal id.", "cards": []}

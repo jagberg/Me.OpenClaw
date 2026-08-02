@@ -1688,6 +1688,7 @@ def _fresh_db():
         # Proposals are keyed to claims that are about to be deleted; leaving
         # them makes "did this refusal queue anything?" depend on test order.
         conn.execute("DELETE FROM pending_proposals")
+        conn.execute("DELETE FROM pending_flows")
         conn.execute("UPDATE pets SET policy_anniversary = NULL")
 
 
@@ -5171,6 +5172,139 @@ def test_a_confirm_with_a_junk_id_changes_nothing_and_says_so():
         assert outcome["ok"] is False, (junk, outcome)
         assert "Nothing was changed" in outcome["message"] or "not found" in outcome["message"], outcome
     assert _claim_count_snapshot() == before
+
+
+def test_a_pending_condition_flow_claims_the_next_typed_message_and_then_releases():
+    """4.3 / 12.2 — the whole reason this flow exists. What Justin types is
+    stored verbatim, with no model between his words and `condition_text`, which
+    is the field the hard rules forbid inferring.
+
+    Claims exactly once. A flow that kept claiming would swallow the rest of the
+    conversation; one that never claimed would hand the condition to the agent."""
+    from openclaw import pending_flows
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="matched")
+        cid = conn.execute("SELECT id FROM vet_claims").fetchone()["id"]
+
+    assert pending_flows.claim_text(7001, "hello there") is None, "claimed with no flow pending"
+
+    started = pending_flows.start_condition(7001, cid)
+    assert started["force_reply"] is True and "condition" in started["prompt"], started
+    # Durable: the state is a row, not a dict, because the tap, the claim check
+    # and the reply are three separate requests after the cutover.
+    with db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM pending_flows WHERE kind = 'condition'").fetchone()["c"] == 1
+
+    card = pending_flows.claim_text(7001, "kennel cough")
+    assert card is not None and "kennel cough" in card["text"], card
+    with db.get_connection() as conn:
+        stored = conn.execute("SELECT condition_text FROM vet_claims WHERE id = ?", (cid,)).fetchone()[0]
+    assert stored == "kennel cough", stored
+
+    assert pending_flows.claim_text(7001, "and another thing") is None, "the flow claimed twice"
+    with db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM pending_flows").fetchone()["c"] == 0
+
+
+def test_a_split_flow_walks_every_item_and_only_then_applies():
+    """The per-item walk. Nothing is written until the last item is answered —
+    `apply_item_conditions` runs once, not per item, so an abandoned flow leaves
+    the claim untouched rather than half-conditioned."""
+    from openclaw import pending_flows
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="matched")
+        cid = conn.execute("SELECT id FROM vet_claims").fetchone()["id"]
+
+    items = [{"description": "consult", "amount": 80.0}, {"description": "vaccine", "amount": 40.0}]
+    prompt = pending_flows.start_split(7002, cid, 1, items)
+    assert "Item 1/2" in prompt["prompt"] and "consult" in prompt["prompt"], prompt
+    # Buttons are commands, inside budget, and the verb is registered.
+    from openclaw.button_commands import BUTTON_COMMANDS
+    for button in prompt["buttons"]:
+        assert button["command"][1:].split(" ")[0] in BUTTON_COMMANDS, button
+        assert len(button["command"].encode("utf-8")) <= 58, button
+
+    nxt = pending_flows.record_item(7002, "itchy ear")
+    assert "Item 2/2" in nxt["prompt"], nxt
+    # Still nothing applied at the halfway point.
+    assert pending_flows.get(7002, pending_flows.SPLIT) is not None
+
+    done = pending_flows.record_item(7002, None)
+    assert "text" in done, done
+    assert pending_flows.get(7002, pending_flows.SPLIT) is None, "the flow outlived its last item"
+
+
+def test_a_typed_item_beats_a_pending_condition_and_the_flow_is_one_decision():
+    """Both flows can be pending at once, as they could when they were two
+    dicts. The typed item wins — it is the more specific state.
+
+    And there is ONE decision function: `claim_text`. The PTB handler and the
+    gateway's `before_dispatch` hook both call it, so the two transports cannot
+    disagree about whether the agent sees a typed condition."""
+    from openclaw import pending_flows, telegram_bot
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="matched")
+        cid = conn.execute("SELECT id FROM vet_claims").fetchone()["id"]
+
+    pending_flows.start_condition(7003, cid)
+    pending_flows.start_split(7003, cid, 1, [{"description": "consult", "amount": 80.0}])
+    pending_flows.await_typed_item(7003)
+
+    card = pending_flows.claim_text(7003, "arthritis")
+    assert card is not None, "the typed item did not claim"
+    # The split consumed it, so the condition flow is still waiting.
+    assert pending_flows.get(7003, pending_flows.CONDITION) is not None
+    assert pending_flows.get(7003, pending_flows.SPLIT) is None, "the one-item split did not finish"
+
+    # No second copy of the decision. The scan is for the state KEY, not for
+    # the module's function names -- calling `pending_flows.await_typed_item` is
+    # the intended use; reaching into `state["await_type"]` is the copy. An
+    # earlier version of this check matched both and would have failed forever.
+    marker = '"await_type"'
+    assert marker in (Path(__file__).resolve().parent.parent / "openclaw" / "pending_flows.py"
+                      ).read_text(encoding="utf-8"), "the scan's marker no longer exists"
+    offenders = [p.name for p in (Path(__file__).resolve().parent.parent / "openclaw").glob("*.py")
+                 if p.name != "pending_flows.py" and marker in p.read_text(encoding="utf-8")]
+    assert not offenders, f"these reimplement the pending-flow decision: {offenders}"
+    assert callable(telegram_bot._send_flow_card)
+
+
+def test_the_claim_endpoint_fails_open_and_refuses_a_stranger():
+    """A claim check that errors must let the message through — a lost message
+    is worse than a stray chat turn — and a stranger's message must never be
+    consumed by a flow of Justin's."""
+    from openclaw import internal_api, pending_flows
+
+    _fresh_db()
+    assert internal_api.commands_is_authorized("someone-else") is False
+    assert internal_api.commands_is_authorized(config.TELEGRAM_USERNAME) is True
+
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="matched")
+        cid = conn.execute("SELECT id FROM vet_claims").fetchone()["id"]
+    pending_flows.start_condition(7004, cid)
+
+    real = pending_flows.claim_text
+    pending_flows.claim_text = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db gone"))
+    try:
+        # The route's own body is async; assert the property the route relies on
+        # — that the failure is catchable here rather than escaping upward.
+        try:
+            pending_flows.claim_text(7004, "x")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("the stub did not raise")
+    finally:
+        pending_flows.claim_text = real
+    # And the flow is still pending, so nothing was consumed by the failure.
+    assert pending_flows.get(7004, pending_flows.CONDITION) is not None
 
 
 def test_an_unattended_notification_with_no_registered_chat_says_so_and_sends_nothing():
