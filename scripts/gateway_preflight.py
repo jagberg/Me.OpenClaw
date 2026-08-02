@@ -250,6 +250,49 @@ def check_isolation(gw: Gateway) -> Result:
     return result.fail("; ".join(problems)) if problems else result.ok()
 
 
+def check_exactly_one_poller(gw: Gateway, app_health: dict | None) -> Result:
+    """The single most dangerous configuration in this whole change.
+
+    Telegram answers a second long-poller on the same token with `409 Conflict`,
+    and the bot stops working. The app polls whenever `telegram_bot.start_polling`
+    runs; the gateway starts polling the *instant* it detects a token, and
+    announces it as `auto-enabled plugins for this runtime without writing
+    config` — so simply putting the token in the gateway's environment is enough
+    to break Telegram, with nothing in compose looking wrong.
+
+    Both states are legitimate, at different times:
+      - slice 1: the app polls, the gateway does not (no token, no channel)
+      - after cutover: the gateway polls, the app's updater is off
+
+    Neither is: two pollers fight, and zero means nobody is listening at all and
+    every message is silently dropped. This check exists so the cutover is a
+    verifiable step rather than a hope, in both directions.
+    """
+    result = Result("exactly one Telegram poller")
+    if app_health is None:
+        return result.skip("the app's /health was unreachable; the poller count is UNVERIFIED")
+
+    app_polling = bool(app_health.get("polling_alive"))
+    try:
+        telegram = ((gw.health().get("channels") or {}).get("telegram") or {})
+    except Exception as exc:  # noqa: BLE001
+        return result.skip(f"could not read the gateway's channel state: {exc}")
+    gateway_polling = bool(telegram.get("running"))
+
+    if app_polling and gateway_polling:
+        return result.fail(
+            "BOTH runtimes are polling the bot token. Telegram answers the second poller with "
+            "409 Conflict and the bot stops working. Clear TELEGRAM_BOT_TOKEN from the gateway, "
+            "or disable the app's updater — not neither"
+        )
+    if not app_polling and not gateway_polling:
+        return result.fail(
+            "NEITHER runtime is polling. Nothing is listening to Telegram and every message is "
+            "dropped in silence, which looks identical to a quiet day"
+        )
+    return result.ok("the gateway" if gateway_polling else "the app (pre-cutover)")
+
+
 def check_media_roots(cfg: dict) -> Result:
     """19b.7 / 14.4 — `localRoots: "any"` disables the check outright.
 
@@ -380,6 +423,7 @@ def main() -> int:
     else:
         results.append(Result("app reachable").ok(f"version {app_health.get('app_version')}"))
 
+    results.append(check_exactly_one_poller(gw, app_health))
     results.append(check_boundary_plugins(gw))
     results.append(check_access_policy({"telegram": gw.config("channels.telegram"),
                                         "commands": gw.config("commands")}))

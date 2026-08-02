@@ -45,9 +45,28 @@ services:
     #     forbidden.
     #   - no Docker socket.
     environment:
-      # The gateway holds the bot token. Nothing else does — two pollers on one
-      # token is a 409 Conflict, which is why the cutover is atomic.
-      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:?the gateway owns the bot token}"
+      # ---------------------------------------------------------------------
+      # SUPPLYING THIS TOKEN *IS* THE CUTOVER. Leave it empty until then.
+      #
+      # The gateway auto-enables Telegram the moment it detects a token, and
+      # says so without writing config: "auto-enabled plugins for this runtime
+      # without writing config: Telegram configured, enabled automatically."
+      # The Python app still calls telegram_bot.start_polling(). Two pollers on
+      # one token is a 409 Conflict from Telegram and the bot stops working.
+      #
+      # So this is deliberately NOT required. Slice 1 runs both containers with
+      # the gateway holding no token and no channel bound; the app owns Telegram
+      # exactly as it does today. Section 4 disables the app's updater and fills
+      # this in, in that order, as one step.
+      #
+      # `scripts/gateway_preflight.py` asserts exactly one poller and fails the
+      # deploy if both or neither are live, so getting this wrong is loud.
+      #
+      # Consequence while it is empty: the plugin cannot claim Telegram's
+      # per-chat command menu and logs a warning saying so. Expected, not a
+      # fault -- there is no bot for it to claim a menu on.
+      # ---------------------------------------------------------------------
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
       # It refuses to bind without auth and defaults to 0.0.0.0 in a container.
       # A good default: it fails closed.
       OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN:?gateway refuses to bind unauthenticated}"

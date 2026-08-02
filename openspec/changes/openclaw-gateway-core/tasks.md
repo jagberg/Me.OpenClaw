@@ -138,6 +138,21 @@ Do not start until phase 4 has run one full claim lifecycle on real data.
 
 **DECIDED (Justin, 2026-08-01): the gateway runs in its own Docker container** — chosen for *isolation and to build trust in it*, not for deployment tidiness. That reason is stronger than the one I offered and it changes what the container must look like: containment is the point, so the boundary is the feature. Remaining integration details deliberately left open to decide together.
 
+- [x] 7.8 **DEFECT FOUND AND FIXED BEFORE ANY DEPLOY, 2026-08-02 — the compose file as first written would have broken Telegram.**
+
+  It declared `TELEGRAM_BOT_TOKEN` **required** on the gateway service. The gateway auto-enables Telegram the instant it detects a token, and says so plainly in its own log — *"auto-enabled plugins for this runtime without writing config: Telegram configured, enabled automatically"* — while `main.py` still calls `telegram_bot.start_polling()`. Two long-pollers on one token is a `409 Conflict` and the bot stops working.
+
+  That is a direct contradiction of slice 1's own definition, written three days earlier: *both runtimes up, the gateway holding no bot token and no channel bound.* I wrote the definition and then wrote a compose file that violated it, and nothing about the file looked wrong — the failure only appears when both containers are running against the real token.
+
+  Found by asking "are we ready to deploy?" and checking rather than answering. It would otherwise have been found by Justin's bot going silent.
+
+  **Three fixes, and the third is the one that matters:**
+  - `TELEGRAM_BOT_TOKEN` is now optional and empty by default, with the comment saying supplying it **is** the cutover.
+  - `.env.example` says the same at the point someone would fill it in.
+  - **`scripts/gateway_preflight.py` asserts exactly one poller.** Both is a 409; *neither* is worse — nothing is listening and every message is dropped in silence, which looks exactly like a quiet day. The check is direction-agnostic, so it guards slice 1 (app polls) and the cutover (gateway polls) with the same assertion, and makes the cutover a verifiable step rather than a hope.
+
+  Expected consequence while the token is blank: the plugin logs a warning that it cannot claim the per-chat command menu. Correct — there is no bot for it to claim a menu on.
+
 - [x] **7.0a / 7.0c / 7.1 / 7.2 / 7.3 / 7.4 BUILT 2026-08-02.** `docker-compose.yml` gains the gateway service; `scripts/deploy.ps1` brings up both runtimes, stamps and reports both versions, and treats a partial start as a failure; `scripts/gateway_preflight.py` runs the config assertions and fails the deploy. Compose validates.
 
   **The isolation decisions are enforced by the file, not by discipline.** No `env_file` on the gateway, no bind mount to `app/data`, no Docker socket, its own named volume for state. The only path between the containers is a `media_outbox` volume, mounted read-only into `<stateDir>/media` because the media allowlist is a fixed set of roots and ignores mounts it does not know about (14.4).
