@@ -448,9 +448,18 @@ def main() -> int:
     else:
         results.extend(check_turn_size(gw, args.session_key))
 
+    # The console is cp1252. A detail string carrying anything outside it --
+    # Groq's rate-limit error contains a warning emoji -- raises
+    # UnicodeEncodeError *while printing a FAIL*, so the script dies at the
+    # exact moment it is trying to tell you something went wrong. Worse, piping
+    # the run through anything reports the PIPE's exit code, so the crash read
+    # as a clean pass. Sanitise on the way out.
+    def ascii_only(text: str) -> str:
+        return (text or "").encode("ascii", "replace").decode("ascii")
+
     width = max(len(r.name) for r in results)
     for r in results:
-        print(f"{r.status:<5} {r.name:<{width}}  {r.detail}")
+        print(f"{r.status:<5} {r.name:<{width}}  {ascii_only(r.detail)}")
 
     failed = [r for r in results if r.status == "FAIL"]
     skipped = [r for r in results if r.status == "SKIP"]
