@@ -915,8 +915,13 @@ def test_watchdog_restarts_the_process_when_polling_is_dead():
         conn.execute("DELETE FROM ops_alerts WHERE kind = ?", (pipeline._POLLING_ALERT,))
 
     exits, sent = [], []
-    original_alive, original_send = telegram_bot.polling_alive, telegram_bot.send_message_sync
-    telegram_bot.send_message_sync = lambda msg: sent.append(msg)
+    # The watchdog's alert goes through the `notify` seam now, not straight at
+    # PTB — that is the whole point of the seam, and this alert must survive the
+    # transport switch or a dead updater stops announcing itself.
+    from openclaw import notify
+
+    original_alive, original_send = telegram_bot.polling_alive, notify.send_text
+    notify.send_text = lambda msg, buttons=None: sent.append(msg) or True
     try:
         telegram_bot.polling_alive = lambda: True
         assert pipeline._watchdog_telegram_polling(exit_fn=lambda: exits.append(1)) is False
@@ -932,7 +937,7 @@ def test_watchdog_restarts_the_process_when_polling_is_dead():
         assert sent and "Telegram polling" in sent[0], sent
     finally:
         telegram_bot.polling_alive = original_alive
-        telegram_bot.send_message_sync = original_send
+        notify.send_text = original_send
 
 
 def test_unhandled_callback_data_reports_instead_of_silently_returning():
@@ -5166,6 +5171,163 @@ def test_a_confirm_with_a_junk_id_changes_nothing_and_says_so():
         assert outcome["ok"] is False, (junk, outcome)
         assert "Nothing was changed" in outcome["message"] or "not found" in outcome["message"], outcome
     assert _claim_count_snapshot() == before
+
+
+def test_both_transports_run_the_same_command_logic():
+    """4.1's real requirement. The updater flag stays on for a week after the
+    cutover, so the PTB path and the gateway path run side by side — and a
+    behaviour that differs by transport is one that will differ after the flag
+    is removed, when nobody is looking for it.
+
+    Aliased, not wrapped: assert identity, because a wrapper is where the drift
+    would live."""
+    from openclaw import commands, telegram_bot
+
+    for name in ("handle_mark", "handle_pet", "handle_resolved", "handle_sent", "handle_process",
+                 "handle_vetemail", "handle_notvet", "handle_start", "register_chat",
+                 "_action_card_text", "prior_conditions"):
+        assert getattr(telegram_bot, name) is getattr(commands, name.lstrip("_")
+                                                      if name.startswith("_action") or name.startswith("prior")
+                                                      else name, None) or \
+               getattr(telegram_bot, name) is getattr(commands, name), name
+    assert telegram_bot._is_authorized is commands.is_authorized
+
+
+def test_an_unauthorized_command_is_refused_out_loud():
+    """4.8 — the check stays app-side. The gateway deciding to deliver an event
+    is not the same as this app accepting it, and the username check is the only
+    thing between a stranger's `/mark 7 sent` and a Petcover submission.
+
+    Refused *out loud*: a tap that did nothing and said nothing is
+    indistinguishable from one that never arrived."""
+    from openclaw import commands
+
+    for name in ("mark", "pet", "resolve", "confirm", "actions", "history", "unmatch"):
+        out = commands.dispatch(name, "7 x", "someone-else")
+        assert out == {"text": "Not authorized.", "cards": []}, (name, out)
+    # Case-insensitive: Telegram reports display casing, so an exact compare
+    # wrongly rejects the real user.
+    assert commands.is_authorized(config.TELEGRAM_USERNAME.upper()) is True
+    assert commands.is_authorized(None) is False
+
+
+def test_an_unknown_command_says_so_instead_of_shrugging():
+    """A plugin registering something this app cannot serve is a deploy-time
+    mistake. The pre-gateway equivalent — an unhandled callback prefix — did
+    nothing silently, which read as a tap that never arrived."""
+    from openclaw import commands
+
+    out = commands.dispatch("ping", "", config.TELEGRAM_USERNAME)
+    assert "not a command this app serves" in out["text"], out
+    assert out["cards"] == []
+    for name in ("mark", "pet", "resolve", "unmatch", "invreq", "dismiss"):
+        out = commands.dispatch(name, "", config.TELEGRAM_USERNAME)
+        assert "needs a claim id" in out["text"], (name, out)
+
+
+def test_mark_reserves_two_words_and_treats_the_rest_as_a_condition():
+    """Slice 1's design writes the mark-sent tap as `/mark 7 sent`, while this
+    app's `/mark` sets the condition text. Both are true, so `sent` joins
+    `reviewed` as reserved. The hazard is named rather than hidden: a condition
+    genuinely called "sent" cannot be set by button."""
+    from openclaw import claim_status, commands
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="drafted", draft_id="d-mark")
+        cid = conn.execute("SELECT id FROM vet_claims").fetchone()["id"]
+
+    assert commands.RESERVED_MARK_WORDS == {"sent", "reviewed"}
+    commands.dispatch("mark", f"{cid} kennel cough", config.TELEGRAM_USERNAME)
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT status, condition_text FROM vet_claims WHERE id = ?", (cid,)).fetchone()
+    assert row["condition_text"] == "kennel cough", dict(row)
+    assert row["status"] == "drafted", dict(row)
+
+    commands.dispatch("mark", f"{cid} sent", config.TELEGRAM_USERNAME)
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT status, condition_text FROM vet_claims WHERE id = ?", (cid,)).fetchone()
+    # The reserved word marked it sent and did NOT overwrite the condition.
+    assert row["status"] == "sent", dict(row)
+    assert row["condition_text"] == "kennel cough", dict(row)
+    assert claim_status.history_rows() is not None
+
+
+def test_every_card_button_names_a_command_the_plugin_registered():
+    """The hazard slice 1 measured: a `command` button is deterministic only
+    while its command is registered. An unregistered one is not an error — the
+    tap reaches the agent as a chat turn with its own token in the prompt, which
+    is the commit-token-through-a-model path D12 exists to prevent.
+
+    So every button any card can build is checked against the tuple, and against
+    the 58-byte budget that silently deletes an overlong one from the keyboard."""
+    from openclaw import claim_status, commands
+    from openclaw.button_commands import BUTTON_COMMANDS
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="drafted", draft_id="d-cards")
+        _insert_claim(conn, 1, "2026-06-02", status="matched", condition="itchy ear")
+
+    cards = commands.actions_cards() + [c for c in [commands.history_card(1)] if c]
+    # Synthesise one card per action kind too: the live fixture will not produce
+    # all eight, and an unexercised kind is exactly where an unregistered verb
+    # would hide.
+    for kind in commands._ACTION_EMOJI:
+        cards.append({"buttons": commands._action_buttons(
+            {"kind": kind, "claim_id": 7, "pet_id": 1})})
+
+    checked = 0
+    for card in cards:
+        for button in card.get("buttons") or []:
+            verb = button["command"][1:].split(" ", 1)[0]
+            assert verb in BUTTON_COMMANDS, (verb, button)
+            assert len(button["command"].encode("utf-8")) <= 58, button
+            assert button["label"].strip(), button
+            checked += 1
+    assert checked, "no buttons were checked — the fixture proves nothing"
+
+    # And the guard fires: an unregistered verb is refused at build time.
+    try:
+        commands._command_button("nope", "/ping 7")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("an unregistered command was allowed onto a card")
+    assert claim_status.pending_actions() is not None
+
+
+def test_actions_never_truncates_silently():
+    """The cap is fine; a cap nobody is told about is not. `/actions` holds back
+    everything past ACTION_CARD_CAP, and the held-back count has to be said.
+
+    Driven off a synthetic action list rather than seeded claims: what is under
+    test is the announcement, and a fixture that happened to produce nine
+    actionable claims would assert nothing while looking thorough."""
+    from openclaw import claim_card, claim_status, commands
+
+    fake = [{"kind": "mark_sent", "claim_id": i, "pet_id": 1, "actionable": True,
+             "title": "mark sent", "merchant": "THE SHIRE VET", "amount": -120.0,
+             "date": "2026-05-01", "age_days": 30, "pet_name": "Aari",
+             "condition_text": "itchy ear", "blocks": "the claim", "flag": None,
+             "claim_ids": [i], "members": None, "group_id": f"S{i}"}
+            for i in range(1, commands.ACTION_CARD_CAP + 4)]
+
+    real_actions, real_summary = claim_status.pending_actions, claim_card.render_actions_summary
+    claim_status.pending_actions = lambda: fake
+    claim_card.render_actions_summary = lambda actions, shown: b"png"
+    try:
+        cards = commands.actions_cards()
+    finally:
+        claim_status.pending_actions, claim_card.render_actions_summary = real_actions, real_summary
+
+    texts = [c.get("text", "") or c.get("caption", "") for c in cards]
+    assert any("more — run /actions again" in t for t in texts), texts
+    assert f"+{len(fake) - commands.ACTION_CARD_CAP} more" in " ".join(texts), texts
+    # The summary card is always first and always says the split.
+    assert cards[0].get("png") is not None and "to action" in cards[0]["caption"], cards[0]
+    # One card per shown action, and no more.
+    assert sum(1 for c in cards if c.get("buttons")) == commands.ACTION_CARD_CAP, len(cards)
 
 
 def test_the_plugin_registers_exactly_the_commands_a_button_may_emit():

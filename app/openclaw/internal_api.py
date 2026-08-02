@@ -227,6 +227,74 @@ def confirm_proposal(args) -> dict:
     return outcome
 
 
+@router.post("/command/{name}")
+async def command(
+    name: str,
+    request: Request,
+    x_openclaw_secret: str | None = Header(default=None),
+    x_correlation_id: str | None = Header(default=None),
+):
+    """Every slash command the plugin registered arrives here.
+
+    The plugin holds no claims logic: it forwards `{args}` and returns whatever
+    text comes back. Cards are *not* returned — a command's reply is one string
+    through the gateway, and a card is an image with its own buttons, so cards
+    are pushed separately over `gateway_client` and the reply says what went.
+
+    Authorization stays on this side (task 4.8). The gateway deciding to deliver
+    an event is not the same as this app accepting it, and the username check is
+    the only thing standing between a stranger's `/mark 7 sent` and a Petcover
+    submission.
+    """
+    from . import commands, gateway_client
+
+    correlation = _correlation_id(x_correlation_id)
+    rejected = _guard(request, x_openclaw_secret, f"command/{name}", correlation)
+    if rejected is not None:
+        return rejected
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    username = body.get("username") or config.TELEGRAM_USERNAME
+    try:
+        outcome = commands.dispatch(name, body.get("args") or "", username)
+    except Exception as exc:  # noqa: BLE001 — a tap that failed must say so
+        logger.error("command %s failed correlation=%s: %s", name, correlation, exc, exc_info=True)
+        return JSONResponse({"status": "error", "route": f"command/{name}",
+                             "correlation_id": correlation, "result": f"/{name} failed: {exc}"},
+                            status_code=500)
+
+    sent, failed = 0, []
+    target = db.registered_chat_id()
+    for card in outcome["cards"]:
+        if target is None:
+            failed.append("no registered chat")
+            break
+        try:
+            if card.get("png") is not None:
+                gateway_client.send_card(str(target), card["png"], caption=card.get("caption", ""),
+                                         buttons=card.get("buttons") or None)
+            else:
+                gateway_client.send_message(str(target), card["text"],
+                                            buttons=card.get("buttons") or None)
+            sent += 1
+        except Exception as exc:  # noqa: BLE001
+            # Never silent: a card that did not arrive must not read as one that did.
+            logger.error("card delivery failed for /%s correlation=%s: %s", name, correlation, exc)
+            failed.append(str(exc))
+
+    text = outcome["text"]
+    if failed:
+        text = (text + f"\n⚠️ {len(failed)} card(s) did not send: {failed[0]}").strip()
+    elif sent and not text:
+        text = f"Sent {sent} card(s)."
+    logger.info("command /%s cards=%s failed=%s correlation=%s", name, sent, len(failed), correlation)
+    return {"status": "ok" if not failed else "partial", "route": f"command/{name}",
+            "correlation_id": correlation, "result": text}
+
+
 @router.post("/telegram/event")
 async def telegram_event(
     request: Request,

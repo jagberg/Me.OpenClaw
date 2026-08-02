@@ -456,8 +456,10 @@ def test_batch_action_card_is_one_card_naming_every_member():
     assert f"#{a}" in text and f"#{b}" in text, "group id supplements the claim ids, never replaces them"
     keyboard = telegram_bot._action_keyboard(action)
     buttons = [btn for row in keyboard.inline_keyboard for btn in row]
-    assert len(buttons) == 1 and buttons[0].callback_data == f"sent:{min(a, b)}"
-    telegram_bot.handle_sent(AUTHORIZED_USER, int(buttons[0].callback_data.split(":", 1)[1]))
+    # `cmd:` wraps the gateway's own command string — one card builder, two
+    # renderings, so the PTB tap and the gateway tap cannot diverge.
+    assert len(buttons) == 1 and buttons[0].callback_data == f"cmd:/mark {min(a, b)} sent"
+    telegram_bot.handle_sent(AUTHORIZED_USER, int(buttons[0].callback_data.split(" ")[1]))
     with db.get_connection() as conn:
         statuses = [
             r["status"]
@@ -491,10 +493,15 @@ def test_drafted_batch_notifies_once_with_button():
     assert len(mine) == 1, "a 2-claim batch must produce exactly one message"
     text, markup = mine[0]
     assert markup is not None, "drafted batch must carry a mark-sent button"
-    cb = markup.inline_keyboard[0][0].callback_data
-    assert cb.startswith("sent:")
-    # tapping the button (its callback claim id) advances the whole batch
-    telegram_bot.handle_sent(AUTHORIZED_USER, int(cb.split(":", 1)[1]))
+    # Buttons are built in the GATEWAY's shape everywhere now: a command string,
+    # not a bespoke callback token. The PTB path wraps it as `cmd:` until the
+    # cutover, so the 58-byte budget and the registered-verb rule are exercised
+    # on every send from today rather than first thing on the risky day.
+    command = markup[0]["command"]
+    assert command.startswith("/mark ") and command.endswith(" sent"), markup
+    assert len(command.encode("utf-8")) <= 58, command
+    # tapping the button (its command's claim id) advances the whole batch
+    telegram_bot.handle_sent(AUTHORIZED_USER, int(command.split(" ")[1]))
     with db.get_connection() as conn:
         statuses = [r["status"] for r in conn.execute(
             "SELECT status FROM vet_claims WHERE id IN (?, ?)", (a, b)).fetchall()]
@@ -517,8 +524,11 @@ def test_condition_prompt_lists_items_and_offers_prior_conditions():
     assert len(mine) == 1, "matched-needs-condition claim must prompt once"
     text, markup = mine[0]
     assert "•" in text  # lists the claimed item(s)
-    labels = [b.text for row in markup.inline_keyboard for b in row]
-    assert "Arthritis" in labels and any("Other" in x for x in labels)
+    labels = [b["label"] for b in markup]
+    assert "Arthritis" in labels, labels
+    # "Other" is PTB-only until 12.2: a `command` button cannot carry free text.
+    ptb = telegram_bot._action_keyboard({"kind": "set_condition", "claim_id": cid, "pet_id": pet_id})
+    assert any("Other" in b.text for row in ptb.inline_keyboard for b in row), ptb
     # tapping the Arthritis button (its index) applies that condition
     conds = telegram_bot.prior_conditions(pet_id)
     _with_stubbed_claim_fill(lambda: claim_forms.set_condition_text(cid, conds[conds.index("Arthritis")]))
@@ -540,7 +550,7 @@ def test_suspicious_match_explains_why_and_offers_unmatch():
     assert len(mine) == 1
     text, markup = mine[0]
     assert "more than the matched invoice" in text  # explains the unexplained gap
-    assert markup.inline_keyboard[0][0].callback_data == f"unmatch:{cid}"
+    assert markup[0]["command"] == f"/unmatch {cid}", markup
     # unmatch resets to pending_match and remembers the rejected email
     result = invoice_matching.unmatch(cid)
     assert result["ok"] is True

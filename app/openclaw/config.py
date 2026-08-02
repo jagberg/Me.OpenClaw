@@ -81,6 +81,13 @@ OWNER_BANK_ACCOUNT_NUMBER = os.environ.get("OWNER_BANK_ACCOUNT_NUMBER", "")
 # copied chat ID — the bot self-registers its chat ID via /start, see telegram_bot.py).
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USERNAME = os.environ.get("TELEGRAM_USERNAME", "jagberg")
+# Which runtime polls Telegram. Default on = this app, which is the pre-cutover
+# state. Turning it off hands the channel to the gateway, and that IS the
+# cutover -- two pollers on one token is a 409 Conflict, so the two are exact
+# opposites and `scripts/gateway_preflight.py` fails the deploy if both poll or
+# neither does. Kept as a flag rather than a deletion for one week of real use
+# after cutover (task 4.1): rollback is this env var and a restart, ~30s.
+TELEGRAM_UPDATER_ENABLED = os.environ.get("TELEGRAM_UPDATER_ENABLED", "1").strip().lower()     not in ("0", "false", "no", "off")
 
 # The OpenClaw gateway's side of the house. The gateway owns the bot token and
 # the agent loop; this app owns the claims domain and calls out to it. Two

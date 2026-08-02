@@ -123,3 +123,51 @@ invoices.
   needs an agent turn and Groq's daily budget was exhausted the same day, the
   second needs the plugin's `/internal/command/confirm` route, which section 4
   builds. Both are hermetically tested and neither is proven end to end.
+
+## Amendment (2026-08-02) — the card surface collapsed to one builder, and 0.10 is answered
+
+Two findings from building sections 3 and 4, both read from the gateway's
+shipped code rather than its prose.
+
+**Cards are built once, in the gateway's shape, and each transport renders it.**
+Porting the outbound path left two card builders for a while —
+`telegram_bot._action_keyboard` producing callback tokens and
+`commands._action_buttons` producing command strings — which is the exact shape
+this codebase has been bitten by five times. `_action_keyboard` is now a
+renderer over the same builder. The consequence worth stating: **the 58-byte
+budget and the registered-verb rule are exercised on every send from today**,
+a week before they could bite in production, because the PTB path wraps the
+gateway's own command string as `cmd:<command>` rather than inventing a token.
+
+Two costs, both accepted deliberately:
+
+- **Card text lost its bold.** `_action_card_text` emitted HTML and the PTB path
+  set `parse_mode="HTML"`. The gateway path sends plain text, so the same string
+  would have arrived showing literal `<b>` tags. One plain rendering for both
+  beats two renderings that agree today.
+- **Five button commands became eleven.** Every action-card tap needs a
+  registered verb or it reaches the agent as a chat turn, so `unmatch`,
+  `invreq`, `dismiss`, `merge` and `reject` joined the five. That is five more
+  entries in Telegram's per-chat menu, and five more things the preflight
+  compares.
+
+**Task 0.10 is answered: yes, a plugin can conditionally claim inbound text.**
+The gateway's hook runner has two claiming hooks, both running before the model:
+`inbound_claim` (*"Allows plugins to claim an inbound event before commands/agent
+dispatch"*) and `before_dispatch` (*"Allows plugins to inspect or handle a
+message before model dispatch. First handler returning `{ handled: true }`
+wins"*). Both route through `runClaimingHook`, so claiming stops onward
+dispatch.
+
+This matters because it was the largest unverified assumption in slice 2, and
+task 12.2 — Justin's decision that his typed condition reaches `condition_text`
+verbatim, with no model in between — rests entirely on it. **`before_dispatch`
+is the right hook of the two**: it runs after command routing, so a slash
+command still works while a condition-entry flow is pending.
+
+Held back from being called settled, for the same reason the elicitation finding
+is: this is read, not observed. And `registerInternalHook` was not found on the
+object a plugin's `register(api)` receives — the machinery is plainly present,
+but how *this* plugin reaches it is unestablished, and that is the next thing to
+answer before 12.2 is built. Until then the free-text "Other" condition button
+stays on the PTB path only, and the gateway path asks Justin to reply.

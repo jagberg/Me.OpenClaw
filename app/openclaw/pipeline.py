@@ -10,7 +10,9 @@ import socket
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
-from . import claim_forms, claim_status, config, db, gmail_client, gmail_ingest, invoice_matching, llm, message_log, status_labels, telegram_bot, vet_detection
+from . import (claim_forms, claim_status, commands, config, db, gmail_client, gmail_ingest,
+               invoice_matching, llm, message_log, notify, status_labels, telegram_bot,
+               vet_detection)
 from .scheduler import scheduler
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,7 @@ def _alert_rate_limited(kind: str, message: str, cap: int = _MAX_AUTH_ALERTS_24H
     """Send an ops alert to Telegram at most `cap` times per rolling 24h.
     ops_alerts is the ledger, so a container restart can't reset the count and
     re-spam. Returns whether it actually sent."""
-    send = send_fn or telegram_bot.send_message_sync
+    send = send_fn or notify.send_text
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(hours=24)).isoformat()
     with db.get_connection() as conn:
@@ -71,7 +73,7 @@ def _ensure_gmail_auth(send_fn=None) -> bool:
     recovery command and return False so the tick skips Gmail-dependent work.
     On success after any alert: send one 'restored' confirmation and clear the
     alert state. Returns True when Gmail is usable."""
-    send = send_fn or telegram_bot.send_message_sync
+    send = send_fn or notify.send_text
     try:
         gmail_client.build_service()
     except Exception as exc:  # noqa: BLE001 — non-auth errors re-raise below
@@ -286,7 +288,7 @@ def notify_split_proposals(send_fn=None) -> None:
     each covered charge, with a button per claim — Justin picks which claim
     carries the invoice (see invoice_matching.resolve_split_proposal). Sent
     once per proposal (notified_at)."""
-    send = send_fn or telegram_bot.send_message_sync
+    send = send_fn or notify.send_text
     with db.get_connection() as conn:
         proposals = conn.execute(
             "SELECT * FROM split_proposals WHERE status = 'open' AND notified_at IS NULL"
@@ -325,7 +327,7 @@ def notify_split_proposals(send_fn=None) -> None:
             "(Petcover sees the invoice, not the bank charges — no split needed.)"
         )
         text = "\n".join(lines)
-        markup = telegram_bot.merge_bill_keyboard(proposal["id"])
+        markup = commands.merge_buttons(proposal["id"])
         # attach the invoice pages themselves so the merge can be reviewed in place
         document = None
         if send_fn is None:
@@ -334,7 +336,7 @@ def notify_split_proposals(send_fn=None) -> None:
             except Exception as exc:
                 logger.warning("merge-proposal pdf fetch failed (proposal %s): %s", proposal["id"], exc)
         if document:
-            telegram_bot.send_document_sync(text, document[1], document[0], markup)
+            notify.send_document(text, document[1], document[0], buttons=markup)
         else:
             send(text, markup)
         with db.get_connection() as conn:
@@ -393,7 +395,7 @@ def notify_claim_states(send_fn=None) -> None:
     Claims sharing one draft are summarized in a single message; a group is
     skipped when no member's (status, flag) changed since last notified.
     `send_fn` is overridable for tests (spy) — defaults to the real send."""
-    send = send_fn or telegram_bot.send_message_sync
+    send = send_fn or notify.send_text
     with db.get_connection() as conn:
         rows = conn.execute(
             "SELECT vc.*, p.name AS pet_name, bt.date AS txn_date, bt.amount AS txn_amount, "
@@ -432,14 +434,14 @@ def notify_claim_states(send_fn=None) -> None:
         lead = group[0]
         suspicious = lead["flag"] and "possible additional invoice" in lead["flag"]
         if lead["status"] == "drafted":
-            markup = telegram_bot.mark_sent_button(lead["id"])
+            markup = commands._action_buttons({"kind": "mark_sent", "claim_id": lead["id"]})
         elif lead["status"] == "matched" and suspicious:
-            markup = telegram_bot.wrong_invoice_button(lead["id"])  # bad match — fix it first
+            markup = commands._action_buttons({"kind": "unmatch", "claim_id": lead["id"]})  # bad match — fix it first
         elif lead["status"] == "matched" and lead["pet_id"] is None:
-            markup = telegram_bot.pet_keyboard(lead["id"])  # assign pet first
+            markup = commands._action_buttons({"kind": "assign_pet", "claim_id": lead["id"]})  # assign pet first
         elif _needs_condition(lead) and lead["pet_id"]:
-            multi = len(_invoice_lines(lead)) > 1
-            markup = telegram_bot.condition_keyboard(lead["id"], lead["pet_id"], multi_item=multi)
+            markup = commands._action_buttons(
+                {"kind": "set_condition", "claim_id": lead["id"], "pet_id": lead["pet_id"]})
         else:
             markup = None
         # Review alerts carry the offending PDF itself. Only when using the
@@ -451,7 +453,7 @@ def notify_claim_states(send_fn=None) -> None:
             except Exception as exc:
                 logger.warning("review-pdf fetch failed for claim %s: %s", lead["id"], exc)
         if document:
-            telegram_bot.send_document_sync(text, document[1], document[0], markup)
+            notify.send_document(text, document[1], document[0], buttons=markup)
         else:
             send(text, markup)
         with db.get_connection() as conn:
@@ -563,7 +565,7 @@ def nudge_stale_actions() -> dict:
         f"{len(stale)} action(s) still waiting — oldest is #{oldest['claim_id']} "
         f"({oldest['age_days']}d). Send /actions for the cards."
     )
-    telegram_bot.send_photo_sync(caption, claim_card.render_actions_summary(actions, shown=len(stale)))
+    notify.send_card(caption, claim_card.render_actions_summary(actions, shown=len(stale)))
     logger.info("nudge: reminded about %s stale actions", len(stale))
     return {"sent": True, "stale": len(stale)}
 
@@ -627,7 +629,7 @@ def nudge_unanswered_vet_requests(send_fn=None) -> dict:
             f" (treated {r['treated_on']}{'' if r['treatment_date_known'] else ', assumed = charge date'})"
         )
     text = "\n".join(lines)
-    (send_fn or telegram_bot.send_message_sync)(text)
+    (send_fn or notify.send_text)(text)
     logger.info("vet nudge: reminded about %s unanswered request(s)", len(outstanding))
     return {"sent": True, "outstanding": len(outstanding), "text": text}
 

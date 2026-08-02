@@ -62,6 +62,14 @@ const COMMANDS = [
   // `/confirm <row id>` -- no free text, well inside the 58-byte budget. The
   // app commits on this and only on this (ADR-0027).
   { name: "confirm", description: "Confirm a proposed change" },
+  // The remaining action-card taps. Each exists because its card has a button,
+  // and a button whose command nobody registered is not an error -- the tap
+  // reaches the agent as a chat turn and spends tokens.
+  { name: "unmatch", description: "This invoice is the wrong one" },
+  { name: "invreq", description: "I have sent the invoice request" },
+  { name: "dismiss", description: "Reviewed, dismiss the mismatch" },
+  { name: "merge", description: "One invoice, one claim -- merge these charges" },
+  { name: "reject", description: "Not the same invoice" },
 ];
 
 async function callApp(route, body, correlationId) {

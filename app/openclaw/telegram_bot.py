@@ -22,8 +22,8 @@ from telegram.ext import (
     filters,
 )
 
-from . import (agent, claim_card, claim_forms, claim_status, config, db, invoice_matching, llm,
-               message_log, proposals)
+from . import (agent, claim_card, claim_forms, claim_status, commands, config, db,
+               invoice_matching, llm, message_log, proposals)
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +44,6 @@ _application: Application | None = None
 # Holds the startup replay task: create_task alone doesn't keep a strong
 # reference, and a GC'd task stops mid-replay with nothing in the log.
 _replay_task: "asyncio.Task | None" = None
-
-
-def _is_authorized(username: str | None) -> bool:
-    # Telegram usernames are case-insensitive; the API reports display casing
-    # (e.g. "Jagberg"), so an exact compare wrongly rejects the real user.
-    authorized = bool(username) and username.lower() == config.TELEGRAM_USERNAME.lower()
-    if not authorized:
-        logger.warning("Telegram update rejected — unauthorized username %r", username)
-    return authorized
 
 
 async def _ack(message) -> None:
@@ -82,90 +73,27 @@ def get_registered_chat_id() -> int | None:
     return db.registered_chat_id()
 
 
-def register_chat(username: str, chat_id: int) -> None:
-    with db.get_connection() as conn:
-        conn.execute(
-            "INSERT INTO telegram_registrations (username, chat_id, registered_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(username) DO UPDATE SET chat_id = excluded.chat_id, registered_at = excluded.registered_at",
-            (username, chat_id, datetime.now(timezone.utc).isoformat()),
-        )
-
-
-# Pure command logic, independent of the telegram library — testable without
-# constructing an Update, and the single place command handlers delegate to.
-
-
-def handle_start(username: str | None, chat_id: int) -> str:
-    if not _is_authorized(username):
-        return ""
-    register_chat(username, chat_id)
-    return "Registered — you'll get claim notifications here."
-
-
-def handle_mark(username: str | None, claim_id: int, rest: str) -> dict:
-    if not _is_authorized(username):
-        return {"ok": False, "message": "Not authorized."}
-    if rest.strip().lower() == "reviewed":
-        return claim_forms.mark_reviewed(claim_id)
-    return claim_forms.set_condition_text(claim_id, rest)
-
-
-def handle_pet(username: str | None, claim_id: int, pet_name: str) -> dict:
-    if not _is_authorized(username):
-        return {"ok": False, "message": "Not authorized."}
-    with db.get_connection() as conn:
-        pet = conn.execute("SELECT * FROM pets WHERE name = ?", (pet_name,)).fetchone()
-    if pet is None:
-        return {"ok": False, "message": f"No pet named '{pet_name}'."}
-    return claim_forms.assign_pet(claim_id, pet["id"])
-
-
-def handle_process(username: str | None, claim_id: int) -> dict:
-    if not _is_authorized(username):
-        return {"ok": False, "message": "Not authorized."}
-    return claim_forms.process_and_report(claim_id)
-
-
-def handle_sent(username: str | None, claim_id: int) -> dict:
-    if not _is_authorized(username):
-        return {"ok": False, "message": "Not authorized."}
-    return claim_status.mark_sent(claim_id)
-
-
-def handle_resolved(username: str | None, claim_id: int) -> dict:
-    if not _is_authorized(username):
-        return {"ok": False, "message": "Not authorized."}
-    with db.get_connection() as conn:
-        claim = conn.execute("SELECT 1 FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
-    if claim is None:
-        return {"ok": False, "message": f"No claim #{claim_id} found."}
-    return claim_status.confirm_resolved(claim_id)
-
-
-def handle_vetemail(username: str | None, merchant: str, email: str) -> dict:
-    if not _is_authorized(username):
-        return {"ok": False, "message": "Not authorized."}
-    if "@" not in email:
-        return {"ok": False, "message": f"'{email}' doesn't look like an email address."}
-    with db.get_connection() as conn:
-        conn.execute(
-            "INSERT INTO vet_contacts (merchant, email) VALUES (?, ?) "
-            "ON CONFLICT(merchant) DO UPDATE SET email = excluded.email",
-            (merchant, email),
-        )
-    return {"ok": True, "message": f"Vet contact saved: {merchant} → {email}"}
-
-
-def handle_notvet(username: str | None, pattern: str) -> dict:
-    if not _is_authorized(username):
-        return {"ok": False, "message": "Not authorized."}
-    if not pattern.strip():
-        return {"ok": False, "message": "Usage: /notvet <merchant text>"}
-    added = db.add_non_vet_pattern(pattern)
-    normalised = pattern.strip().lower()
-    if added:
-        return {"ok": True, "message": f"Added to non-vet list: '{normalised}'. Matching charges won't become claims."}
-    return {"ok": True, "message": f"'{normalised}' is already on the non-vet list."}
+# The pure command logic lives in `commands`, which has no transport in it and
+# survives this module's deletion at the cutover. Aliased rather than wrapped so
+# the PTB handlers below and the gateway's `/internal/command/<name>` dispatcher
+# call the identical function — a behaviour that differs by transport is one
+# that will differ after the updater flag is removed, and nobody would find out
+# until then.
+_is_authorized = commands.is_authorized
+register_chat = commands.register_chat
+handle_start = commands.handle_start
+handle_mark = commands.handle_mark
+handle_pet = commands.handle_pet
+handle_process = commands.handle_process
+handle_sent = commands.handle_sent
+handle_resolved = commands.handle_resolved
+handle_vetemail = commands.handle_vetemail
+handle_notvet = commands.handle_notvet
+_esc = commands._esc
+_ACTION_EMOJI = commands._ACTION_EMOJI
+_action_card_text = commands._action_card_text
+prior_conditions = commands.prior_conditions
+ACTION_CARD_CAP = commands.ACTION_CARD_CAP
 
 
 # Thin async adapters — extract args from the Update/Context, call the pure
@@ -315,124 +243,44 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_photo(photo=png, caption=caption, reply_markup=_history_keyboard(page, total_pages))
 
 
-ACTION_CARD_CAP = 10
-
-
-def _esc(s: str) -> str:
-    """HTML-escape for message bodies. quote=False because none of this goes
-    into an attribute — escaping apostrophes would render "hasn&#x27;t"."""
-    return html.escape(s or "", quote=False)
-
-_ACTION_EMOJI = {
-    "split_proposal": "🔀",
-    "unmatch": "❌",
-    "confirm_resolved": "✅",
-    "mark_sent": "📤",
-    "invoice_request_sent": "📧",
-    "assign_pet": "🐾",
-    "set_condition": "⚠️",
-    "dismiss_mismatch": "🔍",
-}
-
-
-def _action_card_text(action: dict) -> str:
-    """One action as a short HTML card. Always carries the claim #id — Justin
-    acts by id (/mark, /pet), and an alert without one is unusable.
-
-    A submission-level action covers several claims (one Gmail draft, one email,
-    one tap), so it names the group and itemises the members: they differ in date,
-    amount and condition, and a single summary line would hide what's in the
-    email Justin is confirming he sent."""
-    members = action.get("members")
-    head = f"{_ACTION_EMOJI.get(action['kind'], '•')} <b>{_esc(action["title"].upper())}</b>"
-    if members:
-        lines = [
-            head,
-            f"<b>{action['group_id']}</b> · {len(members)} claims · ${abs(action['amount']):,.2f}",
-        ]
-        lines += [
-            f"  • #{m['claim_id']} {m['date']} · {_esc(claim_card._vet_name(m["merchant"]))}"
-            f" · ${abs(m['amount']):,.2f}{' · ' + _esc(m['condition_text']) if m['condition_text'] else ''}"
-            for m in members
-        ]
-        lines.append(f"{_esc(action['pet_name'] or '')} · oldest {action['date']} ({action['age_days']}d ago)")
-    else:
-        lines = [
-            head,
-            f"Claim #{action['claim_id']} · {_esc(claim_card._vet_name(action["merchant"]))}"
-            f" · ${abs(action['amount']):,.2f}",
-        ]
-        who = " · ".join(filter(None, [action["pet_name"], action["condition_text"]]))
-        lines.append(f"{_esc(who) + ' · ' if who else ''}{action['date']} ({action['age_days']}d ago)")
-    lines.append(f"<i>Blocks: {_esc(action["blocks"])}</i>")
-    if action["kind"] == "assign_pet":
-        # The buttons can only say ONE pet. An invoice covering two needs a share
-        # each, which is a reply, not a tap — and he has to know that's allowed.
-        lines.append("<i>Shared invoice? Reply with the pets and one amount.</i>")
-    return "\n".join(lines)
-
-
 def _action_keyboard(action: dict) -> InlineKeyboardMarkup | None:
-    """Reuses the existing per-action keyboards rather than inventing new ones,
-    so a tap from an action card behaves identically to a tap from the alert
-    the pipeline already pushes. None = nothing to tap (blocked items)."""
-    kind, claim_id = action["kind"], action["claim_id"]
-    if kind == "mark_sent":
-        return mark_sent_button(claim_id)
-    if kind == "assign_pet":
-        return pet_keyboard(claim_id)
-    if kind == "set_condition":
-        return condition_keyboard(claim_id, action["pet_id"], multi_item=len(_invoice_items(claim_id)) > 1)
-    if kind == "unmatch":
-        return wrong_invoice_button(claim_id)
-    if kind == "invoice_request_sent":
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📧 I've sent it", callback_data=f"invreq:{claim_id}")]]
-        )
-    if kind == "dismiss_mismatch":
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("👍 Reviewed", callback_data=f"dismiss:{claim_id}")]]
-        )
-    if kind == "confirm_resolved":
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("✅ Resolved", callback_data=f"resolved:{claim_id}")]]
-        )
-    return None
+    """The PTB rendering of `commands._action_buttons`, not a second source.
+
+    Cards are built in the gateway's shape everywhere now; this converts. Two
+    builders is how a tap from an action card came to behave differently from
+    the same tap on the alert the pipeline pushes, and it is the shape this
+    codebase has been bitten by five times.
+
+    **One deliberate, temporary divergence.** `set_condition` also gets an
+    "Other" button here, because typing a new condition is free text and a
+    `command` button cannot carry it. The gateway equivalent needs a plugin to
+    conditionally claim an inbound text message — task 0.10, answered 2026-08-02
+    (`before_dispatch` exists and claims) but not yet built. Until it is, the
+    PTB path keeps the button and the gateway path says to reply. Delete this
+    branch when 12.2 lands, not before: dropping it early loses the only way to
+    enter a condition Justin has never used.
+    """
+    buttons = commands._action_buttons(action)
+    rows = [[InlineKeyboardButton(b["label"], callback_data=f"cmd:{b['command']}")] for b in buttons]
+    if action["kind"] == "set_condition":
+        rows.append([InlineKeyboardButton("✏️ Other", callback_data=f"condother:{action['claim_id']}")])
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 async def actions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Renders `commands.actions_cards()`, which is also what the gateway path
+    sends. The cap, the held-back count and the blocked summary are decided
+    there, once — a second copy here is how chat and cards came to disagree."""
     username = update.effective_user.username if update.effective_user else None
     if not _is_authorized(username):
         return
-    actions = claim_status.pending_actions()
-    if not actions:
-        await update.message.reply_text("Nothing waiting on you — every claim is with Petcover or closed.")
-        return
-
-    tappable = [a for a in actions if a["actionable"]]
-    shown = tappable[:ACTION_CARD_CAP]
-    await update.message.reply_photo(
-        photo=claim_card.render_actions_summary(actions, shown=len(shown)),
-        caption=f"{len(tappable)} to action, {len(actions) - len(tappable)} blocked",
-    )
-    for action in shown:
-        await update.message.reply_text(
-            _action_card_text(action), parse_mode="HTML", reply_markup=_action_keyboard(action)
-        )
-    # Never truncate silently: say what was held back and why.
-    if len(tappable) > len(shown):
-        await update.message.reply_text(
-            f"+{len(tappable) - len(shown)} more — run /actions again once these are cleared."
-        )
-    blocked = [a for a in actions if not a["actionable"]]
-    if blocked:
-        total = sum(abs(a["amount"]) for a in blocked)
-        await update.message.reply_text(
-            f"🚫 <b>{len(blocked)} claims blocked</b> · ${total:,.2f}\n"
-            f"{_esc(blocked[0]["flag"] or "blocked")}\n"
-            "<i>No button can fix this — it needs the insurer's claim process on file.</i>",
-            parse_mode="HTML",
-        )
+    for card in commands.actions_cards():
+        markup = _cmd_markup(card.get("buttons"))
+        if card.get("png") is not None:
+            await update.message.reply_photo(photo=card["png"], caption=card.get("caption", "")[:1024],
+                                             reply_markup=markup)
+        else:
+            await update.message.reply_text(card["text"], reply_markup=markup)
 
 
 def mark_sent_button(claim_id: int) -> InlineKeyboardMarkup:
@@ -440,20 +288,6 @@ def mark_sent_button(claim_id: int) -> InlineKeyboardMarkup:
     marks the whole submission sent (any claim id in the batch resolves to the
     shared draft), so Justin never types /sent or juggles per-claim ids."""
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Mark sent", callback_data=f"sent:{claim_id}")]])
-
-
-def prior_conditions(pet_id: int) -> list[str]:
-    """Conditions Justin has claimed for this pet before — offered as tap
-    options so a repeat condition (arthritis, ear infection…) is one tap, not
-    retyping. This is the reusable condition history the original spec deferred."""
-    with db.get_connection() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT condition_text FROM vet_claims "
-            "WHERE pet_id = ? AND condition_text IS NOT NULL AND condition_text != '' "
-            "ORDER BY condition_text",
-            (pet_id,),
-        ).fetchall()
-    return [r["condition_text"] for r in rows]
 
 
 def condition_keyboard(claim_id: int, pet_id: int, multi_item: bool = False) -> InlineKeyboardMarkup:
@@ -585,6 +419,15 @@ def _execute_action(proposal: dict) -> str:
     return proposals.execute(proposal)
 
 
+def _cmd_markup(buttons):
+    """Gateway-shape buttons -> a PTB keyboard whose callbacks re-enter
+    `commands.dispatch`. One converter, used by the callback path and by
+    `notify`, so the two cannot render the same card differently."""
+    from . import notify
+
+    return notify._to_ptb_markup(buttons)
+
+
 async def _append_result(query, suffix: str) -> None:
     """Append a result line to the tapped message. Keyboard messages may be
     plain text OR a document with caption (merge/review alerts carry the PDF) —
@@ -607,7 +450,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not _is_authorized(username):
         logger.warning("telegram tap ignored — %r not authorized", username)
         return
-    if data.startswith("sent:"):
+    if data.startswith("cmd:"):
+        # Cards are built in the gateway's shape everywhere now — a command
+        # string, not a bespoke callback token — so this path runs the same
+        # `commands.dispatch` the plugin reaches. A Telegram inline button
+        # cannot invoke a slash command, hence the `cmd:` wrapper; after the
+        # cutover the wrapper goes and the command travels natively.
+        #
+        # Doing it this way means the 58-byte budget and the registered-verb
+        # rule are exercised on every send from today, a week before they can
+        # bite in production.
+        command = data.split(":", 1)[1]
+        name, _, args = command.lstrip("/").partition(" ")
+        outcome = commands.dispatch(name, args, username)
+        for card in outcome["cards"]:
+            markup = _cmd_markup(card.get("buttons"))
+            if card.get("png") is not None:
+                await context.bot.send_photo(chat_id=query.message.chat_id, photo=card["png"],
+                                             caption=card.get("caption", "")[:1024], reply_markup=markup)
+            else:
+                await context.bot.send_message(chat_id=query.message.chat_id, text=card["text"],
+                                               reply_markup=markup)
+        if outcome["text"]:
+            await _append_result(query, outcome["text"])
+    elif data.startswith("sent:"):
         result = claim_status.mark_sent(int(data.split(":", 1)[1]))
         await _append_result(query, f"✅ {result['message']}")
     elif data.startswith("cond:"):
