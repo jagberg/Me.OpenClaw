@@ -79,26 +79,28 @@ Write-Host "  GATEWAY_VERSION = $($env:GATEWAY_VERSION)"
 #     `config set` will not run while the config it is fixing is invalid.
 Write-Host "  seeding pre-boot config and the plugin"
 $pluginSrc = (Resolve-Path "./app/gateway-plugin").Path -replace '\', '/'
-docker compose run --rm --no-deps -v "${pluginSrc}:/src:ro" --entrypoint sh gateway -lc @'
-set -e
-mkdir -p /home/node/.openclaw/plugins/claims
-cp /src/index.js /src/openclaw.plugin.json /src/package.json /home/node/.openclaw/plugins/claims/
-chmod 755 /home/node/.openclaw/plugins/claims
-chmod 644 /home/node/.openclaw/plugins/claims/*
-node -e '
-  const fs = require("fs"), f = "/home/node/.openclaw/openclaw.json";
-  const c = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : {};
-  c.gateway = Object.assign({}, c.gateway, { mode: "local" });
-  c.plugins = c.plugins || {};
-  c.plugins.load = Object.assign({}, c.plugins.load, { paths: ["/home/node/.openclaw/plugins/claims"] });
-  c.plugins.entries = Object.assign({}, c.plugins.entries, { claims: { enabled: true } });
-  fs.writeFileSync(f, JSON.stringify(c, null, 2));
-'
-node openclaw.mjs config validate
-'@ | Out-Null
+# NOTE: one line, not a PowerShell here-string. A multi-line string handed to a
+# native exe gets mangled on the way through, and the seed failed with no output
+# to say why. Keep it single-line.
+$seedScript = 'set -e; ' +
+  'mkdir -p /home/node/.openclaw/plugins/claims; ' +
+  'cp /src/index.js /src/openclaw.plugin.json /src/package.json /home/node/.openclaw/plugins/claims/; ' +
+  'chmod 755 /home/node/.openclaw/plugins/claims; chmod 644 /home/node/.openclaw/plugins/claims/*; ' +
+  'node -e ' + [char]34 +
+    'const fs=require("fs"),f="/home/node/.openclaw/openclaw.json";' +
+    'const c=fs.existsSync(f)?JSON.parse(fs.readFileSync(f,"utf8")):{};' +
+    'c.gateway=Object.assign({},c.gateway,{mode:"local"});' +
+    'c.plugins=c.plugins||{};' +
+    'c.plugins.load=Object.assign({},c.plugins.load,{paths:["/home/node/.openclaw/plugins/claims"]});' +
+    'c.plugins.entries=Object.assign({},c.plugins.entries,{claims:{enabled:true}});' +
+    'fs.writeFileSync(f,JSON.stringify(c,null,2));' +
+  [char]34 + '; ' +
+  'node openclaw.mjs config validate'
+$seedOut = docker compose run --rm --no-deps -v "${pluginSrc}:/src:ro" --entrypoint sh gateway -lc $seedScript 2>&1 | Out-String
+$seedExit = $LASTEXITCODE
 $seedExit = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
-if ($seedExit -ne 0) { throw "pre-boot seed failed ($seedExit) -- the gateway would not have started" }
+if ($seedExit -ne 0) { throw "pre-boot seed failed ($seedExit) -- the gateway would not have started:`n$($seedOut.Trim())" }
 
 $ErrorActionPreference = "Continue"
 docker compose up -d --build
