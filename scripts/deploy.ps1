@@ -37,17 +37,31 @@ if ((git status --porcelain) -ne $null) { $dirty = "-dirty" }
 
 $env:APP_VERSION = "$sha+$branch$dirty"
 
-# The gateway is a pulled image, not a build, so its version is whatever the tag
-# resolves to. Read it rather than assume it: "latest" moved twice during the
-# swap work, and an upgrade is exactly what re-enables a boundary plugin.
-# NOTE: no `2>&1` on a native command. PowerShell 5.1 wraps each stderr line in
-# an ErrorRecord, and with $ErrorActionPreference = "Stop" that throws even when
-# docker exited 0 -- `docker compose pull` writes its progress to stderr, so the
-# first run of this script died on a successful pull.
+# --- everything that must be true BEFORE the gateway boots --------------------
+#
+# The gateway validates its whole config at startup and REFUSES to boot on a bad
+# one -- and while it is refusing, `config set` refuses too, because it also
+# validates first. So a single bad value written by a failed deploy bricks the
+# volume and the only way out is editing the JSON by hand. That happened: a
+# stale `plugins.load.paths` pointing at a mount that no longer existed took
+# four restarts and tripped the restart-loop breaker.
+#
+# The rule that falls out: anything that can fail startup validation is applied
+# HERE, in a one-shot container, before `up`. Everything else waits until the
+# gateway is running, where a mistake is recoverable.
+#
+# The gateway is stopped first because the service holds a static IP on the
+# compose network and `compose run` collides with it ("Address already in use").
+# That also has to happen before the version probe, which is itself a
+# `compose run` -- getting the order wrong reported the version as "unknown".
 $ErrorActionPreference = "Continue"
+docker compose stop gateway | Out-Null
+
+# The image is pulled, not built, so its version is whatever the tag resolves
+# to. Read it rather than assume it: `latest` moved from 2026.6.34 to 2026.7.1
+# during this work, and an upgrade is exactly what re-enables a boundary plugin.
 docker compose pull gateway | Out-Null
 $version = docker compose run --rm --no-deps --entrypoint sh gateway -lc "node openclaw.mjs --version"
-$ErrorActionPreference = "Stop"
 $env:GATEWAY_VERSION = ($version | Where-Object { $_ -match "\S" } | Select-Object -Last 1)
 if (-not $env:GATEWAY_VERSION) { $env:GATEWAY_VERSION = "unknown" }
 
@@ -55,19 +69,36 @@ Write-Host "Deploying"
 Write-Host "  APP_VERSION     = $($env:APP_VERSION)"
 Write-Host "  GATEWAY_VERSION = $($env:GATEWAY_VERSION)"
 
-# The gateway refuses to start unconfigured -- "Missing config. Run `openclaw
-# setup` or set gateway.mode=local" -- and it cannot be configured while it is
-# refusing to start. Seed the one setting that breaks the cycle, before `up`,
-# into the same named volume the service will use. Idempotent; only the first
-# deploy on a fresh volume actually needs it.
-#
-# The gateway is stopped first because the service claims a static IP on the
-# compose network, and `compose run` would collide with it: "Address already in
-# use". On a first deploy there is nothing to stop.
-$ErrorActionPreference = "Continue"
-docker compose stop gateway | Out-Null
-docker compose run --rm --no-deps --entrypoint sh gateway -lc "node openclaw.mjs config set gateway.mode local" | Out-Null
+# One shot, with the plugin source bound in read-only:
+#   - gateway.mode=local, or it refuses to start at all ("Missing config")
+#   - the plugin copied into the state volume and chmodded. NOT bind mounted:
+#     a Windows bind mount is mode 777 and the gateway blocks a world-writable
+#     plugin directory, which is right -- anything able to write there can run
+#     code inside the gateway.
+#   - plugins.load.paths written by editing the JSON directly, because
+#     `config set` will not run while the config it is fixing is invalid.
+Write-Host "  seeding pre-boot config and the plugin"
+$pluginSrc = (Resolve-Path "./app/gateway-plugin").Path -replace '\', '/'
+docker compose run --rm --no-deps -v "${pluginSrc}:/src:ro" --entrypoint sh gateway -lc @'
+set -e
+mkdir -p /home/node/.openclaw/plugins/claims
+cp /src/index.js /src/openclaw.plugin.json /src/package.json /home/node/.openclaw/plugins/claims/
+chmod 755 /home/node/.openclaw/plugins/claims
+chmod 644 /home/node/.openclaw/plugins/claims/*
+node -e '
+  const fs = require("fs"), f = "/home/node/.openclaw/openclaw.json";
+  const c = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : {};
+  c.gateway = Object.assign({}, c.gateway, { mode: "local" });
+  c.plugins = c.plugins || {};
+  c.plugins.load = Object.assign({}, c.plugins.load, { paths: ["/home/node/.openclaw/plugins/claims"] });
+  c.plugins.entries = Object.assign({}, c.plugins.entries, { claims: { enabled: true } });
+  fs.writeFileSync(f, JSON.stringify(c, null, 2));
+'
+node openclaw.mjs config validate
+'@ | Out-Null
+$seedExit = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
+if ($seedExit -ne 0) { throw "pre-boot seed failed ($seedExit) -- the gateway would not have started" }
 
 $ErrorActionPreference = "Continue"
 docker compose up -d --build

@@ -28,24 +28,9 @@ function Set-GatewayConfig($path, $value) {
 
 Write-Host "`n--- configuring the gateway ---"
 
-# The plugin, copied rather than bind mounted. A Windows bind mount is mode 777
-# and the gateway blocks a world-writable plugin directory -- correctly, since
-# anything able to write there can run code inside the gateway. So the source
-# stays in the repo and the deployed copy lives in the state volume, owned by
-# the container's own user.
-Write-Host "  copying the plugin"
-$ErrorActionPreference = "Continue"
-docker compose exec -T gateway sh -lc "rm -rf /home/node/.openclaw/plugins/claims && mkdir -p /home/node/.openclaw/plugins/claims" | Out-Null
-Get-ChildItem "./app/gateway-plugin/*" -File | ForEach-Object {
-    docker compose cp $_.FullName "gateway:/home/node/.openclaw/plugins/claims/$($_.Name)" | Out-Null
-}
-docker compose exec -T gateway sh -lc "chmod 755 /home/node/.openclaw/plugins/claims && chmod 644 /home/node/.openclaw/plugins/claims/*" | Out-Null
-$ErrorActionPreference = "Stop"
-
-# Two enablement gates, both silent if missed: the load path AND the entry. A
-# plugin that loads without being enabled never runs and says nothing.
-Set-GatewayConfig "plugins.load.paths" '["/home/node/.openclaw/plugins/claims"]'
-Set-GatewayConfig "plugins.entries.claims.enabled" "true"
+# The plugin and its load path are applied BEFORE boot by deploy.ps1 -- a bad
+# plugins.load.paths fails config validation and the gateway then refuses to
+# start, which also makes `config set` refuse. See the pre-boot block there.
 
 # The tool surface. `claims__*` because MCP tools are namespaced <server>__<tool>
 # -- an allowlist written from the bare names resolves to nothing and the turn
