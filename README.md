@@ -107,6 +107,12 @@ Production runs in Docker via `./scripts/deploy.ps1`, which stamps the image wit
 
 Tests: `cd app && .venv/Scripts/python tests/test_core.py` — assert-based, no pytest, fully hermetic (all LLM keys force-blanked, vision calls stubbed; tests never spend API tokens).
 
+## Deploying
+
+Two runtimes as of the gateway swap — see **[docs/gateway-deploy.md](docs/gateway-deploy.md)**
+for the command, the two `.env` files and, most importantly, the list of things
+the preflight *cannot* assert.
+
 ## In flight: the OpenClaw gateway swap
 
 Nothing below has changed yet — this section exists so the gap between the docs and the plan is visible rather than discovered.
