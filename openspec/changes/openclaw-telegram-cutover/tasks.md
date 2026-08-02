@@ -61,7 +61,9 @@ what the suite proved:
   the SKIP depends on it. **A quota result, not a deploy failure** — do not read
   it as one.
 
-Still needing the token: 4.2, 4.3, 4.6, 4.7 and 4.10–4.13. 4.2 and 4.3 also need
+**Second deploy, 2026-08-03 (`d91ef44+deploy`): the preflight passes in full — 10 of 10, nothing skipped.** Groq's budget had rolled over, so the turn check ran: `llama-3.3-70b-versatile answered`, and `turn size under ceiling — 5,395 tokens; toolSchemaChars=2359, workspaceFileChars=6665, skillChars=0`. Twelve button commands registered, no collisions. `pending_flows` created at startup alongside `pending_proposals`.
+
+Still needing the token: 4.6, 4.7 and 4.10–4.13. 4.2 and 4.3 also need
 0.10a — how a plugin reaches `before_dispatch`, which exists but whose plugin-side
 API is unestablished.
 
@@ -120,6 +122,8 @@ Found 2026-08-01 while reconciling the specs with D2's correction. Four of these
   - **No allowlist of event names.** Each entry goes straight to `registerInternalHook(event, wrappedHandler)`, so `"before_dispatch"` is accepted as written.
   - **The handler's return value propagates** — the wrapper is `return await handler({...evt, context})` — which is what `runClaimingHook` reads to decide whether the message was claimed. So `{ handled: true }` actually claims.
   - **Two conditions.** `config.hooks.internal.enabled !== false` (this gateway has no `hooks` key at all, so it is enabled by default — checked live), and `registrationCapabilities.capabilityHandlers`, which is true for registration modes `full` / `discovery` / `tool-discovery`. **The plugin's `registerCommand` comes from the same gated block and demonstrably works** — eleven commands registered live on 2026-08-02 — so `registerHook` is available to it by the same token. That is an inference from observed behaviour rather than a separate observation, and it is the one step here still worth confirming with a real hook.
+
+  **Confirmed live 2026-08-03, `d91ef44+deploy`.** `openclaw hooks list` shows `claims-pending-flow — ready — plugin:claims` among 6/6, and the plugin logs an ERROR if `api.registerHook` is missing, which it did not. So the inference above is now an observation: `registerHook` is available to this plugin and the hook is registered. Still unproven is a real message being *claimed* — that needs the token, and `hooks list` reads a registry, which is the same class of evidence the project's rule warns about for `plugins list`.
 
   Hook names are global: a collision pushes an `error` diagnostic (`hook already registered: <name> (<other plugin>)`) and **returns without registering**. Same silent-ish class as `registerCommand`'s collision, so the name wants a prefix and the registration wants asserting.
 
