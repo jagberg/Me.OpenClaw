@@ -14,6 +14,12 @@ services:
     env_file:
       - ./app/.env
     environment:
+      # The gateway arrives from its static address on the compose network, not
+      # from loopback, so the app's loopback default rejects it with a bare 403.
+      # This is the whole reason the subnet is pinned. Found by the first real
+      # deploy: the plugin's boot report and the MCP handshake both came back
+      # {"error":"rejected"} while the network itself was fine.
+      INTERNAL_API_ALLOW_HOSTS: "127.0.0.1,::1,172.28.0.20"
       # Recorded beside app_version on /health, never into it. Two runtimes mean
       # two versions, and telegram_messages.app_version must keep meaning "the
       # Python code that handled this row".
