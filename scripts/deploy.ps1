@@ -55,6 +55,20 @@ Write-Host "Deploying"
 Write-Host "  APP_VERSION     = $($env:APP_VERSION)"
 Write-Host "  GATEWAY_VERSION = $($env:GATEWAY_VERSION)"
 
+# The gateway refuses to start unconfigured -- "Missing config. Run `openclaw
+# setup` or set gateway.mode=local" -- and it cannot be configured while it is
+# refusing to start. Seed the one setting that breaks the cycle, before `up`,
+# into the same named volume the service will use. Idempotent; only the first
+# deploy on a fresh volume actually needs it.
+#
+# The gateway is stopped first because the service claims a static IP on the
+# compose network, and `compose run` would collide with it: "Address already in
+# use". On a first deploy there is nothing to stop.
+$ErrorActionPreference = "Continue"
+docker compose stop gateway | Out-Null
+docker compose run --rm --no-deps --entrypoint sh gateway -lc "node openclaw.mjs config set gateway.mode local" | Out-Null
+$ErrorActionPreference = "Stop"
+
 $ErrorActionPreference = "Continue"
 docker compose up -d --build
 $buildExit = $LASTEXITCODE
