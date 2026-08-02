@@ -1,6 +1,6 @@
 # ADR 0025: The proposal gate is split by origin, and its text is composed by code
 
-- Status: accepted
+- Status: accepted (gate location superseded by ADR-0027)
 - Date: 2026-08-01
 - Supersedes the gate's location in ADR-0016 (`telegram_bot._execute_action`)
 - Related: ADR-0024 (two runtimes), ADR-0023 (tool inventory)
@@ -159,7 +159,8 @@ Two costs this creates, neither of them blocking:
   requests in separate runtimes. That needs a durable store, not the per-turn
   `proposals` list `telegram_bot` passes around today.
 
-**Status: this ADR's Decision is superseded in part and awaits Justin.** Nothing
-in section 3 that depends on where the commit lands has been built. The parts
-that do not depend on it — the `propose_*` refusals, the claim-id requirement,
-and the proof that a proposal changes nothing — are unaffected either way.
+**Justin decided on 2026-08-02: proceed with one commit path.** Recorded as
+**ADR-0027**, which supersedes this ADR's gate *location* and nothing else.
+Everything above about code-composed confirmation text, harness-enforced
+refusals, and a commit never being a tool return value stands unchanged and is
+carried forward verbatim.

@@ -1680,6 +1680,9 @@ def _fresh_db():
         conn.execute("DELETE FROM vet_claims")
         conn.execute("DELETE FROM bank_transactions")
         conn.execute("DELETE FROM ops_alerts")
+        # Proposals are keyed to claims that are about to be deleted; leaving
+        # them makes "did this refusal queue anything?" depend on test order.
+        conn.execute("DELETE FROM pending_proposals")
         conn.execute("UPDATE pets SET policy_anniversary = NULL")
 
 
@@ -4753,19 +4756,34 @@ def test_mcp_inventory_has_no_dangerous_tool():
 
     assert not scan(mcp_server.TOOL_NAMES), scan(mcp_server.TOOL_NAMES)
 
-    # No mutation reachable, whatever the inventory says. `_impls` selects BY
-    # NAME out of TOOL_NAMES, so set-equality and "no propose_*" hold by
-    # construction — they cannot fail. What discriminates is that there was
-    # something to filter: assert the agent dict really does carry mutations and
-    # the selection really does drop them. Without this the two asserts below
-    # would still pass if `_build_impls` returned an empty dict.
-    from openclaw import agent
+    # Proposals ARE reachable here as of section 3, and that is not a hole: a
+    # propose_* tool queues a row and sends a button, and the write happens on
+    # the tap. What must stay unreachable is the commit. Assert the boundary
+    # where it actually is — no implementation on this surface reaches
+    # `proposals.commit` or `proposals.execute`.
+    from openclaw import agent, proposals
 
     droppable = [n for n in agent._build_impls([], "") if n.startswith("propose_")]
     assert droppable, "the agent exposes no propose_* — this test would prove nothing"
     impls = mcp_server._impls()
     assert set(impls) == set(mcp_server.TOOL_NAMES), (set(impls) ^ set(mcp_server.TOOL_NAMES))
-    assert not [n for n in impls if n.startswith("propose_")], list(impls)
+
+    committed = []
+    real_commit, real_execute = proposals.commit, proposals.execute
+    proposals.commit = lambda *a, **k: committed.append(("commit", a)) or {"ok": True, "message": ""}
+    proposals.execute = lambda *a, **k: committed.append(("execute", a)) or ""
+    try:
+        # Every tool, called with nothing. Most will complain about missing
+        # arguments; none may reach a write. A TypeError here is the tool
+        # refusing bad input, which is the correct behaviour and not a commit.
+        for name, fn in mcp_server._impls().items():
+            try:
+                fn()
+            except TypeError:
+                pass
+        assert not committed, f"an MCP implementation reached the commit path: {committed}"
+    finally:
+        proposals.commit, proposals.execute = real_commit, real_execute
 
 
 def test_mcp_inventory_is_enumerated_and_within_its_token_budget():
@@ -4779,15 +4797,19 @@ def test_mcp_inventory_is_enumerated_and_within_its_token_budget():
 
     from openclaw import mcp_server
 
-    # Ceilings sit just above the measured truth (7 tools, 2,405 chars), not at
-    # the theoretical headroom. They were 12 and 8,000, which let five tools and
-    # 3.3x the schema arrive with the suite still green — a budget nothing can
-    # exceed is not a budget. Slice 2's proposal tools WILL turn this red; that
-    # is the mechanism working, and the fix is to re-measure a real turn and
-    # raise both numbers deliberately, never to widen them ahead of the need.
-    assert len(mcp_server.TOOLS) <= 8, f"{len(mcp_server.TOOLS)} tools — re-measure the turn before raising this"
+    # Ceilings sit just above the measured truth, not at the theoretical
+    # headroom. They were 12 and 8,000 against 7 tools / 2,405 chars, which let
+    # five tools and 3.3x the schema arrive with the suite green — a budget
+    # nothing can exceed is not a budget.
+    #
+    # Raised 2026-08-02 when section 3 added the five propose_* tools, which is
+    # the mechanism working as designed: 12 tools / 4,660 chars measured, so 13
+    # and 5,200. Still ~1,165 tokens at the usual 4 chars/token, against the
+    # ~8,100 of headroom measured after the 17.8/17.10 cuts. Raise these only
+    # after re-measuring a real turn, never ahead of the need.
+    assert len(mcp_server.TOOLS) <= 13, f"{len(mcp_server.TOOLS)} tools — re-measure the turn before raising this"
     schema_chars = len(_json.dumps(mcp_server.TOOLS))
-    assert schema_chars <= 3000, f"tool schemas are {schema_chars} chars; they ship on every turn"
+    assert schema_chars <= 5200, f"tool schemas are {schema_chars} chars; they ship on every turn"
     for tool in mcp_server.TOOLS:
         assert tool["name"] and tool["description"] and "inputSchema" in tool, tool
 
@@ -4813,7 +4835,9 @@ def test_mcp_speaks_enough_of_the_protocol_to_be_probed():
     # gmail-isolation-boundary surface and a per-turn token cost, so it changes
     # by deliberate edit here or not at all.
     assert served == ["turn_context", "query_claims", "pending_actions", "claim_detail",
-                      "claim_history", "submissions_awaiting_reply", "list_tasks"], served
+                      "claim_history", "submissions_awaiting_reply", "list_tasks",
+                      "propose_mark_sent", "propose_set_condition", "propose_assign_pet",
+                      "propose_mark_resolved", "propose_split_between_pets"], served
     # A client reads the schemas off this response, never off TOOLS.
     assert all(t["inputSchema"]["type"] == "object" and t["description"]
                for t in listed["result"]["tools"]), listed["result"]["tools"]
@@ -4984,6 +5008,164 @@ def test_the_plugin_report_is_per_boot_and_never_persisted():
 
     assert gateway_client.BUTTON_COMMANDS, "the preflight has nothing to assert"
     assert all(not c.startswith("/") for c in gateway_client.BUTTON_COMMANDS), gateway_client.BUTTON_COMMANDS
+
+
+def _propose_via_mcp(name, arguments, runner=None):
+    """Drive one propose_* tool the way the gateway's agent would, with the
+    Confirm card's send captured instead of shelled out."""
+    from openclaw import mcp_server
+
+    seen, capture = _capture_argv()
+    out = mcp_server._call_tool(name, arguments, runner=runner or capture)
+    return out["content"][0]["text"], seen
+
+
+def _claim_count_snapshot():
+    with db.get_connection() as conn:
+        return [tuple(r) for r in conn.execute(
+            "SELECT id, status, pet_id, condition_text FROM vet_claims ORDER BY id")]
+
+
+def test_a_proposal_writes_a_pending_row_and_changes_no_claim_data():
+    """3.1 / 3.7 — the whole gate. A propose_* call must leave the claims table
+    byte-identical and put a Confirm button in front of Justin instead.
+
+    3.7's framing is the one that matters: the model saying it did something is
+    not evidence either way, so assert the data, not the sentence."""
+    from openclaw import db as _db, proposals
+
+    _fresh_db()
+    with _db.get_connection() as conn:
+        conn.execute("INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+                     "VALUES (?, ?, '2026-08-02T00:00:00Z')", (config.TELEGRAM_USERNAME, 4242))
+        _insert_claim(conn, 1, "2026-06-01", status="drafted", draft_id="d-proposal")
+        claim = conn.execute("SELECT id FROM vet_claims ORDER BY id LIMIT 1").fetchone()
+    assert claim, "fixture has no claim to propose against"
+
+    before = _claim_count_snapshot()
+    text, seen = _propose_via_mcp("propose_mark_sent", {"claim_id": claim["id"]})
+
+    assert _claim_count_snapshot() == before, "a proposal changed claim data"
+    with _db.get_connection() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM pending_proposals")]
+    assert len(rows) == 1, rows
+    assert rows[0]["action"] == "mark_sent" and rows[0]["confirmed_at"] is None, rows[0]
+    assert rows[0]["origin"] == "chat" and str(claim["id"]) in rows[0]["label"], rows[0]
+
+    # A Confirm button went out, carrying the row id and nothing the model wrote.
+    assert len(seen) == 1, seen
+    argv = seen[0]
+    import json as _json
+    presentation = _json.loads(argv[argv.index("--presentation") + 1])
+    button = presentation["blocks"][0]["buttons"][0]
+    assert button["action"] == {"type": "command", "command": f"/confirm {rows[0]['id']}"}, button
+    assert len(button["action"]["command"].encode("utf-8")) <= 58, button
+    # The card's text is composed from the code-built label, not from the model.
+    assert argv[argv.index("--message") + 1] == f"Confirm: {rows[0]['label']}", argv
+    assert f"#{rows[0]['id']}" in text and "Nothing has changed yet" in text, text
+
+    # And only the tap commits.
+    assert proposals.commit(rows[0]["id"])["ok"] is True
+    assert _claim_count_snapshot() != before, "the confirmed proposal changed nothing"
+    # Single-use: Telegram redelivers, and a second mark-sent is a second
+    # Petcover submission for one set of invoices.
+    again = proposals.commit(rows[0]["id"])
+    assert again["ok"] is False and "Already confirmed" in again["message"], again
+
+
+def test_the_mcp_surface_refuses_a_single_pet_assignment_when_the_message_names_two():
+    """3.3 — the live 2026-07-27 failure, replayed through the new surface.
+
+    Replaying *"This is actually split between echo and Aari. Aari cost was $35
+    out of this"* against the ASSIGN PET card, the model proposed assigning Aari
+    AND Echo — no API error, the split tool present in the schema. ADR-0025 says
+    this refusal is enforced in the MCP surface, not mirrored there.
+
+    The message text is read from the message log, not from a tool argument: a
+    model that paraphrased it would paraphrase the second pet name away and take
+    the refusal with it."""
+    from openclaw import db as _db
+
+    _fresh_db()
+    live = "This is actually split between echo and Aari. Aari cost was $35 out of this"
+    with _db.get_connection() as conn:
+        conn.execute("INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+                     "VALUES (?, ?, '2026-08-02T00:00:00Z')", (config.TELEGRAM_USERNAME, 4242))
+        conn.execute(
+            "INSERT INTO telegram_messages (update_id, direction, kind, summary, payload, "
+            "app_version, received_at) VALUES (?, 'in', 'text', ?, '{}', 'test', '2026-08-02T00:00:00Z')",
+            (990001, live))
+        _insert_claim(conn, 1, "2026-06-01", status="pending_match")
+        claim = conn.execute("SELECT id FROM vet_claims ORDER BY id LIMIT 1").fetchone()
+    assert _db.latest_inbound_text() == live, _db.latest_inbound_text()
+
+    before = _claim_count_snapshot()
+    text, seen = _propose_via_mcp("propose_assign_pet", {"pet_name": "Aari", "claim_id": claim["id"]})
+
+    assert "SPLIT" in text and "propose_split_between_pets" in text, text
+    assert _claim_count_snapshot() == before, "the refusal still changed claim data"
+    with _db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM pending_proposals").fetchone()["c"] == 0, \
+            "a refusal queued a proposal"
+    assert not seen, "a refusal sent a Confirm button"
+
+
+def test_the_mcp_surface_refuses_a_split_with_no_amounts_rather_than_writing_zero_rows():
+    """3.4 — a per-pet split with nothing to apportion must be refused, not
+    filled with $0. `propose_split_between_pets` dry-runs the same guards the
+    write uses, so an impossible split is refused in the reply instead of
+    failing after the tap."""
+    from openclaw import db as _db
+
+    _fresh_db()
+    with _db.get_connection() as conn:
+        conn.execute("INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+                     "VALUES (?, ?, '2026-08-02T00:00:00Z')", (config.TELEGRAM_USERNAME, 4242))
+        _insert_claim(conn, 1, "2026-06-01", status="matched")
+        claim = conn.execute("SELECT id FROM vet_claims ORDER BY id LIMIT 1").fetchone()
+
+    before = _claim_count_snapshot()
+    # Two pets, neither carrying an amount: only one share may be left out, and
+    # inventing the other is exactly what must not happen.
+    text, seen = _propose_via_mcp("propose_split_between_pets", {
+        "claim_id": claim["id"], "pets_and_amounts": [{"pet": "Aari"}, {"pet": "Echo"}]})
+
+    assert "Never invent" in text or "missing amounts" in text, text
+    assert _claim_count_snapshot() == before, "the refusal changed claim data"
+    with _db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM pending_proposals").fetchone()["c"] == 0, text
+    assert not seen, "a refusal sent a Confirm button"
+
+
+def test_every_mutating_tool_takes_an_explicit_claim_id():
+    """3.5 — with no way to name the claim under discussion, the model
+    fabricated argument values out of the tool schemas' own description strings
+    (live, 2026-07-27). No tool may be targetable only by pet or reference."""
+    from openclaw import mcp_server
+
+    mutating = [t for t in mcp_server.TOOLS if t["name"].startswith("propose_")]
+    assert mutating, "no proposal tools to check"
+    for tool in mutating:
+        assert "claim_id" in tool["inputSchema"]["properties"], tool["name"]
+        assert tool["inputSchema"]["properties"]["claim_id"]["type"] == "integer", tool["name"]
+    # And the claim under discussion is available to the turn without one:
+    # turn_context carries today's date and the pets, and the message log
+    # carries what he actually typed.
+    assert isinstance(db.latest_inbound_text(), str)
+
+
+def test_a_confirm_with_a_junk_id_changes_nothing_and_says_so():
+    """The tap path's own bad input. A 404-shaped answer that reads like success
+    is how a morning of taps changed nothing and left no evidence of why."""
+    from openclaw import internal_api
+
+    _fresh_db()
+    before = _claim_count_snapshot()
+    for junk in ("", "abc", None, "99999"):
+        outcome = internal_api.confirm_proposal(junk)
+        assert outcome["ok"] is False, (junk, outcome)
+        assert "Nothing was changed" in outcome["message"] or "not found" in outcome["message"], outcome
+    assert _claim_count_snapshot() == before
 
 
 def test_the_plugin_registers_exactly_the_commands_a_button_may_emit():

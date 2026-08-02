@@ -58,6 +58,10 @@ const COMMANDS = [
   { name: "resolve", description: "Confirm an action is dealt with" },
   { name: "history", description: "Claim history" },
   { name: "actions", description: "What is waiting on you" },
+  // The Confirm button on a chat-initiated proposal. Its whole payload is
+  // `/confirm <row id>` -- no free text, well inside the 58-byte budget. The
+  // app commits on this and only on this (ADR-0027).
+  { name: "confirm", description: "Confirm a proposed change" },
 ];
 
 async function callApp(route, body, correlationId) {

@@ -189,6 +189,30 @@ CREATE TABLE IF NOT EXISTS telegram_messages (
 
 CREATE INDEX IF NOT EXISTS idx_telegram_messages_pending
     ON telegram_messages(direction, processed_at);
+
+-- A mutation the model proposed, waiting for Justin to tap Confirm.
+-- Durable rather than in-process because the proposal and the tap are now two
+-- separate requests in two separate runtimes: the MCP call arrives from the
+-- gateway's agent, the tap arrives later through the plugin. `telegram_bot`'s
+-- in-memory `_pending_actions` dict cannot span that, and a restart in between
+-- would silently turn a proposal into a tap that does nothing.
+-- `confirmed_at` is what makes a tap single-use — a double tap must not commit
+-- twice, and Telegram redelivers.
+CREATE TABLE IF NOT EXISTS pending_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin TEXT NOT NULL,
+    action TEXT NOT NULL,
+    claim_id INTEGER,
+    task_id INTEGER,
+    arg TEXT,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT,
+    result TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_proposals_open
+    ON pending_proposals(confirmed_at, created_at);
 """
 
 # vet_claims columns added after the table's initial release — CREATE TABLE IF
@@ -265,6 +289,41 @@ def get_connection(path: str | None = None):
         conn.commit()
     finally:
         conn.close()
+
+
+def registered_chat_id() -> int | None:
+    """The chat Justin registered with /start. THE reader — do not inline it.
+
+    Lived in `telegram_bot`, which the gateway cutover deletes, while being a
+    plain DB read three unrelated callers need. Same move as `list_pet_names`
+    below, for the same reason.
+    """
+    from . import config
+
+    with get_connection() as conn:
+        row = conn.execute("SELECT chat_id FROM telegram_registrations WHERE username = ?",
+                           (config.TELEGRAM_USERNAME,)).fetchone()
+    return row["chat_id"] if row else None
+
+
+def latest_inbound_text() -> str:
+    """The most recent thing Justin typed, as the message log recorded it.
+
+    The MCP surface needs this and cannot see the conversation: the gateway's
+    agent calls a tool, and the tool gets its arguments and nothing else. The
+    two-pets refusal keys on what he actually wrote, so taking it from the
+    model's paraphrase would let the model paraphrase the refusal away — which
+    is the exact failure the refusal exists for (2026-07-27).
+
+    `summary` rather than `payload`: it is already the extracted text, written
+    by the same `_describe` for both transports. Empty string when there is
+    nothing, never None — every caller substring-matches.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT summary FROM telegram_messages WHERE direction = 'in' AND kind IN ('text', 'command') "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+    return (row["summary"] or "") if row else ""
 
 
 def list_pet_names() -> list[str]:

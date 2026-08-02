@@ -22,7 +22,8 @@ from telegram.ext import (
     filters,
 )
 
-from . import agent, claim_card, claim_forms, claim_status, config, db, invoice_matching, llm, message_log
+from . import (agent, claim_card, claim_forms, claim_status, config, db, invoice_matching, llm,
+               message_log, proposals)
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +79,7 @@ async def _ack_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 def get_registered_chat_id() -> int | None:
-    with db.get_connection() as conn:
-        row = conn.execute(
-            "SELECT chat_id FROM telegram_registrations WHERE username = ?",
-            (config.TELEGRAM_USERNAME,),
-        ).fetchone()
-    return row["chat_id"] if row else None
+    return db.registered_chat_id()
 
 
 def register_chat(username: str, chat_id: int) -> None:
@@ -578,36 +574,15 @@ def _register_action(proposal: dict) -> str:
 
 
 def _execute_action(proposal: dict) -> str:
-    """Run a confirmed mutation through the same domain functions the slash
-    commands use — the write happens here, only after a Confirm tap."""
-    action, claim_id, arg = proposal["action"], proposal.get("claim_id"), proposal.get("arg")
-    if action == "mark_sent":
-        return claim_status.mark_sent(claim_id)["message"]
-    if action == "set_condition":
-        return claim_forms.set_condition_text(claim_id, arg)["message"]
-    if action == "assign_pet":
-        return claim_forms.assign_pet(claim_id, arg)["message"]
-    if action == "mark_resolved":
-        return claim_status.confirm_resolved(claim_id)["message"]
-    # Named split_pets, not split: `split:` callbacks are the per-item CONDITION
-    # split, a different axis on the same invoice.
-    if action == "split_pets":
-        return claim_forms.split_between_pets(claim_id, arg)["message"]
-    # Assistant side — no claim_id involved anywhere in the round trip. Imported
-    # here, not at module scope: tasks -> reminders -> scheduler constructs a
-    # jobstore against the DB at import time, and the bot shouldn't trigger that.
-    from . import tasks
+    """The card path's way into the one commit switch.
 
-    if action == "create_task":
-        try:
-            task_id = tasks.create_task(arg, source="chat")
-        except llm.LLMUnavailableError as exc:  # visible, never a silent drop
-            return f"⚠️ Couldn't save the task — {exc}"
-        return f"Task #{task_id} saved: {arg}"
-    if action == "close_task":
-        tasks.record_outcome(proposal["task_id"], arg)
-        return f"Task #{proposal['task_id']} closed: {arg}"
-    return f"Unknown action: {action}"
+    The switch itself moved to `proposals.execute` on 2026-08-02, when the chat
+    path stopped being able to commit inside the MCP surface (ADR-0027). Both
+    origins run the same code — a second copy here is exactly the drift this
+    module is being deleted to avoid, and the deletion must not take the
+    behaviour with it.
+    """
+    return proposals.execute(proposal)
 
 
 async def _append_result(query, suffix: str) -> None:

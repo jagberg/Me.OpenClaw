@@ -202,6 +202,31 @@ def plugin_report() -> dict:
     return dict(_plugin_report)
 
 
+def confirm_proposal(args) -> dict:
+    """A Confirm tap on a chat-initiated proposal: `/confirm <id>`.
+
+    **Deliberately not its own route.** The plugin forwards every command to
+    `/internal/command/<name>`, which section 4 builds; that dispatcher calls
+    this. A second door straight to the commit is exactly what ADR-0027 just
+    finished collapsing, and one entry point per origin is the property worth
+    keeping.
+
+    `args` arrives as the raw string the plugin passed through, so the parse
+    lives here rather than in the caller. `proposals.commit` refuses a second
+    tap — Telegram redelivers, and a double mark-sent is a second Petcover
+    submission for one set of invoices.
+    """
+    from . import proposals
+
+    try:
+        pid = int(str(args).strip())
+    except (TypeError, ValueError):
+        return {"ok": False, "message": f"Not a proposal id: {args!r}. Nothing was changed."}
+    outcome = proposals.commit(pid)
+    logger.info("confirm proposal=%s ok=%s", pid, outcome["ok"])
+    return outcome
+
+
 @router.post("/telegram/event")
 async def telegram_event(
     request: Request,
