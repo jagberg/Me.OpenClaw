@@ -1,17 +1,26 @@
-## ADDED Requirements
+# openclaw-gateway-runtime Specification
 
-### Requirement: The gateway owns channel transport; the app owns the domain
-The OpenClaw gateway SHALL be the only process holding the Telegram bot token and the only process polling Telegram. The Python app SHALL NOT run its own updater. Claims logic, Gmail access, the database and the dashboard SHALL remain in the Python process.
+## Purpose
+The OpenClaw gateway runs as a second runtime alongside the Python app. It owns
+the agent session, model resolution and the plugin surface; the Python app owns
+claims logic, Gmail, the database and the dashboard. This capability covers what
+must hold while both runtimes run: who registers the app's commands, how large an
+agent turn may be, what the agent's workspace contains, which configuration the
+deploy must assert because no test can see it, how versions are stamped when
+there are two of them, and that bringing the pair up stays one command.
 
-Two processes cannot long-poll one bot token — Telegram answers the second poller with `409 Conflict` — so this is a mutual-exclusion requirement, not a stylistic one.
+**Scope note (2026-08-02).** Four further requirements — the gateway owning
+channel transport, the app reaching Telegram through gateway actions, independent
+degradation, and gateway cron — are not yet true. They are specified in
+`openspec/changes/openclaw-telegram-cutover/` and become part of this capability
+when that change archives. Today the Python app still holds the bot token.
 
-#### Scenario: Gateway is the sole poller
-- **WHEN** both runtimes are up
-- **THEN** exactly one process is polling the bot token, and the Python app has no `Application`/updater instance
+Implemented across `docker-compose.yml` (two services, fixed subnet),
+`scripts/deploy.ps1`, `scripts/gateway_seed.sh`, `scripts/gateway_preflight.py`,
+`app/gateway-plugin/` and `app/gateway-workspace/`. See ADR-0023, ADR-0024,
+ADR-0025 and `docs/gateway-deploy.md`.
 
-#### Scenario: Domain logic is not moved
-- **WHEN** the swap is complete
-- **THEN** `pipeline`, `claim_status`, `invoice_matching`, `claim_forms`, `vet_detection` and `gmail_client` are unchanged in behaviour and still owned by Python
+## Requirements
 
 ### Requirement: An in-gateway plugin owns the app's command surface
 A plugin running inside the gateway SHALL register the app's slash commands (`/mark`, `/pet`, `/resolve` and the rest) via the plugin API, and its command handlers SHALL do no claims work themselves — each forwards to the app's `/internal` endpoints.
@@ -70,17 +79,6 @@ Rationale: left with the seeded templates, the stock agent opened by interviewin
 - **WHEN** a platform upgrade would rewrite the workspace files
 - **THEN** re-seeding is disabled and the shipped versions survive, or the deploy fails
 
-### Requirement: The app reaches Telegram through gateway actions, not the Bot API
-Unattended outbound messages — claim notifications, cards, PDF alerts, nudges — SHALL be emitted by calling the gateway's send/edit actions, and SHALL NOT call the Telegram Bot API directly.
-
-#### Scenario: Pipeline tick notifies a blocked claim
-- **WHEN** a tick finds a claim needing attention
-- **THEN** the notification is sent via a gateway action, with no direct Bot API call from Python
-
-#### Scenario: Gateway is down when a notification is due
-- **WHEN** a send is attempted and the gateway is unreachable
-- **THEN** the failure is recorded with a human-readable reason and surfaced, never swallowed, consistent with the project's failure-visibility rule
-
 ### Requirement: Configuration that can silently regress is asserted at deploy
 The deploy SHALL assert, against the running gateway, that: the boundary plugins (`browser`, `file-transfer`, and any other granting filesystem, shell or browser reach) are disabled; `channels.telegram.dmPolicy` is `allowlist` with a non-empty `allowFrom`; `commands.ownerAllowFrom` is non-empty; the gateway holds no Gmail credential and no mount reaching `app/data`; and the media outbox directory is narrow.
 
@@ -93,28 +91,6 @@ Rationale: every item here was found silently wrong during the 2026-08-01 spike.
 #### Scenario: Access policy left at its default
 - **WHEN** `dmPolicy` is `pairing` rather than `allowlist`
 - **THEN** the deploy fails, because unknown senders would receive a pairing code and instructions to obtain approval
-
-### Requirement: Each runtime degrades visibly and independently
-Neither runtime's absence SHALL cause the other to fail silently. If the gateway is down, the pipeline SHALL continue matching, drafting and recording state, queueing what it could not deliver. If the Python app is down, the gateway SHALL report the tool surface as unavailable rather than answering from the model's own knowledge.
-
-#### Scenario: Python app down, user asks a question
-- **WHEN** the MCP server is unreachable and the user asks about a claim
-- **THEN** the reply states the claims service is unavailable, and no claim facts are asserted
-
-#### Scenario: Gateway down, tick still runs
-- **WHEN** the gateway is down for a full tick interval
-- **THEN** claim state still advances and the undelivered notifications remain pending rather than being marked notified
-
-### Requirement: Scheduled work runs from gateway cron with single-fire guarantees
-The 15-minute pipeline tick, the Gmail ingest job and the daily stale-action nudge SHALL be registered as gateway cron entries invoking the app. A tick SHALL NOT overlap itself, and a missed window SHALL NOT cause two ticks to run concurrently on recovery.
-
-#### Scenario: A tick outruns its interval
-- **WHEN** one tick is still running when the next is due
-- **THEN** the next invocation is skipped or queued, and two `pipeline.run_once` calls never run concurrently against the same database
-
-#### Scenario: Gateway restarts between ticks
-- **WHEN** the gateway restarts
-- **THEN** cron entries survive the restart without manual re-registration
 
 ### Requirement: Version stamping survives the second runtime
 Every row written to `telegram_messages` SHALL continue to carry the Python app's version. The gateway's own version SHALL be recorded separately and SHALL NOT overwrite or masquerade as `app_version`.

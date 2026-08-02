@@ -233,3 +233,24 @@ the fix is to create the capability or drop the sentence.
 
 Worth doing before the next archive either way — a baseline that references
 missing capabilities gets less trustworthy each time it is read and believed.
+
+## Doctor reports two CRITICALs that do not block startup (found 2026-08-01)
+
+Slice 1's task 13.6, moved here at archive on 2026-08-02 rather than into
+`openclaw-telegram-cutover`, because it is true of the gateway as it runs today
+and has nothing to do with holding the bot token.
+
+`openclaw doctor` on a first run reports `CRITICAL: Session store dir missing
+(~/.openclaw/agents/main/sessions)` and 32 skills with missing requirements.
+Neither blocked startup, and the gateway has since served turns, so at least the
+first is either self-healing or misclassified.
+
+**Why it matters that this stays open.** `scripts/gateway_seed.sh` already calls
+`oc doctor --fix` as a repair step for an invalid config volume. Nobody should
+promote `doctor` from a repair tool to a health gate — the obvious next step —
+until these two are understood, because a gate that fails on a condition the
+system tolerates gets skipped, and a skipped gate is worse than no gate.
+
+Slice 1 deliberately used `config validate` as the authoritative pre-boot check
+instead, since it exits non-zero on warnings and is the same validation the
+gateway runs at startup.

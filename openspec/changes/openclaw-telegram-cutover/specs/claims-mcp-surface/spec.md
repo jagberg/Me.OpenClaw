@@ -1,41 +1,15 @@
 ## ADDED Requirements
 
-### Requirement: MCP serves conversation only; deterministic paths never use it
-The MCP inventory SHALL be reachable only from the conversational agent. A button tap, a slash command, or an unattended pipeline notification SHALL NOT pass through MCP, a tool call, or a model.
+<!--
+The three requirements that need a real tap on a real button, which needs the
+gateway polling. The five read-surface requirements shipped and archived with
+`openclaw-gateway-core` (slice 1) and are already in `openspec/specs/`.
 
-Decided by Justin, 2026-08-01: no MCP for deterministic calls. A tap is a `command` action → plugin-registered command → `/internal` → existing claim logic. Beyond correctness, this is a cost control: every tool schema is transmitted on every chat turn, so a deterministic path routed through MCP would be charged the whole inventory for work that needs no model.
-
-#### Scenario: A tap never reaches MCP
-- **WHEN** the user taps a claim card button
-- **THEN** the command path handles it end to end, and no MCP tool is invoked and no model runs
-
-#### Scenario: Chat reaches the domain through MCP
-- **WHEN** the user asks a question in free text
-- **THEN** the agent answers using the MCP read tools
-
-### Requirement: The tool inventory has a declared budget
-The number of tools SHALL be bounded by a declared maximum, and exceeding it SHALL fail the test suite rather than silently increasing the cost of every conversational turn.
-
-The maximum SHALL be derived from the configured provider's per-request limit less the measured cost of everything else in a turn, not chosen by judgement.
-
-Rationale: tool schemas ship on every request, so inventory size is a recurring per-turn cost. Measured 2026-08-01: a trimmed turn with no claims tools is 5,355 tokens against Groq free tier's 12,000 per minute, leaving roughly 6,600 tokens for the entire claims inventory. That is the budget. For scale, the platform's own stock inventory of 32 tools was 31,972 chars — about five times the headroom available — so the constraint is real and a plausible-looking inventory can breach it.
-
-#### Scenario: A tool is added beyond the budget
-- **WHEN** a new tool takes the inventory past its declared maximum
-- **THEN** the suite fails, naming the budget and the current count
-
-### Requirement: The claims domain is exposed as a bounded MCP tool inventory
-The Python app SHALL expose its capabilities to the gateway agent as an MCP server with an explicit, enumerated tool inventory. A capability absent from the inventory SHALL be unreachable by the agent, not merely discouraged by prompt text.
-
-Rationale: today's boundaries (ADR-0016) are held by a tool registry in `agent.py` plus prompt discipline. Once a general-purpose agent runtime holds the loop, prompt discipline is no longer a boundary — the inventory is.
-
-#### Scenario: A capability with no tool
-- **WHEN** the user asks for an operation the inventory does not implement
-- **THEN** the agent cannot perform it, and no adjacent tool is used as a substitute
-
-#### Scenario: Inventory is enumerable
-- **WHEN** the tool surface is inspected
-- **THEN** every tool the agent can call is listed, with no wildcard or dynamically-registered addition
+Splitting this capability across two slices was the deliberate cost recorded in
+that change's task 8.11: holding it whole would have dragged the read tools —
+exercisable through `openclaw agent` with no channel bound — into the risky day
+for no reason.
+-->
 
 ### Requirement: Reads commit nothing; mutations are proposals the harness gates
 Read tools SHALL return current state directly. Every mutating capability SHALL be exposed only as a `propose_*` tool that records a pending action and returns a confirmation to be presented with a confirm button. The commit SHALL happen on the confirm callback path inside the Python app, never as a return value of a tool the model called.
@@ -71,13 +45,6 @@ Refusals currently enforced by the harness rather than the prompt SHALL be enfor
 - **WHEN** a per-item condition split is proposed for an invoice whose items have no extracted amounts
 - **THEN** the server refuses with an explanation and no $0 rows are produced
 
-### Requirement: Outstanding work has exactly one derivation
-Any tool answering what is outstanding, blocked, or waiting SHALL call the shared `claim_status.pending_actions()` derivation. The inventory SHALL NOT contain a second tool from which the agent could assemble its own list.
-
-#### Scenario: Asked what is outstanding
-- **WHEN** the agent answers what is waiting on the user
-- **THEN** the entries come from the shared derivation, and agree with the `/actions` cards item for item
-
 ### Requirement: Claim identity is always available to a tool
 Every mutating tool SHALL accept an explicit claim id, and the current claim resolved from a replied-to card SHALL be supplied to the turn. No tool SHALL exist that can only be targeted by pet, reference, or merchant.
 
@@ -90,10 +57,3 @@ Rationale: with no way to name the claim under discussion, the model fabricated 
 #### Scenario: No id resolvable
 - **WHEN** neither the message nor the replied-to message names a claim and the request is ambiguous
 - **THEN** the agent asks for clarification and commits nothing
-
-### Requirement: Secrets and implementation internals are outside the inventory
-The inventory SHALL contain no tool returning `.env` contents, API keys, bank credentials, database files, or source code. Claim-level "why" SHALL be answered by the claim-detail tool; questions about the implementation SHALL be declined for want of a tool.
-
-#### Scenario: Asked for secrets
-- **WHEN** the user asks for API keys, bank details or `.env` contents
-- **THEN** no tool can return them and the agent declines
