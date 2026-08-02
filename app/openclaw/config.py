@@ -82,6 +82,51 @@ OWNER_BANK_ACCOUNT_NUMBER = os.environ.get("OWNER_BANK_ACCOUNT_NUMBER", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USERNAME = os.environ.get("TELEGRAM_USERNAME", "jagberg")
 
+# The OpenClaw gateway's side of the house. The gateway owns the bot token and
+# the agent loop; this app owns the claims domain and calls out to it. Two
+# deliberate absences here: no Gmail credential and no Google key of any kind
+# belongs to the gateway (gmail-isolation-boundary), and the gateway is never
+# given DATABASE_PATH — a read-write open from the wrong side deleted the WAL
+# sidecars once and took the whole app down.
+#
+# Shared secret for the /internal routes the gateway calls (cron + the event
+# bridge). Blank means the surface refuses every request rather than running
+# open: an unset secret is a misconfiguration, not a permission.
+INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET", "")
+# Host allowlist for those routes — defence in depth, the secret is the actual
+# auth. Default is loopback only. A gateway running in its own compose service
+# is NOT loopback, so that deployment has to widen this deliberately.
+INTERNAL_API_ALLOW_HOSTS = {
+    h.strip() for h in os.environ.get("INTERNAL_API_ALLOW_HOSTS", "127.0.0.1,::1").split(",") if h.strip()
+}
+# How outbound Telegram messages leave once the gateway owns the token. Every
+# send goes through gateway_client so there is one logged seam — the same reason
+# every send goes through LoggedBot today.
+OPENCLAW_CLI = os.environ.get("OPENCLAW_CLI", "openclaw")
+OPENCLAW_CLI_TIMEOUT_SECONDS = _int_env("OPENCLAW_CLI_TIMEOUT_SECONDS", 30)
+# The CLI is multi-channel and defaults to nothing, so every invocation must
+# name its channel. Configurable only because the flag takes a value; adding a
+# second channel is a design decision (the authorization check is Telegram
+# username-based and has no equivalent elsewhere), not an env change.
+OPENCLAW_CHANNEL = os.environ.get("OPENCLAW_CHANNEL", "telegram")
+# The gateway's own version, stamped by scripts/deploy.ps1 and surfaced on
+# /health. It must never be written into `telegram_messages.app_version`: that
+# column exists so the message log is a dataset keyed to the code that produced
+# each row, and two runtimes mean two versions. Conflating them makes the
+# dataset lie about which deploy handled a message (ADR-0014).
+GATEWAY_VERSION = os.environ.get("GATEWAY_VERSION", "")
+# The media outbox: one shared volume, two path spaces for the same file. The
+# app writes to the first, and must hand the gateway the second — the gateway's
+# media allowlist is a fixed set of roots, and a path outside them is refused
+# with an error that reads like a permissions problem (media_outbox.py).
+#
+# These are the ONLY bytes that cross the container boundary. Widening either to
+# reach `app/data` would undo the isolation the whole design rests on.
+MEDIA_OUTBOX_DIR = os.environ.get("MEDIA_OUTBOX_DIR", "/data/outbox")
+MEDIA_OUTBOX_GATEWAY_DIR = os.environ.get(
+    "MEDIA_OUTBOX_GATEWAY_DIR", "/home/node/.openclaw/media"
+)
+
 # Twice-daily Google Drive DB backup (drive_backup.py). Folder ID is from
 # https://drive.google.com/drive/folders/1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2
 DRIVE_BACKUP_FOLDER_ID = os.environ.get("DRIVE_BACKUP_FOLDER_ID", "1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2")

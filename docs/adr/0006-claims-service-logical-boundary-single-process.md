@@ -35,3 +35,27 @@ The claims service is a logical module boundary inside the one FastAPI app, not 
 
 ### Risks
 - If multi-user or remote deployment becomes real, revisit; the entry-point discipline (pipeline + routes) keeps the eventual extraction tractable.
+
+---
+
+## Amendment (2026-08-01) — still holds; the gateway is not a counterexample
+
+The OpenClaw gateway swap (ADR-0024) introduces a second container, which looks
+at a glance like the "separate deployable" this ADR rejected. It is not, and the
+distinction is worth stating because someone will otherwise read the two as
+contradictory.
+
+**What this ADR decided is unchanged:** the claims service — `vet_detection`,
+`invoice_matching`, `claim_forms`, `claim_status`, orchestrated by `pipeline` —
+remains a logical boundary inside the one FastAPI app. Nothing was split out.
+
+**What the gateway is:** a second runtime for *transport and the chat loop*, not
+for claims. It owns the Telegram token, polling, model routing and cron. It holds
+no claim logic, no Gmail credential, and no database access.
+
+**Alternative 1's reasoning holds and is now load-bearing.** This ADR rejected a
+second process partly because "SQLite is single-writer, so a second process adds
+real contention". That is precisely why ADR-0024 forbids the gateway from
+touching the database file at all — reaching the domain through `/internal` and
+MCP rather than through shared storage. The constraint recorded here shaped the
+new design rather than being overruled by it.

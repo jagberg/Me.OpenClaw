@@ -1,0 +1,199 @@
+# Tasks — the Telegram cutover
+
+Carved out of `openclaw-gateway-core` on 2026-08-02 by that change's task 8.14,
+after slice 1 deployed. **Every task below moved verbatim.** Nothing was
+rewritten, re-numbered or re-worded in the move, so a reader who follows a
+cross-reference from slice 1 lands on the same text it pointed at. That is also
+why the numbering is not contiguous: sections 3–6, 9, 10 and 12 keep their
+original numbers, and the stragglers keep theirs.
+
+**Read slice 1 first.** The decision trail — D1–D12, ADR-0023/0024/0025, the
+eight silent-failure modes, the token measurements, the 58-byte command budget —
+lives in `openspec/changes/archive/*-openclaw-gateway-core/`. This change
+references it and does not restate it, because a copied decision trail diverges.
+
+**The boundary rule that put these tasks here** (slice 1, task 8.11): a task is
+slice 2 if it is only true once the gateway holds the bot token. Not "is it
+hard" or "is it related". Slice 1 archived by syncing its requirements into
+`openspec/specs/`, so the test was whether each requirement is *true* after that
+slice ships.
+
+**What is already built and waiting.** `gateway_client.py` is merged with no
+caller. `app/gateway-plugin/index.js` registers the five commands and its
+`claimCommandMenu` no-ops for want of a token. `docker-compose.yml` carries
+`TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"`, empty. Supplying that token
+**is** the cutover, and `scripts/gateway_preflight.py` fails the deploy if both
+runtimes poll or neither does.
+
+**Two tokens need revoking before any of this runs** — both were exposed in
+plaintext during slice 1's build (once by running `docker compose config`). The
+live bot's replacement goes in the deploy worktree's `app/.env`.
+
+## 3. MCP server — proposals and the confirm gate
+
+- [ ] 3.1 Add `propose_*` tools for the existing mutations (mark sent, set condition, assign pet, mark resolved, split between pets). Each records a pending action and returns a confirmation; none commits.
+- [ ] 3.2 Move the commit path so it is reachable only from the confirm callback, never as a tool return value.
+- [ ] 3.3 Port the two-pets-named refusal into the MCP server and assert it with the live 2026-07-27 message text ("This is actually split between echo and Aari. Aari cost was $35 out of this").
+- [ ] 3.4 Port the no-per-item-amounts split refusal; assert no $0 rows are produced.
+- [ ] 3.5 Assert every mutating tool accepts an explicit claim id, and that current-claim-from-reply is supplied to the turn.
+- [ ] 3.6 Set the agent's tool-iteration cap explicitly in config; verify reaching it yields a best answer with visible truncation rather than a silent stop.
+- [ ] 3.7 Verify a proposal reported as done by the model has in fact changed nothing in the DB.
+
+## 4. Telegram cutover
+
+- [ ] 4.1 Put the Python updater behind a config flag, defaulting on, so it can be disabled without deleting code. **DECIDED: the flag stays for one week of real daily use after cutover** (Justin, 2026-08-01), then section 6 removes it. Rollback is one env var and a restart, ~30s. A week is what it takes for the failures only real use finds — a caption that will not edit, buttons that will not attach to a card, a tap that quietly reached the LLM.
+- [ ] 4.2 Write the thin Node event-bridge plugin: forwards inbound messages, edits and callback queries to `/internal/telegram/event`. No claims logic in the plugin.
+- [ ] 4.3 Route the pending-free-text-flow check before the agent turn, so condition entry still consumes its reply and the agent never sees it.
+- [ ] 4.4 Port outbound notification sends to `gateway_client`, including batched-claim messages, lifecycle notifications and the daily nudge. Every message keeps its `#id`.
+- [ ] 4.5 Port card delivery: history cards, actions summary, per-item tap-to-resolve cards, PDF review alerts — all with working buttons.
+- [ ] 4.6 Port `_append_result` to the gateway edit action, keeping the caption-vs-text split for documents and photos. Fall back to a reply if caption editing proved unavailable in 0.3, and log the degradation.
+- [ ] 4.7 Port the 👍 acknowledgement to the gateway reaction action; verify a reaction failure does not break the handler.
+- [ ] 4.8 Keep the authorization check app-side and case-insensitive; verify an event from any other username is rejected even if the gateway delivered it.
+- [ ] 4.9 Persist the chat ID app-side from the `/start` event; verify an unattended notification with no registered chat ID logs the gap visibly and sends nothing.
+- [ ] 4.10 Cut over: disable the updater flag, bind the gateway channel, enable the bridge. Single deploy step.
+- [ ] 4.11 Verify live against the real chat: one claim taken from notification through condition tap, pet assign, mark sent, and confirm resolved. Record which claim id was used.
+- [ ] 4.12 Verify a mid-handler crash leaves the row unprocessed and the replay queue re-runs it at startup.
+- [ ] 4.13 Verify a duplicated gateway delivery commits no duplicate mutation.
+
+## 5. Scheduling
+
+- [ ] 5.1 Register gateway cron entries for the 15-minute tick, Gmail ingest and the daily nudge, pointing at the internal endpoints.
+- [ ] 5.2 Add the reminder catch-up sweep replacing `misfire_grace_time=None`; a due-but-unfired reminder fires on startup.
+- [ ] 5.3 Verify exactly-once firing across three restart cases: Python only, gateway only, both.
+- [ ] 5.4 Verify a duplicated cron trigger does not re-fire an already-fired reminder.
+- [ ] 5.5 Verify cron entries survive a gateway restart without re-registration.
+- [ ] 5.6 Make a missing or disabled cron entry visible rather than presenting as an absence of due work.
+
+## 6. Deletion and dependency cleanup
+
+Do not start until phase 4 has run one full claim lifecycle on real data.
+
+- [ ] 6.1 Delete `agent.py`'s tool loop and `llm.chat()`; confirm `extract()` / `extract_vision()` callers are untouched.
+- [ ] 6.2 Delete `scheduler.py` and the updater code path; remove the flag from 4.1.
+- [ ] 6.3 Remove `python-telegram-bot` and `apscheduler` from `requirements.txt`; rebuild and confirm the app starts.
+- [ ] 6.4 Re-verify structurally that `send()` appears nowhere in `app/openclaw/` and no tool exposes sending.
+- [ ] 6.5 Confirm the daily-budget walk still works for extraction after `chat()` is gone.
+- [ ] 6.6 Run the full smoke suite; all LLM keys still force-blanked, vision still stubbed.
+
+## 12. Consequences of conversation bypassing the app (design D9)
+
+Found 2026-08-01 while reconciling the specs with D2's correction. Four of these five are the gateway having to do something the app used to; none may be assumed to work.
+
+- [ ] 12.1 **Resolves the D7/D2 collision.** Plugin forwards a *copy* of every inbound message to `/internal` for logging only — a tee, not a bridge. Without it the training dataset Justin kept the table for narrows to callbacks and outbound, which is the half he did not ask for. Assert an agent-handled message still produces a `telegram_messages` row with its raw payload.
+- [x] 12.2 **DECIDED (Justin, 2026-08-01): the plugin claims text while a flow is pending.** `_pending_condition` and `_pending_split` are preserved; what he types is stored verbatim with no model between his words and `condition_text` — the field the hard rules forbid inferring. **This makes a currently-unverified capability load-bearing:** the plugin must be able to *conditionally intercept a text message*, not merely claim callbacks. The docs only evidence callback claiming. Note this is a different capability from 12.1's logging tee — a tee copies, this intercepts. See 0.10.
+- [ ] 0.10 **Gates 12.2.** Confirm a plugin can conditionally claim an inbound *text* message (not just a callback) and prevent it reaching the agent. If it cannot, 12.2's decision is unavailable and Justin must re-choose between the agent-tool and fully-conversational options — both of which put the model between his typing and a hard-rule field. **Raise this before building anything in section 12.**
+- [ ] ~~12.2-old~~ Superseded: decide the fate of `_pending_condition` and `_pending_split` (the "Other (type it)" condition entry and the per-item split walk). They need the next typed message routed to the app, which the correction removes. Three options: claim text while a flow is pending (reopens part of 0.8), re-express both as agent tools, or let the agent handle them conversationally and delete the dicts. `_pending_actions` is unaffected — it is a callback. **Justin's call: the third is most native, and least like the interface he has today.**
+- [x] 12.3 **DECIDED (Justin, 2026-08-01): keep the 👍 ack for now.** Removing it mid-swap would blur a real regression with an intended change. The native typing indicator is better — it shows work in progress, not just receipt — and replacing the ack with it is logged in `openspec/BACKLOG.md` to revisit after cutover. Caveat recorded there: a **tap** may produce no typing indicator, which is the case the ack was added for.
+- [ ] 12.3a Superseded — original: Confirm who sends the 👍 acknowledgement once the app no longer sees inbound messages. If the gateway does not ack automatically, decide between the agent doing it and dropping it. It exists so a slow handler does not feel dead.
+- [ ] 12.4 Confirm the gateway delivers **edited** messages to the agent. If it does not, a typed correction vanishes — the exact 2026-07-27 failure, whose fix now sits outside the path.
+- [ ] 12.5 Re-scope the app-side authorization requirement to callbacks only, and record that for conversation the gateway's access control *is* the authorization. This promotes 0.5 from a nice-to-have to load-bearing.
+- [ ] 12.6 Rewrite the `telegram-bot` and `openclaw-gateway-runtime` spec deltas to match: they currently describe the app receiving all inbound events, which D2 no longer does.
+
+## 9. Logging and observability — parity or better
+
+Baseline to hold: `telegram_messages` (raw payload + `app_version` + `processed_at`), `llm_calls` (per attempt), `ops_alerts` with ADR-0015 levels, `vet_claims.flag` human-readable reasons, `claim_status_events`, `vision_ocr_attempts`, `email_extractions`. Nothing here may get quieter.
+
+- [ ] 9.10 **Added by 0.8.** Prove the interactive handler actually registered: assert at startup that a known callback token is claimed, and treat any `callback_data:` string reaching the agent as an error, never as input. Without this, a plugin that registered nothing looks healthy and silently routes every tap — including `sent:7` — through the LLM. Registering with the wrong API fails silently (confirmed in a working plugin's source), so "it loaded" is not evidence.
+- [ ] 9.11 **Added by D8.** Record the measured token cost of one chat turn with the final tool inventory, against the 100k/day/model ceiling. The schema ships on every request, so tool count is a per-turn tax — treat it as a budget with a number, not a matter of taste.
+- [ ] 9.1 Add a correlation id minted at the gateway edge and carried through plugin → internal endpoint → handler → any resulting send. Persist it on the `telegram_messages` row. This is the "better": today an event crossing two runtimes cannot be traced end to end.
+- [x] 9.2 Log every `/internal/*` request: route, outcome, correlation id. Log rejections (bad/missing secret, non-loopback origin) explicitly — a rejected event must not look like an event that never arrived.
+- [x] 9.3 Make `gateway_client` failures loud: capture the CLI's exit code and stderr into the logged reason. A failed send writes a human-readable reason and never becomes a silent no-op.
+- [ ] 9.4 Keep `telegram_messages` writing on the gateway path with no field lost — raw payload, truthful kind, summary, `app_version`, `processed_at` ordering. Assert an edit event still logs as an edit with its text (the 2026-07-27 empty-`other` regression).
+- [ ] 9.5 Locate and document where the gateway records its own LLM calls and chat turns; write down the two-place accounting (`llm_calls` + gateway records) so a token-spend question is answerable. Record retention and whether that store is backed up.
+- [ ] 9.6 Log each tick's outcome app-side (claims advanced, flags written, duration) rather than relying on `cron runs` alone; `cron runs` says it fired, not what it did.
+- [ ] 9.7 Preserve ADR-0015 alerting levels across the swap, and add a dead-channel alert if 7.7 finds the gateway's supervision quieter than the old restart-on-dead-updater.
+- [ ] 9.8 Verify no log line, alert, or error message carries a secret, a bank detail, or `.env` content — the new internal endpoint and the CLI stderr capture are both new places one could leak.
+- [ ] 9.12 **Added by 7.7 (slice 2).** Poll the gateway's health from the app and raise an `ops_alert` at ADR-0015's levels when the Telegram channel is not running, or when the health monitor is restarting it repeatedly. The gateway restarts a dead channel by itself — what it does not do is tell anybody outside its own container log, which is destroyed on recreate. Assert the alert fires, not merely that the poll runs.
+- [ ] 9.9 Write down the one thing that does get quieter: chat-side LLM calls leaving `llm_calls`. Named in the llm-backend spec; it must also be in the docs, not just the spec.
+
+## 10. Test coverage
+
+All additions go in `app/tests/test_core.py` (assert-based, no pytest) and must stay hermetic: LLM keys force-blanked, vision stubbed, **and runnable with no gateway installed**.
+
+- [x] 10.1 Stub the gateway CLI at a single seam so every send/edit/react path is testable without a daemon; assert the suite passes with the gateway absent.
+- [x] 10.2 **DONE — the same assertion as 19a.7, which was ticked while this stayed open** (eval, 2026-08-02). One test, `test_mcp_inventory_has_no_dangerous_tool`, satisfies both; two checkboxes for one assertion is how a reader concludes there are two guards. Kept as a cross-reference rather than deleted, since both section 10 and section 19a are meant to be readable alone. Original: Regression: agent tool inventory contains no filesystem, shell, browser, mailbox-search or secret-returning tool.
+- [ ] 10.3 Regression: no send path — `send()` absent from `app/openclaw/`, no send tool in the inventory.
+- [ ] 10.4 Regression: every outbound claim message carries its `#id` (existing test, re-pointed at the gateway path).
+- [ ] 10.5 Regression: a `propose_*` tool commits nothing; only the confirm callback commits. Include the case where the model's text asserts it is already done.
+- [ ] 10.6 Regression: the two-pets-named refusal, asserted with the live 2026-07-27 message text.
+- [ ] 10.7 Regression: split with no per-item amounts is refused, no $0 rows.
+- [ ] 10.8 Regression: pending free-text flow consumes its reply and the agent never receives it as a turn.
+- [ ] 10.9 Regression: caption-vs-text append on document and photo messages.
+- [ ] 10.10 Regression: authorization rejects any other username even when the gateway delivered the event; case-insensitive compare still passes.
+- [x] 10.11 Regression: two concurrent `/internal/tick` calls never both enter `pipeline.run_once`.
+- [ ] 10.12 Regression: duplicate gateway delivery commits no duplicate mutation; unprocessed row replays at startup.
+- [ ] 10.13 Regression: daily-budget fallback still walks models for `extract()` after `chat()` is deleted.
+- [ ] 10.14 Regression: correlation id present on the `telegram_messages` row for a gateway-delivered event.
+- [x] 10.16 **Added.** Guard test: nothing outside `gateway_client` imports `subprocess` or reads `config.OPENCLAW_CLI`. Converts the one-seam rule from convention into enforcement — the gap the module map rates as only *partial* for `LoggedBot`. Match the USAGE form (`config.OPENCLAW_CLI`), not the bare name: `config.py` defines the setting and a guard that fires on its own definition site gets trained away.
+- [ ] 10.15 Run the full suite at the end of every phase, not only at phase 6. Record pass/fail in this file with the actual output on failure.
+
+  **Section 1 run, 2026-08-01: PASS.** 190/190 tests, exit 0, `ALL TESTS PASSED`. 11 new tests, gateway CLI stubbed via an injected `runner` — suite still passes with no gateway installed and no new dependency.
+  Two harness facts learned the hard way, both worth knowing before adding tests here:
+  - The runner iterates `globals()` inside `if __name__ == "__main__":`, so anything appended **below** that block is never defined when it runs. The suite still prints `ALL TESTS PASSED`. A silent no-op.
+  - `_fresh_db()` deliberately does NOT clear `telegram_messages` (it is the RL dataset), so assert message-log counts **relatively**, never against an absolute total.
+  - Piping the run through `tail` reports `tail`'s exit code, not Python's. Redirect to a file if you need the real one.
+
+## Carried over from slice 1
+
+Six items that were open when slice 1 archived. Each is here rather than in
+`openspec/BACKLOG.md` because each depends on the gateway holding the token —
+they are not stragglers, they are slice-2 work that was written early.
+
+Two of them (13.1c, 17.6) carry a `[x]`-worth of verification already; the tick
+state is preserved exactly as slice 1 left it rather than reset, so nobody
+re-runs a live check that already produced a number.
+
+One slice-1 item did **not** come here: 13.6 (doctor's `CRITICAL: Session store
+dir missing` and 32 skills with missing requirements) is operational and true
+today, so it went to `openspec/BACKLOG.md` instead.
+
+- [ ] 2.7 **Added by 2.6.** Map the gateway's empty-allowlist error to a human sentence before it reaches the chat. Must not become a fallback that answers the question anyway — the whole value of the current behaviour is that no claim fact can be produced when the source of truth is unreachable.
+
+- [x] 13.1c **RESOLVED AND VERIFIED LIVE — see the body below; the per-chat scope is the answer.** **CONTRADICTION FLAGGED — the option Justin chose does not exist as configuration.** He asked for the app's five commands plus `/status` and `/models`. There is no per-command menu allowlist. `commands.native` is a single boolean for the entire native command surface, and disabling it excludes plugin commands from the catalog too (`bot-native-commands.ts:1056`, `...(nativeEnabled ? pluginCatalog.commands : [])`) — which would break every `command` button, the whole basis of D12. So the achievable choices are **all ~60 commands, or none plus a broken button path.**
+
+  Attempted and measured 2026-08-01: removing all 13 skills dropped the menu from 61 to **60**. Skills were not the source. The 30 enabled plugins are almost all model providers contributing no commands; the bulk is core (`/status`, `/models`, `/cron`, `/agents`, `/memory`, …) and core is exactly what `commands.native` gates as one unit.
+
+  One structural detail that limits the damage, worth not forgetting: menu visibility and callability are **decoupled**. `bot-native-commands.ts:1125` — *"Telegram only limits the setMyCommands payload (menu entries). Keep hidden commands callable by registering handlers for the full catalog."* So commands beyond Telegram's cap still work; they are merely invisible. That is the mechanism a per-command menu allowlist would use if one existed.
+
+  **RESOLVED 2026-08-01 — there is a clean way, and it is Telegram's own, not a workaround.** Justin asked whether the menu could be limited or the app's commands grouped at the top; looking properly answered the first.
+
+  The gateway registers its menu into exactly **two** scopes — `default` and `all_group_chats` (`TELEGRAM_COMMAND_MENU_SCOPES`, `bot-native-command-menu.ts:38`). Its delete loop iterates the same two. Telegram resolves a private chat's menu most-specific-first: **`BotCommandScopeChat` → `BotCommandScopeAllPrivateChats` → `BotCommandScopeDefault`.** The per-chat scope is therefore **unclaimed**, and writing it for Justin's chat id replaces his menu entirely with the app's five commands — without overwriting, racing, or deleting anything the gateway owns. Every one of the other ~60 stays callable, because visibility and callability are decoupled (line 1125).
+
+  This satisfies the guiding principle rather than straining it: it is the layering Telegram documents, used as designed, in a slot the gateway deliberately left free.
+
+  **Where the call belongs:** the in-gateway plugin, which already holds the bot instance. Not `gateway_client` — that would need the Bot API and a second token holder, which D12 forbids. Re-apply on plugin start, since the gateway rewrites its own scopes on restart and a future version could widen `TELEGRAM_COMMAND_MENU_SCOPES` to include ours.
+
+  **VERIFIED LIVE 2026-08-01.** `setMyCommands` with `scope: {type:"chat", chat_id:…}` returned `ok:true`; reading that scope back returned exactly the five; the default scope was untouched at 47 entries; and Justin confirmed his `/` menu now shows five actions. The mechanism works as the Bot API documents it.
+
+  Incidental, and consistent with 18.6's lesson: the gateway logged *"shortening descriptions to keep 60 commands visible"* while the default scope actually holds **47**. The log's count is taken before the text-budget drop. `getMyCommands` is authoritative; the log is not.
+
+  Residual risk to assert in preflight: if a future gateway version adds the chat scope to `TELEGRAM_COMMAND_MENU_SCOPES`, it would overwrite ours on every restart and the menu would silently revert. Assert the scope list is still the two it writes today.
+
+  Ordering, for completeness: the registered list preserves construction order and is never alphabetised (the sort at line 337 only feeds a cache hash). Plugin commands are concatenated **after** core (`bot-native-commands.ts:1056`), so within the default menu the app's commands sit at the bottom *and* are first to be dropped on overflow. Another reason to own the chat scope rather than live in the default one.
+
+- [ ] 13.5 **Still open, and now scoped: it is 9.2's counterpart on the gateway side.** The app logs every rejected command; the gateway logged nothing at default level. Note for whoever picks this up — the gateway's log file is JSON per line and lives *inside* the container (`/tmp/openclaw/*.log`), lost on recreate, so "turn up the log level" is only half a fix if the record has to outlive a redeploy. Original: An access denial reached the user as "OpenClaw: access not configured" and produced **no log line at default level** — verified against 10 minutes of container logs. A rejection that leaves no trace is the silent failure the project's rules forbid; the app logs every rejected command today. Find the log level that records it, or add it. Feeds 9.2.
+
+- [ ] 13.3 Telegram polling runs through an "isolated polling ingress" with a spool at `/home/node/.openclaw/telegram/ingress-spool-default`. Worth understanding before trusting delivery guarantees — it may already provide some of what ADR-0014's replay queue does.
+
+- [ ] 17.6 **MEASURED, with a number, on the first real deploy (2026-08-02): `Limit 100000, Used 96708`.** The gateway's log says `TPD` and `tokens per day` in as many words. My agent measurement turns consumed **97% of the shared Groq daily budget for `llama-3.3-70b-versatile`**, and the deploy's own preflight then failed on it.
+
+  This is the starvation this task predicted, arriving faster than expected and from the direction it named. Consequence for Justin today, stated precisely rather than alarmingly: `llm.py` walks **four** Groq models each with its own 100k/day ceiling (ADR-0017), so `extract()` falls through to model 2 rather than failing — degraded, not broken. The agent is pinned to one model and is simply out until midnight UTC.
+
+  Two things follow. **The gateway needs its own key**, or the agent must be given the same multi-model chain the app has — 11.5 recorded that the gateway has a single `rate_limit` bucket and treats a daily exhaustion as transient, so it will spend three futile retries discovering this every turn. And the **preflight now names it**: "no turn completed" reads as a broken deploy, when the operator's actual response is to wait rather than to fix anything.
+
+- [ ] 19a.6 **`#id` on every outbound claim message** across the gateway path, including button labels and command strings. **MOVED TO SLICE 2 (2026-08-02), because the thing it asserts does not exist yet.** The gateway-path outbound composition is section 4 (`notify_claim_states`, card delivery, `_append_result`); until those are ported there is no message for this to inspect, and a test written now would either assert nothing or assert a stub. `test_notify_messages_carry_claim_ids` continues to cover the current transport and must be re-pointed, not replaced, when 4.4/4.5 land.
+
+  Sharper than when it was written, from 2.5: the model **dropped the ids** on its first live turn despite the MCP instructions demanding them. So this splits in two. The tool output and the composed message are code, and are assertable. What the *agent* repeats is not — that is the same lesson as 13.4, and it belongs in the "cannot be asserted" list in `docs/gateway-deploy.md` rather than in a test that will pass by luck.
+
+## 20. Documentation and archive
+
+- [ ] 20.1 Sync this change's deltas into `openspec/specs/` before archiving — the second of 8.9's two runs. Four requirements of `openclaw-gateway-runtime`, three of `claims-mcp-surface`, four of `gmail-isolation-boundary` (all ADDED to capabilities the baseline already holds from slice 1), plus the five whole capabilities `telegram-bot`, `conversational-agent`, `llm-backend`, `reminder-scheduling` and `task-capture` (MODIFIED/REMOVED against the existing baseline). **Check the three ADDED files do not restate a requirement slice 1 already put in the baseline** — that is the failure mode `openspec validate --specs --strict` will not catch, because two differently-titled requirements about the same subject both validate.
+- [ ] 20.2 Update `README.md` and root `CLAUDE.md` at cutover, not before. Slice 1's eval found both asserting the swap was unbuilt while it ran; the mirror-image error here is asserting the cutover happened while the token is still empty.
+- [ ] 20.3 Append the cutover outcome to ADR-0015 (dead-channel supervision moved to the container boundary) and ADR-0014 (replay under gateway delivery) as `## Amendment (YYYY-MM-DD)` blocks. Append, never edit above the first amendment line.
+- [ ] 20.4 Amend ADR-0025 if the confirm gate's location moves again during 3.2. It already records one correction ("in the MCP server" → split by origin); a second would make three states, and only the ADR can hold that history.
+- [ ] 20.5 Fix the four non-discriminating assertions slice 1's eval found on axis 2, and add the missing self-checks. Justin's call (2026-08-02): after the merge, before slice 2's build starts.
+
+## 21. Deferred out of slice 1's eval
+
+- [ ] 21.1 The `1,172` vs `1,422` MCP schema-character discrepancy is recorded as unreconciled in slice 1's trail. Reconcile it here or state which number the budget assertion uses and why the other exists.
+- [ ] 21.2 `openspec/specs/task-capture/spec.md` references a capability that does not exist, `task-telegram-surface` — pre-existing, from another change's incomplete sync, logged in `openspec/BACKLOG.md`. This change modifies `task-capture`, so it is the natural place to fix it.

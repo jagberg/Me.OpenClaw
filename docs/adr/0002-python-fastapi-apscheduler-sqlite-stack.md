@@ -35,3 +35,29 @@ Core service is Python + FastAPI (dashboard/HTTP) + APScheduler with a SQLite jo
 
 ### Risks
 - None significant at current scale
+
+---
+
+## Amendment (2026-08-01) — the "single Docker Compose service" half is superseded
+
+**Superseded by:** ADR-0024. **Still holds:** Python, FastAPI, SQLite and the
+claims domain — none of that moves.
+
+**What changed:** the stack is now two runtimes, the Python service and the
+OpenClaw gateway (Node), each in its own container. The original reasoning is
+kept below rather than rewritten, because it was correct for what it decided and
+the cost of leaving it behind should be visible.
+
+What that cost actually is:
+
+- **Two configurations.** `.env` already diverged between the main checkout and
+  the deploy worktree before any of this; a second runtime with its own config
+  doubles that surface.
+- **Two versions.** `app_version` can no longer stand for "the code that
+  produced this row" on its own — see the ADR-0014 addendum.
+- **A deploy that can half-succeed.** One command still brings both up, and a
+  partial start must report failure rather than success.
+
+APScheduler is also displaced: the 15-minute tick, Gmail ingest and the daily
+nudge become gateway cron entries invoking the app. `reminders.py` goes with it
+(`cron --at` covers the misfire behaviour it was written for). `tasks.py` stays.

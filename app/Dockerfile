@@ -20,4 +20,15 @@ ENV APP_VERSION=$APP_VERSION
 
 COPY openclaw ./openclaw
 
+# Single worker, and that is load-bearing — do NOT add `--workers` without
+# reading this. Overlap protection for the scheduled jobs (tick, ingest, nudge)
+# is a per-job in-process lock in internal_api. Each worker would get its OWN
+# lock and see nothing of the others, so the protection disappears silently —
+# no error, no log line, just two ticks running at once. Two concurrent
+# pipeline.run_once calls batch the same claims into two Gmail drafts, i.e. two
+# Petcover submissions for one set of invoices, plus duplicate rows in the
+# append-only claim_status_events. If this app ever needs more than one worker,
+# the lock has to move into the database first (design notes: the openclaw-
+# gateway-core change, decision D6 — a lock row cannot be naive, because a row
+# saying "running" outlives the process that wrote it).
 CMD ["uvicorn", "openclaw.main:app", "--host", "0.0.0.0", "--port", "8000"]

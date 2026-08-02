@@ -113,7 +113,19 @@ def _vet_name(merchant: str) -> str:
 
 
 def _group_by_month(rows: list[dict]) -> list[tuple]:
-    """[(month label, month charge total, rows)] preserving newest-first order."""
+    """[(month label, month charge total, rows)] preserving the caller's order.
+
+    That order is **oldest first**, and it is a domain rule rather than a
+    presentation choice: a visit stops being claimable once it is a year old, so
+    the rows nearest the cutoff are the ones about to expire and they belong at
+    the top of page 1. `claim_status.history_rows` inverts `visit_ledger`'s
+    newest-first order deliberately to produce it, `pending_actions` sorts the
+    same way for the same reason, and the card prints "Oldest first — a visit is
+    unclaimable once a year old" in its own footer.
+
+    This docstring used to claim "newest-first", which was wrong and was the one
+    place in the codebase that invited someone to "fix" the order. Do not.
+    """
     groups = []
     for row in rows:
         key = row["date"][:7]

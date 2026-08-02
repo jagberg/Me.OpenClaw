@@ -1,0 +1,5 @@
+# Shell scripts run inside Linux containers. Git's autocrlf turns them into
+# CRLF on a Windows checkout, and `sh` then reads `set -e\r` and dies with
+# "Illegal option -" -- an error that names the option and not the line ending.
+# Cost an hour on the first real deploy.
+*.sh text eol=lf

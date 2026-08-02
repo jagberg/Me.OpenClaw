@@ -13,6 +13,8 @@ from . import (
     config,
     db,
     gmail_ingest,
+    internal_api,
+    mcp_server,
     message_log,
     netbank_csv,
     pipeline,
@@ -64,6 +66,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+# The gateway's entry point into this app: cron invocations and (later) inbound
+# channel events. Secret-guarded, loopback by default — see internal_api.
+app.include_router(internal_api.router)
+# The other half of the split: deterministic work arrives at /internal, and a
+# typed question arrives here as MCP tool calls. Read only, same shared secret —
+# the answers name pets, vets and amounts, so an open endpoint leaks the history.
+app.include_router(mcp_server.router)
 
 
 @app.get("/")
@@ -141,6 +150,15 @@ def health():
         # `polling_alive` down with it, on the one URL you check to find out
         # whether anything is wrong. Reports the failure as a value instead.
         "state_projection_disagreements": _disagreement_count(),
+        # What the in-gateway plugin reported registering, this boot. Empty
+        # means it has not run — which is a broken tap path, not a quiet one:
+        # an unregistered command in a button reaches the model instead of
+        # erroring. `scripts/gateway_preflight.py` fails the deploy on it.
+        "gateway_plugin": internal_api.plugin_report(),
+        # Recorded separately and never as `app_version`. Two runtimes mean two
+        # versions, and `telegram_messages.app_version` exists so the dataset is
+        # keyed to the code that produced a row — conflating them makes it lie.
+        "gateway_version": config.GATEWAY_VERSION or None,
         **message_log.stats(),
     }
 

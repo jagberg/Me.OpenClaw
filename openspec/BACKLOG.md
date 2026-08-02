@@ -183,3 +183,168 @@ What would close it: a test that replays real misrouted mail against a claim who
 Nothing live has yet exercised the transition table, event ordering, or the illegal-event skip. Only the seed and the copy-back have. `apply_event`'s `BACKFILL_EVENT` branch has never run at all, because the script raw-`INSERT`s.
 
 This does not mean the machine is wrong — the unit tests cover it, and claims #2 and #8 folded `backfill`→`approved`→`settled` correctly on 2026-07-30T08:45, which is the first live fold that could have disagreed. It means 6.4's week of zero is a much weaker signal than it reads as, and should be judged on **claims that transition during the week**, not on the count staying at zero.
+
+
+### Should the 👍 acknowledgement survive the gateway's native typing indicator?
+*Open since 2026-08-01. Capability: `telegram-bot`. Raised by Justin while spiking OpenClaw; deferred deliberately, not forgotten.*
+
+The 👍 reaction exists for one reason: a slow handler (an LLM turn) made the bot feel dead, so every inbound message is reacted to before its handler runs. Seeing the gateway live, Justin's own words: *"I liked that I could see the bot change to show typing … that's what I was after by the thumbs up, but this is better because it shows its working in the background."*
+
+The native indicator is strictly more informative — receipt **plus** work-in-progress, and it clears by itself when the reply lands. The 👍 only ever signalled receipt.
+
+**Decided for now: keep the ack.** It is cheap, it is already specified (`telegram-bot`: "Every incoming message is acknowledged immediately"), and removing it during a transport swap would confuse a real regression with an intended change.
+
+What would close it: after cutover, confirm the typing indicator fires on the paths that matter — an LLM chat turn, and a tap whose handler is slow — then decide whether the reaction is redundant. If it is, this removes a requirement and its code rather than adding any. Note the two are not equivalent for **taps**: a button press may show no typing indicator at all, which is exactly the case the ack was added for.
+
+## Reminders should push, now that a push channel exists (opened 2026-08-01)
+
+ADR-0003 chose dashboard-only reminder delivery because no push channel existed.
+That reason expired — Telegram has been live for months, and the gateway swap
+(ADR-0024) brings cron and multi-channel push with it.
+
+Deliberately **not** folded into `openclaw-gateway-core` (Justin, 2026-08-01):
+independent of the transport swap, and near-trivial once the gateway is in
+place, so including it would add scope without reducing work.
+
+What a change here would need to settle: whether a due reminder pushes
+unconditionally or only when unacknowledged; whether it reuses the claims
+notification path or gets its own; and what happens to reminders that came due
+while the gateway was down (gateway cron runs missed jobs at startup, capped at
+five per restart — see tasks 11.4).
+
+## The baseline references a capability that does not exist (found 2026-08-01)
+
+`openspec/specs/task-capture/spec.md` points at a capability named
+`task-telegram-surface` — "Full detail in the `task-telegram-surface`
+capability." There is no such capability among the 18 in `openspec/specs/`.
+The only other reference is in `openspec/changes/telegram-agent-reach/`, an
+unarchived change.
+
+**Not fixed in `openclaw-gateway-core`** (Justin, 2026-08-01). It is pre-existing
+baseline rot created by another change's incomplete sync, and pulling it into the
+gateway diff would be tidying someone else's unfinished work into unrelated
+scope.
+
+Two possibilities, and whoever picks this up should check which before acting:
+`telegram-agent-reach` may be about to create the capability, in which case this
+is an ordering problem between two open changes and resolves itself on archive.
+Or that change stalled and the reference is permanently dangling, in which case
+the fix is to create the capability or drop the sentence.
+
+Worth doing before the next archive either way — a baseline that references
+missing capabilities gets less trustworthy each time it is read and believed.
+
+## Doctor reports two CRITICALs that do not block startup (found 2026-08-01)
+
+Slice 1's task 13.6, moved here at archive on 2026-08-02 rather than into
+`openclaw-telegram-cutover`, because it is true of the gateway as it runs today
+and has nothing to do with holding the bot token.
+
+`openclaw doctor` on a first run reports `CRITICAL: Session store dir missing
+(~/.openclaw/agents/main/sessions)` and 32 skills with missing requirements.
+Neither blocked startup, and the gateway has since served turns, so at least the
+first is either self-healing or misclassified.
+
+**Why it matters that this stays open.** `scripts/gateway_seed.sh` already calls
+`oc doctor --fix` as a repair step for an invalid config volume. Nobody should
+promote `doctor` from a repair tool to a health gate — the obvious next step —
+until these two are understood, because a gate that fails on a condition the
+system tolerates gets skipped, and a skipped gate is worse than no gate.
+
+Slice 1 deliberately used `config validate` as the authoritative pre-boot check
+instead, since it exits non-zero on warnings and is the same validation the
+gateway runs at startup.
+
+## Route the LLM backend by purpose, and get vision off the unpaid Gemini quota (2026-08-02)
+
+Design settled in **ADR-0026** (status: *proposed*, not accepted). Survey and the
+numbers behind it: `docs/research/2026-08-02-free-llm-providers.md`.
+
+**Why it is open rather than done.** The routing shape is agreed; the vision
+provider is not, and picking it needs two things nobody has tested:
+
+1. Whether this account can obtain a **Cerebras** key. Its free tier was sold out
+   for this account on 2026-07-23 and has not been retried. Cerebras is the only
+   surveyed candidate that answers vision *and* the cross-provider gap in one
+   move, so this gates the recommendation.
+2. Whether any candidate's **OCR holds up against a real scanned invoice** from
+   the corpus — not a benchmark. Wrong OCR means a wrong amount on a claim sent
+   to an insurer. This is the one LLM purpose where a quality failure costs money
+   rather than patience.
+
+**Why it should not wait indefinitely.** Verified from Google's own terms on
+2026-08-02: the unpaid Gemini quota is used to "provide, improve, and develop"
+its models, "human reviewers may read, annotate, and process your API input and
+output", and it says "Do not submit sensitive, confidential" data. Every scanned
+vet invoice `extract_vision()` handles goes there, carrying name, address, pet
+names and itemised amounts. That is a boundary problem and it is live now.
+
+**The work, once the provider is chosen** (~40 lines, no call-site changes —
+`purpose` is already an argument on all five call sites):
+
+- `_PURPOSE_PROVIDER` map consulted by `_resolve()`, defaulting to
+  `config.LLM_PROVIDER` for any unmapped purpose.
+- `_client` module global becomes a dict keyed by base URL. **This is the
+  load-bearing change** — it is what currently makes a cross-provider chain
+  impossible, and it is why simply adding a second provider to config does not
+  fix the eval's single-point finding (axis 5c).
+- `_FALLBACK_MODELS` entries become `(provider, model)`.
+- Per-provider 429 classification. `_is_daily_budget_exhausted` matches
+  `"tokens per day"`/`"(tpd)"`, which is Groq-shaped; any other provider's body
+  produces a chain that never walks and never says so.
+- `_last_model_used` stops being a module global — with routing it goes from
+  stale to wrong, and it is how Justin learns he got a fallback.
+
+**Related, and cheap to check first:** one agent observed Groq returning 403 to
+python-urllib's default User-Agent and 200 with any UA set. Not reproduced
+independently. If it holds it may explain the unexplained `403 Access denied` at
+`llm.py:139-142`. Ten minutes, and it is unrelated to the provider choice.
+
+## Split `mcp_server.py` into transport / protocol / tool-registry layers (PR #4 review, 2026-08-02)
+
+Justin's review comments on PR #4, `app/openclaw/mcp_server.py:126` and `:225` —
+*"This class is doing too much work"* and *"The mcp layer should be in its own
+file, following SOLID"*.
+
+**The concern is right; the wording needs one correction before anyone acts on
+it.** There is no class in the file, and the MCP layer *is* already its own file.
+What is actually mixed inside those 244 lines is three layers:
+
+1. **HTTP transport** — `mcp_endpoint`, the `POST`/`GET` routes, the auth guard,
+   batch handling, status codes.
+2. **JSON-RPC / MCP protocol** — `dispatch`, `_error`, `_result`, the method
+   table, protocol-version negotiation, notification handling.
+3. **Tool registry and invocation** — `TOOLS`, `TOOL_NAMES`, `_impls`,
+   `_call_tool`, `turn_context`.
+
+Splitting those three is the real request.
+
+**Deferred deliberately, and the timing is the argument.** Slice 2's section 3
+adds `propose_*` tools and the confirm gate to this exact file (tasks 3.1–3.7).
+That is roughly a 50% growth in a 244-line module, and it lands squarely in
+layer 3. Refactoring the layering now means doing it twice, or doing it against
+a shape that is about to change. **Do the split as the first task of section 3**,
+when the mutation surface arrives and the structure finally earns its keep.
+
+**Two constraints that must survive the split**, both currently resting on the
+file being one unit:
+
+- `test_mcp_inventory_has_no_dangerous_tool` and the tool-count budget assertion
+  read `TOOLS` / `TOOL_NAMES`. The inventory is the `gmail-isolation-boundary`
+  enforcement surface, so whichever module ends up owning it must stay the single
+  enumerated place — no dynamic registration, no second registry.
+- `_impls()` selects from `agent._build_impls` **by name from `TOOL_NAMES`**,
+  which is the only reason the `propose_*` functions in that same dict are
+  unreachable today. Once section 3 makes proposals legitimate, that filter stops
+  being the boundary and the split must not quietly drop it before its
+  replacement exists.
+
+**Already done from the same review** (commit on `feature/integration`): the raw
+`SELECT name FROM pets ORDER BY name` inside `turn_context` — the "data queries"
+half of the comment — collapsed into `db.list_pet_names()`. It had been written
+out four times.
+
+**Not in scope here, and much larger:** raw SQL is spread across the whole
+codebase — `claim_status.py` 44 sites, `claim_forms.py` 31, `invoice_matching.py`
+30. A general data-access layer is a different proposal and would need its own
+change; do not let it ride in on this one.

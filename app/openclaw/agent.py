@@ -92,8 +92,7 @@ _BASE_SYSTEM_PROMPT = (
 
 
 def _known_pets() -> list[str]:
-    with db.get_connection() as conn:
-        return [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
+    return db.list_pet_names()
 
 
 def system_prompt() -> str:
@@ -218,8 +217,7 @@ def _range_label(since, until) -> str:
 def _pets_named_in(text: str) -> list[str]:
     """Which pets on file this message names. Word-boundary matched so 'Echo'
     doesn't fire on 'echoed'."""
-    with db.get_connection() as conn:
-        names = [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
+    names = db.list_pet_names()
     return [name for name in names if re.search(rf"\b{re.escape(name)}\b", text or "", re.IGNORECASE)]
 
 

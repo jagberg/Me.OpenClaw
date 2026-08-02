@@ -4,6 +4,19 @@ Vet-insurance claims automation for one household: bank charges in, ready-to-sen
 
 ## Language
 
+**OpenClaw** (the name collides — say which you mean):
+*This repo* has been called OpenClaw since inception. **OpenClaw the product** is an unrelated local-first gateway daemon (channel transport, agent sessions, model routing, cron, plugins). The repo never depended on it — verified 2026-08-01 — and the resemblance is entirely the name. A change in flight (`openclaw-gateway-core`, ADR-0024) adopts the product as this system's shell, which makes the ambiguity operational rather than cosmetic: "OpenClaw is down" will mean two different outages.
+_Say_: "the gateway" for the product, "the app" or "the claims service" for this codebase.
+_Avoid_: bare "OpenClaw" in anything written after the swap.
+
+**The gateway**:
+The OpenClaw daemon, in its own container. Owns the Telegram bot token, polling, the chat agent loop, model resolution and cron. Owns no claim logic and holds no Gmail credential, deliberately (ADR-0024, ADR-0023).
+_Avoid_: server, bot, OpenClaw
+
+**The plugin**:
+`openclaw-claims`, running *inside* the gateway. Registers this app's slash commands and forwards each to `/internal`. Exists because a `command` button invokes a **native** command and `/mark` is not native to the gateway. Carries no claim rules.
+_Avoid_: adapter, bridge, integration
+
 **Claim**:
 One `vet_claims` row, anchored 1:1 to a bank charge. The system's unit of reconciliation ("claim #22"). Not what the insurer sees.
 _Avoid_: transaction-claim, charge-claim
@@ -45,7 +58,7 @@ _Avoid_: action (an Action is claims-side, one of `pending_actions`' nine kinds)
 A datetime extracted from a Task's own text by the LLM at capture time, which schedules a Reminder. Absent when the text implies no date — most Tasks have none.
 
 **Reminder**:
-One `reminders` row plus an APScheduler job. Fires by flipping to `due`; restart-safe (a reminder whose time passed while the app was down fires on startup, not skipped).
+One `reminders` row plus a scheduled job — APScheduler today, gateway cron plus an app-side catch-up sweep after the swap (ADR-0002 addendum). Fires by flipping to `due`; restart-safe (a reminder whose time passed while the app was down fires on startup, not skipped).
 _Avoid_: notification, alert (those are the claims side's Telegram pushes and `ops_alerts`)
 
 ## Sweep

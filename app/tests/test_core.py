@@ -684,9 +684,9 @@ def test_edited_message_is_handled_and_logged_not_crashed():
     update = _edited_reply_to_card_update()
 
     assert update.message is None, "the fixture must be a genuine edit, not a new message"
-    assert message_log._describe(update) == (
+    assert message_log._describe(update.to_dict()) == (
         "text", "edit: This is actually split between echo and Aari. Aari cost was $35 out of this"
-    ), message_log._describe(update)
+    ), message_log._describe(update.to_dict())
     assert telegram_bot._replied_to_claim_id(update.effective_message) == 1
 
     acked, replies, seen = [], [], {}
@@ -4299,9 +4299,655 @@ def test_the_shadow_comparison_reports_without_repairing_anything():
     assert after["status"] == "settled" and after["flag"] == before["flag"], "the comparison wrote something"
 
 
+# --- OpenClaw gateway: the internal surface and the outbound seam -------------
+# Tested at the function level rather than through fastapi's TestClient on
+# purpose: TestClient needs httpx, and adding a test-only dependency to reach
+# code that is already directly callable buys nothing. The suite must also pass
+# with no gateway installed, which is why every send test injects a runner.
+
+
+class _FakeRequest:
+    def __init__(self, host="127.0.0.1"):
+        self.client = type("c", (), {"host": host})()
+
+
+def _with_secret(secret, allow=None):
+    """Set the internal-API config and hand back a restore callable."""
+    from openclaw import config as cfg
+
+    before = (cfg.INTERNAL_API_SECRET, cfg.INTERNAL_API_ALLOW_HOSTS)
+    cfg.INTERNAL_API_SECRET = secret
+    if allow is not None:
+        cfg.INTERNAL_API_ALLOW_HOSTS = allow
+
+    def restore():
+        cfg.INTERNAL_API_SECRET, cfg.INTERNAL_API_ALLOW_HOSTS = before
+
+    return restore
+
+
+def test_internal_surface_refuses_when_no_secret_is_configured():
+    """An unset secret is a misconfiguration, not a permission. Defaulting to
+    allow would make the whole surface public the first time someone forgot the
+    env var."""
+    from openclaw import internal_api
+
+    restore = _with_secret("")
+    try:
+        reason = internal_api._authorized(_FakeRequest(), "anything")
+        assert reason and "not configured" in reason, reason
+    finally:
+        restore()
+
+
+def test_internal_surface_rejects_a_bad_or_missing_secret():
+    from openclaw import internal_api
+
+    restore = _with_secret("s3cret")
+    try:
+        assert internal_api._authorized(_FakeRequest(), "wrong") == "bad or missing secret"
+        assert internal_api._authorized(_FakeRequest(), None) == "bad or missing secret"
+        assert internal_api._authorized(_FakeRequest(), "s3cret") is None
+    finally:
+        restore()
+
+
+def test_internal_surface_rejects_a_host_outside_the_allowlist():
+    """Defence in depth — the secret is the real auth, but a correct secret from
+    an unexpected host is still worth refusing and logging."""
+    from openclaw import internal_api
+
+    restore = _with_secret("s3cret", allow={"127.0.0.1"})
+    try:
+        reason = internal_api._authorized(_FakeRequest(host="10.1.2.3"), "s3cret")
+        assert reason and "not in allowlist" in reason, reason
+        assert internal_api._authorized(_FakeRequest(host="127.0.0.1"), "s3cret") is None
+    finally:
+        restore()
+
+
+def test_two_concurrent_ticks_never_both_run():
+    """Two pipeline.run_once calls against one database would draft the same
+    claims into two Gmail drafts — two Petcover submissions for one set of
+    invoices. APScheduler refused an overlapping run for free (max_instances
+    defaults to 1, unset everywhere here); gateway cron does not, so this is a
+    guarantee being rebuilt rather than a new one."""
+    import threading
+
+    from openclaw import internal_api
+
+    entered = []
+    release = threading.Event()
+
+    def _slow():
+        entered.append(1)
+        release.wait(5)
+        return "done"
+
+    outcomes = []
+    first = threading.Thread(target=lambda: outcomes.append(internal_api.run_exclusive("tick", _slow)))
+    first.start()
+    for _ in range(500):  # wait for the first tick to actually hold the lock
+        if entered:
+            break
+        time.sleep(0.01)
+    assert entered, "the first tick never started"
+
+    assert internal_api.run_exclusive("tick", _slow) == (False, None), "a second tick entered the body"
+    assert len(entered) == 1, entered
+
+    release.set()
+    first.join(5)
+    assert outcomes == [(True, "done")], outcomes
+
+    # Released, so the next invocation after the first finishes does run.
+    assert internal_api.run_exclusive("tick", lambda: "second") == (True, "second")
+
+
+def test_different_jobs_do_not_block_each_other():
+    """The lock is per job name — a running tick must not stop the nudge."""
+    import threading
+
+    from openclaw import internal_api
+
+    held = threading.Event()
+    release = threading.Event()
+    t = threading.Thread(target=lambda: internal_api.run_exclusive(
+        "tick", lambda: (held.set(), release.wait(5))))
+    t.start()
+    try:
+        assert held.wait(5), "the tick never took its lock"
+        assert internal_api.run_exclusive("nudge", lambda: "ok") == (True, "ok")
+    finally:
+        release.set()
+        t.join(5)
+
+
+def test_nothing_outside_gateway_client_shells_out_to_the_gateway():
+    """The LoggedBot rule, carried to the new transport: one seam, or the message
+    log stops being complete. A bypassing caller sends the message and writes no
+    row, and a missing row is indistinguishable from a message never sent.
+
+    This is the guard the module map rates as only *partial* for LoggedBot —
+    nothing there stops a second `telegram.Bot` being constructed."""
+    src = Path(__file__).resolve().parent.parent / "openclaw"
+    offenders = []
+    for path in sorted(src.glob("*.py")):
+        if path.name == "gateway_client.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        # `config.OPENCLAW_CLI`, not bare `OPENCLAW_CLI` — config.py is where the
+        # setting is DEFINED, and naming a setting is not reaching the gateway.
+        for marker in ("import subprocess", "from subprocess", "config.OPENCLAW_CLI"):
+            if marker in text:
+                offenders.append(f"{path.name}: {marker}")
+    assert not offenders, (
+        "these reach the gateway outside the logged seam, so their messages "
+        f"would never land in telegram_messages: {offenders}"
+    )
+
+
+def test_correlation_id_is_minted_when_the_caller_supplies_none():
+    """An event crosses two runtimes now. Without a shared id a failure halfway
+    is untraceable in either log."""
+    from openclaw import internal_api
+
+    assert internal_api._correlation_id("abc123") == "abc123"
+    assert internal_api._correlation_id("  ") .startswith("int-")
+    assert internal_api._correlation_id(None).startswith("int-")
+    assert internal_api._correlation_id(None) != internal_api._correlation_id(None)
+
+
+def _ok_runner(stdout='{"ok": true}'):
+    def run(argv, **kwargs):
+        return type("p", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    return run
+
+
+def test_gateway_send_failure_carries_the_stderr_reason():
+    """A send that did not happen must never look like one that did, and an exit
+    code alone is useless for diagnosis."""
+    from openclaw import gateway_client
+
+    def run(argv, **kwargs):
+        return type("p", (), {"returncode": 2, "stdout": "", "stderr": "chat not found"})()
+
+    try:
+        gateway_client.send_message("42", "hello #7", runner=run)
+    except gateway_client.GatewaySendError as exc:
+        assert "exit 2" in str(exc) and "chat not found" in str(exc), str(exc)
+    else:
+        raise AssertionError("a failed send did not raise")
+
+
+def test_the_suite_runs_with_no_gateway_installed():
+    """Hermetic: no daemon, no CLI on PATH. A missing binary is a named failure,
+    not a stack trace from subprocess."""
+    from openclaw import gateway_client
+
+    def run(argv, **kwargs):
+        raise FileNotFoundError(argv[0])
+
+    try:
+        gateway_client.send_message("42", "hello", runner=run)
+    except gateway_client.GatewaySendError as exc:
+        assert "not found" in str(exc), str(exc)
+    else:
+        raise AssertionError("a missing gateway CLI did not raise")
+
+
+def test_every_gateway_send_lands_in_the_message_log():
+    """The LoggedBot guarantee, carried over: nothing reaches the channel without
+    a telegram_messages row. This is the seam that keeps the log trustworthy."""
+    from openclaw import gateway_client, message_log
+
+    _fresh_db()
+    before = message_log.stats()["total"]
+    gateway_client.send_message("42", "Claim #7 needs a condition", runner=_ok_runner())
+    gateway_client.send_file("42", "/tmp/card.png", caption="Claim #7", runner=_ok_runner())
+    gateway_client.edit_message("42", "9", "Claim #7 — done", runner=_ok_runner())
+    assert message_log.stats()["total"] == before + 3, message_log.stats()
+
+
+def test_a_react_failure_does_not_break_the_handler():
+    """The ack exists so a slow handler does not feel dead. Losing the ack is
+    strictly better than losing the handler."""
+    from openclaw import gateway_client
+
+    def run(argv, **kwargs):
+        return type("p", (), {"returncode": 1, "stdout": "", "stderr": "rate limited"})()
+
+    _fresh_db()
+    assert gateway_client.react("42", "9", runner=run) is False
+    assert gateway_client.react("42", "9", runner=_ok_runner()) is True
+
+
+def test_a_non_json_success_is_not_treated_as_a_failed_send():
+    """Raising here would let a caller retry a message that already went out."""
+    from openclaw import gateway_client, message_log
+
+    # _fresh_db() deliberately leaves telegram_messages alone (it is the RL
+    # dataset), so count relatively — an absolute total depends on test order.
+    _fresh_db()
+    before = message_log.stats()["total"]
+    assert gateway_client.send_message("42", "hi", runner=_ok_runner(stdout="sent")) == {}
+    assert message_log.stats()["total"] == before + 1
+
+
+def _capture_argv():
+    """Record the argv a gateway_client call builds, without running anything."""
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append(argv)
+        return type("p", (), {"returncode": 0, "stdout": '{"ok": true}', "stderr": ""})()
+
+    return seen, run
+
+
+def test_gateway_argv_uses_the_flags_the_cli_actually_has():
+    """19a — the first version of gateway_client guessed every flag and got every
+    flag wrong: --chat, --text, --file, --caption, --buttons. None exist. The CLI
+    accepts none of them, but the failure that matters is subtler than a crash:
+    a wrong *presentation* is discarded silently with ok:true and a real message
+    id, so there is no signal to notice.
+
+    Verified against `openclaw message <sub> --help` on gateway 2026.6.34. This
+    test exists so the next person to guess is stopped by a red suite."""
+    from openclaw import gateway_client
+
+    _fresh_db()
+    invented = {"--chat", "--text", "--file", "--caption", "--buttons"}
+
+    seen, run = _capture_argv()
+    gateway_client.send_message("42", "hello #7", runner=run)
+    gateway_client.send_file("42", "/data/card.png", caption="Claim #7", runner=run)
+    gateway_client.edit_message("42", "9", "Claim #7 — done", runner=run)
+    gateway_client.react("42", "9", runner=run)
+
+    for argv in seen:
+        assert not invented & set(argv), f"invented flag in {argv}"
+        assert argv[1] == "message" and "--channel" in argv and "--target" in argv, argv
+        assert argv[-1] == "--json", argv
+
+    send, media, edit, react = seen
+    assert "--message" in send and send[send.index("--message") + 1] == "hello #7"
+    # With --media set, --message IS the caption. The CLI's own help says
+    # --message is "required unless --media is set"; there is no caption flag.
+    assert "--media" in media and media[media.index("--message") + 1] == "Claim #7"
+    assert "--message-id" in edit and "--message" in edit
+    assert "--message-id" in react and "--emoji" in react
+
+
+def test_buttons_are_nested_in_a_blocks_array_never_at_the_top_level():
+    """19a.1 — five real sends were discarded for putting `buttons` at the top of
+    the presentation. Every one returned ok:true with a message id.
+
+    Checked against the platform's own normalizeMessagePresentation, which
+    returns undefined for the top-level shape and echoes this one back. Assert
+    the exact nesting, not merely that buttons are present somewhere."""
+    from openclaw import gateway_client
+
+    _fresh_db()
+    seen, run = _capture_argv()
+    gateway_client.send_message(
+        "42", "Claim #7", buttons=[{"label": "Mark sent", "command": "/mark 7 sent"}], runner=run)
+
+    import json as _json
+
+    payload = _json.loads(seen[0][seen[0].index("--presentation") + 1])
+    assert "buttons" not in payload, f"top-level buttons are silently discarded: {payload}"
+    assert payload == {"blocks": [{"type": "buttons", "buttons": [
+        {"label": "Mark sent", "action": {"type": "command", "command": "/mark 7 sent"}}]}]}, payload
+
+
+def test_a_button_command_over_the_byte_budget_is_refused_not_sent():
+    """19a.4 — Telegram caps callback_data at 64 bytes and the gateway spends 6
+    on a `tgcmd:` prefix. At 59 the button is filtered out, its row is dropped,
+    and a message whose only row was dropped arrives with NO keyboard — ok:true,
+    real message id, no error. Measured live at the boundary.
+
+    Count UTF-8 bytes, not characters: a non-ASCII pet name costs more than one
+    byte each and would walk past a len() check."""
+    from openclaw import gateway_client
+
+    _fresh_db()
+    budget = gateway_client.COMMAND_CALLBACK_BUDGET_BYTES
+    assert budget == 58, budget
+
+    seen, run = _capture_argv()
+    gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": "/" + "a" * (budget - 1)}],
+                                runner=run)
+    assert len(seen) == 1, "a command exactly at the budget must still send"
+
+    for command in ("/" + "a" * budget, "/mark 7 " + "é" * 30):
+        try:
+            gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": command}],
+                                        runner=run)
+        except gateway_client.PresentationError as exc:
+            assert "byte" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"an over-budget command was sent and its button lost: {command!r}")
+    assert len(seen) == 1, "an over-budget send reached the CLI"
+
+
+def test_a_label_less_button_costs_every_button_on_the_message():
+    """19a.2 — verified against the shipped normalizer: one button with no label
+    makes it return undefined for the WHOLE presentation, so a single bad button
+    silently strips the keyboard off the message. Refuse instead."""
+    from openclaw import gateway_client
+
+    _fresh_db()
+    seen, run = _capture_argv()
+    for bad in ({"command": "/mark 7 sent"}, {"label": "  ", "command": "/mark 7 sent"},
+                {"label": "Mark", "command": "mark 7 sent"}):
+        try:
+            gateway_client.send_message("42", "x", buttons=[bad], runner=run)
+        except gateway_client.PresentationError:
+            pass
+        else:
+            raise AssertionError(f"a presentation the platform would discard was sent: {bad}")
+    assert not seen, "a payload that would be discarded reached the CLI"
+
+
+def test_the_telegram_tee_writes_the_same_row_shape_the_old_transport_did():
+    """1.4 / 12.1 — after the cutover the app never sees a PTB Update, but the
+    dataset must not change meaning halfway through. Same `kind` vocabulary,
+    same raw payload, same app_version, whichever transport delivered it."""
+    from openclaw import config, internal_api, message_log
+
+    _fresh_db()
+    body = {"update_id": 77001, "update": {"message": {"text": "/mark 7 sent"}}}
+    assert internal_api.record_event(body, "corr-1")["status"] == "ok"
+    # A redelivery is not an error and must not double-count the dataset.
+    assert internal_api.record_event(body, "corr-2")["status"] == "duplicate"
+
+    with db.get_connection() as conn:
+        row = dict(conn.execute(
+            "SELECT kind, summary, payload, app_version, direction, processed_at "
+            "FROM telegram_messages WHERE update_id = 77001").fetchone())
+    assert row["kind"] == "command" and row["summary"] == "/mark 7 sent", row
+    assert row["direction"] == "in" and row["app_version"] == config.APP_VERSION, row
+    # Written before anything handles it — that unset processed_at IS the replay
+    # queue, and it is why a crash mid-handler does not lose the message.
+    assert row["processed_at"] is None, row
+    assert "/mark 7 sent" in row["payload"], row["payload"]
+    assert message_log.stats()["queued"] >= 1
+
+
+def test_the_telegram_tee_refuses_an_event_with_no_update_id():
+    """No id means no dedupe key and no way to settle the row, so every
+    redelivery would silently grow the dataset."""
+    from openclaw import internal_api
+
+    _fresh_db()
+    assert internal_api.record_event({"update": {}}, "corr-3").status_code == 400
+    # The tee is guarded by the same secret as every other internal route — it
+    # carries raw message content, so an open one leaks the conversation.
+    restore = _with_secret("s3cret", allow={"127.0.0.1"})
+    try:
+        assert internal_api._guard(_FakeRequest(), "wrong", "telegram/event", "c") is not None
+        assert internal_api._guard(_FakeRequest(host="10.0.0.9"), "s3cret", "telegram/event", "c") is not None
+        assert internal_api._guard(_FakeRequest(), "s3cret", "telegram/event", "c") is None
+    finally:
+        restore()
+
+
+def test_one_classifier_describes_both_transports():
+    """The gateway delivers dicts and PTB delivered objects. Two classifiers
+    would drift, and the drift would only show up months later in the dataset —
+    an edit once logged as kind `other` with an empty summary for exactly this
+    kind of reason (2026-07-27)."""
+    from openclaw import message_log
+
+    cases = [
+        ({"message": {"text": "/mark 7 sent"}}, ("command", "/mark 7 sent")),
+        ({"message": {"text": "hello"}}, ("text", "hello")),
+        ({"edited_message": {"text": "actually $35"}}, ("text", "edit: actually $35")),
+        ({"callback_query": {"data": "sent:7"}}, ("tap", "sent:7")),
+        ({"message": {"document": {"file_id": "x"}}}, ("non_text", "<document>")),
+        ({"message": {"photo": [{"file_id": "x"}]}}, ("non_text", "<photo>")),
+        ({}, ("other", "")),
+    ]
+    for raw, expected in cases:
+        assert message_log._describe(raw) == expected, (raw, message_log._describe(raw))
+
+
+# --- the MCP read surface -----------------------------------------------------
+
+
+def test_mcp_inventory_has_no_dangerous_tool():
+    """2.3 / 19a.7 — this test IS the gmail-isolation-boundary enforcement.
+
+    The stock gateway agent asserted it had checked email in a runtime with no
+    mail credential, so prompt-level discipline demonstrably does not hold this
+    line. The inventory is written by hand precisely so it can be asserted."""
+    from openclaw import mcp_server
+
+    offenders = []
+    for name in mcp_server.TOOL_NAMES:
+        for bad in mcp_server.FORBIDDEN_TOOL_SUBSTRINGS:
+            if bad in name:
+                offenders.append(f"{name} contains {bad!r}")
+    assert not offenders, offenders
+
+    # No mutation reachable, whatever the inventory says. `_impls` is built from
+    # the chat agent's implementations, which include every propose_* function;
+    # only names listed in TOOLS are selected out of it.
+    impls = mcp_server._impls()
+    assert set(impls) == set(mcp_server.TOOL_NAMES), (set(impls) ^ set(mcp_server.TOOL_NAMES))
+    assert not [n for n in impls if n.startswith("propose_")], list(impls)
+
+
+def test_mcp_inventory_is_enumerated_and_within_its_token_budget():
+    """2.2 / 19a.3 — every schema here ships in EVERY agent turn. A trimmed turn
+    is 3,865 tokens against Groq's 12,000 TPM, so the inventory has a real
+    budget rather than a taste. Failing loudly on tool #N+1 is the point.
+
+    No dynamic or wildcard registration: a tool that can only arrive by being
+    written into TOOLS is a tool that can be counted."""
+    import json as _json
+
+    from openclaw import mcp_server
+
+    assert len(mcp_server.TOOLS) <= 12, f"{len(mcp_server.TOOLS)} tools — re-measure the turn before raising this"
+    schema_chars = len(_json.dumps(mcp_server.TOOLS))
+    # ~8,100 tokens of headroom were measured after the 17.8/17.10 cuts. At the
+    # usual ~4 chars/token this ceiling is roughly a quarter of it, which leaves
+    # room for the answers themselves.
+    assert schema_chars <= 8000, f"tool schemas are {schema_chars} chars; they ship on every turn"
+    for tool in mcp_server.TOOLS:
+        assert tool["name"] and tool["description"] and "inputSchema" in tool, tool
+
+
+def test_mcp_speaks_enough_of_the_protocol_to_be_probed():
+    """2.5's hermetic half. The live half needs the gateway and is a preflight
+    assertion; this one catches the shape breaking without one."""
+    from openclaw import mcp_server
+
+    init = mcp_server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                "params": {"protocolVersion": "2025-06-18"}})
+    assert init["result"]["protocolVersion"] == "2025-06-18", init
+    assert init["result"]["capabilities"]["tools"] is not None, init
+    # The instructions must say what this surface CANNOT do. The absence of a
+    # mailbox has to be stated, not inferred from an inventory nobody reads.
+    assert "READ ONLY" in init["result"]["instructions"], init["result"]["instructions"]
+
+    listed = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    assert [t["name"] for t in listed["result"]["tools"]] == mcp_server.TOOL_NAMES
+
+    # A notification gets no response at all — returning one is a protocol
+    # violation, and the client is entitled to treat it as a broken server.
+    assert mcp_server.dispatch({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+    assert mcp_server.dispatch({"jsonrpc": "2.0", "id": 3, "method": "nonsense"})["error"]["code"] == -32601
+
+
+def test_mcp_turn_context_reads_the_pets_live():
+    """2.4 — the pet list is a DB read at call time, never baked into agent
+    config. The model invented 'Whiskers' and 'Fluffy' when left to guess, and a
+    list written into a workspace file is correct until a pet is added and then
+    wrong silently. This is why the shipped USER.md deliberately has none."""
+    from datetime import datetime, timezone
+
+    from openclaw import mcp_server
+
+    _fresh_db()
+    out = mcp_server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "turn_context", "arguments": {}}})
+    text = out["result"]["content"][0]["text"]
+    assert out["result"]["isError"] is False, out
+    assert "Aari" in text and "Echo" in text, text
+    assert datetime.now(timezone.utc).date().isoformat() in text, text
+
+    with db.get_connection() as conn:
+        conn.execute("INSERT INTO pets (name, insurer) VALUES ('Bandit', 'Petcover')")
+    later = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                 "params": {"name": "turn_context", "arguments": {}}})
+    assert "Bandit" in later["result"]["content"][0]["text"], "the pet list was cached, not read"
+
+
+def test_a_failing_mcp_tool_reports_to_the_model_not_the_transport():
+    """A tool failure the model can see is one it can recover from or report. A
+    JSON-RPC error ends the turn with nothing said, which is the silent no-op
+    the project's rules forbid."""
+    from openclaw import mcp_server
+
+    _fresh_db()
+    missing = mcp_server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "no_such_tool", "arguments": {}}})
+    assert missing["result"]["isError"] is True and "error" not in missing, missing
+
+    bad_args = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                    "params": {"name": "claim_detail", "arguments": {"nope": 1}}})
+    assert bad_args["result"]["isError"] is True, bad_args
+    assert "claim_detail" in bad_args["result"]["content"][0]["text"], bad_args
+
+
+def _scratch() -> str:
+    """A throwaway directory. The outbox tests must never touch a real one."""
+    return tempfile.mkdtemp(prefix="openclaw-outbox-")
+
+
+def test_a_card_is_published_under_the_path_the_gateway_can_actually_read():
+    """14.2 — one file, two path spaces, and handing over the wrong one fails
+    with `Local media path is not under an allowed directory`: an error that
+    reads like a permissions problem and is really a namespace one.
+
+    The gateway's media allowlist is a fixed set of roots and `/tmp` is not
+    among them (14.1/14.4), so the app's own path is never sendable."""
+    from openclaw import config, gateway_client, media_outbox
+
+    _fresh_db()
+    outbox = Path(_scratch()) / "outbox"
+    before = (config.MEDIA_OUTBOX_DIR, config.MEDIA_OUTBOX_GATEWAY_DIR)
+    try:
+        config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = str(outbox)
+        config.MEDIA_OUTBOX_GATEWAY_DIR = media_outbox.config.MEDIA_OUTBOX_GATEWAY_DIR = "/home/node/.openclaw/media"
+
+        seen, run = _capture_argv()
+        gateway_client.send_card("42", b"\x89PNG-not-really", caption="Claim #7", runner=run)
+
+        argv = seen[0]
+        sent = argv[argv.index("--media") + 1]
+        # The gateway's namespace, never the app's. Returning the app path would
+        # be refused by the platform, silently to anyone reading our own logs.
+        assert sent.startswith("/home/node/.openclaw/media/"), sent
+        assert str(outbox) not in sent, sent
+
+        written = list(outbox.glob("card-*.png"))
+        assert len(written) == 1 and written[0].read_bytes() == b"\x89PNG-not-really"
+        # Not the claim id: these names sit in a directory the gateway can read.
+        assert Path(sent).name == written[0].name
+        assert not list(outbox.glob("*.part")), "a partial write was left behind"
+    finally:
+        config.MEDIA_OUTBOX_DIR, config.MEDIA_OUTBOX_GATEWAY_DIR = before
+        media_outbox.config.MEDIA_OUTBOX_DIR, media_outbox.config.MEDIA_OUTBOX_GATEWAY_DIR = before
+
+
+def test_an_unwritable_outbox_fails_before_anything_is_sent():
+    """A card that could not be written must never look like one delivered."""
+    from openclaw import config, gateway_client, media_outbox
+
+    _fresh_db()
+    before = config.MEDIA_OUTBOX_DIR
+    try:
+        # A path under an existing FILE cannot be created as a directory.
+        blocker = Path(_scratch()) / "not-a-dir"
+        blocker.write_text("x", encoding="utf-8")
+        config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = str(blocker / "outbox")
+
+        seen, run = _capture_argv()
+        try:
+            gateway_client.send_card("42", b"png", runner=run)
+        except media_outbox.OutboxError:
+            pass
+        else:
+            raise AssertionError("an unpublishable card reported success")
+        assert not seen, "the CLI was invoked for a card that was never written"
+    finally:
+        config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = before
+
+
+def test_the_outbox_sweeps_its_own_expired_files():
+    """Nothing reads these back — Telegram keeps its own copy once delivered.
+    Swept on publish rather than on a timer: publishing is the only event that
+    matters, and a directory nobody writes to needs no tidying."""
+    import time as _time
+
+    from openclaw import config, media_outbox
+
+    outbox = Path(_scratch()) / "outbox-sweep"
+    before = config.MEDIA_OUTBOX_DIR
+    try:
+        config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = str(outbox)
+        outbox.mkdir(parents=True, exist_ok=True)
+        stale, fresh = outbox / "card-old.png", outbox / "card-new.png"
+        stale.write_bytes(b"old")
+        fresh.write_bytes(b"new")
+        old_enough = _time.time() - media_outbox.TTL_SECONDS - 60
+        os.utime(stale, (old_enough, old_enough))
+
+        media_outbox.publish(b"png")
+        assert not stale.exists(), "an expired card was left in the outbox"
+        assert fresh.exists(), "a live card was swept"
+    finally:
+        config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = before
+
+
+def test_the_plugin_report_is_per_boot_and_never_persisted():
+    """19b.6's evidence. An unregistered command in a button is not an error —
+    it reaches the agent as a chat turn and spends tokens (16.8, measured live
+    three times in Justin's chat). Both plugin enablement gates fail silently
+    (18.7), so "it loaded" proves nothing.
+
+    In-memory on purpose: persisting it would recreate the exact failure that
+    makes `plugins list` useless — a saved registry that goes stale and reported
+    `commands: []` for commands that worked (18.6)."""
+    from openclaw import gateway_client, internal_api
+
+    internal_api._plugin_report.clear()
+    assert internal_api.plugin_report() == {}, "an absent report must read as 'the plugin has not run'"
+
+    internal_api._plugin_report.update({"plugin": "claims", "commands": ["mark", "pet"]})
+    assert internal_api.plugin_report()["commands"] == ["mark", "pet"]
+    # A copy, not the live dict — /health must not hand out something a caller
+    # can mutate into a passing report.
+    internal_api.plugin_report()["commands"] = []
+    assert internal_api.plugin_report()["commands"] == ["mark", "pet"]
+    internal_api._plugin_report.clear()
+
+    # The declared button commands are the preflight's input. If this list and
+    # the card-building code ever diverge, a button ships unasserted.
+    assert gateway_client.BUTTON_COMMANDS, "the preflight has nothing to assert"
+    assert all(not c.startswith("/") for c in gateway_client.BUTTON_COMMANDS), gateway_client.BUTTON_COMMANDS
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()
             print(f"{name} OK")
     print("ALL TESTS PASSED")
+
+

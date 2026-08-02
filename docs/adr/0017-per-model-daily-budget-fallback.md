@@ -76,3 +76,26 @@ Both found by Justin using the feature, not by the test suite — worth recordin
 2. **Markdown in a plain-text channel** (`b304325`). `gpt-oss-120b` answers with pipe tables by default, and `_handle_chat` sends replies with no `parse_mode`, so they would have arrived on his phone as raw pipes. The prompt now requires short plain-text lines.
 
 Generalisable lesson: adding a fallback path adds every *behavioural* difference of the fallback models, not just their capacity. Capacity was the reason for the change; formatting and response-shape differences came along uninvited.
+
+---
+
+## Amendment (2026-08-01) — untouched by the gateway's token work, and that is the point
+
+The agent's per-turn size was cut from 22,810 tokens to 3,865 (ADR-0023). That
+addresses Groq's **per-minute** ceiling of 12,000 TPM. It does nothing whatever
+about the **per-day, per-model** budget of 100,000 tokens that this ADR exists
+to walk.
+
+Stated explicitly because "the token problem is solved" will otherwise be read
+as covering both. Two independent limits, two independent mechanisms:
+
+| Limit | Window | Cure | Owner |
+|---|---|---|---|
+| 12,000 TPM | per minute | make the request smaller | tool allowlist (ADR-0023) |
+| 100,000 tokens | per day, per model | move to another model's budget | this ADR's walk |
+
+The gateway does not distinguish them. Its failover has a single `rate_limit`
+classification, treated as transient and re-probed during cooldown — correct for
+a per-minute limit, useless for a per-day one. So this ADR's walk stays in
+`llm.py` for extraction and vision, which are the calls that exhaust a day. See
+the addendum to ADR-0009 for what the chat path gives up.

@@ -1,7 +1,7 @@
 # ADR-0016: The Telegram agent's tool surface — how far it reaches, and why not MCP
 
 **Date**: 2026-07-25
-**Status**: accepted
+**Status**: accepted; gate location superseded by ADR-0025, tool surface by ADR-0023 (2026-08-01)
 **Deciders**: Justin
 
 ## Context
@@ -104,3 +104,32 @@ Two consequences:
 2. **The tool-schema size guard matters more than it looked.** At ~1.5k of those 2.6k tokens, the schema is the largest fixed cost of every request, and 8 → 15 tools raised the price of *every* chat turn, not just the ones using the new tools.
 
 Method note worth keeping: this is the second time in this change that measuring the obvious surface gave a wrong-but-plausible answer. Headers are a partial view of a provider's limits; the errors it throws are the complete one.
+
+---
+
+## Amendment (2026-08-01) — the gate's location is superseded by 0025; the reasoning is not
+
+**Superseded in part by:** ADR-0025 (gate location), ADR-0023 (tool inventory).
+
+This ADR placed the proposal gate in `telegram_bot._execute_action` and made the
+point that a gate in a prompt is not a gate. **That point stands and is now
+carried further.** What changes is only *where* the code sits, because
+`telegram_bot.py` is deleted by the gateway swap (ADR-0024).
+
+- **Gate location:** split by origin. A card's confirm tap commits behind
+  `/internal`; a chat-initiated proposal commits in the MCP surface. Both inside
+  Python. ADR-0025.
+- **Tool surface:** this ADR's registry in `agent.py` becomes an enumerated MCP
+  inventory plus a `tools.allow` allowlist on the gateway. The change is not
+  cosmetic — on a general-purpose agent runtime, prompt discipline is not a
+  boundary at all, so the inventory has to be one. ADR-0023.
+- **The three named sweeps** (`reconcile_sent_invoice_requests`,
+  `rematch_claims`, `poll_petcover_now`) and the rule that the agent must state
+  their scope rather than imply it read the mailbox: **unchanged**. Reinforced,
+  in fact — the platform's stock agent was observed on 2026-08-01 claiming it had
+  checked mail in a runtime holding no mail credential, which is exactly the
+  failure this ADR named and exactly why enforcement is the inventory rather
+  than the prompt.
+
+Recorded here rather than only in ADR-0025 so that a reader arriving at this ADR
+first is not led to a location that no longer exists.

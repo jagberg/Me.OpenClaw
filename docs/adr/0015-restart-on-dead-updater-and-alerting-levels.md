@@ -89,3 +89,27 @@ Note the one honest signal: `/health` itself would have failed, because `message
 
 - `pipeline.py` and `db.py` previously cited "ADR-0011 ops-alerting" for the rate-limited alert mechanism. ADR-0011 does not cover it; those citations now point here. The 2026-07-23 decision itself stands unchanged — only its pointer was wrong.
 - ADR-0013 existed as a file but was missing from `docs/adr/README.md`; added.
+
+---
+
+## Amendment (2026-08-01) — supervision moves, alerting levels do not
+
+The restart-on-dead-updater mechanism described here supervises a
+`python-telegram-bot` updater that no longer exists — the gateway polls, and the
+app has no updater to watch (ADR-0024).
+
+**Supervision moves to the container boundary.** The gateway is a Docker service
+with a healthcheck; a dead poller is a dead container and restarts as one. What
+must not be lost is the *guarantee*: a silently dead channel was the failure this
+ADR was written for, and Docker's healthcheck only covers process liveness, not
+"the bot stopped receiving updates while the process stayed up". If the
+gateway's supervision proves quieter than the mechanism it replaces, a
+dead-channel alert has to be added on the app side.
+
+**The alerting levels are unchanged and still binding.** ERROR means Justin must
+act. Nothing in the transport swap may make a failure quieter than it is today —
+which the swap has already threatened once: the platform's default media-edit
+path logs `editMessage failed` on every *successful* caption edit, and a log
+that cries wolf on the happy path is how a real failure stops being visible.
+That is why the app names `caption` explicitly rather than relying on the
+fallback.
