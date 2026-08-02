@@ -78,7 +78,11 @@ Write-Host "  GATEWAY_VERSION = $($env:GATEWAY_VERSION)"
 #   - plugins.load.paths written by editing the JSON directly, because
 #     `config set` will not run while the config it is fixing is invalid.
 Write-Host "  seeding pre-boot config and the plugin"
-$pluginSrc = (Resolve-Path "./app/gateway-plugin").Path -replace '\', '/'
+# .Replace(), not -replace: the latter takes a REGEX, and a lone backslash is not
+# a valid one. It silently produced an empty string, and docker then reported
+# "invalid spec: :/src:ro: empty section between colons" -- an error about the
+# mount that was really an error about the path.
+$pluginSrc = (Resolve-Path "./app/gateway-plugin").Path.Replace('\', '/')
 # NOTE: one line, not a PowerShell here-string. A multi-line string handed to a
 # native exe gets mangled on the way through, and the seed failed with no output
 # to say why. Keep it single-line.
