@@ -432,7 +432,9 @@ def main() -> int:
     results.append(check_menu_scopes(gw))
 
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "app"))
-    from openclaw.gateway_client import BUTTON_COMMANDS
+    # The leaf module, not gateway_client: this runs from a worktree with no
+    # virtualenv, and anything reaching config or db would fail to import.
+    from openclaw.button_commands import BUTTON_COMMANDS
 
     results.append(check_button_commands(gw, app_health, BUTTON_COMMANDS))
 

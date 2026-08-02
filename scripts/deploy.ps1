@@ -79,7 +79,12 @@ try {
     Write-Host "  telegram: running=$($tg.running) connected=$($tg.connected) lastError=$($tg.lastError)"
     if (-not $gwHealth.ok) { $failures += "gateway: health reports not ok" }
     if ($gwHealth.plugins.errors.Count -gt 0) { $failures += "gateway: plugin errors $($gwHealth.plugins.errors -join ',')" }
-    if ($tg -and -not $tg.running) { $failures += "gateway: the Telegram channel is not running" }
+    # NOT a failure here. Before the cutover the gateway deliberately holds no
+    # token and runs no channel, so asserting "running" would fail every slice-1
+    # deploy. Which runtime should be polling is direction-dependent, so it
+    # belongs in the preflight's check_exactly_one_poller -- which fails on BOTH
+    # polling (409 Conflict) and on neither (every message silently dropped).
+    if ($tg -and $tg.lastError) { $failures += "gateway: telegram lastError = $($tg.lastError)" }
 } catch {
     $failures += "gateway: health unreachable ($($_.Exception.Message))"
     Write-Host "UNREACHABLE"
@@ -125,7 +130,11 @@ if ($SkipPreflight) {
     Write-Host "`n--- gateway preflight ---"
     $preflightArgs = @("scripts/gateway_preflight.py", "--session-key", "preflight-$(Get-Date -UFormat %s)")
     if ($SkipTurnCheck) { $preflightArgs += "--skip-turn" }
-    & ./app/.venv/Scripts/python.exe @preflightArgs
+    # The deploy worktree has no virtualenv -- .venv is gitignored and never
+    # travels with a branch. The preflight is deliberately stdlib-only so any
+    # python can run it.
+    $py = if (Test-Path "./app/.venv/Scripts/python.exe") { "./app/.venv/Scripts/python.exe" } else { "python" }
+    & $py @preflightArgs
     if ($LASTEXITCODE -ne 0) { throw "gateway preflight failed -- see the FAIL lines above" }
 }
 

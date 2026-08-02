@@ -34,19 +34,11 @@ logger = logging.getLogger(__name__)
 # live at the boundary — 58 renders, 59 vanishes, both reporting success.
 COMMAND_CALLBACK_BUDGET_BYTES = 58
 
-# Every slash command a button is allowed to emit, in one place.
-#
-# This is not documentation. An **unregistered** command in a button does not
-# error and does not no-op — it reaches the agent as a chat turn and spends
-# tokens, measured live on 2026-08-01 when three `/ping` taps produced three
-# model replies. So `/mark 7 sent` arriving at an LLM as free text is one typo,
-# one failed plugin load or one rename away, and that is exactly the
-# commit-token-through-a-model path the whole button design exists to prevent.
-#
-# `scripts/gateway_preflight.py` asserts every name here responds on the running
-# gateway and fails the deploy otherwise. Card-building code must draw its
-# commands from this list so a new button cannot ship unasserted.
-BUTTON_COMMANDS = ("mark", "pet", "resolve", "history", "actions")
+# Re-exported so existing callers keep working. The declaration lives in
+# `button_commands.py`, which imports nothing, because the deploy-time
+# preflight reads it from a worktree with no virtualenv and importing this
+# module would drag in config (dotenv) and db.
+from .button_commands import BUTTON_COMMANDS  # noqa: F401
 
 
 class GatewaySendError(RuntimeError):
