@@ -87,9 +87,10 @@ $pluginSrc = (Resolve-Path "./app/gateway-plugin").Path.Replace('\', '/')
 # a string here failed twice -- a here-string arrived truncated with no error,
 # then a `node -e` had its quotes eaten and died on "Unexpected end of input".
 # Quoting through PowerShell -> docker -> sh is not worth defending.
+$workspaceSrc = (Resolve-Path "./app/gateway-workspace").Path.Replace('\', '/')
 $scriptsSrc = (Resolve-Path "./scripts").Path.Replace('\', '/')
 $seedOut = docker compose run --rm --no-deps `
-    -v "${pluginSrc}:/src:ro" -v "${scriptsSrc}:/seed:ro" `
+    -v "${pluginSrc}:/src:ro" -v "${scriptsSrc}:/seed:ro" -v "${workspaceSrc}:/workspace:ro" `
     --entrypoint sh gateway /seed/gateway_seed.sh 2>&1 | Out-String
 $seedExit = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
@@ -148,37 +149,6 @@ if ($failures.Count -gt 0) {
     $failures | ForEach-Object { Write-Host "  - $_" }
     throw "partial start"
 }
-
-# --- apply the config the preflight then verifies -----------------------------
-#
-# 7.6: the boundary plugins are DISABLED here rather than assumed off. 47 of 66
-# ship enabled, every boundary-relevant one among them, so this needs positive
-# action on every deploy -- an upgrade re-enables them silently. Applying and
-# then asserting is deliberate: the preflight stays an independent check rather
-# than a restatement of what this block just did.
-$boundaryPlugins = @("browser", "file-transfer", "phone-control", "canvas", "device-pair")
-$changed = $false
-foreach ($plugin in $boundaryPlugins) {
-    $ErrorActionPreference = "Continue"
-    $current = docker compose exec -T gateway node openclaw.mjs config get "plugins.entries.$plugin.enabled"
-    $ErrorActionPreference = "Stop"
-    if ($current -notmatch "false") {
-        docker compose exec -T gateway node openclaw.mjs config set "plugins.entries.$plugin.enabled" false | Out-Null
-        Write-Host "  disabled boundary plugin: $plugin"
-        $changed = $true
-    }
-}
-if ($changed) {
-    # Plugin enablement is read at startup, so a set without a restart leaves
-    # the plugin running while config claims otherwise -- which is exactly the
-    # divergence the preflight reads the RUNNING set to catch.
-    Write-Host "  restarting the gateway to apply plugin changes"
-    docker compose restart gateway | Out-Null
-    Start-Sleep -Seconds 15
-}
-
-# --- apply the gateway's own configuration ------------------------------------
-& ./scripts/gateway_configure.ps1
 
 # --- preflight: the config assertions no app-side test can make ---------------
 

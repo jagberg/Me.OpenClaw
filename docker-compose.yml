@@ -81,6 +81,10 @@ services:
       # during the spike (16.2).
       CLAIMS_APP_URL: "http://app:8000"
       CLAIMS_INTERNAL_SECRET: "${INTERNAL_API_SECRET:?the internal surface refuses every request without it}"
+      # Read by scripts/gateway_seed.sh, which runs as a one-shot container of
+      # this same service and therefore inherits its environment.
+      CLAIMS_TELEGRAM_CHAT_ID: "${CLAIMS_TELEGRAM_CHAT_ID:-}"
+      GROQ_API_KEY: "${GROQ_API_KEY:-}"
     ports:
       # Loopback only. The image declares no EXPOSE, so this has to be explicit.
       - "127.0.0.1:18789:18789"
