@@ -40,16 +40,26 @@ $env:APP_VERSION = "$sha+$branch$dirty"
 # The gateway is a pulled image, not a build, so its version is whatever the tag
 # resolves to. Read it rather than assume it: "latest" moved twice during the
 # swap work, and an upgrade is exactly what re-enables a boundary plugin.
-docker compose pull gateway 2>&1 | Out-Null
-$env:GATEWAY_VERSION = (docker compose run --rm --no-deps --entrypoint sh gateway -lc "node openclaw.mjs --version" 2>$null | Select-Object -Last 1)
+# NOTE: no `2>&1` on a native command. PowerShell 5.1 wraps each stderr line in
+# an ErrorRecord, and with $ErrorActionPreference = "Stop" that throws even when
+# docker exited 0 -- `docker compose pull` writes its progress to stderr, so the
+# first run of this script died on a successful pull.
+$ErrorActionPreference = "Continue"
+docker compose pull gateway | Out-Null
+$version = docker compose run --rm --no-deps --entrypoint sh gateway -lc "node openclaw.mjs --version"
+$ErrorActionPreference = "Stop"
+$env:GATEWAY_VERSION = ($version | Where-Object { $_ -match "\S" } | Select-Object -Last 1)
 if (-not $env:GATEWAY_VERSION) { $env:GATEWAY_VERSION = "unknown" }
 
 Write-Host "Deploying"
 Write-Host "  APP_VERSION     = $($env:APP_VERSION)"
 Write-Host "  GATEWAY_VERSION = $($env:GATEWAY_VERSION)"
 
+$ErrorActionPreference = "Continue"
 docker compose up -d --build
-if ($LASTEXITCODE -ne 0) { throw "docker compose failed with exit code $LASTEXITCODE" }
+$buildExit = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+if ($buildExit -ne 0) { throw "docker compose failed with exit code $buildExit" }
 
 Start-Sleep -Seconds 15
 
@@ -68,8 +78,11 @@ try {
 
 Write-Host "`n--- gateway health ---"
 try {
+    $ErrorActionPreference = "Continue"
     $raw = docker compose exec -T gateway node openclaw.mjs health --json
-    if ($LASTEXITCODE -ne 0) { throw "health exited $LASTEXITCODE" }
+    $healthExit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($healthExit -ne 0) { throw "health exited $healthExit" }
     $gwHealth = $raw | ConvertFrom-Json
     # `ok` alone is not enough. The Telegram channel can be configured, enabled
     # and not running, which is the dead-updater failure ADR-0015 was written
@@ -106,7 +119,9 @@ if ($failures.Count -gt 0) {
 $boundaryPlugins = @("browser", "file-transfer", "phone-control", "canvas", "device-pair")
 $changed = $false
 foreach ($plugin in $boundaryPlugins) {
-    $current = docker compose exec -T gateway node openclaw.mjs config get "plugins.entries.$plugin.enabled" 2>$null
+    $ErrorActionPreference = "Continue"
+    $current = docker compose exec -T gateway node openclaw.mjs config get "plugins.entries.$plugin.enabled"
+    $ErrorActionPreference = "Stop"
     if ($current -notmatch "false") {
         docker compose exec -T gateway node openclaw.mjs config set "plugins.entries.$plugin.enabled" false | Out-Null
         Write-Host "  disabled boundary plugin: $plugin"
