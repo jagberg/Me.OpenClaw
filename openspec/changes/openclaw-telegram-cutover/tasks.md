@@ -42,6 +42,30 @@ live bot's replacement goes in the deploy worktree's `app/.env`.
 
 ## 4. Telegram cutover
 
+**Deployed and verified live 2026-08-02 (`e06cf94+deploy`), pre-cutover.** The
+non-cutover half — 4.1, 4.4, 4.5, 4.8, and 4.9's failure-visibility half — is
+built, deployed and running. What the deploy actually proved, as distinct from
+what the suite proved:
+
+- Both containers up; `/health` returns `polling_alive: true` and
+  `state_projection_disagreements: 0`.
+- **All eleven button commands registered inside the gateway**, reported by the
+  plugin and confirmed by the preflight's own log read: `PASS button commands
+  registered — 11 reported, no collisions`. Five became eleven because every
+  action-card tap needs a registered verb.
+- `pending_proposals` exists in the live DB with its ten columns, created by
+  `CREATE TABLE IF NOT EXISTS` at startup — no manual DDL, because that
+  constraint only binds *existing* tables.
+- Preflight: 8 PASS, 1 FAIL, 1 SKIP. The FAIL is `model serves a turn`, a Groq
+  daily-budget exhaustion (`Limit 100000, Used 96708` earlier the same day), and
+  the SKIP depends on it. **A quota result, not a deploy failure** — do not read
+  it as one.
+
+Still needing the token: 4.2, 4.3, 4.6, 4.7 and 4.10–4.13. 4.2 and 4.3 also need
+0.10a — how a plugin reaches `before_dispatch`, which exists but whose plugin-side
+API is unestablished.
+
+
 - [x] 4.1 **DONE 2026-08-02** — `config.TELEGRAM_UPDATER_ENABLED`, default on; `notify.using_gateway()` is its inverse and the one place the transports diverge. Put the Python updater behind a config flag, defaulting on, so it can be disabled without deleting code. **DECIDED: the flag stays for one week of real daily use after cutover** (Justin, 2026-08-01), then section 6 removes it. Rollback is one env var and a restart, ~30s. A week is what it takes for the failures only real use finds — a caption that will not edit, buttons that will not attach to a card, a tap that quietly reached the LLM.
 - [ ] 4.2 Write the thin Node event-bridge plugin: forwards inbound messages, edits and callback queries to `/internal/telegram/event`. No claims logic in the plugin.
 - [ ] 4.3 Route the pending-free-text-flow check before the agent turn, so condition entry still consumes its reply and the agent never sees it.
