@@ -13,6 +13,11 @@ services:
         APP_VERSION: "${APP_VERSION:-unknown}"
     env_file:
       - ./app/.env
+    environment:
+      # Recorded beside app_version on /health, never into it. Two runtimes mean
+      # two versions, and telegram_messages.app_version must keep meaning "the
+      # Python code that handled this row".
+      GATEWAY_VERSION: "${GATEWAY_VERSION:-unknown}"
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
@@ -93,11 +98,12 @@ services:
       # permissions problem (14.4). Read-only: the gateway sends these, it does
       # not write them.
       - media_outbox:/home/node/.openclaw/media:ro
-      # The plugin, read-only and straight from the repo, so it is versioned with
-      # the app rather than copied into a volume where a diff cannot see it. The
-      # gateway only ever reads a plugin directory. `plugins.load.paths` points
-      # here -- set by scripts/gateway_configure.ps1, not by hand.
-      - ./app/gateway-plugin:/opt/claims-plugin:ro
+      # NOTE: the plugin is COPIED IN by scripts/gateway_configure.ps1, not bind
+      # mounted. A Windows bind mount lands as mode 777 and the gateway refuses
+      # it -- "blocked plugin candidate: world-writable path" -- which is a
+      # sound control: anything that can write a plugin directory can run
+      # arbitrary code inside the gateway. Copying keeps the source in the repo
+      # and versioned; only the deployed copy lives in the volume.
     depends_on:
       - app
 

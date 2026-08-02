@@ -11,18 +11,40 @@
 $ErrorActionPreference = "Stop"
 
 function Set-GatewayConfig($path, $value) {
+    # `config set` exits 1 on a WARNING as well as on a failure, and prints
+    # "Updated <path>" either way. Treating the exit code as authoritative
+    # aborted a deploy over an advisory message while the setting had in fact
+    # been written. Read what it says, not just how it exited.
     $ErrorActionPreference = "Continue"
-    docker compose exec -T gateway node openclaw.mjs config set $path $value | Out-Null
+    $out = docker compose exec -T gateway node openclaw.mjs config set $path $value 2>&1 | Out-String
     $code = $LASTEXITCODE
     $ErrorActionPreference = "Stop"
-    if ($code -ne 0) { throw "config set $path failed ($code)" }
+    if ($out -match "Updated") {
+        if ($out -match "warning") { Write-Host "  note on ${path}: $(($out -split "`n" | Where-Object { $_ -match '^- ' }) -join '; ')" }
+        return
+    }
+    throw "config set $path failed ($code): $($out.Trim())"
 }
 
 Write-Host "`n--- configuring the gateway ---"
 
-# The plugin. Two enablement gates, both silent if missed: the load path AND the
-# entry. A plugin that loads without being enabled never runs and says nothing.
-Set-GatewayConfig "plugins.load.paths" '["/opt/claims-plugin"]'
+# The plugin, copied rather than bind mounted. A Windows bind mount is mode 777
+# and the gateway blocks a world-writable plugin directory -- correctly, since
+# anything able to write there can run code inside the gateway. So the source
+# stays in the repo and the deployed copy lives in the state volume, owned by
+# the container's own user.
+Write-Host "  copying the plugin"
+$ErrorActionPreference = "Continue"
+docker compose exec -T gateway sh -lc "rm -rf /home/node/.openclaw/plugins/claims && mkdir -p /home/node/.openclaw/plugins/claims" | Out-Null
+Get-ChildItem "./app/gateway-plugin/*" -File | ForEach-Object {
+    docker compose cp $_.FullName "gateway:/home/node/.openclaw/plugins/claims/$($_.Name)" | Out-Null
+}
+docker compose exec -T gateway sh -lc "chmod 755 /home/node/.openclaw/plugins/claims && chmod 644 /home/node/.openclaw/plugins/claims/*" | Out-Null
+$ErrorActionPreference = "Stop"
+
+# Two enablement gates, both silent if missed: the load path AND the entry. A
+# plugin that loads without being enabled never runs and says nothing.
+Set-GatewayConfig "plugins.load.paths" '["/home/node/.openclaw/plugins/claims"]'
 Set-GatewayConfig "plugins.entries.claims.enabled" "true"
 
 # The tool surface. `claims__*` because MCP tools are namespaced <server>__<tool>
