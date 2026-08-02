@@ -150,6 +150,19 @@ def check_turn_size(gw: Gateway, session_key: str) -> list[Result]:
         # A model id config ACCEPTS can still fail at runtime with
         # model_not_found — Groq did, before a custom provider entry existed.
         # "It validated" is not verification.
+        # Name a daily exhaustion for what it is. "no turn completed" reads as
+        # a broken deploy, and the operator's response is entirely different:
+        # waiting until midnight UTC versus fixing config. The gateway itself
+        # cannot make this distinction -- it has one `rate_limit` bucket and
+        # treats it as transient (ADR-0017, task 11.5) -- so the preflight has
+        # to, from the provider's own words.
+        detail = str(exc)
+        if "TPD" in detail or "tokens per day" in detail:
+            return [served.fail(
+                "the model's DAILY token budget is exhausted, not a config fault. Groq's ceiling is "
+                "100k/day per model and it resets at midnight UTC. Retrying will not help; the agent "
+                "and the app's extraction calls share this key (task 17.6)"),
+                sized.skip("no turn to measure")]
         return [served.fail(f"no turn completed: {exc}"), sized.skip("no turn to measure")]
 
     meta = (payload.get("result") or {}).get("meta") or {}
