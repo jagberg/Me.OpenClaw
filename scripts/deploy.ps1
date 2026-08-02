@@ -91,6 +91,32 @@ if ($failures.Count -gt 0) {
     throw "partial start"
 }
 
+# --- apply the config the preflight then verifies -----------------------------
+#
+# 7.6: the boundary plugins are DISABLED here rather than assumed off. 47 of 66
+# ship enabled, every boundary-relevant one among them, so this needs positive
+# action on every deploy -- an upgrade re-enables them silently. Applying and
+# then asserting is deliberate: the preflight stays an independent check rather
+# than a restatement of what this block just did.
+$boundaryPlugins = @("browser", "file-transfer", "phone-control", "canvas", "device-pair")
+$changed = $false
+foreach ($plugin in $boundaryPlugins) {
+    $current = docker compose exec -T gateway node openclaw.mjs config get "plugins.entries.$plugin.enabled" 2>$null
+    if ($current -notmatch "false") {
+        docker compose exec -T gateway node openclaw.mjs config set "plugins.entries.$plugin.enabled" false | Out-Null
+        Write-Host "  disabled boundary plugin: $plugin"
+        $changed = $true
+    }
+}
+if ($changed) {
+    # Plugin enablement is read at startup, so a set without a restart leaves
+    # the plugin running while config claims otherwise -- which is exactly the
+    # divergence the preflight reads the RUNNING set to catch.
+    Write-Host "  restarting the gateway to apply plugin changes"
+    docker compose restart gateway | Out-Null
+    Start-Sleep -Seconds 15
+}
+
 # --- preflight: the config assertions no app-side test can make ---------------
 
 if ($SkipPreflight) {
