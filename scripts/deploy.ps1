@@ -83,24 +83,14 @@ Write-Host "  seeding pre-boot config and the plugin"
 # "invalid spec: :/src:ro: empty section between colons" -- an error about the
 # mount that was really an error about the path.
 $pluginSrc = (Resolve-Path "./app/gateway-plugin").Path.Replace('\', '/')
-# NOTE: one line, not a PowerShell here-string. A multi-line string handed to a
-# native exe gets mangled on the way through, and the seed failed with no output
-# to say why. Keep it single-line.
-$seedScript = 'set -e; ' +
-  'mkdir -p /home/node/.openclaw/plugins/claims; ' +
-  'cp /src/index.js /src/openclaw.plugin.json /src/package.json /home/node/.openclaw/plugins/claims/; ' +
-  'chmod 755 /home/node/.openclaw/plugins/claims; chmod 644 /home/node/.openclaw/plugins/claims/*; ' +
-  'node -e ' + [char]34 +
-    'const fs=require("fs"),f="/home/node/.openclaw/openclaw.json";' +
-    'const c=fs.existsSync(f)?JSON.parse(fs.readFileSync(f,"utf8")):{};' +
-    'c.gateway=Object.assign({},c.gateway,{mode:"local"});' +
-    'c.plugins=c.plugins||{};' +
-    'c.plugins.load=Object.assign({},c.plugins.load,{paths:["/home/node/.openclaw/plugins/claims"]});' +
-    'c.plugins.entries=Object.assign({},c.plugins.entries,{claims:{enabled:true}});' +
-    'fs.writeFileSync(f,JSON.stringify(c,null,2));' +
-  [char]34 + '; ' +
-  'node openclaw.mjs config validate'
-$seedOut = docker compose run --rm --no-deps -v "${pluginSrc}:/src:ro" --entrypoint sh gateway -lc $seedScript 2>&1 | Out-String
+# The seed is a FILE (scripts/gateway_seed.sh), mounted and run. Building it as
+# a string here failed twice -- a here-string arrived truncated with no error,
+# then a `node -e` had its quotes eaten and died on "Unexpected end of input".
+# Quoting through PowerShell -> docker -> sh is not worth defending.
+$scriptsSrc = (Resolve-Path "./scripts").Path.Replace('', '/')
+$seedOut = docker compose run --rm --no-deps `
+    -v "${pluginSrc}:/src:ro" -v "${scriptsSrc}:/seed:ro" `
+    --entrypoint sh gateway /seed/gateway_seed.sh 2>&1 | Out-String
 $seedExit = $LASTEXITCODE
 $seedExit = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
