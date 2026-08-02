@@ -158,12 +158,19 @@ async def plugin_hello(
     x_openclaw_secret: str | None = Header(default=None),
     x_correlation_id: str | None = Header(default=None),
 ):
-    """The plugin says, at boot, what `api.registerCommand` actually accepted.
+    """The plugin says, at boot, which commands it ATTEMPTED to register.
 
-    Self-reported, and that limit is stated rather than hidden: this is a
-    runtime signal from inside the registration call, which is stronger than
-    reading a registry and weaker than a real tap. A tap cannot be faked by a
-    deploy script against Justin's chat, so this is the best available.
+    **Not what `registerCommand` accepted** — the eval on 2026-08-02 caught that
+    overclaim here. The plugin pushes each name unconditionally
+    (`gateway-plugin/index.js`), because `registerCommand` returns nothing and
+    reports a collision asynchronously about a second later. So a name that was
+    silently refused produces an identical report.
+
+    What this therefore proves: the plugin LOADED AND RAN. That is worth having,
+    since both enablement gates fail silently and a plugin that never ran never
+    reports. What it does not prove is ownership; `scripts/gateway_preflight.py`
+    covers that separately by reading the gateway's log for registration
+    failures. Do not restore the stronger wording without making the claim true.
     """
     correlation = _correlation_id(x_correlation_id)
     rejected = _guard(request, x_openclaw_secret, "plugin/hello", correlation)

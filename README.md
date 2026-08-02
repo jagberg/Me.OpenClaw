@@ -80,7 +80,7 @@ For each unmatched vet charge, `invoice_matching`:
 | **OpenAI** (optional, `gpt-4o-mini`) | Paid fallback provider — only if `LLM_PROVIDER=openai` | Same as Groq | `OPENAI_API_KEY` |
 | **Telegram Bot API** | Notifications, questions with tap-buttons, document (PDF) review messages, 👍 receipt acks, free-chat queries | Claim summaries (amounts, dates, vet names, pet names), invoice PDFs for review | `TELEGRAM_BOT_TOKEN`; single authorized username |
 | **Google Drive** (via `db_backup`) | SQLite DB backup | The database file | Same Google OAuth |
-| **OpenClaw gateway** *(not yet — see "In flight" below)* | Will own Telegram transport, the chat agent loop, model routing and cron | Same claim summaries the Bot API already carries; **no Gmail credential and no database access, deliberately** | Runs locally in Docker; holds `TELEGRAM_BOT_TOKEN` once the swap happens |
+| **OpenClaw gateway** *(deployed 2026-08-02; not yet polling — see "In flight" below)* | Will own Telegram transport, the chat agent loop, model routing and cron | Same claim summaries the Bot API already carries; **no Gmail credential and no database access, deliberately** | Runs locally in Docker; holds no `TELEGRAM_BOT_TOKEN` until the cutover |
 
 Every LLM call is rate-limited and logged to the `llm_calls` table (provider, purpose, latency, error). No other network calls exist; the bank is never contacted.
 
@@ -115,11 +115,19 @@ the preflight *cannot* assert.
 
 ## In flight: the OpenClaw gateway swap
 
-Nothing below has changed yet — this section exists so the gap between the docs and the plan is visible rather than discovered.
+**Slice 1 is deployed** (2026-08-02). Both runtimes run; the app still owns Telegram exactly as documented above, and the gateway holds no bot token. Filling that token in is the cutover, and it has not happened.
 
 `openspec/changes/openclaw-gateway-core` replaces the hand-rolled transport, chat loop and scheduler with **OpenClaw the product** (an unrelated local-first gateway daemon; the repo has shared its name since inception and never depended on it). After the swap there are two runtimes: the gateway owns the Telegram token, polling, the agent loop, model routing and cron; this app keeps claims, Gmail, SQLite and the dashboard, reached over a secret-guarded `/internal` surface and an enumerated MCP tool inventory.
 
-Already merged and inert until then: `internal_api.py`, `gateway_client.py`, and `app/gateway-workspace/` (the agent's prompt files). Everything else runs exactly as documented above.
+**Live now:** a second compose service running the gateway, `internal_api.py` (`/internal/*`,
+secret-guarded), `mcp_server.py` (the claims read surface at `/mcp`), `media_outbox.py`,
+`app/gateway-plugin/` (registers the app's five slash commands inside the gateway) and
+`app/gateway-workspace/` (the agent's prompt files, injected every turn). `gateway_client.py` is
+merged and has no caller until the cutover.
+
+**Unchanged:** Telegram polling, the chat agent, the scheduler, and everything the sections above
+describe. See [docs/gateway-deploy.md](docs/gateway-deploy.md) — especially the list of what the
+deploy preflight *cannot* assert.
 
 Read ADR-0024 (why the domain is not ported), ADR-0025 (where the proposal gate lives) and ADR-0023 (why the agent's tool allowlist is load-bearing for both security and cost) before touching any of it.
 

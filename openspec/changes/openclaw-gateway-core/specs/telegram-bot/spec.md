@@ -99,6 +99,21 @@ The guarantee SHALL be verified across both runtimes: `send()` absent from `app/
 - **WHEN** the agent's tool inventory is enumerated
 - **THEN** it contains no tool that sends mail
 
+### Requirement: Interactive condition entry
+When a claim is blocked needing a condition, the notification SHALL show the invoice line items and offer the pet's previously-used conditions as one-tap buttons, an "Other" button prompting free-text, and — when the invoice has more than one line item — a per-item split option. The message SHALL NOT tell Justin to use the dashboard.
+
+**The payload mechanism changes and the discipline does not.** The buttons carry a `command` action naming a registered slash command with an **index** into the re-queried condition list — never the condition text, which routinely exceeds the limit. The budget is 58 UTF-8 bytes rather than 64, because the gateway prefixes `tgcmd:`, and overflow is silent: the button is dropped from its row and a message whose only row was dropped arrives with no keyboard at all.
+
+Restated here rather than left in the baseline because the baseline says `callback_data`, and this change adds a requirement that callback actions SHALL NOT be used for the card interface. Archiving without this MODIFIED block would put both in `openspec/specs/telegram-bot/spec.md` at once.
+
+#### Scenario: Repeat condition in one tap
+- **WHEN** Justin taps a past condition on a blocked claim
+- **THEN** the registered command runs with the index, the condition is recorded from the re-queried list, and no model is involved
+
+#### Scenario: A condition name too long for the budget
+- **WHEN** a generated command string would exceed 58 UTF-8 bytes
+- **THEN** the send is refused before it leaves the app, because the platform would drop the button silently and report success
+
 ## ADDED Requirements
 
 ### Requirement: Buttons are command actions, and a tap never involves a model
@@ -143,7 +158,7 @@ Rationale for checking rather than trusting: an over-long command is not rejecte
 ### Requirement: The card interface is preserved feature-for-feature
 Every element of the existing Telegram interface SHALL survive the transport change: Pillow-rendered claim-history and actions-summary cards sent as photos, inline keyboards on both text and photo messages, one-tap condition and pet buttons, tap-to-resolve action cards, "Wrong invoice", Confirm buttons on proposals, paging, and the PDF review alerts.
 
-Callback payloads SHALL continue to carry an index or id rather than free text, preserving the existing 64-byte discipline. A UI element that cannot be reproduced through the gateway SHALL be reported as a blocking gap before the old transport is retired — not quietly dropped.
+Button payloads SHALL continue to carry an index or id rather than free text. The discipline survives, but the mechanism and the number both change: the card interface uses `command` actions, not callbacks, and the budget is **58 UTF-8 bytes** — Telegram's 64 less the gateway's `tgcmd:` prefix — measured at the boundary, where 58 renders and 59 deletes the button with no error. A UI element that cannot be reproduced through the gateway SHALL be reported as a blocking gap before the old transport is retired — not quietly dropped.
 
 #### Scenario: Actions view requested after the swap
 - **WHEN** the actions view is requested

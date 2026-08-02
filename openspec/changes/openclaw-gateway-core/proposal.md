@@ -33,6 +33,14 @@ OpenClaw is explicitly *not* becoming the core in the sense of owning claims log
 - `llm-backend`: `chat()` is no longer the app's own tool loop. Provider selection and rate-limit failover delegate to the gateway; the exhausted-daily-budget requirement changes because the gateway does not cover it. Gemini-only vision stays in Python.
 - `reminder-scheduling`: firing moves to gateway cron; the restart-safe requirement (a reminder whose time passed while down fires on startup) must be restated against a scheduler the app no longer owns.
 
+### Added after the proposal was written
+
+- **`task-capture`** (2026-08-01). Its confirm-before-commit requirement *is* the proposal gate,
+  and the gate's location split by origin (ADR-0025), so the capability was affected and had no
+  delta. Added while the reasoning was fresh rather than rediscovered months later during the
+  archive sync. Recorded here because the eval on 2026-08-02 found it declared only inside
+  `tasks.md` — a whole capability that this document, the one that states scope, did not mention.
+
 ## Impact
 
 - **Retired**: `telegram_bot.py` updater loop, `agent.py` tool loop, `scheduler.py`, APScheduler dependency, `python-telegram-bot` dependency.

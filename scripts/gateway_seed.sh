@@ -50,6 +50,15 @@ chmod 644 "$PLUGIN_DIR"/*
 mkdir -p "$WORKSPACE"
 cp /workspace/*.md "$WORKSPACE/" 2>/dev/null || true
 rm -f "$WORKSPACE/BOOTSTRAP.md"
+# A floor, not just the preflight's ceiling. `cp ... || true` above means a
+# mistyped mount ships an EMPTY workspace, the seed exits 0 and the deploy
+# passes -- while the spec scenario "a fresh workspace is deployed" asserts the
+# shipped files are present. Without this the agent silently runs with no
+# identity, no user context and no #id convention.
+if [ "$(ls -1 "$WORKSPACE"/*.md 2>/dev/null | wc -l)" -lt 5 ]; then
+  echo "FAIL: fewer than 5 workspace files in $WORKSPACE - is /workspace mounted?"
+  exit 1
+fi
 
 # --- config -------------------------------------------------------------------
 # A volume left invalid by an earlier failed deploy cannot be repaired with
@@ -110,7 +119,8 @@ oc config set mcp.servers.claims "{\"url\":\"http://app:8000/mcp\",\"transport\"
 # them, so this needs positive action on every deploy -- an upgrade re-enables
 # them with no signal. The preflight then re-checks the RUNNING set, because
 # Telegram auto-enables itself without writing config at all.
-for p in browser file-transfer phone-control canvas device-pair; do
+# Seven, matching gateway_preflight.BOUNDARY_PLUGINS and task 7.6's own list.
+for p in browser file-transfer phone-control canvas device-pair memory-core talk-voice; do
   oc config set "plugins.entries.$p.enabled" false
 done
 

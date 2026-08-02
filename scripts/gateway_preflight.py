@@ -36,7 +36,11 @@ TURN_TOKEN_CEILING = 7000
 # stays under budget is exactly what a single total hides, and it is the failure
 # this is meant to catch (17.9). Chars, as the platform reports them.
 COMPONENT_CEILINGS = {
-    "toolSchemaChars": 8000,       # measured 1,172 with the seven claims tools
+    # Measured twice on the same seven tools and it moved: 1,172 (task 2.5) and
+    # 1,422 (the live run recorded at tasks.md:644). Unreconciled -- likely a
+    # description edit between runs. The ceiling is set far above both on
+    # purpose; treat either number as an order of magnitude, not a baseline.
+    "toolSchemaChars": 8000,
     "workspaceFileChars": 8000,    # measured 6,508 for the six shipped files
     "skillChars": 100,             # skills are removed; anything here is a regression
 }
@@ -44,7 +48,13 @@ COMPONENT_CEILINGS = {
 # Must be off. Each grants filesystem, shell or browser reach, and 47 of 66
 # plugins are enabled by default — every boundary-relevant one among them. The
 # design assumed the opposite, so this needs positive action, not restraint.
-BOUNDARY_PLUGINS = ("browser", "file-transfer", "phone-control", "canvas", "device-pair")
+# Widened 2026-08-02 by the eval: this listed five, while task 7.6 -- the task
+# that produced it -- named SEVEN boundary-relevant plugins enabled by default.
+# `memory-core` and `talk-voice` were outside the check that enforces
+# `gmail-isolation-boundary`, so the guard was narrower than the finding that
+# justified it. Both were running on the deployed gateway when this was found.
+BOUNDARY_PLUGINS = ("browser", "file-transfer", "phone-control", "canvas", "device-pair",
+                    "memory-core", "talk-voice")
 
 # The gateway writes its command menu into exactly these scopes. The app owns
 # `chat`, which Telegram resolves first, and that only works while this list
@@ -356,10 +366,12 @@ def check_button_commands(gw: Gateway, app_health: dict | None, commands: tuple)
     command: openclaw command"*), and the only real dispatch path is a Telegram
     tap, which a deploy script must not fake against Justin's chat.
 
-    What is asserted instead: the plugin reports, at boot, the command list that
-    `api.registerCommand` actually accepted, and the app records it. That is a
-    runtime signal from inside the registration call, not a read of the
-    persisted registry — which matters, because `plugins list` reported
+    What is asserted instead: the plugin reports, at boot, the command list it
+    ATTEMPTED to register, and the app records it. It cannot report what
+    `registerCommand` accepted -- that call returns nothing and surfaces a
+    collision asynchronously -- so this proves the plugin loaded and RAN, not
+    that it owns the names. Ownership is covered below by reading the gateway's
+    log. A runtime signal, not a read of the persisted registry — which matters, because `plugins list` reported
     `commands: []` for commands that demonstrably worked (18.6), and a plugin
     can load without ever running (18.7). A plugin that never ran never reports,
     so the check fails rather than passing quietly.

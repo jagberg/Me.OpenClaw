@@ -113,18 +113,32 @@ async function claimCommandMenu(logger) {
     commands: COMMANDS.map((c) => ({ command: c.name, description: c.description })),
     scope: { type: "chat", chat_id: Number(CHAT_ID) },
   };
-  const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const result = await response.json().catch(() => ({}));
-  if (result?.ok) {
-    logger?.info?.(`claims: chat command menu set to ${COMMANDS.length} entries`);
-  } else {
-    // Loud, not fatal. A wrong menu is cosmetic; a plugin that refused to load
-    // over it would take the whole tap path down with it.
-    logger?.warn?.(`claims: could not set the chat command menu: ${JSON.stringify(result)}`);
+  // The try/catch is load-bearing, not defensive habit. This runs fire-and-forget
+  // from register() during gateway boot, so an unhandled rejection here — a DNS
+  // failure, api.telegram.org unreachable — exits the Node process, and the
+  // gateway restarts into the same failure. That is a boot loop, and the
+  // restart-loop breaker trips at four unclean boots in five minutes.
+  //
+  // It was missing until the 2026-08-02 eval, while its sibling
+  // reportRegistration had it. Harmless only because slice 1 sets no token and
+  // this returns above; it would have armed itself on the cutover, which is
+  // exactly the worst moment for the gateway to refuse to start.
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (result?.ok) {
+      logger?.info?.(`claims: chat command menu set to ${COMMANDS.length} entries`);
+    } else {
+      // Loud, not fatal. A wrong menu is cosmetic; a plugin that refused to load
+      // over it would take the whole tap path down with it.
+      logger?.warn?.(`claims: could not set the chat command menu: ${JSON.stringify(result)}`);
+    }
+  } catch (err) {
+    logger?.warn?.(`claims: could not reach Telegram to set the chat command menu: ${String(err)}`);
   }
 }
 

@@ -38,7 +38,13 @@ Personal assistant for Justin: task/reminder capture from Gmail, plus a vet-insu
 
 ## The OpenClaw gateway swap (in flight — `openspec/changes/openclaw-gateway-core`)
 
-**Not built yet.** The app runs exactly as the rest of this file describes. `internal_api.py`, `gateway_client.py` and `app/gateway-workspace/` are merged and inert. Read ADR-0024/0025/0023 before working on it.
+**Slice 1 is deployed as of 2026-08-02; slice 2 (the cutover) is not.** Both containers run. The
+app still owns Telegram and the gateway holds no bot token — supplying it *is* the cutover, and
+`scripts/gateway_preflight.py` fails the deploy if both runtimes poll or neither does.
+
+Live: the gateway service, `internal_api.py`, `mcp_server.py`, `media_outbox.py`,
+`app/gateway-plugin/`, `app/gateway-workspace/`. Merged with no caller until the cutover:
+`gateway_client.py`. Read ADR-0024/0025/0023 and `docs/gateway-deploy.md` before working on it.
 
 **The name is a collision.** This repo has been called OpenClaw since inception and never depended on OpenClaw the product. After the swap, "OpenClaw is down" means two possible outages — say **the gateway** or **the app**.
 
