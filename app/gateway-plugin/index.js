@@ -284,7 +284,19 @@ function registerInboundAck(api) {
     async (event) => {
       const context = event?.context ?? {};
       const messageId = context.messageId ?? context.message?.id ?? null;
-      if (!messageId) return {};
+      // INSTRUMENTED 2026-08-03. The first version returned silently when
+      // there was no id, so "the hook never fired" and "the hook fired with
+      // no id" looked identical from the app side -- and the app side is all I
+      // can see. That is the silent no-op this project's rules forbid, and it
+      // cost a whole deploy cycle to notice. One line, and the two cases are
+      // distinguishable forever.
+      api.logger?.info?.(
+        `claims: message_received keys=[${Object.keys(context).join(",")}] messageId=${String(messageId)}`,
+      );
+      if (!messageId) {
+        api.logger?.warn?.("claims: message_received carried no messageId -- no ack sent");
+        return {};
+      }
       try {
         await callApp(
           "telegram/ack",
