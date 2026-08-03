@@ -95,8 +95,29 @@ def run_exclusive(job: str, fn) -> tuple[bool, object]:
         lock.release()
 
 
+def record_run(route: str, column: str, error: str | None = None) -> None:
+    """Stamp `job_runs` with what just happened to this route. Task 5.6.
+
+    Never raises: a liveness record that can kill the job it records is worse than
+    no record. It logs at WARNING and returns, because the run itself succeeded
+    and the only casualty is the freshness signal.
+    """
+    assert column in ("last_started_at", "last_ok_at", "last_error_at", "last_skipped_at"), column
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with db.get_connection() as conn:
+            conn.execute("INSERT OR IGNORE INTO job_runs (route) VALUES (?)", (route,))
+            conn.execute(
+                f"UPDATE job_runs SET {column} = ?, last_error = ? WHERE route = ?",
+                (now, (error or "")[:300] if column == "last_error_at" else None, route),
+            )
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        logger.warning("could not record the %s run of %s: %s", column, route, exc)
+
+
 def _run(route: str, fn, correlation: str):
     logger.info("internal %s starting correlation=%s", route, correlation)
+    record_run(route, "last_started_at")
     try:
         ran, outcome = run_exclusive(route, fn)
     except Exception as exc:
@@ -104,6 +125,7 @@ def _run(route: str, fn, correlation: str):
         # so the only place this can surface is the log.
         level = logging.WARNING if pipeline._is_transient(exc) else logging.ERROR
         logger.log(level, "internal %s failed correlation=%s: %s", route, correlation, exc, exc_info=True)
+        record_run(route, "last_error_at", str(exc))
         return JSONResponse(
             {"status": "error", "route": route, "correlation_id": correlation, "reason": str(exc)},
             status_code=500,
@@ -111,10 +133,14 @@ def _run(route: str, fn, correlation: str):
     if not ran:
         # Not an error: cron fired while the previous run was still going. Say
         # so explicitly so a skipped run is never read as a run that happened.
+        # Recorded separately from a success for the same reason — a route that
+        # only ever skips is a stuck lock, and it must not read as healthy.
         logger.info("internal %s skipped, already running correlation=%s", route, correlation)
+        record_run(route, "last_skipped_at")
         return {"status": "skipped", "route": route, "correlation_id": correlation,
                 "reason": "already running"}
     logger.info("internal %s done correlation=%s result=%s", route, correlation, outcome)
+    record_run(route, "last_ok_at")
     return {"status": "ok", "route": route, "correlation_id": correlation, "result": outcome}
 
 
@@ -131,10 +157,22 @@ def _endpoint(route: str, fn):
     return handler
 
 
-# One shape for all three: guard, correlate, run under the job's lock, report.
+# One shape for all five: guard, correlate, run under the job's lock, report.
+#
+# Five, not three, because APScheduler ran five jobs and the cron cutover has to
+# reach all of them. The two added 2026-08-04 were previously in-process only, so
+# without them the gateway's cron would drive the tick while the weekly vet chase
+# and the queue expiry quietly stopped happening the moment the in-process
+# scheduler was disabled — a silent loss of the exact kind the hard rules forbid.
+#
+# The sixth APScheduler job has no endpoint on purpose: reminders are one-shots at
+# arbitrary minutes, which cron cannot express, so `reminders.sweep_due()` runs
+# inside `pipeline.run_once` and rides the tick.
 router.post("/tick")(_endpoint("tick", lambda: pipeline.run_once()))
 router.post("/ingest")(_endpoint("ingest", lambda: gmail_ingest.poll_once()))
 router.post("/nudge")(_endpoint("nudge", lambda: pipeline.nudge_stale_actions()))
+router.post("/vet-nudge")(_endpoint("vet-nudge", lambda: pipeline.nudge_unanswered_vet_requests()))
+router.post("/expire-queue")(_endpoint("expire-queue", lambda: message_log.expire_queue()))
 
 
 # What the in-gateway plugin reported it registered, this boot.
@@ -201,6 +239,88 @@ async def plugin_hello(
 def plugin_report() -> dict:
     """For `/health`. Empty means the plugin has not reported since this boot."""
     return dict(_plugin_report)
+
+
+# How long each route may go unrun before it is overdue, in minutes. Derived from
+# the same config the schedules are, so changing an interval cannot leave the
+# check asserting the old one.
+#
+# The multiplier is 3 on the frequent jobs and a day of slack on the calendar
+# ones, deliberately loose: this must fire on "nothing is driving this at all",
+# not on a stagger window or one skipped run. A tripwire that cries during normal
+# operation gets ignored, and then it is not a tripwire.
+def _expected_max_idle() -> dict[str, int]:
+    day = 24 * 60
+    return {
+        "tick": config.VET_CLAIM_PIPELINE_INTERVAL_MINUTES * 3,
+        "ingest": config.GMAIL_POLL_INTERVAL_MINUTES * 3,
+        "nudge": day + 6 * 60,
+        "vet-nudge": 7 * day + day,
+        "expire-queue": day + 6 * 60,
+    }
+
+
+def scheduler_health() -> dict:
+    """Which runtime is scheduling, and whether anything has actually driven each
+    job lately. Task 5.6.
+
+    The failure being made visible: after the cron cutover the app no longer has
+    any opinion about *when* work happens, so a cron entry that was never declared
+    or was silently disabled produces exactly what a quiet week produces. This
+    reports the last outcome per route and names the overdue ones.
+
+    `owner` is read from the flag rather than inferred, because "nothing has run"
+    means two different things: with the in-process scheduler ON it is a broken
+    app; with it OFF it is a missing cron entry, and those have different fixes.
+
+    Reports a read failure as a value. `/health` is the URL consulted when
+    something is already wrong, and this must never be the reason it 500s — the
+    projection count learned that the hard way (see main.health).
+    """
+    owner = "in-process scheduler" if config.SCHEDULER_ENABLED else "gateway cron"
+    try:
+        with db.get_connection() as conn:
+            rows = {r["route"]: r for r in conn.execute(
+                "SELECT route, last_started_at, last_ok_at, last_error_at, last_error, "
+                "last_skipped_at FROM job_runs").fetchall()}
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        return {"owner": owner, "error": f"could not read job_runs: {exc}"}
+
+    now = datetime.now(timezone.utc)
+    jobs, overdue = {}, []
+    for route, max_idle in _expected_max_idle().items():
+        row = rows.get(route)
+        last_ok = row["last_ok_at"] if row else None
+        entry = {"last_ok_at": last_ok, "max_idle_minutes": max_idle}
+        if row and row["last_error_at"]:
+            entry["last_error_at"] = row["last_error_at"]
+            entry["last_error"] = row["last_error"]
+        if row and row["last_skipped_at"]:
+            entry["last_skipped_at"] = row["last_skipped_at"]
+
+        if not last_ok:
+            # No row at all is the state a never-declared cron entry leaves, and
+            # it is the one this whole mechanism exists to catch. A fresh DB looks
+            # identical for one cadence, which is why the value says "never" rather
+            # than claiming an age it cannot know.
+            entry["minutes_since_ok"] = None
+            overdue.append(f"{route}: never")
+        else:
+            try:
+                when = datetime.fromisoformat(last_ok)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                idle = int((now - when).total_seconds() // 60)
+            except ValueError:
+                entry["minutes_since_ok"] = None
+                overdue.append(f"{route}: unreadable timestamp")
+            else:
+                entry["minutes_since_ok"] = idle
+                if idle > max_idle:
+                    overdue.append(f"{route}: {idle}m > {max_idle}m")
+        jobs[route] = entry
+
+    return {"owner": owner, "jobs": jobs, "overdue": overdue}
 
 
 def confirm_proposal(args) -> dict:

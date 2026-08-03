@@ -5903,6 +5903,145 @@ def test_chat_has_a_gemini_backend_and_the_agents_primary_is_the_reachable_provi
     assert groq_primary <= 1, "Groq must be at most the no-Gemini fallback, never the default primary"
 
 
+def test_the_cron_declarations_cover_every_job_apscheduler_ran_at_the_cadence_config_says():
+    """Task 5.1. Two copies of a schedule is the duplication this repo keeps
+    getting bitten by, so the numbers in `scripts/gateway_cron.sh` are asserted
+    against `config.py`'s defaults rather than trusted to stay in step.
+
+    And the COVERAGE half matters more than the cadences: APScheduler ran five
+    jobs, and the two nobody thinks about — the weekly vet chase and the queue
+    expiry — had no internal endpoint at all. Without them the cutover stops them
+    silently, which is indistinguishable from a week with nothing to chase."""
+    cron = (Path(__file__).resolve().parent.parent.parent / "scripts" / "gateway_cron.sh").read_text(encoding="utf-8")
+
+    # Every route the script posts to must exist on the router, and every
+    # scheduled job must have a route. Derived from the app, not a second list.
+    from openclaw import internal_api
+
+    routes = {r.path for r in internal_api.router.routes}
+    for route in ("tick", "ingest", "nudge", "vet-nudge", "expire-queue"):
+        assert f"/internal/{route}" in routes, (
+            f"/internal/{route} is scheduled but the router has no such path: {sorted(routes)}")
+        assert route in cron, f"{route} has an endpoint but nothing schedules it"
+
+    assert f"{config.VET_CLAIM_PIPELINE_INTERVAL_MINUTES}m" in cron, (
+        "the tick cadence in gateway_cron.sh disagrees with VET_CLAIM_PIPELINE_INTERVAL_MINUTES")
+    assert f"{config.GMAIL_POLL_INTERVAL_MINUTES}m" in cron, (
+        "the ingest cadence disagrees with GMAIL_POLL_INTERVAL_MINUTES")
+    assert f"0 {config.ACTION_NUDGE_HOUR} * * *" in cron, (
+        "the daily cron hour disagrees with ACTION_NUDGE_HOUR")
+    # Monday, as VET_NUDGE_DAY says. Cron's 5-field day-of-week is numeric here.
+    weekday = {"mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6, "sun": 0}
+    assert f"0 {config.ACTION_NUDGE_HOUR} * * {weekday[config.VET_NUDGE_DAY]}" in cron, (
+        f"the weekly cron day disagrees with VET_NUDGE_DAY={config.VET_NUDGE_DAY}")
+
+    # The secret must reach the app as an unexpanded variable. Interpolating it
+    # into the payload would persist it in the gateway's cron store and echo it
+    # back from `cron get`, `cron list` and the run log.
+    assert '$CLAIMS_INTERNAL_SECRET' in cron and 'X-OpenClaw-Secret' in cron
+    # -f, or curl exits 0 on a 500 and a failed tick reads as a successful run.
+    assert "curl -fsS" in cron, "without -f an HTTP error is not an error"
+    # Idempotency: without a declaration key every deploy adds five more jobs.
+    assert cron.count("--declaration-key") >= 1
+
+
+def test_a_reminder_due_while_the_app_was_down_still_fires_and_says_how_late():
+    """Justin's call, 2026-08-04: never drop a late one, and never let it pass for
+    fresh. Cron cannot express a one-shot at an arbitrary minute, so the sweep
+    rides the 15-minute tick — which also means the sweep must be idempotent,
+    since a duplicated cron delivery (5.4) calls it twice."""
+    from openclaw import reminders
+
+    db.init_db()
+    # Inserted directly: `tasks.create_task` runs an LLM follow-up extraction, and
+    # the suite forces every provider key blank to stay hermetic.
+    with db.get_connection() as conn:
+        task_id = conn.execute(
+            "INSERT INTO tasks (description, status, source, created_at) VALUES (?,?,?,?)",
+            ("feed the cat", "open", "test", datetime.now(timezone.utc).isoformat()),
+        ).lastrowid
+    now = datetime.now(timezone.utc)
+    long_ago = now - timedelta(days=3)
+    future = now + timedelta(hours=4)
+    reminders.schedule_reminder(task_id, long_ago)
+    reminders.schedule_reminder(task_id, future)
+
+    assert reminders.sweep_due(now) == 1, "exactly the overdue one fires"
+    # Idempotent: the second call marks nothing, so a duplicated cron delivery
+    # cannot double-fire. The guarantee is the WHERE clause, not a fired_at
+    # column — a new column would need hand-run ALTER TABLE on the live DB.
+    assert reminders.sweep_due(now) == 0
+
+    with db.get_connection() as conn:
+        rows = {r["scheduled_at"]: r["status"] for r in
+                conn.execute("SELECT scheduled_at, status FROM reminders").fetchall()}
+    assert rows[long_ago.isoformat()] == "due"
+    assert rows[future.isoformat()] == "scheduled", "a future reminder must not be swept"
+
+    # "note how late" — the words, so a three-day-late reminder cannot be read as
+    # one set this morning.
+    assert reminders.overdue_text(long_ago.isoformat(), now) == "overdue by 3d"
+    assert reminders.overdue_text((now - timedelta(hours=5)).isoformat(), now) == "overdue by 5h"
+    assert reminders.overdue_text((now - timedelta(minutes=40)).isoformat(), now) == "overdue by 40m"
+    # Inside one tick's lag is the design, not a delay worth naming.
+    assert reminders.overdue_text((now - timedelta(minutes=4)).isoformat(), now) == "on time"
+
+
+def test_a_scheduler_that_stopped_firing_is_a_value_on_health_not_an_absence():
+    """Task 5.6, and the whole reason `job_runs` exists. Once cron owns
+    scheduling, a never-declared or disabled entry looks exactly like a quiet
+    week — the app has no opinion about *when* work happens any more.
+
+    Asserted through `record_run` rather than by hand-writing rows, so the thing
+    under test is the path `/internal/*` actually takes."""
+    from openclaw import internal_api
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM job_runs")
+
+    # Nothing has ever run: every job overdue, and "never" rather than a made-up
+    # age. This is the state a missing cron entry leaves behind.
+    health = internal_api.scheduler_health()
+    assert health["jobs"]["tick"]["minutes_since_ok"] is None
+    assert any(o.startswith("tick: never") for o in health["overdue"]), health["overdue"]
+    assert len(health["overdue"]) == 5, health["overdue"]
+
+    internal_api.record_run("tick", "last_ok_at")
+    health = internal_api.scheduler_health()
+    assert health["jobs"]["tick"]["minutes_since_ok"] == 0
+    assert not any(o.startswith("tick") for o in health["overdue"]), health["overdue"]
+
+    # A stale success is overdue. Written directly because the point is age, and
+    # the only way to age a row through record_run is to wait 45 minutes.
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=46)).isoformat()
+    with db.get_connection() as conn:
+        conn.execute("UPDATE job_runs SET last_ok_at = ? WHERE route = 'tick'", (stale,))
+    health = internal_api.scheduler_health()
+    assert any(o.startswith("tick: 46m") for o in health["overdue"]), health["overdue"]
+
+    # An error and a skip are recorded distinctly. A route that only ever skips is
+    # a stuck lock and must not read as healthy.
+    internal_api.record_run("ingest", "last_error_at", "boom")
+    internal_api.record_run("nudge", "last_skipped_at")
+    health = internal_api.scheduler_health()
+    assert health["jobs"]["ingest"]["last_error"] == "boom"
+    assert health["jobs"]["nudge"]["last_skipped_at"]
+    assert health["jobs"]["nudge"]["last_ok_at"] is None, "a skip is not a success"
+
+    # Which runtime is expected to be driving, read from the flag rather than
+    # guessed: "nothing ran" means a broken app when the flag is on and a missing
+    # cron entry when it is off, and those have different fixes.
+    original = config.SCHEDULER_ENABLED
+    try:
+        config.SCHEDULER_ENABLED = False
+        assert internal_api.scheduler_health()["owner"] == "gateway cron"
+        config.SCHEDULER_ENABLED = True
+        assert internal_api.scheduler_health()["owner"] == "in-process scheduler"
+    finally:
+        config.SCHEDULER_ENABLED = original
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

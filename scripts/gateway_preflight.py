@@ -249,6 +249,48 @@ def check_turn_size(gw: Gateway, session_key: str) -> list[Result]:
     return [served, sized.fail("; ".join(failures)) if failures else sized.ok(detail)]
 
 
+def check_cron_declared(gw: Gateway) -> Result:
+    """Task 5.1/5.6 — the five schedules exist, are enabled, and point at this app.
+
+    The failure this catches is the one the cutover creates: with the app's own
+    scheduler off, a cron entry that was never declared or was left disabled
+    produces the same silence as a week with no claims. `/health`'s
+    `scheduler.overdue` catches it eventually; this catches it at deploy time,
+    before Justin notices nothing has happened.
+
+    Also asserts the payload is a COMMAND, not an agent turn. An agent-turn
+    payload would still "work" -- and would spend model tokens deciding to do what
+    a curl does, on every tick, forever.
+    """
+    result = Result("cron entries declared")
+    expected = {"claims.tick", "claims.ingest", "claims.nudge",
+                "claims.vet-nudge", "claims.expire"}
+    try:
+        payload = gw.json("cron", "list", "--json")
+    except Exception as exc:  # noqa: BLE001
+        return result.skip(f"could not read the cron list: {exc}")
+
+    jobs = payload.get("jobs") if isinstance(payload, dict) else payload
+    if not isinstance(jobs, list):
+        return result.fail(f"cron list returned no job array: {str(payload)[:160]}")
+
+    by_key = {j.get("declarationKey"): j for j in jobs if isinstance(j, dict)}
+    problems = []
+    for key in sorted(expected):
+        job = by_key.get(key)
+        if job is None:
+            problems.append(f"{key} is not declared")
+            continue
+        if not job.get("enabled"):
+            problems.append(f"{key} is disabled")
+        kind = (job.get("payload") or {}).get("kind")
+        if kind != "command":
+            problems.append(f"{key} payload is {kind!r}, must be 'command'")
+    if problems:
+        return result.fail("; ".join(problems))
+    return result.ok(f"{len(expected)} declared and enabled")
+
+
 def check_boundary_plugins(gw: Gateway) -> Result:
     """19b.3 — an upgrade that re-enables `browser` must fail the deploy.
 
@@ -567,6 +609,7 @@ def main() -> int:
         results.append(Result("app reachable").ok(f"version {app_health.get('app_version')}"))
 
     results.append(check_exactly_one_poller(gw, app_health))
+    results.append(check_cron_declared(gw))
     results.append(check_boundary_plugins(gw))
     results.append(check_access_policy({"telegram": gw.config("channels.telegram"),
                                         "commands": gw.config("commands")}))

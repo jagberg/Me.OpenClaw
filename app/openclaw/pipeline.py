@@ -11,8 +11,8 @@ from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
 from . import (claim_forms, claim_status, commands, config, db, gmail_client, gmail_ingest,
-               invoice_matching, llm, message_log, notify, status_labels, telegram_bot,
-               vet_detection)
+               invoice_matching, llm, message_log, notify, reminders, status_labels,
+               telegram_bot, vet_detection)
 from .scheduler import scheduler
 
 logger = logging.getLogger(__name__)
@@ -847,6 +847,12 @@ def run_once() -> None:
     _watchdog_telegram_polling()
     vet_detection.classify_unflagged()
     compare_state_projection()
+
+    # Reminders ride the tick because a one-shot at an arbitrary minute has no
+    # cron expression (Justin's call, 2026-08-04: one tick of lag beats a
+    # minute-resolution cron entry). ABOVE the Gmail gate deliberately — a
+    # reminder needs no mail, and a dead OAuth token must not silently stop them.
+    reminders.sweep_due()
 
     # Every remaining step reads or writes Gmail — if the token is dead, alert
     # (loudly, on Telegram) and skip them rather than fail silently in logs.

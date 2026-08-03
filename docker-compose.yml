@@ -161,6 +161,17 @@ services:
       # permissions problem (14.4). Read-only: the gateway sends these, it does
       # not write them.
       - media_outbox:/home/node/.openclaw/media:ro
+      # The deploy scripts, read-only, so `deploy.ps1` can run
+      # scripts/gateway_cron.sh through `docker compose exec` -- cron jobs are
+      # added via the RUNNING gateway's RPC (`cron.add`), so unlike the pre-boot
+      # seed this cannot be a one-shot container with its own -v. `exec` accepts
+      # no volume flag, hence a mount declared here.
+      #
+      # Safe to bind where the plugin is not: nothing here is loaded as code by
+      # the gateway, so the world-writable refusal that forces the plugin to be
+      # copied does not apply. Holds no secrets -- the scripts read theirs from
+      # the environment (see gateway_cron.sh on why the cron payload does too).
+      - ./scripts:/seed:ro
       # NOTE: the plugin is COPIED IN by scripts/gateway_configure.ps1, not bind
       # mounted. A Windows bind mount lands as mode 777 and the gateway refuses
       # it -- "blocked plugin candidate: world-writable path" -- which is a

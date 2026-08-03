@@ -89,6 +89,19 @@ TELEGRAM_USERNAME = os.environ.get("TELEGRAM_USERNAME", "jagberg")
 # after cutover (task 4.1): rollback is this env var and a restart, ~30s.
 TELEGRAM_UPDATER_ENABLED = os.environ.get("TELEGRAM_UPDATER_ENABLED", "1").strip().lower()     not in ("0", "false", "no", "off")
 
+# Which runtime schedules work. Default on = APScheduler in this process, the
+# pre-cutover state. Off hands the five cadences to the gateway's cron, which
+# drives `/internal/*` (task 5.1). Same shape and same reason as the flag above:
+# a week of real use before section 6 deletes the loser, rollback in one env var.
+#
+# Deliberately a SWAP, not an overlap. `internal_api.run_exclusive` dedupes
+# concurrent runs of a route, which is not the same as idempotence -- two
+# schedulers firing the daily nudge ten seconds apart are not concurrent, and
+# Justin would get two messages. The gateway's own convention agrees: cron jobs are
+# declarative (`--declaration-key`) and it has no notion of a second scheduler,
+# so per-job `cron disable` is its rollback and this flag is ours.
+SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "1").strip().lower()     not in ("0", "false", "no", "off")
+
 # The OpenClaw gateway's side of the house. The gateway owns the bot token and
 # the agent loop; this app owns the claims domain and calls out to it. Two
 # deliberate absences here: no Gmail credential and no Google key of any kind

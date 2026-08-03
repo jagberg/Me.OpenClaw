@@ -233,6 +233,27 @@ CREATE TABLE IF NOT EXISTS pending_flows (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (chat_id, kind)
 );
+
+-- When each scheduled job last ran, and how it ended. Task 5.6.
+--
+-- The failure this exists for: once the gateway's cron owns scheduling, a cron
+-- entry that was never declared, or was disabled, or whose curl silently 404s,
+-- looks EXACTLY like a quiet week. No claims to chase and no cron firing produce
+-- the same empty dashboard, and the in-process scheduler used to make the
+-- difference obvious by being in the same process as the log.
+--
+-- Durable rather than a module dict, because the question is "has anything driven
+-- the tick since the last restart or before it", and a dict answers only the
+-- first half. One row per route, overwritten -- this is a liveness signal, not a
+-- history; `telegram_messages` is where history lives.
+CREATE TABLE IF NOT EXISTS job_runs (
+    route TEXT PRIMARY KEY,
+    last_started_at TEXT,
+    last_ok_at TEXT,
+    last_error_at TEXT,
+    last_error TEXT,
+    last_skipped_at TEXT
+);
 """
 
 # vet_claims columns added after the table's initial release — CREATE TABLE IF
