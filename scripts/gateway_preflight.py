@@ -318,6 +318,42 @@ def check_exactly_one_poller(gw: Gateway, app_health: dict | None) -> Result:
     return result.ok("the gateway" if gateway_polling else "the app (pre-cutover)")
 
 
+def check_app_can_send(app_container: str) -> Result:
+    """The check whose absence cost a rollback on 2026-08-03.
+
+    This script asserted eleven things about the deploy and never once asked
+    whether the app could actually **send a message**. `gateway_client` shells
+    out to `openclaw`; every flag in it had been verified against `--help` on
+    the *host*; nobody had run it from inside the app container, where there
+    was no such binary. The first real tap after the cutover answered
+    `gateway CLI not found at 'openclaw'`, and all outbound was broken.
+
+    A `--dry-run` send is the cheapest thing that would have caught it: it
+    exercises binary resolution, gateway URL, token and argv, and delivers
+    nothing. Deliberately NOT a real send — a preflight that messages Justin on
+    every deploy trains him to ignore it.
+    """
+    result = Result("app can reach the gateway")
+    probe = ["docker", "exec", app_container, "openclaw", "message", "send",
+             "--channel", "telegram", "--target", "0", "--message", "preflight",
+             "--dry-run", "--json"]
+    try:
+        proc = subprocess.run(probe, capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        return result.skip("docker not on PATH")
+    except subprocess.TimeoutExpired:
+        return result.fail("the dry-run send did not return within 60s")
+    blob = f"{proc.stdout}
+{proc.stderr}".strip()
+    if proc.returncode != 0:
+        # The exact shape of the 2026-08-03 failure, called out by name so the
+        # next person does not have to re-derive it from an exit code.
+        if "not found" in blob.lower():
+            return result.fail(f"the app cannot run the gateway CLI: {blob[:200]}")
+        return result.fail(f"dry-run send exited {proc.returncode}: {blob[:200]}")
+    return result.ok("dry-run send accepted")
+
+
 def check_media_roots(cfg: dict) -> Result:
     """19b.7 / 14.4 — `localRoots: "any"` disables the check outright.
 
@@ -429,6 +465,8 @@ def main() -> int:
                         help="MUST be unused; an existing session measures conversation, not surface")
     parser.add_argument("--skip-turn", action="store_true",
                         help="skip the agent turn (it spends tokens against a real provider budget)")
+    parser.add_argument("--app-container", default="meopenclaw-telegram-claimquery-app-1",
+                        help="container the app runs in; the send probe execs the gateway CLI there")
     parser.add_argument("--app-health", default="http://127.0.0.1:8000/health",
                         help="the Python app's health URL")
     args = parser.parse_args()
@@ -455,6 +493,7 @@ def main() -> int:
     results.append(check_access_policy({"telegram": gw.config("channels.telegram"),
                                         "commands": gw.config("commands")}))
     results.append(check_media_roots(gw.config("media")))
+    results.append(check_app_can_send(args.app_container))
     results.append(check_isolation(gw))
     results.append(check_menu_scopes(gw))
 

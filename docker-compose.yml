@@ -29,7 +29,12 @@ services:
       # documented at docs.openclaw.ai/gateway/remote. `ws://`, not `http://`:
       # the gateway protocol is a WebSocket, and the service name resolves on
       # the compose network.
-      OPENCLAW_GATEWAY_URL: "ws://gateway:18789"
+      # The literal address, NOT the `gateway` service name. The CLI refuses
+      # plaintext `ws://` to a non-loopback host and cannot tell that a Docker
+      # DNS name resolves to a private address -- it fails closed with
+      # "SECURITY ERROR: ... uses plaintext ws:// to a non-loopback address".
+      # The pinned subnet (below) is what makes hardcoding this safe.
+      OPENCLAW_GATEWAY_URL: "ws://172.28.0.20:18789"
       # The same owner-level credential the gateway binds with. This widens the
       # boundary ADR-0024 drew: the app can now drive the gateway, not just be
       # driven by it. Accepted deliberately (Justin, 2026-08-03) as the price of
@@ -53,6 +58,14 @@ services:
       # This is the ONE path between the two containers, and it must never grow
       # into a general mount of app/data.
       - media_outbox:/data/outbox
+      # The gateway CLI's device identity. Shared-secret auth alone is only
+      # enough for a LOOPBACK client; this one connects from the compose subnet,
+      # so the gateway requires a paired device
+      # (docs.openclaw.ai/gateway/security). Pairing is one-time and approved
+      # with `openclaw devices approve <id>` on the gateway -- but the token
+      # lands here, and without a volume every rebuild would silently need
+      # re-pairing and every send would fail until someone noticed.
+      - app_openclaw_identity:/root/.openclaw
 
   gateway:
     image: ghcr.io/openclaw/openclaw:latest
@@ -144,6 +157,11 @@ networks:
         - subnet: 172.28.0.0/24
 
 volumes:
+  # The app's gateway device identity. Small, and losing it costs a re-pair
+  # rather than any data -- but a silent re-pair means every outbound send
+  # fails until someone approves the device, so it is a volume rather than a
+  # container-lifetime directory.
+  app_openclaw_identity:
   # Outside every backup today. 7.0c decides whether it joins db_backup's scope;
   # until then, losing it costs the agent's session history, not claim state.
   gateway_state:
