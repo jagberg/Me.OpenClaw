@@ -338,13 +338,17 @@ async def telegram_ack(
     x_openclaw_secret: str | None = Header(default=None),
     x_correlation_id: str | None = Header(default=None),
 ):
-    """React to an inbound message so a slow answer does not feel dead.
+    """React to a TYPED inbound message so a slow answer does not feel dead.
 
-    Posted by the plugin's `message_received` hook, which fires on receipt and
-    before command routing — the only place a **command's** message id is
-    available. `before_dispatch` runs after routing, and a command handler's
-    own context carries no id (16.2, confirmed live 2026-08-03 when every
-    correlation id came through with the counter fallback).
+    Posted by the plugin's `message_received` hook, which the gateway emits
+    inside `dispatch-from-config` with the message id in its context.
+
+    **A tapped button never reaches here, and cannot.** Commands are routed
+    before dispatch, so no message hook sees them, and the context a plugin
+    command handler is given (`commands-CDhgE9eG.js`) contains no message id at
+    all — there is nothing to react to. Settled 2026-08-03 by reading that
+    construction; two earlier attempts moved the hook around instead, on the
+    assumption that some hook must carry it. A tap's feedback is its reply.
 
     Never fails a caller: `notify.ack` returns a bool. Losing the ack is
     strictly better than delaying or breaking the real handler.

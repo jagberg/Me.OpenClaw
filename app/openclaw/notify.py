@@ -149,10 +149,11 @@ def ack(message_id, chat_id=None) -> bool:
     strictly better than losing the handler, which is why every failure here is
     a WARNING rather than an ERROR.
 
-    **Only the claim path can call this.** A `command` handler's context carries
-    no usable message id (16.2 — every correlation id came through with the `x`
-    fallback), so a tapped button gets no reaction. Its feedback is the reply
-    text instead, which is the same feedback it had before.
+    **Typed messages only, and that is a platform limit.** A plugin command
+    handler's context carries no message id — not under a different name, it is
+    simply not in the object the gateway builds (`commands-CDhgE9eG.js`) — and
+    commands are routed before any message hook runs. So a tapped button gets no
+    reaction; its feedback is the reply text, as before.
     """
     if message_id in (None, ""):
         return False

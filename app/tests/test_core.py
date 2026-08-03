@@ -5779,6 +5779,30 @@ def test_the_fast_send_path_batches_one_call_keeps_order_and_still_logs_every_ca
     assert gateway_client.using_http_route() is False
 
 
+def test_the_ack_hook_is_the_one_the_gateway_actually_emits():
+    """This hook name has now been wrong twice, and both times the symptom was
+    silence — nothing to fail, nothing to notice until Justin said the 👍 had not
+    appeared. So the name is pinned here with the reason.
+
+    `message_received` is emitted by `emitMessageReceivedHooks()` inside the
+    gateway's `dispatch-from-config`, guarded only by
+    `SuppressMessageReceivedHooks` and `hasHooks(...)`, and its context carries
+    the message id.
+
+    `inbound_claim` is not a general pre-dispatch hook: its only call site is
+    `runInboundClaimForPluginOutcome(pluginOwnedBinding.pluginId, …)`, so it runs
+    for the plugin that owns the conversation binding and for nobody else. This
+    plugin owns no binding, which is why it logged nothing across six hours of
+    real use."""
+    plugin = (Path(__file__).resolve().parent.parent / "gateway-plugin" / "index.js").read_text(encoding="utf-8")
+    ack = plugin.split("function registerInboundAck", 1)
+    assert len(ack) == 2, "registerInboundAck is gone — the ack has no hook"
+    body = ack[1].split("function ", 1)[0]
+    assert '"message_received"' in body, "the ack is registered on a hook the gateway does not emit for us"
+    assert '"inbound_claim"' not in body, (
+        "inbound_claim only fires for the conversation binding's owner — this plugin owns none")
+
+
 def test_the_plugin_declares_the_contract_its_in_process_send_depends_on():
     """The load-bearing line is in a JSON manifest, and losing it fails at
     RUNTIME with a thrown dispatch — no build error, no lint, nothing at deploy.

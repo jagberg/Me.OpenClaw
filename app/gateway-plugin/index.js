@@ -263,14 +263,33 @@ function registerPendingFlowClaim(api) {
 
 
 /**
- * The 👍 on every inbound message, including commands (task 4.7).
+ * The 👍 on a TYPED message. Not on a tap — see below (task 4.7).
  *
- * WHY A SECOND HOOK. `before_dispatch` runs AFTER command routing, so a
- * command never reaches it, and a command handler's own ctx carries no usable
- * message id -- 16.2, confirmed live on 2026-08-03 when every correlation id
- * came through with the `n1` counter fallback. `message_received` fires on
- * receipt, before routing, and its context DOES carry `messageId`
- * (message-hook-mappers: `ctx.MessageSidFull ?? ctx.MessageSid ?? ...`).
+ * WHICH HOOK, AND WHY THE LAST TWO ANSWERS WERE WRONG. Settled 2026-08-03 by
+ * reading the gateway's dispatch path instead of guessing from hook names:
+ *
+ *   * `message_received` is emitted by `emitMessageReceivedHooks()` inside
+ *     `dispatch-from-config`, guarded only by `SuppressMessageReceivedHooks`
+ *     and `hasHooks("message_received")`. Its context carries the id
+ *     (`ctx.MessageSidFull ?? ctx.MessageSid ?? ...` -> `messageId`). This is
+ *     the hook to use.
+ *   * `inbound_claim` is NOT a general pre-dispatch hook. The only call site is
+ *     `runInboundClaimForPluginOutcome(pluginOwnedBinding.pluginId, …)` — it
+ *     runs for the plugin that OWNS the conversation binding and nobody else.
+ *     This plugin owns no binding, so it could never fire here. Zero log lines
+ *     in six hours of real use, with logging unconditional at the top of the
+ *     handler.
+ *
+ * The earlier claim that `message_received` "never fires for Telegram inbound"
+ * was drawn from taps only, and taps never enter `dispatch-from-config` at all —
+ * so it was evidence about commands, not about this hook.
+ *
+ * A TAP CANNOT BE ACKED, and that is a platform fact rather than a gap here.
+ * Commands are routed before dispatch, so neither `message_received` nor
+ * `before_dispatch` sees them, and the ctx a plugin command handler receives
+ * (`commands-CDhgE9eG.js`) has no message id in it — senderId, channel, args,
+ * commandBody, sessionKey, from/to, thread ids, and nothing else. There is no id
+ * to react to. A tap's feedback is its reply text, which is what it was before.
  *
  * The app does the reacting, not the plugin: the plugin api exposes no send
  * capability, and the app already owns the one outbound seam.
@@ -282,30 +301,21 @@ function registerPendingFlowClaim(api) {
 function registerInboundAck(api) {
   if (typeof api.registerHook !== "function") return;
   api.registerHook(
-    // NOT message_received. It registers and reports ready, and never fires
-    // for Telegram inbound -- proven 2026-08-03 by logging unconditionally at
-    // the top of the handler and seeing nothing across several real messages.
-    // `hooks list` saying "ready" means registered, not called; the same trap
-    // as `plugins list`, which this repo already documents.
-    //
-    // inbound_claim runs before commands AND agent dispatch, so it is the one
-    // place a command's message id is visible. This handler observes only and
-    // returns {} -- claiming here would swallow every message in the chat.
-    "inbound_claim",
+    "message_received",
     async (event) => {
       const context = event?.context ?? {};
       const messageId = context.messageId ?? context.message?.id ?? null;
-      // INSTRUMENTED 2026-08-03. The first version returned silently when
-      // there was no id, so "the hook never fired" and "the hook fired with
-      // no id" looked identical from the app side -- and the app side is all I
-      // can see. That is the silent no-op this project's rules forbid, and it
-      // cost a whole deploy cycle to notice. One line, and the two cases are
+      // INSTRUMENTED 2026-08-03, and it stays. The first version returned
+      // silently when there was no id, so "the hook never fired" and "the hook
+      // fired with no id" looked identical from the app side -- and the app side
+      // is all I can see. That is the silent no-op this project's rules forbid,
+      // and it cost two deploy cycles. One line, and the two cases are
       // distinguishable forever.
       api.logger?.info?.(
-        `claims: inbound_claim keys=[${Object.keys(context).join(",")}] messageId=${String(messageId)}`,
+        `claims: message_received keys=[${Object.keys(context).join(",")}] messageId=${String(messageId)}`,
       );
       if (!messageId) {
-        api.logger?.warn?.("claims: inbound_claim carried no messageId -- no ack sent");
+        api.logger?.warn?.("claims: message_received carried no messageId -- no ack sent");
         return {};
       }
       try {
