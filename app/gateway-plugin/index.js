@@ -285,13 +285,35 @@ function registerPendingFlowClaim(api) {
  * break the command it is decorating.
  */
 function startTypingCue(chatId, logger) {
-  if (!BOT_TOKEN || !chatId) return () => {};
+  // A numeric chat id, or nothing. The first version took `ctx.channelId ??
+  // ctx.from ?? ctx.senderId ?? CHAT_ID` and passed it through `Number()`, and
+  // those fields carry channel-qualified strings like "telegram:8995277418" ->
+  // NaN -> Telegram 400. Worse, only network errors were caught, so a rejected
+  // cue logged NOTHING and "typing never showed" was indistinguishable from
+  // "typing was never attempted". That is the silent no-op this project forbids,
+  // and it cost the one deploy it took Justin to say he saw no typing.
+  const numeric = String(chatId ?? "").match(/-?\d+/)?.[0] ?? String(CHAT_ID).match(/-?\d+/)?.[0];
+  if (!BOT_TOKEN || !numeric) {
+    logger?.warn?.(`claims: no typing cue -- token=${Boolean(BOT_TOKEN)} chat=${String(chatId)}`);
+    return () => {};
+  }
+  let announced = false;
   const cue = () => {
     fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: Number(chatId), action: "typing" }),
-    }).catch((err) => logger?.warn?.(`claims: typing cue failed: ${String(err)}`));
+      body: JSON.stringify({ chat_id: Number(numeric), action: "typing" }),
+    })
+      .then(async (response) => {
+        const result = await response.json().catch(() => ({}));
+        // Telegram answers 200 with `ok: false` for a bad chat, so the status
+        // code alone proves nothing. Announced once per run, not per cue.
+        if (!result?.ok && !announced) {
+          announced = true;
+          logger?.warn?.(`claims: typing cue rejected for chat ${numeric}: ${JSON.stringify(result)}`);
+        }
+      })
+      .catch((err) => logger?.warn?.(`claims: typing cue failed: ${String(err)}`));
   };
   cue();
   // 4s, inside Telegram's ~5s expiry, so the indicator never blinks off mid-run.

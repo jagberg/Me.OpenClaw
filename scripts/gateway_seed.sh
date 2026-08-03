@@ -128,6 +128,12 @@ oc config set messages.ackReaction '"\ud83d\udc4d"'
 # Telegram requires this explicitly true; unset is not enough (Discord is the
 # only channel that infers it from ack reactions being active).
 oc config set messages.statusReactions.enabled true
+# The reaction felt slower than the pre-gateway one, and this is why: the
+# lifecycle controller debounces its first emoji by 700ms before anything appears
+# (schema default, `statusReactions.timing.debounceMs`). Nothing here needs
+# debouncing -- one user, one chat, no burst to coalesce -- so it goes to 0 and
+# the emoji lands as soon as the gateway has the message.
+oc config set messages.statusReactions.timing.debounceMs 0
 
 # The claims read surface. Service name, not host.docker.internal: the latter
 # resolves through the host and NATs the source address to loopback.
