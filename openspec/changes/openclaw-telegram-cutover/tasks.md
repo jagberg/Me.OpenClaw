@@ -102,12 +102,26 @@ API is unestablished.
 
 ## 5. Scheduling
 
-- [ ] 5.1 Register gateway cron entries for the 15-minute tick, Gmail ingest and the daily nudge, pointing at the internal endpoints.
-- [ ] 5.2 Add the reminder catch-up sweep replacing `misfire_grace_time=None`; a due-but-unfired reminder fires on startup.
-- [ ] 5.3 Verify exactly-once firing across three restart cases: Python only, gateway only, both.
-- [ ] 5.4 Verify a duplicated cron trigger does not re-fire an already-fired reminder.
-- [ ] 5.5 Verify cron entries survive a gateway restart without re-registration.
-- [ ] 5.6 Make a missing or disabled cron entry visible rather than presenting as an absence of due work.
+**Cut over 2026-08-04, `2490ab9`/`35db686+deploy`. Preflight 12 of 12, `owner: gateway cron`, no APScheduler lines in the app log.** Justin's two calls: reminders piggyback the 15-minute tick rather than getting a minute-resolution cron entry, and a late reminder always fires and says how late.
+
+- [x] 5.1 **DONE.** Five entries, not three: `claims.tick` (every 15m), `claims.ingest` (5m), `claims.nudge` (`0 9 * * *` UTC), `claims.vet-nudge` (`0 9 * * 1`), `claims.expire` (`0 9 * * *`), declared by `scripts/gateway_cron.sh` and asserted by the new `cron entries declared` preflight check.
+
+  **Two of the five had no endpoint at all** — the weekly vet chase and the queue expiry were in-process only, so the cutover as originally written would have stopped both silently. `/internal/vet-nudge` and `/internal/expire-queue` added.
+
+  Facts checked against the product rather than assumed: `cron.add` is a gateway RPC, so this cannot live in the pre-boot seed (`config get cron` returns scheduler settings — `enabled`, `retry`, `runLog`, `maxConcurrentRuns` — and no job definitions; the plugin SDK exposes no cron surface). Payload kinds are agent turn / shell command / system event, so a deterministic call is `--command` + curl. `--declaration-key` is the product's own idempotency handle, which is why a redeploy re-asserts the same five rather than adding five more.
+
+  The secret is left as `$CLAIMS_INTERNAL_SECRET` in the payload, not interpolated: argv is persisted in the cron store and echoed by `cron get`, `cron list` and the run log. Verified it still resolves — the app logged `internal ingest starting correlation=int-53e1d403c38c` and answered **200**, which is the guard passing. (An earlier probe hit 404 on a not-yet-deployed route, which proves nothing about the secret — FastAPI routes before it guards.)
+
+- [x] 5.2 **DONE — and it recovered two real reminders that had been silently lost.** `reminders.sweep_due()` runs inside `pipeline.run_once`. On the first live tick it logged `reminder 6 due (overdue by 2d)` and `reminder 12 due (overdue by 2d)`; the DB confirms reminder 12 was due `2026-08-01T12:02` and still `scheduled` on 08-03.
+
+  **The bug it exposes is older than this change.** APScheduler's jobstore is in-memory (deliberately, 2026-07-31), and only the interval/cron jobs are re-registered at startup — `schedule_reminder` runs at *capture* time, so a one-shot `date` job for a pending reminder simply vanished on the next restart. `misfire_grace_time=None` promised restart-safety and could not deliver it, because after a restart there was no job left to misfire. A sweep gets it right by construction: it asks the DB what is due rather than remembering what it meant to do.
+
+- [x] 5.3 **DONE for the gateway and both cases; Python-only is not applicable.** Over 25 minutes after the deploy (which recreated *both* containers) and a `docker compose restart gateway`: exactly **1** `internal tick starting` and **3** `internal ingest starting` at a 5-minute cadence, and zero `apscheduler` lines. An app-only restart cannot double-fire anything now — the app holds no schedule.
+- [x] 5.4 **DONE, unit-tested, not yet seen live.** `sweep_due` is idempotent by its `WHERE status = 'scheduled'`, asserted in `test_a_reminder_due_while_the_app_was_down_still_fires_and_says_how_late` (second call marks 0). Deliberately no `fired_at` column — that needs hand-run `ALTER TABLE` on the live DB, and `status` already carries the fact. Not exercised by a genuinely duplicated cron delivery, because none has occurred.
+- [x] 5.5 **DONE, verified live.** After `docker compose restart gateway`: 5 jobs, all enabled, next-run times preserved, and the tick then fired on schedule at 23:34. The store is sqlite (`/home/node/.openclaw/state/openclaw.sqlite`), so nothing needs re-registering — `gateway_cron.sh` asserts the declaration rather than creating it.
+- [x] 5.6 **DONE, both at deploy time and at runtime.** The `cron entries declared` preflight check fails the deploy if any of the five is missing, disabled, or carries an `agentTurn` payload (which would work, and burn model tokens every tick forever). At runtime `/health.scheduler` reports `owner`, per-job `last_ok_at`/`minutes_since_ok`, and an `overdue` list — seen going from five `never` entries to none as each job first fired. `owner` is read from `SCHEDULER_ENABLED` rather than inferred, because "nothing ran" means a broken app when it is on and a missing cron entry when it is off.
+
+  Still true, and worth naming: `job_runs` records that a route *ran*, not that it did the right thing. A tick that runs and matches nothing looks identical to a healthy one.
 
 ## 6. Deletion and dependency cleanup
 

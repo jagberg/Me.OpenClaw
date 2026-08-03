@@ -44,7 +44,7 @@ Telegram + dashboard ── every state change, question and blocker lands as a
                         message with the claim #id and one-tap buttons
 ```
 
-The whole pipeline runs on an APScheduler tick (default 15 min) inside one FastAPI process (ADR-0006). A failure on one claim flags that claim and moves on — a tick is never lost to one bad email (visible failures are a hard rule).
+The whole pipeline runs on a 15-minute tick inside one FastAPI process (ADR-0006). The tick is driven by the **gateway's cron** since 2026-08-04 (`POST /internal/tick`); APScheduler is still in the code behind `SCHEDULER_ENABLED` for one week's rollback, and off in the deployed config. A failure on one claim flags that claim and moves on — a tick is never lost to one bad email (visible failures are a hard rule).
 
 The lifecycle above is a **declared state machine**, not a column anyone may write. Every legal move is in one transition table, and `claim_status.apply_event` is the only thing that writes a claim's state: it records the event first, then applies it if the table allows the move — and if it doesn't, the state stays put and the claim is flagged naming both states, with the event kept as evidence. So a claim's history is a fact on record rather than something to reconstruct: re-reading an old acknowledgement can no longer walk a settled claim backwards, which it did to two claims in July 2026 (two others moved the same day by being routed to the wrong claim, which is a separate guard). Each tick folds every claim's events and compares the result against the stored status; `/health` publishes the disagreement count, and it should read zero. Reverting a state change, and the timeline view that would show it, are not built yet.
 
@@ -125,8 +125,12 @@ secret-guarded), `mcp_server.py` (the claims read surface at `/mcp`), `media_out
 `app/gateway-workspace/` (the agent's prompt files, injected every turn). `gateway_client.py` is
 merged and has no caller until the cutover.
 
-**Unchanged:** Telegram polling, the chat agent, the scheduler, and everything the sections above
-describe. See [docs/gateway-deploy.md](docs/gateway-deploy.md) — especially the list of what the
+**Cut over:** Telegram polling and the chat agent (the gateway holds the token; the app's updater
+is off), and scheduling — five cron entries in the gateway drive `/internal/tick`, `/internal/ingest`,
+`/internal/nudge`, `/internal/vet-nudge` and `/internal/expire-queue`. Reminders are the one job cron
+cannot express (a one-shot at an arbitrary minute), so they sweep on the tick.
+
+**Unchanged:** everything the sections above describe. See [docs/gateway-deploy.md](docs/gateway-deploy.md) — especially the list of what the
 deploy preflight *cannot* assert.
 
 Read ADR-0024 (why the domain is not ported), ADR-0025 (where the proposal gate lives) and ADR-0023 (why the agent's tool allowlist is load-bearing for both security and cost) before touching any of it.
