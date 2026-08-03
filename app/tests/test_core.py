@@ -5796,8 +5796,9 @@ def test_the_ack_is_the_gateways_own_and_the_scope_is_the_one_that_covers_a_dm()
     seed = (Path(__file__).resolve().parent.parent.parent / "scripts" / "gateway_seed.sh").read_text(encoding="utf-8")
     assert "messages.ackReactionScope '\"all\"'" in seed, "the ack scope is not set to one that includes a DM"
     assert "messages.ackReaction " in seed, "no ack emoji is configured"
-    assert "messages.statusReactions.enabled true" in seed, (
-        "Telegram needs statusReactions explicitly enabled — unset is not enough")
+    assert "messages.statusReactions.enabled false" in seed, (
+        "statusReactions turns the sticky ack into a transient lifecycle emoji that clears — "
+        "it was enabled once and the 👍 stopped coming back")
 
     plugin = (Path(__file__).resolve().parent.parent / "gateway-plugin" / "index.js").read_text(encoding="utf-8")
     assert "registerInboundAck" not in plugin, (

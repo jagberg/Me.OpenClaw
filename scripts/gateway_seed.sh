@@ -127,13 +127,20 @@ oc config set messages.ackReaction '"\ud83d\udc4d"'
 # Lifecycle reactions on the trigger message: queued -> thinking -> done/error.
 # Telegram requires this explicitly true; unset is not enough (Discord is the
 # only channel that infers it from ack reactions being active).
-oc config set messages.statusReactions.enabled true
-# The reaction felt slower than the pre-gateway one, and this is why: the
-# lifecycle controller debounces its first emoji by 700ms before anything appears
-# (schema default, `statusReactions.timing.debounceMs`). Nothing here needs
-# debouncing -- one user, one chat, no burst to coalesce -- so it goes to 0 and
-# the emoji lands as soon as the gateway has the message.
-oc config set messages.statusReactions.timing.debounceMs 0
+#
+# statusReactions stays OFF, and turning it on was a mistake worth recording.
+# It replaces the sticky ack with a LIFECYCLE emoji on the same message: queued
+# -> thinking -> done, cleared at the end. `ackReactionPromise` becomes
+# `statusReactionController.setQueued()` rather than a plain reaction
+# (telegram-ingress-spool ~5566), so the 👍 stops being an acknowledgement that
+# stays and becomes a progress indicator that vanishes -- which is exactly what
+# Justin saw: slow to appear on a typed message, and gone again after /actions.
+# It also carried a 700ms `timing.debounceMs` before the first emoji.
+#
+# A command has no agent lifecycle to display, so there is nothing for the
+# controller to show anyway. Off means line 5566's other branch runs: one
+# reaction, added once, left alone (`removeAckAfterReply` is false).
+oc config set messages.statusReactions.enabled false
 
 # The claims read surface. Service name, not host.docker.internal: the latter
 # resolves through the host and NATs the source address to loopback.
