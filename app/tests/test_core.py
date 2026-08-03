@@ -5177,11 +5177,12 @@ def test_a_confirm_with_a_junk_id_changes_nothing_and_says_so():
 def test_the_actions_run_is_one_concurrent_burst_and_still_announces_truncation():
     """Latency and honesty at once, because the cheap fix threatened the rule.
 
-    Each send spawns the gateway CLI at ~6s (measured live 2026-08-03), so the
-    old shape — a rendered summary card, then N tap cards, then up to two notes
-    — cost two ordered rounds: ~6s to the summary, ~6s again for the rest.
-    Folding the counts onto the first tap card removes the ordering, and then
-    everything can go at once.
+    Every send costs 9–13s end to end (measured live 2026-08-03; ~6.6s of it is
+    local CLI initialisation), so the old shape — summary card first, then N tap
+    cards, then up to two note messages — cost two ordered rounds. What removed
+    the ordering was making nothing depend on it, NOT dropping the summary: the
+    summary is card 0 of the burst, and Telegram may deliver it anywhere in the
+    run (Justin's call 2026-08-03, restoring it).
 
     The risk in that trade is the held-back count. A cap nobody is told about is
     a silent truncation, and no latency saving buys that — so it is asserted
@@ -5208,21 +5209,24 @@ def test_the_actions_run_is_one_concurrent_burst_and_still_announces_truncation(
     finally:
         claim_status.pending_actions = real
 
-    # One message per shown action, and no separate summary or note messages.
-    assert len(cards) == commands.ACTION_CARD_CAP, len(cards)
-    assert not any(c.get("png") for c in cards), "a rendered summary card is still being sent"
-    # The truncation is still stated, and it rides on the first card.
-    assert f"+{over - commands.ACTION_CARD_CAP} more" in cards[0]["text"], cards[0]["text"]
-    assert "to action" in cards[0]["text"], cards[0]["text"]
-    # Every card is tappable, including the one carrying the notes.
-    assert all(c["buttons"] for c in cards), [c["buttons"] for c in cards]
+    # The summary card plus one message per shown action, and no separate note
+    # messages — the notes ride on the summary's caption.
+    assert len(cards) == commands.ACTION_CARD_CAP + 1, len(cards)
+    assert cards[0].get("png"), "the rendered summary card is missing from the burst"
+    assert not any(c.get("png") for c in cards[1:]), "more than one rendered card is being sent"
+    # The truncation is still stated, on the summary's caption.
+    assert f"+{over - commands.ACTION_CARD_CAP} more" in cards[0]["caption"], cards[0]["caption"]
+    assert "to action" in cards[0]["caption"], cards[0]["caption"]
+    # Every tap card is tappable; the summary carries no buttons.
+    assert all(c["buttons"] for c in cards[1:]), [c["buttons"] for c in cards[1:]]
+    assert not cards[0]["buttons"], cards[0]["buttons"]
 
     # And nothing about the run is order-dependent, so it can go at once.
     order, lock = [], threading.Lock()
 
     def deliver(card):
         with lock:
-            order.append(card["text"][:12])
+            order.append((card.get("text") or card.get("caption") or "")[:12])
         _time.sleep(0.12)
         return None
 

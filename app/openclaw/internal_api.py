@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
 
-from . import config, db, gmail_ingest, message_log, pipeline
+from . import config, db, gmail_ingest, message_log, pipeline, trace
 
 logger = logging.getLogger(__name__)
 
@@ -260,7 +260,8 @@ async def command(
 
     username = body.get("username") or config.TELEGRAM_USERNAME
     try:
-        outcome = commands.dispatch(name, body.get("args") or "", username)
+        with trace.step("command.dispatch", correlation, command=name):
+            outcome = commands.dispatch(name, body.get("args") or "", username)
     except Exception as exc:  # noqa: BLE001 — a tap that failed must say so
         logger.error("command %s failed correlation=%s: %s", name, correlation, exc, exc_info=True)
         return JSONResponse({"status": "error", "route": f"command/{name}",
@@ -270,37 +271,43 @@ async def command(
     sent, failed = 0, []
     target = db.registered_chat_id()
 
-    def deliver(card: dict) -> str | None:
+    def deliver(index_card: tuple[int, dict]) -> str | None:
+        index, card = index_card
         try:
-            if card.get("png") is not None:
-                gateway_client.send_card(str(target), card["png"], caption=card.get("caption", ""),
-                                         buttons=card.get("buttons") or None)
-            else:
-                gateway_client.send_message(str(target), card["text"],
-                                            buttons=card.get("buttons") or None)
+            with trace.step("command.deliver", correlation, card=index,
+                            kind="png" if card.get("png") is not None else "text"):
+                _deliver_one(card)
             return None
         except Exception as exc:  # noqa: BLE001
             # Never silent: a card that did not arrive must not read as one that did.
             logger.error("card delivery failed for /%s correlation=%s: %s", name, correlation, exc)
             return str(exc)
 
+    def _deliver_one(card: dict) -> None:
+        if card.get("png") is not None:
+            gateway_client.send_card(str(target), card["png"], caption=card.get("caption", ""),
+                                     buttons=card.get("buttons") or None)
+        else:
+            gateway_client.send_message(str(target), card["text"],
+                                        buttons=card.get("buttons") or None)
+
     cards = outcome["cards"]
     if target is None:
         failed.append("no registered chat")
     elif cards:
-        # **All at once.** Each send spawns the gateway CLI at ~6s, of which
-        # ~2.5s is connection setup that cannot be amortised across processes.
-        # There used to be a separate summary card that had to land first, so a
-        # run cost two ordered rounds -- measured live at ~6s, then ~6s again.
-        # `commands.actions_cards` folds the counts onto the first tap card
-        # instead, so nothing here is order-dependent and the whole run costs
-        # one send's wall time.
+        # **All at once, including the rendered summary card.** Every send costs
+        # 9-13s end to end, and the decomposition (see `trace`) is ~6.6s of local
+        # CLI initialisation, ~2.5s of connect + auth, and under a second of
+        # gateway work -- so ordering two rounds doubles the wall time for
+        # nothing. Nothing here is order-dependent; the summary is one card in
+        # the burst and may not arrive first.
         #
         # Concurrency measured sub-linear (5 sends: ~32s serial, ~15s wall), so
         # the pool is capped rather than unbounded -- the gateway serialises
         # some of it and more threads buy less each.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(cards))) as pool:
-            outcomes = list(pool.map(deliver, cards))
+        with trace.step("command.burst", correlation, cards=len(cards)):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(cards))) as pool:
+                outcomes = list(pool.map(deliver, enumerate(cards)))
         failed.extend(o for o in outcomes if o is not None)
         sent = sum(1 for o in outcomes if o is None)
 

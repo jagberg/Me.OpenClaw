@@ -344,28 +344,33 @@ def _action_buttons(action: dict) -> list[dict]:
 
 
 def actions_cards() -> list[dict]:
-    """The /actions run, as cards that can all be sent at once.
+    """The /actions run, as cards that all go out in one burst.
 
     Same derivation as the chat agent's `pending_actions`, deliberately: chat
     and cards answering differently is the failure this shares a source to
     avoid.
 
-    **No separate summary message, and no ordered first send.** Each send spawns
-    the gateway CLI and costs ~6s — measured live 2026-08-03, and ~2.5s of that
-    is connection setup that cannot be amortised because the CLI is one process
-    per message. The old shape was a rendered summary card, then N tap cards,
-    then two possible notes: four-plus messages and two ordered rounds, which
-    Justin measured at ~6s to the summary and ~6s again for the rest.
+    **The rendered summary card is the first card in the burst, not a first
+    round** (Justin's call 2026-08-03, after a version that dropped it). The
+    original shape sent the summary, waited, then sent the tap cards — two
+    ordered rounds, ~6s each. Latency is not what ordering buys here: every send
+    costs 9–13s of which ~6.6s is local CLI initialisation and under a second is
+    the gateway (see `trace` for the measurements), so a second round doubles the
+    wait. Dispatching all of them together costs one send's wall time.
 
-    So the counts, the truncation notice and the blocked total ride on the FIRST
-    tap card, and every card goes out concurrently. Latency becomes one send's
-    worth rather than two rounds'.
+    The consequence to expect rather than fix: **the summary may not arrive
+    first.** Nothing downstream is order-dependent, and Telegram decides the
+    final order of a concurrent burst.
 
-    What is deliberately NOT lost: the held-back count. A cap nobody is told
-    about is a silent truncation, and that rule outranks the message budget —
-    it just travels as a line of text now instead of its own message.
+    The counts, the held-back count and the blocked total ride on the summary
+    card's caption. A cap nobody is told about is a silent truncation, and that
+    rule outranks the message budget — so when everything is blocked and there
+    is no summary to caption, the notes become the card.
     """
-    actions = claim_status.pending_actions()
+    from . import trace
+
+    with trace.step("actions.pending"):
+        actions = claim_status.pending_actions()
     if not actions:
         return [{"text": "Nothing waiting on you — every claim is with Petcover or closed.", "buttons": []}]
 
@@ -381,13 +386,17 @@ def actions_cards() -> list[dict]:
         notes.append(f"🚫 {len(blocked)} claims blocked · ${total:,.2f} — {blocked[0]['flag'] or 'blocked'}. "
                      "No button can fix this; it needs the insurer's claim process on file.")
 
-    cards = [{"text": _action_card_text(a), "buttons": _action_buttons(a)} for a in shown]
-    if not cards:
+    tap_cards = [{"text": _action_card_text(a), "buttons": _action_buttons(a)} for a in shown]
+    if not tap_cards:
         # Everything is blocked. The notes ARE the answer, and there is nothing
         # to tap — but it still has to be said.
         return [{"text": chr(10).join(notes), "buttons": []}]
-    cards[0]["text"] = chr(10).join(notes) + chr(10) * 2 + cards[0]["text"]
-    return cards
+
+    with trace.step("actions.render_summary", actions=len(actions)):
+        png = claim_card.render_actions_summary(actions, shown=len(shown))
+    # Telegram caps a caption at 1024; the notes are three short lines, so this
+    # truncates nothing today and refuses to lie if that ever changes.
+    return [{"png": png, "caption": chr(10).join(notes)[:1024], "buttons": []}] + tap_cards
 
 
 # --- dispatch ----------------------------------------------------------------

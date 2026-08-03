@@ -22,7 +22,7 @@ import json
 import logging
 import subprocess
 
-from . import config, message_log
+from . import config, message_log, trace
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +121,11 @@ def _run(action: str, target: str, args: list[str], *, kind: str, summary: str,
     logger.info("gateway %s target=%s correlation=%s", action, target, correlation)
     run = runner or subprocess.run
     try:
-        completed = run(argv, capture_output=True, text=True, timeout=config.OPENCLAW_CLI_TIMEOUT_SECONDS)
+        # The one step worth timing above all others: 6.6s of this is the CLI
+        # initialising itself with no network involved, ~2.5s is connect + auth,
+        # and under a second is the gateway's actual work. See `trace`.
+        with trace.step(f"cli.{action}", correlation):
+            completed = run(argv, capture_output=True, text=True, timeout=config.OPENCLAW_CLI_TIMEOUT_SECONDS)
     except FileNotFoundError as exc:
         raise GatewaySendError(f"gateway CLI not found at {config.OPENCLAW_CLI!r}") from exc
     except subprocess.TimeoutExpired as exc:
@@ -136,7 +140,8 @@ def _run(action: str, target: str, args: list[str], *, kind: str, summary: str,
 
     # Outbound logging stays on this path, so the gateway era keeps the same
     # audit trail and RL dataset the LoggedBot era had.
-    message_log.record_outbound(kind, summary, {**payload, "correlation_id": correlation})
+    with trace.step("log.outbound", correlation, kind=kind):
+        message_log.record_outbound(kind, summary, {**payload, "correlation_id": correlation})
 
     try:
         return json.loads(completed.stdout or "{}")
@@ -198,7 +203,8 @@ def send_card(target: str, image: bytes, caption: str = "", buttons: list[dict] 
     """
     from . import media_outbox
 
-    path = media_outbox.publish(image, ".png", stem)
+    with trace.step("outbox.publish", correlation, bytes=len(image)):
+        path = media_outbox.publish(image, ".png", stem)
     return send_file(target, path, caption=caption, buttons=buttons,
                      correlation=correlation, runner=runner)
 

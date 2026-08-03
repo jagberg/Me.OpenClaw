@@ -28,7 +28,7 @@ because a notification failed, and it must never look like it sent one.
 
 import logging
 
-from . import config, db
+from . import config, db, trace
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +71,15 @@ def send_text(text: str, buttons: list[dict] | None = None) -> bool:
     if target is None:
         return False
     try:
-        if using_gateway():
-            from . import gateway_client
+        with trace.step("notify.text", transport="gateway" if using_gateway() else "ptb"):
+            if using_gateway():
+                from . import gateway_client
 
-            gateway_client.send_message(target, text, buttons=buttons)
-        else:
-            from . import telegram_bot
+                gateway_client.send_message(target, text, buttons=buttons)
+            else:
+                from . import telegram_bot
 
-            telegram_bot.send_message_sync(text, reply_markup=_to_ptb_markup(buttons))
+                telegram_bot.send_message_sync(text, reply_markup=_to_ptb_markup(buttons))
     except Exception as exc:  # noqa: BLE001 — a tick must not die on a lost notification
         logger.error("outbound text dropped: %s", exc, exc_info=True)
         return False
@@ -92,14 +93,15 @@ def send_card(caption: str, image: bytes, buttons: list[dict] | None = None) -> 
     if target is None:
         return False
     try:
-        if using_gateway():
-            from . import gateway_client
+        with trace.step("notify.card", transport="gateway" if using_gateway() else "ptb"):
+            if using_gateway():
+                from . import gateway_client
 
-            gateway_client.send_card(target, image, caption=caption, buttons=buttons)
-        else:
-            from . import telegram_bot
+                gateway_client.send_card(target, image, caption=caption, buttons=buttons)
+            else:
+                from . import telegram_bot
 
-            telegram_bot.send_photo_sync(caption, image, reply_markup=_to_ptb_markup(buttons))
+                telegram_bot.send_photo_sync(caption, image, reply_markup=_to_ptb_markup(buttons))
     except Exception as exc:  # noqa: BLE001
         logger.error("outbound card dropped: %s", exc, exc_info=True)
         return False
@@ -114,16 +116,17 @@ def send_document(caption: str, document: bytes, filename: str,
     if target is None:
         return False
     try:
-        if using_gateway():
-            from . import gateway_client, media_outbox
+        with trace.step("notify.document", transport="gateway" if using_gateway() else "ptb"):
+            if using_gateway():
+                from . import gateway_client, media_outbox
 
-            path = media_outbox.publish(document, suffix=".pdf", stem=filename.rsplit(".", 1)[0])
-            gateway_client.send_file(target, path, caption=caption[:1024], buttons=buttons)
-        else:
-            from . import telegram_bot
+                path = media_outbox.publish(document, suffix=".pdf", stem=filename.rsplit(".", 1)[0])
+                gateway_client.send_file(target, path, caption=caption[:1024], buttons=buttons)
+            else:
+                from . import telegram_bot
 
-            telegram_bot.send_document_sync(caption, document, filename,
-                                            reply_markup=_to_ptb_markup(buttons))
+                telegram_bot.send_document_sync(caption, document, filename,
+                                                reply_markup=_to_ptb_markup(buttons))
     except Exception as exc:  # noqa: BLE001
         logger.error("outbound document dropped: %s", exc, exc_info=True)
         return False
