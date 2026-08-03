@@ -345,8 +345,7 @@ def check_app_can_send(app_container: str) -> Result:
         return result.skip("docker not on PATH")
     except subprocess.TimeoutExpired:
         return result.fail("`openclaw health` did not return within 90s from the app container")
-    blob = f"{proc.stdout}
-{proc.stderr}".strip()
+    blob = (proc.stdout + chr(10) + proc.stderr).strip()
     if proc.returncode != 0:
         # The three shapes seen live on 2026-08-03, named so the next person
         # does not have to re-derive any of them from an exit code.
