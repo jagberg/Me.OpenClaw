@@ -24,6 +24,18 @@ services:
       # two versions, and telegram_messages.app_version must keep meaning "the
       # Python code that handled this row".
       GATEWAY_VERSION: "${GATEWAY_VERSION:-unknown}"
+      # How the app reaches the gateway to SEND. The CLI is baked into this
+      # image (see app/Dockerfile) and resolves both of these itself --
+      # documented at docs.openclaw.ai/gateway/remote. `ws://`, not `http://`:
+      # the gateway protocol is a WebSocket, and the service name resolves on
+      # the compose network.
+      OPENCLAW_GATEWAY_URL: "ws://gateway:18789"
+      # The same owner-level credential the gateway binds with. This widens the
+      # boundary ADR-0024 drew: the app can now drive the gateway, not just be
+      # driven by it. Accepted deliberately (Justin, 2026-08-03) as the price of
+      # using the product's own client instead of re-deriving its protocol.
+      # It is still NOT the Gmail credential, which remains app-only.
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN:?the app needs the gateway token to send}"
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
