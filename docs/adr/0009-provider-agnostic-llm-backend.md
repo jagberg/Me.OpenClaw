@@ -79,3 +79,68 @@ Chat therefore spends three futile retries per exhausted-day turn before moving
 on. Mitigated by configuring a multi-model chain so `next=none` becomes
 `next=<model B>`; not eliminated. This is a regression against ADR-0017 for the
 chat path only, recorded rather than left to be discovered.
+
+---
+
+## Amendment (2026-08-04) — Groq is unreachable from this network; Gemini is the default
+
+Not an outage, not a quota, not the key. `api.groq.com/openai/v1/models`
+answers:
+
+```
+403 {"error":{"message":"Access denied. Please check your network settings."}}
+```
+
+to a request with **no `Authorization` header at all**, and identically with a
+valid key, with a garbage key, from the Windows host, from the app container and
+from the gateway container. Groq is refusing this network. Nothing in this repo
+can fix it, and nothing in this repo caused it.
+
+**Why this ADR's swappability finally paid, and where it did not.** Swapping
+`LLM_PROVIDER` was one env var, as designed. What did not survive contact:
+ADR-0017's fallback chain, because all four of its models are Groq models, so a
+network-level block took the primary and every fallback in one move. That is the
+single-point redundancy `docs/failure-modes.md` already lists as a standing gap;
+this is its first live instance. A chain is per-model insurance and was never
+per-provider insurance.
+
+**Decision.** `gemini` becomes the default `LLM_PROVIDER`, and the gateway
+agent's primary becomes `gemini/gemini-2.5-flash`. Groq stays configured in both
+places so a network that can reach it needs one line changed rather than a
+provider rebuilt.
+
+**One thing genuinely new, not just re-pointed.** `chat()` refused
+`LLM_PROVIDER=gemini` outright ("supports `extract()` only") because the Gemini
+SDK path never implemented the tool loop. Google publishes an OpenAI-compatible
+surface at `/v1beta/openai`, so `gemini` is now also a `_PROVIDERS` entry and
+`chat()` works over it; the refusal is gone. `extract()` still delegates to
+`gemini.py` — that path carries the rate limiter and `llm_calls` logging, and
+invoice extraction output is cached forever in `email_extractions`, so changing
+which client produces it is a change nobody asked for.
+
+**Probed before being written, not reasoned about.** Every model was checked
+against a `claims__*`-shaped tool schema through the OpenAI-compatible endpoint:
+
+| Model | Result |
+|---|---|
+| gemini-2.5-flash | `tool_calls`, right tool — now the primary |
+| gemini-3.6-flash | `tool_calls`, 1.9s — fallback 1 |
+| gemini-3.5-flash-lite | `tool_calls`, 1.3s — fallback 2 |
+| gemini-3.1-flash-lite | `tool_calls`, 1.6s — fallback 3 |
+| gemini-3.5-flash | correct but 5.7s — excluded, redundant behind faster links |
+| gemini-2.5-flash-lite | `404`, retired by Google — excluded |
+| gemini-2.0-flash, -lite | `429` quota exceeded on this key — excluded, unproven |
+
+**Trap worth knowing.** 2.5-flash spends tokens on internal reasoning before it
+emits any, so a tight `max_tokens` returns HTTP 200, `finish_reason: length` and
+**empty content**. A caller that caps output tightly gets a silent-looking empty
+reply, not an error.
+
+**Boundary consequence, recorded because it narrows a declared absence.** The
+gateway container now holds `GEMINI_API_KEY`, where `docker-compose.yml`
+previously asserted "no Gmail credential, no Google key". The Gmail isolation
+this protects still holds mechanically — a bare API key is not the OAuth client
+plus refresh token Gmail needs, and `gmail.googleapis.com/users/me/profile`,
+`.../users/me/messages` and `drive/v3/files` each returned **401** for this key.
+What is gone is the broader claim that no Google-issued credential crosses the
+line. See ADR-0024's gmail-isolation-boundary.

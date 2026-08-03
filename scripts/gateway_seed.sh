@@ -101,14 +101,42 @@ else
   echo "WARN: CLAIMS_TELEGRAM_CHAT_ID unset - access policy not configured; the preflight will fail on it"
 fi
 
-# Groq as a custom OpenAI-compatible provider. OpenClaw bundles 38 providers and
-# none of them is Groq, which is the one this project standardised on. `models`
-# must be an ARRAY of objects with `id`; an object keyed by model id is rejected.
+# Groq as a custom OpenAI-compatible provider. OpenClaw's bundled catalogue
+# (`models list --all`) has 20 providers and none is Google; it DOES carry a
+# `groq` id, which this block overrides with the account's own model list.
+# `models` must be an ARRAY of objects with `id`; an object keyed by model id is
+# rejected.
+#
+# Configured, but NOT the primary any more. As of 2026-08-04 Groq refuses this
+# network: `api.groq.com` answers 403 `Access denied. Please check your network
+# settings.` to a request carrying **no Authorization header**, and identically
+# from inside both containers. Not the key, not the account, not a rate limit,
+# and not fixable from here. It stays configured so that a network which can
+# reach Groq gets it back by editing one line rather than rebuilding a provider.
 if [ -n "$GROQ_API_KEY" ]; then
   oc config set models.providers.groq "{\"baseUrl\":\"https://api.groq.com/openai/v1\",\"api\":\"openai-completions\",\"apiKey\":\"$GROQ_API_KEY\",\"models\":[{\"id\":\"llama-3.3-70b-versatile\",\"name\":\"Llama 3.3 70B\",\"input\":[\"text\"],\"contextWindow\":131072}]}"
+fi
+
+# Gemini, the provider this network CAN reach, and therefore the primary.
+# Google publishes an OpenAI-compatible surface at `/v1beta/openai`, so it is
+# the same `openai-completions` shape as Groq rather than a new integration.
+# Probed before being written, per the repo rule about validating against the
+# product rather than reasoning about it: `POST /chat/completions` with a
+# `claims__pending`-shaped tool returned `finish_reason: tool_calls` and the
+# right tool name (2026-08-04).
+#
+# `max_tokens` matters here in a way it did not for Llama: 2.5-flash spends
+# tokens on internal reasoning first, so a 16-token cap returned
+# `finish_reason: length` with EMPTY content and a 200. A silent-looking empty
+# reply is the failure mode to expect if a caller caps output tightly.
+if [ -n "$GEMINI_API_KEY" ]; then
+  oc config set models.providers.gemini "{\"baseUrl\":\"https://generativelanguage.googleapis.com/v1beta/openai\",\"api\":\"openai-completions\",\"apiKey\":\"$GEMINI_API_KEY\",\"models\":[{\"id\":\"gemini-2.5-flash\",\"name\":\"Gemini 2.5 Flash\",\"input\":[\"text\"],\"contextWindow\":1048576}]}"
+  oc config set agents.defaults.model.primary '"gemini/gemini-2.5-flash"'
+elif [ -n "$GROQ_API_KEY" ]; then
   oc config set agents.defaults.model.primary '"groq/llama-3.3-70b-versatile"'
+  echo "WARN: GEMINI_API_KEY unset - falling back to Groq, which is network-blocked here; the preflight will fail on it"
 else
-  echo "WARN: GROQ_API_KEY unset - the agent has no model; the preflight will fail on it"
+  echo "WARN: no model provider key - the agent has no model; the preflight will fail on it"
 fi
 
 # Acknowledgement reactions, which the gateway does natively and this project

@@ -21,9 +21,28 @@ MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 2
 
 # provider -> (base_url, default_model, api_key)
+#
+# Gemini appears here as well as behind its own SDK, and the two are not
+# redundant. Google publishes an OpenAI-compatible surface at
+# `/v1beta/openai`, so one base_url change gives `chat()` — the tool loop —
+# a Gemini backend, which the SDK path never supported (it is extract-only).
+# The SDK path stays because `extract()`/`extract_vision()` already use it and
+# rewriting a working extraction path buys nothing.
+#
+# WHY THIS MATTERED ON 2026-08-04, and why it is not a Groq outage: Groq now
+# refuses this network outright. `GET api.groq.com/openai/v1/models` returns
+# 403 `{"error":{"message":"Access denied. Please check your network
+# settings."}}` **with no Authorization header at all**, and identically from
+# inside both containers — so it is not the key, not the account, and not a
+# rate limit. Nothing in ADR-0017's fallback chain can help: all four models
+# are Groq, so the whole chain is behind the same block (the single-point
+# redundancy `docs/failure-modes.md` already names). Gemini answered 200 on
+# the same probes, including a tool call against a `claims__*`-shaped schema.
 _PROVIDERS = {
     "groq": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", config.GROQ_API_KEY),
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini", config.OPENAI_API_KEY),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai",
+               "gemini-2.5-flash", config.GEMINI_API_KEY),
 }
 
 # Groq's daily token budget is PER MODEL ("Rate limit reached for model
@@ -43,8 +62,24 @@ _PROVIDERS = {
 #   openai/gpt-oss-20b     1.3s
 # Deliberately EXCLUDED: qwen/qwen3.6-27b. It answers correctly but took 62s,
 # which is not a fallback — it's a hang with a reply at the end.
+#
+# Gemini's chain was probed the same way on 2026-08-04, against the same
+# `claims__*`-shaped tool, and every link below returned `finish_reason:
+# tool_calls` with the right tool name:
+#   gemini-3.6-flash        1.9s
+#   gemini-3.5-flash-lite   1.3s
+#   gemini-3.1-flash-lite   1.6s
+# EXCLUDED and why, because the exclusions are the part that rots quietly:
+#   gemini-3.5-flash        answers correctly, 5.7s — redundant behind faster links
+#   gemini-2.5-flash-lite   404, retired by Google
+#   gemini-2.0-flash{,-lite} 429 quota exceeded on this key — an unproven link
+# This chain covers per-model exhaustion, NOT a provider outage: both entries
+# here are still one provider each, which is the single-point redundancy
+# `docs/failure-modes.md` names and which is exactly what Groq's network block
+# hit on 2026-08-04.
 _FALLBACK_MODELS = {
     "groq": ("openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"),
+    "gemini": ("gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"),
 }
 
 
@@ -59,7 +94,7 @@ _client = None
 def _resolve() -> tuple[str, str, str]:
     prov = config.LLM_PROVIDER
     if prov not in _PROVIDERS:
-        raise LLMUnavailableError(f"Unknown LLM_PROVIDER {prov!r} (expected one of {list(_PROVIDERS)} or 'gemini')")
+        raise LLMUnavailableError(f"Unknown LLM_PROVIDER {prov!r} (expected one of {list(_PROVIDERS)})")
     base_url, default_model, api_key = _PROVIDERS[prov]
     return base_url, (config.LLM_MODEL or default_model), api_key
 
@@ -225,8 +260,6 @@ def chat(messages: list, tools: list | None = None, tool_impls: dict | None = No
     Returns {"text": <assistant reply>, "model": <the model that answered>} —
     "model" may differ from the configured one if a daily budget ran out.
     """
-    if config.LLM_PROVIDER == "gemini":
-        raise LLMUnavailableError("chat() needs an OpenAI-compatible provider; gemini supports extract() only")
     client = _openai_client()
     _base, model, _key = _resolve()
     convo = list(messages)
@@ -264,7 +297,13 @@ def extract_vision(prompt: str, image_jpeg: bytes, purpose: str = "vision_extrac
 
 def extract(prompt: str, purpose: str = "extraction") -> str:
     """Single-message completion — the drop-in for the old gemini.extract().
-    Delegates to the legacy Gemini backend when LLM_PROVIDER=gemini."""
+    Delegates to the legacy Gemini backend when LLM_PROVIDER=gemini.
+
+    That delegation stays even though `gemini` is now an OpenAI-compatible entry
+    too: this path carries `gemini.py`'s rate limiter and `llm_calls` logging,
+    and invoice extraction is the one LLM caller whose output is cached forever
+    (`email_extractions`). Changing which client produces it is a change nobody
+    asked for. `chat()` is the half that had no Gemini backend at all."""
     if config.LLM_PROVIDER == "gemini":
         from . import gemini
 

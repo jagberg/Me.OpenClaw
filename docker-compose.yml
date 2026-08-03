@@ -81,9 +81,22 @@ services:
     image: ghcr.io/openclaw/openclaw:latest
     restart: unless-stopped
     # DELIBERATE ABSENCES, each one load-bearing (7.0a, ADR-0024):
-    #   - no env_file. The gateway gets no Gmail credential, no Google key and
-    #     no DATABASE_PATH. gmail-isolation-boundary enforced by the container
+    #   - no env_file. The gateway gets no Gmail credential and no
+    #     DATABASE_PATH. gmail-isolation-boundary enforced by the container
     #     boundary rather than by configuration, which is its strongest form.
+    #
+    #     NARROWED 2026-08-04, and the narrowing is the point: this used to say
+    #     "no Google key" and now the gateway holds GEMINI_API_KEY, because Groq
+    #     blocks this network (403 to an unauthenticated request; see
+    #     scripts/gateway_seed.sh) and Gemini is the only provider left that the
+    #     agent can reach. That is a real weakening of the sentence, so it was
+    #     checked rather than assumed: a Generative Language API key is a bare
+    #     API key, not the OAuth client + refresh token the Gmail path needs, and
+    #     `gmail.googleapis.com/users/me/profile`, `.../users/me/messages` and
+    #     `drive/v3/files` each returned **401** for it. So the boundary the ADR
+    #     actually protects — the gateway cannot read Justin's mail — still holds
+    #     mechanically. What is gone is the broader claim that no Google-issued
+    #     credential crosses the line.
     #   - no bind mount to app/data. The SQLite file, the OAuth token and the
     #     invoice PDFs are simply not on its filesystem. A read-write open from
     #     the wrong side deleted the WAL sidecars once and took the app down for
@@ -126,6 +139,11 @@ services:
       # this same service and therefore inherits its environment.
       CLAIMS_TELEGRAM_CHAT_ID: "${CLAIMS_TELEGRAM_CHAT_ID:-}"
       GROQ_API_KEY: "${GROQ_API_KEY:-}"
+      # The agent's actual model since 2026-08-04 (Groq is network-blocked).
+      # Interpolated from the repo-root .env, never from app/.env -- that file
+      # holds the Gmail credential paths and the DB path, and compose cannot read
+      # a key out of it without handing over the rest.
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
     ports:
       # Loopback only. The image declares no EXPOSE, so this has to be explicit.
       - "127.0.0.1:18789:18789"

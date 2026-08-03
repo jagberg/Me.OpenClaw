@@ -1,5 +1,6 @@
 """Runnable smoke checks — not a full suite. Run with: python tests/test_core.py"""
 
+import contextlib
 import os
 import sys
 import tempfile
@@ -3439,10 +3440,26 @@ def test_daily_budget_exhaustion_falls_through_to_another_model():
                         return type("R", (), {"choices": [type("C", (), {"message": _M()})()]})
         return C()
 
+    # `_completion` reads the chain from config.LLM_PROVIDER, so the provider is
+    # PINNED here. It used to be inherited from whatever .env held, which meant
+    # this test silently stopped exercising a chain at all the day the app moved
+    # off Groq (2026-08-04): `_FALLBACK_MODELS.get("gemini")` was empty, the
+    # "everything spent" case had one link, and the test failed for a reason
+    # unrelated to what it asserts.
+    @contextlib.contextmanager
+    def _pinned(provider):
+        original = config.LLM_PROVIDER
+        config.LLM_PROVIDER = provider
+        try:
+            yield
+        finally:
+            config.LLM_PROVIDER = original
+
     # Primary spent -> second model's own budget answers, and only ONE attempt is
     # spent on the exhausted model (retrying can't free a daily cap).
-    msg = llm._completion(_client({"llama-3.3-70b-versatile"}), "llama-3.3-70b-versatile",
-                          [{"role": "user", "content": "hi"}], None, "test")
+    with _pinned("groq"):
+        msg = llm._completion(_client({"llama-3.3-70b-versatile"}), "llama-3.3-70b-versatile",
+                              [{"role": "user", "content": "hi"}], None, "test")
     assert msg.content == "answered by openai/gpt-oss-120b", tried
     assert tried == ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"], f"no wasted retries: {tried}"
     assert llm._last_model_used == "openai/gpt-oss-120b", "the answering model is recorded"
@@ -3451,15 +3468,22 @@ def test_daily_budget_exhaustion_falls_through_to_another_model():
     # doesn't send him hunting an outage. The model set is DERIVED from the
     # configured chain, not hardcoded — hardcoding it broke the moment a fourth
     # link was added, by silently letting the "everything is spent" case succeed.
-    tried.clear()
-    chain = ["llama-3.3-70b-versatile", *llm._FALLBACK_MODELS["groq"]]
-    try:
-        llm._completion(_client(set(chain)), "llama-3.3-70b-versatile",
-                        [{"role": "user", "content": "hi"}], None, "test")
-        raise AssertionError("must fail visibly once every budget is gone")
-    except llm.LLMUnavailableError as exc:
-        assert "daily token budget" in str(exc) and "rolling window" in str(exc)
-        assert tried == chain, f"tries each model exactly once, in order: {tried}"
+    #
+    # Run for EVERY configured provider, not just Groq: a provider with no chain
+    # would otherwise pass this by having nothing to walk. Gemini's own links were
+    # probed live before being added (see llm._FALLBACK_MODELS).
+    for provider, primary in (("groq", "llama-3.3-70b-versatile"), ("gemini", "gemini-2.5-flash")):
+        tried.clear()
+        chain = [primary, *llm._FALLBACK_MODELS[provider]]
+        assert len(chain) > 1, f"{provider} has no fallback chain to walk"
+        try:
+            with _pinned(provider):
+                llm._completion(_client(set(chain)), primary,
+                                [{"role": "user", "content": "hi"}], None, "test")
+            raise AssertionError(f"{provider}: must fail visibly once every budget is gone")
+        except llm.LLMUnavailableError as exc:
+            assert "daily token budget" in str(exc) and "rolling window" in str(exc)
+            assert tried == chain, f"{provider} tries each model exactly once, in order: {tried}"
 
 
 def test_fallback_model_is_disclosed_in_the_reply():
@@ -5829,6 +5853,54 @@ def test_the_plugin_declares_the_contract_its_in_process_send_depends_on():
     # refused; only the trusted-operator surface resolves the CLI's own scopes.
     assert 'gatewayRuntimeScopeSurface: "trusted-operator"' in plugin, plugin[:0]
     assert 'auth: "gateway"' in plugin, "a plugin-auth route cannot dispatch a write"
+
+
+def test_chat_has_a_gemini_backend_and_the_agents_primary_is_the_reachable_provider():
+    """Groq blocks this network as of 2026-08-04 — 403 to a request carrying no
+    Authorization header at all, from the host and from inside both containers.
+    Not the key, not the account, not a rate limit. Every model in
+    `_FALLBACK_MODELS` is Groq, so the whole ADR-0017 chain went with it and the
+    agent had no model for four deploys.
+
+    Two halves, and each fails differently if lost:
+
+    1. `chat()` used to refuse `LLM_PROVIDER=gemini` outright ("supports
+       extract() only"), so switching the app's provider would have traded a 403
+       for a hard refusal. Asserted by behaviour rather than by grepping for the
+       old message: with the provider set and the key blank it must fail on the
+       KEY, which proves it reached the client instead of the old early return.
+    2. The gateway agent's primary must be the provider that answers. Groq stays
+       configured — a network that can reach it needs one line changed, not a
+       provider rebuilt — but it must not be the primary while it is blocked."""
+    base, model, _key = None, None, None
+    assert "gemini" in llm._PROVIDERS, "chat() has no Gemini backend; the tool loop is Groq-only again"
+    base, model, _key = llm._PROVIDERS["gemini"]
+    assert base.endswith("/v1beta/openai"), (
+        f"the OpenAI-compatible surface is what `openai-completions` needs, got {base}")
+    assert model.startswith("gemini-"), model
+
+    original = config.LLM_PROVIDER
+    original_client = llm._client
+    try:
+        config.LLM_PROVIDER = "gemini"
+        llm._client = None
+        try:
+            llm.chat([{"role": "user", "content": "hi"}])
+            raise AssertionError("a blank key must fail visibly")
+        except llm.LLMUnavailableError as exc:
+            assert "GEMINI_API_KEY" in str(exc), (
+                f"chat() refused gemini before reaching the client: {exc}")
+    finally:
+        config.LLM_PROVIDER = original
+        llm._client = original_client
+
+    seed = (Path(__file__).resolve().parent.parent.parent / "scripts" / "gateway_seed.sh").read_text(encoding="utf-8")
+    assert "models.providers.gemini" in seed, "the gateway has no Gemini provider configured"
+    assert "generativelanguage.googleapis.com/v1beta/openai" in seed, seed[:0]
+    assert "agents.defaults.model.primary '\"gemini/gemini-2.5-flash\"'" in seed, (
+        "the agent's primary is not the provider this network can reach")
+    groq_primary = seed.count("agents.defaults.model.primary '\"groq/")
+    assert groq_primary <= 1, "Groq must be at most the no-Gemini fallback, never the default primary"
 
 
 if __name__ == "__main__":

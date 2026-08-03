@@ -71,6 +71,27 @@ EXPECTED_MENU_SCOPES = {"default", "all_group_chats"}
 # credential family as the Gmail token this boundary exists to keep out.
 FORBIDDEN_GATEWAY_KEYS = ("GMAIL", "GOOGLE", "GEMINI", "DATABASE_PATH")
 
+# ONE exception, added 2026-08-04, and narrowed to an exact name on purpose.
+#
+# The premise of the paragraph above -- "the agent runs on Groq, so any Google
+# credential is unnecessary" -- stopped being true: Groq now refuses this network
+# outright (403 to an unauthenticated request, see ADR-0009's amendment), and
+# Gemini is the only provider the agent can reach. So the key IS necessary, and
+# the honest move is to narrow the check rather than leave a rule that would fail
+# every deploy.
+#
+# What was checked instead of assumed, because "it's only an API key" is exactly
+# the kind of claim this repo has been wrong about: a bare Generative Language
+# key is not the OAuth client + refresh token the Gmail path needs, and
+# `gmail.googleapis.com/users/me/profile`, `.../users/me/messages` and
+# `drive/v3/files` each answered **401** for this key. The boundary the check
+# exists for -- the gateway cannot read Justin's mail -- still holds.
+#
+# EXACT names only, not a prefix: `GEMINI_API_KEY` is the credential the agent
+# needs and nothing else Gemini-shaped has a reason to be here. A prefix
+# exemption would silently readmit whatever Google names next.
+ALLOWED_GATEWAY_KEYS = ("GEMINI_API_KEY",)
+
 
 class Result:
     def __init__(self, name):
@@ -261,7 +282,8 @@ def check_isolation(gw: Gateway) -> Result:
     if code != 0:
         return result.skip("could not read the gateway's environment")
     leaked = sorted({line.split("=", 1)[0] for line in env.splitlines()
-                     for key in FORBIDDEN_GATEWAY_KEYS if line.upper().startswith(key)})
+                     for key in FORBIDDEN_GATEWAY_KEYS if line.upper().startswith(key)}
+                    - set(ALLOWED_GATEWAY_KEYS))
     problems = [f"forbidden env: {leaked}"] if leaked else []
 
     code, mounts, _ = gw.shell("cat /proc/mounts")
