@@ -338,7 +338,20 @@ def check_app_can_send(app_container: str) -> Result:
     him to ignore it.
     """
     result = Result("app can reach the gateway")
-    probe = ["docker", "exec", app_container, "openclaw", "health"]
+    # A **write-scoped** probe, and that detail is the whole check. Three
+    # weaker probes were tried live on 2026-08-03 and each passed while a real
+    # send failed:
+    #   `message send --dry-run` answers `handledBy: "core"` and never contacts
+    #     the gateway at all;
+    #   `openclaw health` connects but needs only `operator.read`, so it passed
+    #     against a device whose write scope was still pending approval;
+    #   the gateway's own /health says nothing about this client.
+    # Sending to target "0" asks for the write scope and is then rejected by
+    # Telegram, which is the point: the connect, the pairing and the scope are
+    # all exercised and no message is delivered. A preflight that messaged
+    # Justin every deploy would train him to ignore it.
+    probe = ["docker", "exec", app_container, "openclaw", "message", "send",
+             "--channel", "telegram", "--target", "0", "--message", "preflight", "--json"]
     try:
         proc = subprocess.run(probe, capture_output=True, text=True, timeout=90)
     except FileNotFoundError:
@@ -346,19 +359,28 @@ def check_app_can_send(app_container: str) -> Result:
     except subprocess.TimeoutExpired:
         return result.fail("`openclaw health` did not return within 90s from the app container")
     blob = (proc.stdout + chr(10) + proc.stderr).strip()
+    lowered = blob.lower()
+    # Reaching the channel and being refused BY the channel is a pass: the
+    # transport, the pairing and the write scope all worked, and target 0 is
+    # not a chat. Checked before the return code, because this is a failure
+    # exit for a successful probe.
+    if "chat not found" in lowered or "chat_id is empty" in lowered or "invalid" in lowered:
+        return result.ok("the gateway accepted a write-scoped send and Telegram refused the dummy target")
     if proc.returncode != 0:
-        # The three shapes seen live on 2026-08-03, named so the next person
-        # does not have to re-derive any of them from an exit code.
-        lowered = blob.lower()
-        if "not found" in lowered:
+        # The shapes seen live on 2026-08-03, named so the next person does not
+        # have to re-derive any of them from an exit code.
+        if "not found at" in lowered or "command not found" in lowered:
             return result.fail(f"the app has no gateway CLI: {blob[:180]}")
+        if "more scopes than currently approved" in lowered or "scope upgrade" in lowered:
+            return result.fail("the app's device is paired but not approved for sending — "
+                               f"`openclaw devices approve <id>` on the gateway: {blob[:140]}")
         if "pairing" in lowered:
             return result.fail("the app's device is not paired — "
-                               f"run `openclaw devices approve <id>` on the gateway: {blob[:140]}")
+                               f"`openclaw devices approve <id>` on the gateway: {blob[:140]}")
         if "non-loopback" in lowered:
             return result.fail(f"OPENCLAW_GATEWAY_URL must be a literal address, not a DNS name: {blob[:140]}")
-        return result.fail(f"`openclaw health` exited {proc.returncode}: {blob[:180]}")
-    return result.ok("openclaw health answered from the app container")
+        return result.fail(f"the write-scoped probe exited {proc.returncode}: {blob[:180]}")
+    return result.ok("write-scoped send accepted by the gateway")
 
 
 def check_media_roots(cfg: dict) -> Result:
