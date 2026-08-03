@@ -5738,10 +5738,12 @@ def test_the_fast_send_path_batches_one_call_keeps_order_and_still_logs_every_ca
         payload = calls[0]["cards"]
         assert [c.get("message") for c in payload] == [
             "3 to action, 1 blocked", "Claim #7 — mark sent", "Claim #8 — assign pet"], payload
-        # The rendered card travels as base64 in `buffer`, so this path needs
-        # neither the shared outbox volume nor a path the gateway would accept.
-        assert payload[0]["media_base64"], payload[0]
-        assert "media_base64" not in payload[1], payload[1]
+        # The rendered card travels as a PATH through the shared outbox. Base64
+        # in `buffer` is accepted by the schema and fails at runtime: the gateway
+        # materialises it under a read-only mount (`ENOENT: mkdir .../media/
+        # outbound`), which only a live send revealed.
+        assert payload[0]["media_url"].startswith(config.MEDIA_OUTBOX_GATEWAY_DIR), payload[0]
+        assert "media_url" not in payload[1], payload[1]
         # Buttons go through the one validated builder, nested inside `blocks` —
         # the shape the platform's own normalizer accepts. Top-level `buttons`
         # is discarded silently with `ok: true`.

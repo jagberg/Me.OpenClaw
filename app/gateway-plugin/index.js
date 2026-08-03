@@ -362,10 +362,13 @@ function registerInboundAck(api) {
  * each dispatch costs what the gateway costs, so ordering is finally free, and
  * `/actions` can put its summary card first again without paying a second round.
  *
- * Media arrives as base64 in `buffer`, which `SendParamsSchema` documents as
- * "base64 attachment payload for gateway-local media materialization" — so this
- * path needs neither the shared outbox volume nor a path the gateway will
- * accept. The outbox stays for the CLI fallback.
+ * Media travels as a PATH through the shared outbox, exactly as it does on the
+ * CLI path. `SendParamsSchema.buffer` takes base64 and was the first thing
+ * tried, because it would have removed the volume entirely — but the gateway
+ * materialises that buffer under `<stateDir>/media/outbound`, which compose
+ * mounts read-only by design (14.2), so every image failed with `ENOENT: mkdir
+ * '/home/node/.openclaw/media/outbound'`. Publishing to the outbox costs 9ms
+ * and keeps the narrow mount.
  */
 async function readJsonBody(req, maxBytes) {
   const chunks = [];
@@ -399,17 +402,18 @@ async function dispatchCard(card, channel, logger) {
   const idempotencyKey = randomUUID();
   const params = { to: `${channel}:${target}`, idempotencyKey };
   if (card.message) params.message = String(card.message);
-  if (card.media_base64) {
-    params.buffer = String(card.media_base64);
-    params.filename = String(card.filename ?? "card.png");
-    params.contentType = String(card.content_type ?? "image/png");
-  }
+  // A path inside the gateway's own media roots, published by the app to the
+  // shared outbox. NOT base64: `SendParamsSchema.buffer` exists and was tried
+  // first, but the gateway materialises it under `<stateDir>/media/outbound`,
+  // which compose mounts read-only on purpose -- every image failed with
+  // `ENOENT: mkdir '/home/node/.openclaw/media/outbound'`.
+  if (card.media_url) params.mediaUrl = String(card.media_url);
   // The app builds this with `gateway_client.build_buttons`, which is validated
   // against the platform's own normalizer. A malformed presentation is
   // discarded SILENTLY and the send still reports success, so it is never
   // hand-written on either side of this boundary.
   if (card.presentation) params.presentation = card.presentation;
-  if (!params.message && !params.buffer) return "card has neither text nor media";
+  if (!params.message && !params.mediaUrl) return "card has neither text nor media";
 
   try {
     const response = await dispatchGatewayMethod("message.action", {

@@ -177,18 +177,25 @@ def send_cards(target: str, cards: list[dict], correlation: str | None = None,
     naming the first reason, because a partial send must never read as a whole
     one.
     """
-    import base64
     import json as _json
     import urllib.error
     import urllib.request
+
+    from . import media_outbox
 
     payload = {"channel": config.OPENCLAW_CHANNEL, "cards": []}
     for card in cards:
         entry: dict = {"target": str(target)}
         if card.get("png") is not None:
-            entry["media_base64"] = base64.b64encode(card["png"]).decode("ascii")
-            entry["filename"] = "card.png"
-            entry["content_type"] = "image/png"
+            # A path through the shared outbox, NOT base64. `SendParamsSchema`
+            # does take a base64 `buffer`, and it was the first thing tried —
+            # the gateway materialises it under `<stateDir>/media/outbound`,
+            # which compose mounts READ-ONLY (14.2, deliberately), so every
+            # image failed with `ENOENT: mkdir '/home/node/.openclaw/media/
+            # outbound'`. Publishing to the outbox keeps the narrow mount and
+            # costs 9ms.
+            with trace.step("outbox.publish", correlation, bytes=len(card["png"])):
+                entry["media_url"] = media_outbox.publish(card["png"], ".png", "card")
             if card.get("caption"):
                 entry["message"] = card["caption"]
         else:
