@@ -30,6 +30,15 @@ import urllib.request
 # room to spare: a turn that only just fits fails the moment an answer is long.
 # Measured with the real claims inventory the turn is 4,934 (task 2.5), so this
 # is roughly a 40% margin rather than a squeeze.
+#
+# The 12k TPM that justified this number is GROQ's, and since 2026-08-04 the
+# agent runs on Gemini, whose context is 1,048,576 tokens — the gateway reports
+# `route: "fits"` with a 1,028,576-token prompt budget. So this is no longer a
+# proxy for "the request will be rejected"; it is a cap on the surface the
+# deployment chooses to ship on every turn, which is worth keeping for cost and
+# for catching a regression. Kept at 7000 deliberately: the measured turn is
+# 4,540 on Gemini, and moving the ceiling to match a roomier provider would
+# discard the regression signal this exists for.
 TURN_TOKEN_CEILING = 7000
 
 # Itemised shares, asserted separately. A component regressing while the total
@@ -198,11 +207,28 @@ def check_turn_size(gw: Gateway, session_key: str) -> list[Result]:
 
     meta = (payload.get("result") or {}).get("meta") or {}
     report = meta.get("systemPromptReport") or {}
-    tokens = (meta.get("agentMeta") or {}).get("promptTokens")
-    served.ok(f"{(meta.get('agentMeta') or {}).get('model', '?')} answered")
+    agent_meta = meta.get("agentMeta") or {}
+    tokens = agent_meta.get("promptTokens")
+    served.ok(f"{agent_meta.get('model', '?')} answered")
 
+    # `promptTokens` is the provider's own count and is not always there. Groq
+    # reported it; Gemini's OpenAI-compatible surface does not — `completion`
+    # carries only a stop reason, and the 2026-08-04 provider switch turned this
+    # check from PASS into the deploy's single FAIL for that reason alone.
+    #
+    # So fall back to the gateway's own `estimatedPromptTokens`, and SAY it is an
+    # estimate in the detail rather than passing silently on a different quantity.
+    # It is a pre-prompt estimate (`source: "pre-prompt-estimate"`), so it cannot
+    # see the answer's own tokens — which is acceptable here because what this
+    # asserts is the SURFACE the deployment chooses, not the reply's length.
+    estimated = False
     if not isinstance(tokens, int):
-        return [served, sized.fail("the turn reported no promptTokens; cannot assert the ceiling")]
+        tokens = (agent_meta.get("contextBudgetStatus") or {}).get("estimatedPromptTokens")
+        estimated = isinstance(tokens, int)
+    if not isinstance(tokens, int):
+        return [served, sized.fail(
+            "the turn reported neither promptTokens nor estimatedPromptTokens; "
+            "cannot assert the ceiling")]
 
     failures = []
     if tokens > TURN_TOKEN_CEILING:
@@ -218,7 +244,8 @@ def check_turn_size(gw: Gateway, session_key: str) -> list[Result]:
         if measured[key] > ceiling:
             failures.append(f"{key} is {measured[key]}, ceiling {ceiling}")
 
-    detail = f"{tokens} tokens; " + ", ".join(f"{k}={v}" for k, v in measured.items())
+    detail = (f"{tokens} tokens{' (gateway estimate; the provider reported none)' if estimated else ''}; "
+              + ", ".join(f"{k}={v}" for k, v in measured.items()))
     return [served, sized.fail("; ".join(failures)) if failures else sized.ok(detail)]
 
 
