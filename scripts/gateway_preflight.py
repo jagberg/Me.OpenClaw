@@ -322,36 +322,44 @@ def check_app_can_send(app_container: str) -> Result:
     """The check whose absence cost a rollback on 2026-08-03.
 
     This script asserted eleven things about the deploy and never once asked
-    whether the app could actually **send a message**. `gateway_client` shells
+    whether the app could actually reach the gateway. `gateway_client` shells
     out to `openclaw`; every flag in it had been verified against `--help` on
     the *host*; nobody had run it from inside the app container, where there
     was no such binary. The first real tap after the cutover answered
     `gateway CLI not found at 'openclaw'`, and all outbound was broken.
 
-    A `--dry-run` send is the cheapest thing that would have caught it: it
-    exercises binary resolution, gateway URL, token and argv, and delivers
-    nothing. Deliberately NOT a real send — a preflight that messages Justin on
-    every deploy trains him to ignore it.
+    **`openclaw health`, not `message send --dry-run`.** The dry run was the
+    obvious probe and it is worthless here: it answers `handledBy: "core"`
+    without contacting the gateway at all, so it passes with a wrong URL, a
+    wrong token, or an unpaired device — every one of the three failures this
+    deploy actually hit. `health` opens the real connection.
+
+    Not a real send: a preflight that messages Justin on every deploy trains
+    him to ignore it.
     """
     result = Result("app can reach the gateway")
-    probe = ["docker", "exec", app_container, "openclaw", "message", "send",
-             "--channel", "telegram", "--target", "0", "--message", "preflight",
-             "--dry-run", "--json"]
+    probe = ["docker", "exec", app_container, "openclaw", "health"]
     try:
-        proc = subprocess.run(probe, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(probe, capture_output=True, text=True, timeout=90)
     except FileNotFoundError:
         return result.skip("docker not on PATH")
     except subprocess.TimeoutExpired:
-        return result.fail("the dry-run send did not return within 60s")
+        return result.fail("`openclaw health` did not return within 90s from the app container")
     blob = f"{proc.stdout}
 {proc.stderr}".strip()
     if proc.returncode != 0:
-        # The exact shape of the 2026-08-03 failure, called out by name so the
-        # next person does not have to re-derive it from an exit code.
-        if "not found" in blob.lower():
-            return result.fail(f"the app cannot run the gateway CLI: {blob[:200]}")
-        return result.fail(f"dry-run send exited {proc.returncode}: {blob[:200]}")
-    return result.ok("dry-run send accepted")
+        # The three shapes seen live on 2026-08-03, named so the next person
+        # does not have to re-derive any of them from an exit code.
+        lowered = blob.lower()
+        if "not found" in lowered:
+            return result.fail(f"the app has no gateway CLI: {blob[:180]}")
+        if "pairing" in lowered:
+            return result.fail("the app's device is not paired — "
+                               f"run `openclaw devices approve <id>` on the gateway: {blob[:140]}")
+        if "non-loopback" in lowered:
+            return result.fail(f"OPENCLAW_GATEWAY_URL must be a literal address, not a DNS name: {blob[:140]}")
+        return result.fail(f"`openclaw health` exited {proc.returncode}: {blob[:180]}")
+    return result.ok("openclaw health answered from the app container")
 
 
 def check_media_roots(cfg: dict) -> Result:
