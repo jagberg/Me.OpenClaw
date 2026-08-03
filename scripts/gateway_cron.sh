@@ -63,6 +63,13 @@ if [ -z "$CLAIMS_APP_URL" ] || [ -z "$CLAIMS_INTERNAL_SECRET" ]; then
   exit 1
 fi
 
+# `--agent main` is not about the payload -- a command job never reaches an agent.
+# Without it every `cron add` writes "No --agent specified; the job will run with
+# the configured default agent" to stderr, PowerShell renders each one as a
+# NativeCommandError block, and five of those in the deploy output is exactly the
+# noise that hides a real failure. Naming the agent the gateway would have picked
+# anyway silences it without changing behaviour.
+#
 # `-f` so an HTTP error is a non-zero exit and lands in the run log; `-sS` so the
 # log holds the error text and not a progress meter. Without `-f`, curl exits 0
 # on a 500 and every failed tick would read as a successful run -- the silent
@@ -72,14 +79,14 @@ post() {
 }
 
 add_every() {
-  oc cron add --name "$1" --declaration-key "$2" --display-name "$3" \
+  oc cron add --agent main --name "$1" --declaration-key "$2" --display-name "$3" \
     --every "$4" --command "$(post "$5")" \
     --no-deliver --timeout-seconds 600 >/dev/null
   echo "  declared $1 (every $4)"
 }
 
 add_cron() {
-  oc cron add --name "$1" --declaration-key "$2" --display-name "$3" \
+  oc cron add --agent main --name "$1" --declaration-key "$2" --display-name "$3" \
     --cron "$4" --tz UTC --command "$(post "$5")" \
     --no-deliver --timeout-seconds 600 >/dev/null
   echo "  declared $1 (cron $4 UTC)"
