@@ -83,6 +83,18 @@ API is unestablished.
 
   The lesson worth keeping: **a flag that names a behaviour is not the same as a flag that gates it**, and the test that existed only checked the outbound seam. There is now one asserting the poller is never built with the flag off, and that a disabled updater reads as *disabled* (`polling_alive() is None`) rather than *dead*, which is what keeps the watchdog from SIGTERMing the process on a loop.
 
+  **Attempt two also failed, on something bigger, and attempt three is the one that stuck.** The first `/actions` after cutting over answered `⚠️ 6 card(s) did not send: gateway CLI not found at 'openclaw'`. `gateway_client` shells out to `openclaw`; every flag in it had been verified against `--help` **on the host**; nobody had run it from inside the app container, which had no such binary. Rolled back again.
+
+  Fixed by Justin's call (2026-08-03): *"I prefer standard uses of frameworks and tools unless it really makes sense to deviate"*, and size is not a constraint. So the CLI is baked into the app image by multi-stage copy from the gateway's own tag — the client the product documents for this, at a version that cannot drift from the server. Three further things had to be true, none of them guessable from the docs alone:
+
+  - **`ws://` to a DNS name is refused.** The CLI cannot tell that `gateway` resolves to a private address and fails closed: *"SECURITY ERROR: … uses plaintext ws:// to a non-loopback address"*. The literal `172.28.0.20` passes, which is safe because the subnet was already pinned.
+  - **Shared-secret auth alone is enough only for a loopback client.** This one connects from the compose subnet, so the gateway required a paired device. One-time `openclaw devices approve`, and the token lives in a volume — without it every rebuild would silently need re-pairing.
+  - **Pairing is scoped, and `read` is not `write`.** `openclaw health` connected on `operator.read` while `notify.send_text` still returned False with *"device is asking for more scopes than currently approved"*. A second approval granted the write scope.
+
+  **The preflight check took three attempts too, and that is the lesson worth keeping.** `message send --dry-run` never contacts the gateway (`handledBy: "core"`). `openclaw health` connects but needs only read scope, so it passed against the exact broken state above. Only a **write-scoped** send probe — to target `0`, refused by Telegram, delivered to nobody — exercises transport, pairing and scope together. Two of the three would have shipped a green check over a broken deploy.
+
+  Proven end to end afterwards: `notify.send_text` from inside the app container delivered a real message to Justin's chat.
+
   Live afterwards: `PASS exactly one Telegram poller — the gateway`, app log `Telegram updater disabled — the gateway owns the channel`, `/health` `polling_alive: null`, gateway `enabled, configured, running, connected, mode:polling, token:env`, twelve commands registered with no collisions. The preflight's only remaining FAIL is Groq's daily budget again — a quota result, not a cutover one.
 - [ ] 4.11 Verify live against the real chat: one claim taken from notification through condition tap, pet assign, mark sent, and confirm resolved. Record which claim id was used.
 - [ ] 4.12 Verify a mid-handler crash leaves the row unprocessed and the replay queue re-runs it at startup.
