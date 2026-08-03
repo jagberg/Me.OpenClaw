@@ -280,7 +280,16 @@ function registerPendingFlowClaim(api) {
 function registerInboundAck(api) {
   if (typeof api.registerHook !== "function") return;
   api.registerHook(
-    "message_received",
+    // NOT message_received. It registers and reports ready, and never fires
+    // for Telegram inbound -- proven 2026-08-03 by logging unconditionally at
+    // the top of the handler and seeing nothing across several real messages.
+    // `hooks list` saying "ready" means registered, not called; the same trap
+    // as `plugins list`, which this repo already documents.
+    //
+    // inbound_claim runs before commands AND agent dispatch, so it is the one
+    // place a command's message id is visible. This handler observes only and
+    // returns {} -- claiming here would swallow every message in the chat.
+    "inbound_claim",
     async (event) => {
       const context = event?.context ?? {};
       const messageId = context.messageId ?? context.message?.id ?? null;
@@ -291,10 +300,10 @@ function registerInboundAck(api) {
       // cost a whole deploy cycle to notice. One line, and the two cases are
       // distinguishable forever.
       api.logger?.info?.(
-        `claims: message_received keys=[${Object.keys(context).join(",")}] messageId=${String(messageId)}`,
+        `claims: inbound_claim keys=[${Object.keys(context).join(",")}] messageId=${String(messageId)}`,
       );
       if (!messageId) {
-        api.logger?.warn?.("claims: message_received carried no messageId -- no ack sent");
+        api.logger?.warn?.("claims: inbound_claim carried no messageId -- no ack sent");
         return {};
       }
       try {

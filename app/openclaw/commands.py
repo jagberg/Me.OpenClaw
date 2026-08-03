@@ -344,11 +344,26 @@ def _action_buttons(action: dict) -> list[dict]:
 
 
 def actions_cards() -> list[dict]:
-    """The /actions run, as an ordered list of cards to send.
+    """The /actions run, as cards that can all be sent at once.
 
     Same derivation as the chat agent's `pending_actions`, deliberately: chat
     and cards answering differently is the failure this shares a source to
-    avoid. Truncation is announced, never silent.
+    avoid.
+
+    **No separate summary message, and no ordered first send.** Each send spawns
+    the gateway CLI and costs ~6s — measured live 2026-08-03, and ~2.5s of that
+    is connection setup that cannot be amortised because the CLI is one process
+    per message. The old shape was a rendered summary card, then N tap cards,
+    then two possible notes: four-plus messages and two ordered rounds, which
+    Justin measured at ~6s to the summary and ~6s again for the rest.
+
+    So the counts, the truncation notice and the blocked total ride on the FIRST
+    tap card, and every card goes out concurrently. Latency becomes one send's
+    worth rather than two rounds'.
+
+    What is deliberately NOT lost: the held-back count. A cap nobody is told
+    about is a silent truncation, and that rule outranks the message budget —
+    it just travels as a line of text now instead of its own message.
     """
     actions = claim_status.pending_actions()
     if not actions:
@@ -356,22 +371,22 @@ def actions_cards() -> list[dict]:
 
     tappable = [a for a in actions if a["actionable"]]
     shown = tappable[:ACTION_CARD_CAP]
-    cards: list[dict] = [{
-        "png": claim_card.render_actions_summary(actions, shown=len(shown)),
-        "caption": f"{len(tappable)} to action, {len(actions) - len(tappable)} blocked",
-        "buttons": [],
-    }]
-    cards += [{"text": _action_card_text(a), "buttons": _action_buttons(a)} for a in shown]
-    if len(tappable) > len(shown):
-        cards.append({"text": f"+{len(tappable) - len(shown)} more — run /actions again once these "
-                              "are cleared.", "buttons": []})
     blocked = [a for a in actions if not a["actionable"]]
+
+    notes = [f"{len(tappable)} to action, {len(blocked)} blocked"]
+    if len(tappable) > len(shown):
+        notes.append(f"+{len(tappable) - len(shown)} more — run /actions again once these are cleared.")
     if blocked:
         total = sum(abs(a["amount"]) for a in blocked)
-        cards.append({"text": f"🚫 {len(blocked)} claims blocked · ${total:,.2f}\n"
-                              f"{blocked[0]['flag'] or 'blocked'}\n"
-                              "No button can fix this — it needs the insurer's claim process on file.",
-                      "buttons": []})
+        notes.append(f"🚫 {len(blocked)} claims blocked · ${total:,.2f} — {blocked[0]['flag'] or 'blocked'}. "
+                     "No button can fix this; it needs the insurer's claim process on file.")
+
+    cards = [{"text": _action_card_text(a), "buttons": _action_buttons(a)} for a in shown]
+    if not cards:
+        # Everything is blocked. The notes ARE the answer, and there is nothing
+        # to tap — but it still has to be said.
+        return [{"text": chr(10).join(notes), "buttons": []}]
+    cards[0]["text"] = chr(10).join(notes) + chr(10) * 2 + cards[0]["text"]
     return cards
 
 

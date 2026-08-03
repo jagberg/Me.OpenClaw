@@ -288,19 +288,19 @@ async def command(
     if target is None:
         failed.append("no registered chat")
     elif cards:
-        # **The summary alone is ordered.** Every send spawns the gateway CLI,
-        # and each spawn re-does the WebSocket handshake, device auth and scope
-        # negotiation -- measured at ~2.5s from inside this container on
-        # 2026-08-03, which is why /actions arrived a card at a time with
-        # visible gaps. The first card is the summary and has to land first;
-        # the tap cards after it carry no order between them, so they go
-        # together and the whole run costs one handshake's wall time instead of
-        # one per card.
-        head, rest = cards[0], cards[1:]
-        outcomes = [deliver(head)]
-        if rest:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(rest))) as pool:
-                outcomes.extend(pool.map(deliver, rest))
+        # **All at once.** Each send spawns the gateway CLI at ~6s, of which
+        # ~2.5s is connection setup that cannot be amortised across processes.
+        # There used to be a separate summary card that had to land first, so a
+        # run cost two ordered rounds -- measured live at ~6s, then ~6s again.
+        # `commands.actions_cards` folds the counts onto the first tap card
+        # instead, so nothing here is order-dependent and the whole run costs
+        # one send's wall time.
+        #
+        # Concurrency measured sub-linear (5 sends: ~32s serial, ~15s wall), so
+        # the pool is capped rather than unbounded -- the gateway serialises
+        # some of it and more threads buy less each.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(cards))) as pool:
+            outcomes = list(pool.map(deliver, cards))
         failed.extend(o for o in outcomes if o is not None)
         sent = sum(1 for o in outcomes if o is None)
 

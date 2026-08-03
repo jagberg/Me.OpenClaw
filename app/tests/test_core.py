@@ -5174,43 +5174,64 @@ def test_a_confirm_with_a_junk_id_changes_nothing_and_says_so():
     assert _claim_count_snapshot() == before
 
 
-def test_the_summary_card_lands_before_the_rest_and_the_rest_go_together():
-    """Every send spawns the gateway CLI, and each spawn redoes the WebSocket
-    handshake, device auth and scope negotiation — measured at ~2.5s from
-    inside the app container on 2026-08-03. Serially, `/actions` arrived a card
-    at a time with visible gaps (Justin, live).
+def test_the_actions_run_is_one_concurrent_burst_and_still_announces_truncation():
+    """Latency and honesty at once, because the cheap fix threatened the rule.
 
-    The summary has to be first; the tap cards after it carry no order between
-    them. So: one ordered send, then the rest concurrently."""
+    Each send spawns the gateway CLI at ~6s (measured live 2026-08-03), so the
+    old shape — a rendered summary card, then N tap cards, then up to two notes
+    — cost two ordered rounds: ~6s to the summary, ~6s again for the rest.
+    Folding the counts onto the first tap card removes the ordering, and then
+    everything can go at once.
+
+    The risk in that trade is the held-back count. A cap nobody is told about is
+    a silent truncation, and no latency saving buys that — so it is asserted
+    here rather than left to the rewrite's good intentions.
+    """
     import concurrent.futures
     import threading
     import time as _time
 
+    from openclaw import claim_card, claim_status, commands
+
+    over = commands.ACTION_CARD_CAP + 2
+    fake = [{"kind": "mark_sent", "claim_id": i, "pet_id": 1, "actionable": True,
+             "title": "mark sent", "merchant": "THE SHIRE VET", "amount": -120.0,
+             "date": "2026-05-01", "age_days": 30, "pet_name": "Aari",
+             "condition_text": "itchy ear", "blocks": "the claim", "flag": None,
+             "claim_ids": [i], "members": None, "group_id": f"S{i}"}
+            for i in range(1, over + 1)]
+
+    real = claim_status.pending_actions
+    claim_status.pending_actions = lambda: fake
+    try:
+        cards = commands.actions_cards()
+    finally:
+        claim_status.pending_actions = real
+
+    # One message per shown action, and no separate summary or note messages.
+    assert len(cards) == commands.ACTION_CARD_CAP, len(cards)
+    assert not any(c.get("png") for c in cards), "a rendered summary card is still being sent"
+    # The truncation is still stated, and it rides on the first card.
+    assert f"+{over - commands.ACTION_CARD_CAP} more" in cards[0]["text"], cards[0]["text"]
+    assert "to action" in cards[0]["text"], cards[0]["text"]
+    # Every card is tappable, including the one carrying the notes.
+    assert all(c["buttons"] for c in cards), [c["buttons"] for c in cards]
+
+    # And nothing about the run is order-dependent, so it can go at once.
     order, lock = [], threading.Lock()
 
     def deliver(card):
         with lock:
-            order.append(("start", card["id"]))
-        _time.sleep(0.15)  # stand-in for the handshake
-        with lock:
-            order.append(("done", card["id"]))
+            order.append(card["text"][:12])
+        _time.sleep(0.12)
         return None
 
-    cards = [{"id": i} for i in range(5)]
-    head, rest = cards[0], cards[1:]
     began = _time.time()
-    outcomes = [deliver(head)]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(rest))) as pool:
-        outcomes.extend(pool.map(deliver, rest))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(cards))) as pool:
+        outcomes = list(pool.map(deliver, cards))
     elapsed = _time.time() - began
-
     assert all(o is None for o in outcomes), outcomes
-    # The summary is fully delivered before anything else starts.
-    first_done = order.index(("done", 0))
-    other_starts = [i for i, (phase, cid) in enumerate(order) if phase == "start" and cid != 0]
-    assert all(i > first_done for i in other_starts), order
-    # And the rest overlap rather than queueing: serial would be 5 x 0.15s.
-    assert elapsed < 0.15 * 3, f"the tap cards did not overlap: {elapsed:.2f}s"
+    assert elapsed < 0.12 * len(cards) / 2, f"the cards did not overlap: {elapsed:.2f}s"
 
 
 def test_a_tap_result_reaches_justin_even_when_the_edit_fails():
@@ -5601,39 +5622,6 @@ def test_every_card_button_names_a_command_the_plugin_registered():
     else:
         raise AssertionError("an unregistered command was allowed onto a card")
     assert claim_status.pending_actions() is not None
-
-
-def test_actions_never_truncates_silently():
-    """The cap is fine; a cap nobody is told about is not. `/actions` holds back
-    everything past ACTION_CARD_CAP, and the held-back count has to be said.
-
-    Driven off a synthetic action list rather than seeded claims: what is under
-    test is the announcement, and a fixture that happened to produce nine
-    actionable claims would assert nothing while looking thorough."""
-    from openclaw import claim_card, claim_status, commands
-
-    fake = [{"kind": "mark_sent", "claim_id": i, "pet_id": 1, "actionable": True,
-             "title": "mark sent", "merchant": "THE SHIRE VET", "amount": -120.0,
-             "date": "2026-05-01", "age_days": 30, "pet_name": "Aari",
-             "condition_text": "itchy ear", "blocks": "the claim", "flag": None,
-             "claim_ids": [i], "members": None, "group_id": f"S{i}"}
-            for i in range(1, commands.ACTION_CARD_CAP + 4)]
-
-    real_actions, real_summary = claim_status.pending_actions, claim_card.render_actions_summary
-    claim_status.pending_actions = lambda: fake
-    claim_card.render_actions_summary = lambda actions, shown: b"png"
-    try:
-        cards = commands.actions_cards()
-    finally:
-        claim_status.pending_actions, claim_card.render_actions_summary = real_actions, real_summary
-
-    texts = [c.get("text", "") or c.get("caption", "") for c in cards]
-    assert any("more — run /actions again" in t for t in texts), texts
-    assert f"+{len(fake) - commands.ACTION_CARD_CAP} more" in " ".join(texts), texts
-    # The summary card is always first and always says the split.
-    assert cards[0].get("png") is not None and "to action" in cards[0]["caption"], cards[0]
-    # One card per shown action, and no more.
-    assert sum(1 for c in cards if c.get("buttons")) == commands.ACTION_CARD_CAP, len(cards)
 
 
 def test_the_plugin_registers_exactly_the_commands_a_button_may_emit():
