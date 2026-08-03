@@ -39,6 +39,8 @@
  */
 
 import { definePluginEntry } from "/app/dist/plugin-sdk/plugin-entry.js";
+import { dispatchGatewayMethod } from "/app/dist/plugin-sdk/gateway-method-runtime.js";
+import { randomUUID } from "node:crypto";
 
 const APP = process.env.CLAIMS_APP_URL ?? "http://app:8000";
 const SECRET = process.env.CLAIMS_INTERNAL_SECRET ?? "";
@@ -327,6 +329,155 @@ function registerInboundAck(api) {
   );
 }
 
+/**
+ * The fast outbound path: send from INSIDE the gateway (task 4.14).
+ *
+ * WHY. `openclaw message send` costs 9-13s per message. Measured 2026-08-03
+ * from the app container: `--version` 0.06s, `--dry-run` **6.6s with no gateway
+ * contact whatsoever** (the gateway logged zero RPCs for three of them),
+ * `health` 2.4s, and the gateway's own `message.action` 0.3-1.1s landing in the
+ * final second. So the dominant cost is the CLI initialising itself, once per
+ * message, and one process per message means it never amortises. Five
+ * concurrent sends took ~20s each rather than ~10s, because that init is
+ * CPU-bound and they fight for cores.
+ *
+ * `dispatchGatewayMethod` runs the same `message.action` the CLI ends up
+ * calling, in this process, with no spawn, no WebSocket and no handshake.
+ *
+ * THE TWO THINGS THAT MAKE IT WORK, both read out of the gateway's own shipped
+ * code rather than assumed:
+ *
+ *   1. `contracts.gatewayMethodDispatch: ["authenticated-request"]` in
+ *      `openclaw.plugin.json`. Without it `dispatchGatewayMethod` throws by
+ *      design — `registry` sets `gatewayMethodDispatchAllowed` from the
+ *      manifest contract alone.
+ *   2. `auth: "gateway"` plus `gatewayRuntimeScopeSurface: "trusted-operator"`.
+ *      A `plugin`-auth route is handed an EMPTY scope list
+ *      (`createPluginRouteRuntimeClient`), so a write would be refused;
+ *      `trusted-operator` with shared-secret bearer auth resolves to the CLI's
+ *      own default operator scopes. `/app/dist/extensions/admin-http-rpc` is
+ *      the product's reference implementation of this exact shape.
+ *
+ * Cards are sent SEQUENTIALLY and that is a feature, not laziness: in-process
+ * each dispatch costs what the gateway costs, so ordering is finally free, and
+ * `/actions` can put its summary card first again without paying a second round.
+ *
+ * Media arrives as base64 in `buffer`, which `SendParamsSchema` documents as
+ * "base64 attachment payload for gateway-local media materialization" — so this
+ * path needs neither the shared outbox volume nor a path the gateway will
+ * accept. The outbox stays for the CLI fallback.
+ */
+async function readJsonBody(req, maxBytes) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.byteLength;
+    if (total > maxBytes) return { ok: false, status: 413, message: "payload too large" };
+    chunks.push(buffer);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8");
+  if (!raw.trim()) return { ok: false, status: 400, message: "request body must be JSON" };
+  try {
+    return { ok: true, value: JSON.parse(raw) };
+  } catch {
+    return { ok: false, status: 400, message: "request body must be valid JSON" };
+  }
+}
+
+function sendJson(res, status, body) {
+  res.statusCode = status;
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(body));
+}
+
+/** One card -> one `message.action` dispatch. Returns null on success, else why. */
+async function dispatchCard(card, channel, logger) {
+  const target = String(card.target ?? "").trim();
+  if (!target) return "card has no target";
+  const idempotencyKey = randomUUID();
+  const params = { to: `${channel}:${target}`, idempotencyKey };
+  if (card.message) params.message = String(card.message);
+  if (card.media_base64) {
+    params.buffer = String(card.media_base64);
+    params.filename = String(card.filename ?? "card.png");
+    params.contentType = String(card.content_type ?? "image/png");
+  }
+  // The app builds this with `gateway_client.build_buttons`, which is validated
+  // against the platform's own normalizer. A malformed presentation is
+  // discarded SILENTLY and the send still reports success, so it is never
+  // hand-written on either side of this boundary.
+  if (card.presentation) params.presentation = card.presentation;
+  if (!params.message && !params.buffer) return "card has neither text nor media";
+
+  try {
+    const response = await dispatchGatewayMethod("message.action", {
+      channel,
+      action: "send",
+      params,
+      idempotencyKey,
+    });
+    if (response?.ok) return null;
+    const error = response?.error;
+    return `${error?.code ?? "UNKNOWN"}: ${error?.message ?? "message.action failed"}`;
+  } catch (err) {
+    logger?.error?.(`claims: in-process send threw: ${String(err)}`);
+    return String(err);
+  }
+}
+
+function registerSendRoute(api) {
+  if (typeof api.registerHttpRoute !== "function") {
+    // Loud, not fatal: the app falls back to the CLI, which is slow but correct.
+    api.logger?.error?.(
+      "claims: api.registerHttpRoute is unavailable -- outbound sends will keep paying the ~9s CLI cost",
+    );
+    return;
+  }
+  api.registerHttpRoute({
+    path: "/api/v1/claims/send",
+    auth: "gateway",
+    match: "exact",
+    gatewayRuntimeScopeSurface: "trusted-operator",
+    handler: async (req, res) => {
+      if ((req.method ?? "GET").toUpperCase() !== "POST") {
+        res.setHeader("Allow", "POST");
+        sendJson(res, 405, { ok: false, error: "method not allowed" });
+        return true;
+      }
+      // A rendered card is ~45KB of PNG, ~60KB base64; a review PDF is larger.
+      const body = await readJsonBody(req, 16 * 1024 * 1024);
+      if (!body.ok) {
+        sendJson(res, body.status, { ok: false, error: body.message });
+        return true;
+      }
+      const cards = Array.isArray(body.value?.cards) ? body.value.cards : [];
+      if (cards.length === 0) {
+        sendJson(res, 400, { ok: false, error: "cards must be a non-empty array" });
+        return true;
+      }
+      const channel = String(body.value?.channel ?? "telegram");
+      const failures = [];
+      let sent = 0;
+      for (const [index, card] of cards.entries()) {
+        const failure = await dispatchCard(card, channel, api.logger);
+        if (failure === null) sent += 1;
+        else failures.push({ card: index, reason: failure });
+      }
+      // Partial success is reported as such and never as ok. A card that did not
+      // arrive must not read like one that did.
+      sendJson(res, failures.length === 0 ? 200 : 502, {
+        ok: failures.length === 0,
+        sent,
+        failures,
+      });
+      return true;
+    },
+  });
+  api.logger?.info?.("claims: in-process send route registered on /api/v1/claims/send");
+}
+
 export default definePluginEntry({
   id: "claims",
   name: "OpenClaw Claims",
@@ -363,6 +514,7 @@ export default definePluginEntry({
     // gateway discards every registration made above (0.7).
     registerPendingFlowClaim(api);
     registerInboundAck(api);
+    registerSendRoute(api);
 
     void claimCommandMenu(api.logger);
     void reportRegistration(registered, api.logger);

@@ -5674,6 +5674,133 @@ def test_the_plugin_registers_exactly_the_commands_a_button_may_emit():
     assert len(seen) == len(BUTTON_COMMANDS), "an undeclared command reached the CLI"
 
 
+def test_the_fast_send_path_batches_one_call_keeps_order_and_still_logs_every_card():
+    """4.14. The CLI costs 9–13s a message and ~6.6s of that is its own
+    initialisation with no network contact, so N messages cost N × 9s however
+    they are scheduled. This path is one local HTTP call and N in-process
+    dispatches inside the gateway.
+
+    Three properties are asserted because each replaces something the CLI path
+    gave for free:
+
+    * ONE request for N cards — the whole point;
+    * order preserved, which the concurrent CLI burst could not offer and which
+      is what lets `/actions` put its summary card first again;
+    * every delivered card still lands in `telegram_messages`. The message log is
+      the audit trail and the RL dataset (ADR-0014); a faster path that logs less
+      is a worse path.
+
+    And a partial send must raise, never return quietly: `sent: 1, failures: 1`
+    reading as success is exactly the silent failure the hard rules forbid.
+    """
+    import json as _json
+
+    from openclaw import config, db, gateway_client, message_log
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        conn.execute("INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+                     "VALUES (?, ?, '2026-08-03T00:00:00Z')", (config.TELEGRAM_USERNAME, 77))
+
+    calls = []
+
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def poster(request, timeout=None):
+        calls.append(_json.loads(request.data))
+        return _Response(_json.dumps({"ok": True, "sent": len(calls[-1]["cards"]), "failures": []}).encode())
+
+    cards = [
+        {"png": b"\x89PNG-summary", "caption": "3 to action, 1 blocked", "buttons": []},
+        {"text": "Claim #7 — mark sent", "buttons": [{"label": "Sent", "command": "/mark 7 sent"}]},
+        {"text": "Claim #8 — assign pet", "buttons": [{"label": "Aari", "command": "/pet 8 1"}]},
+    ]
+    real_url, real_token = config.OPENCLAW_GATEWAY_HTTP_URL, config.OPENCLAW_GATEWAY_TOKEN
+    config.OPENCLAW_GATEWAY_HTTP_URL = "http://gateway:18789"
+    config.OPENCLAW_GATEWAY_TOKEN = "t"
+    try:
+        assert gateway_client.using_http_route() is True
+        gateway_client.send_cards("77", cards, correlation="tg-test-1", poster=poster)
+
+        # One request for three cards, in the order they were given.
+        assert len(calls) == 1, calls
+        payload = calls[0]["cards"]
+        assert [c.get("message") for c in payload] == [
+            "3 to action, 1 blocked", "Claim #7 — mark sent", "Claim #8 — assign pet"], payload
+        # The rendered card travels as base64 in `buffer`, so this path needs
+        # neither the shared outbox volume nor a path the gateway would accept.
+        assert payload[0]["media_base64"], payload[0]
+        assert "media_base64" not in payload[1], payload[1]
+        # Buttons go through the one validated builder, nested inside `blocks` —
+        # the shape the platform's own normalizer accepts. Top-level `buttons`
+        # is discarded silently with `ok: true`.
+        assert payload[1]["presentation"]["blocks"][0]["type"] == "buttons", payload[1]
+        assert "buttons" not in payload[0], "the summary card should carry no presentation"
+
+        # Every delivered card is in the message log, one row each, in order.
+        # Scoped to the last three: earlier tests share this database.
+        with db.get_connection() as conn:
+            logged = conn.execute(
+                "SELECT kind, summary FROM telegram_messages WHERE direction = 'out' "
+                "ORDER BY id DESC LIMIT 3").fetchall()
+        assert [r["kind"] for r in reversed(logged)] == ["file", "text", "text"], [dict(r) for r in logged]
+        assert [r["summary"] for r in reversed(logged)] == [
+            "3 to action, 1 blocked", "Claim #7 — mark sent", "Claim #8 — assign pet"], [dict(r) for r in logged]
+
+        # A partial send raises, naming the reason. Never a quiet success.
+        def failing(request, timeout=None):
+            return _Response(_json.dumps(
+                {"ok": False, "sent": 1, "failures": [{"card": 1, "reason": "chat not found"}]}).encode())
+
+        try:
+            gateway_client.send_cards("77", cards, poster=failing)
+        except gateway_client.GatewaySendError as exc:
+            assert "chat not found" in str(exc), str(exc)
+        else:
+            raise AssertionError("a partial send was reported as a whole one")
+    finally:
+        config.OPENCLAW_GATEWAY_HTTP_URL, config.OPENCLAW_GATEWAY_TOKEN = real_url, real_token
+
+    # Both halves or neither: a URL with no token would 401 every send and read
+    # as an outage rather than as a misconfiguration.
+    assert gateway_client.using_http_route() is False
+
+
+def test_the_plugin_declares_the_contract_its_in_process_send_depends_on():
+    """The load-bearing line is in a JSON manifest, and losing it fails at
+    RUNTIME with a thrown dispatch — no build error, no lint, nothing at deploy.
+
+    `registry.canDispatchGatewayMethodsFromHttpRoute` reads
+    `contracts.gatewayMethodDispatch` from the manifest **alone**; the route
+    cannot ask for the permission itself. So the manifest and the code that
+    depends on it are asserted together, here, where a rename is caught before it
+    reaches a container."""
+    import json as _json
+
+    plugin_dir = Path(__file__).resolve().parent.parent / "gateway-plugin"
+    manifest = _json.loads((plugin_dir / "openclaw.plugin.json").read_text(encoding="utf-8"))
+    assert manifest.get("contracts", {}).get("gatewayMethodDispatch") == ["authenticated-request"], manifest
+
+    plugin = (plugin_dir / "index.js").read_text(encoding="utf-8")
+    assert "dispatchGatewayMethod" in plugin, "the plugin no longer dispatches in-process"
+    assert '"/api/v1/claims/send"' in plugin, "the send route path changed — config must follow"
+    # `auth: "plugin"` routes are handed an EMPTY scope list, so a write would be
+    # refused; only the trusted-operator surface resolves the CLI's own scopes.
+    assert 'gatewayRuntimeScopeSurface: "trusted-operator"' in plugin, plugin[:0]
+    assert 'auth: "gateway"' in plugin, "a plugin-auth route cannot dispatch a write"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

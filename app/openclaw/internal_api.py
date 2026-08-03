@@ -294,6 +294,17 @@ async def command(
     cards = outcome["cards"]
     if target is None:
         failed.append("no registered chat")
+    elif cards and gateway_client.using_http_route():
+        # The fast path: ONE local HTTP call, N in-process dispatches, order
+        # preserved. See `gateway_client.send_cards` for why the CLI burst it
+        # replaces could not get below ~9s per message.
+        try:
+            with trace.step("command.route_send", correlation, cards=len(cards)):
+                gateway_client.send_cards(str(target), cards, correlation=correlation)
+            sent = len(cards)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("in-gateway send failed for /%s correlation=%s: %s", name, correlation, exc)
+            failed.append(str(exc))
     elif cards:
         # **All at once, including the rendered summary card.** Every send costs
         # 9-13s end to end, and the decomposition (see `trace`) is ~6.6s of local

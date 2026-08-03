@@ -116,6 +116,25 @@ OPENCLAW_CLI_TIMEOUT_SECONDS = _int_env("OPENCLAW_CLI_TIMEOUT_SECONDS", 30)
 # second channel is a design decision (the authorization check is Telegram
 # username-based and has no equivalent elsewhere), not an env change.
 OPENCLAW_CHANNEL = os.environ.get("OPENCLAW_CHANNEL", "telegram")
+# The fast outbound path: the plugin's own HTTP route inside the gateway, which
+# dispatches `message.action` in-process. Blank falls back to the CLI.
+#
+# Why it exists, measured 2026-08-03: `openclaw message send` costs 9-13s, of
+# which ~6.6s is the CLI initialising itself with no network contact at all
+# (`--dry-run` costs the same and the gateway logs no RPC), ~2.5s is connect +
+# auth, and under a second is the gateway's own work. One process per message
+# means none of that amortises. Over this route a send is one local HTTP call
+# plus the same sub-second gateway work.
+#
+# `OPENCLAW_GATEWAY_URL` is a `ws://` URL for the CLI; this is the same host and
+# port over HTTP, because the gateway serves both on one listener.
+OPENCLAW_GATEWAY_HTTP_URL = os.environ.get("OPENCLAW_GATEWAY_HTTP_URL", "")
+# Bearer token for that route. The gateway authenticates it as a shared secret
+# and hands the route the CLI's own default operator scopes, which is what makes
+# a write (`message.action`) permitted — verified against the shipped
+# `resolvePluginRouteRuntimeOperatorScopes`, not inferred.
+OPENCLAW_GATEWAY_TOKEN = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
+OPENCLAW_HTTP_TIMEOUT_SECONDS = _int_env("OPENCLAW_HTTP_TIMEOUT_SECONDS", 60)
 # The gateway's own version, stamped by scripts/deploy.ps1 and surfaced on
 # /health. It must never be written into `telegram_messages.app_version`: that
 # column exists so the message log is a dataset keyed to the code that produced

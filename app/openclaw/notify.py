@@ -75,7 +75,10 @@ def send_text(text: str, buttons: list[dict] | None = None) -> bool:
             if using_gateway():
                 from . import gateway_client
 
-                gateway_client.send_message(target, text, buttons=buttons)
+                if gateway_client.using_http_route():
+                    gateway_client.send_cards(target, [{"text": text, "buttons": buttons}])
+                else:
+                    gateway_client.send_message(target, text, buttons=buttons)
             else:
                 from . import telegram_bot
 
@@ -97,7 +100,13 @@ def send_card(caption: str, image: bytes, buttons: list[dict] | None = None) -> 
             if using_gateway():
                 from . import gateway_client
 
-                gateway_client.send_card(target, image, caption=caption, buttons=buttons)
+                if gateway_client.using_http_route():
+                    # Same fast path the command route takes. One card, so the
+                    # win here is ~9s -> ~1s rather than N rounds -> one.
+                    gateway_client.send_cards(
+                        target, [{"png": image, "caption": caption, "buttons": buttons}])
+                else:
+                    gateway_client.send_card(target, image, caption=caption, buttons=buttons)
             else:
                 from . import telegram_bot
 

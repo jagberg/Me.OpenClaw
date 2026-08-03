@@ -152,6 +152,87 @@ def _run(action: str, target: str, args: list[str], *, kind: str, summary: str,
         return {}
 
 
+def using_http_route() -> bool:
+    """Whether the fast in-gateway path is configured. Both halves or neither —
+    a URL with no token would 401 every send and read as an outage."""
+    return bool(config.OPENCLAW_GATEWAY_HTTP_URL and config.OPENCLAW_GATEWAY_TOKEN)
+
+
+def send_cards(target: str, cards: list[dict], correlation: str | None = None,
+               poster=None) -> None:
+    """Send N cards in ONE call to the plugin's in-gateway route.
+
+    This is the fast path and the reason it exists is measured, not assumed: the
+    CLI costs 9–13s per message of which ~6.6s is its own initialisation with no
+    network contact at all, so N messages cost N × 9s no matter how they are
+    scheduled. Here one local HTTP call dispatches `message.action` inside the
+    gateway N times, and the only per-card cost is the gateway's own (0.3–1.1s,
+    mostly Telegram's rate pacing).
+
+    **Order is preserved**, which the CLI burst could not offer: the plugin
+    dispatches sequentially, so `/actions` gets its summary card first again.
+
+    Cards are the same dicts the command layer already builds — `text`/`buttons`
+    or `png`/`caption`/`buttons`. Raises `GatewaySendError` if any card failed,
+    naming the first reason, because a partial send must never read as a whole
+    one.
+    """
+    import base64
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    payload = {"channel": config.OPENCLAW_CHANNEL, "cards": []}
+    for card in cards:
+        entry: dict = {"target": str(target)}
+        if card.get("png") is not None:
+            entry["media_base64"] = base64.b64encode(card["png"]).decode("ascii")
+            entry["filename"] = "card.png"
+            entry["content_type"] = "image/png"
+            if card.get("caption"):
+                entry["message"] = card["caption"]
+        else:
+            entry["message"] = card.get("text") or ""
+        if card.get("buttons"):
+            # Same builder as the CLI path. A presentation the platform rejects
+            # is discarded silently with `ok: true`, so it is never hand-written.
+            entry["presentation"] = build_buttons(card["buttons"])
+        payload["cards"].append(entry)
+
+    url = config.OPENCLAW_GATEWAY_HTTP_URL.rstrip("/") + "/api/v1/claims/send"
+    request = urllib.request.Request(
+        url, data=_json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {config.OPENCLAW_GATEWAY_TOKEN}"})
+    logger.info("gateway http send cards=%s correlation=%s", len(cards), correlation)
+    try:
+        with trace.step("http.send_cards", correlation, cards=len(cards)):
+            opener = poster or urllib.request.urlopen
+            with opener(request, timeout=config.OPENCLAW_HTTP_TIMEOUT_SECONDS) as response:
+                answer = _json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        body = (exc.read() or b"").decode(errors="replace")[:500]
+        raise GatewaySendError(f"gateway send route returned {exc.code}: {body}") from exc
+    except Exception as exc:  # noqa: BLE001 — URLError, timeouts, bad JSON
+        raise GatewaySendError(f"gateway send route unreachable: {exc}") from exc
+
+    sent = int(answer.get("sent") or 0)
+    # Log what actually left, per card, so the audit trail and the RL dataset do
+    # not go thinner on the fast path than they were on the CLI one.
+    with trace.step("log.outbound", correlation, kind="cards"):
+        for card in cards[:sent]:
+            kind = "file" if card.get("png") is not None else "text"
+            summary = card.get("caption") if kind == "file" else card.get("text")
+            message_log.record_outbound(kind, summary or "", {
+                "buttons": card.get("buttons"), "correlation_id": correlation, "via": "plugin_route"})
+
+    failures = answer.get("failures") or []
+    if failures or not answer.get("ok"):
+        first = failures[0].get("reason") if failures else "the route reported failure"
+        raise GatewaySendError(
+            f"{len(failures) or len(cards) - sent} of {len(cards)} card(s) did not send: {first}")
+
+
 def send_message(target: str, text: str, buttons: list[dict] | None = None,
                  correlation: str | None = None, runner=None) -> dict:
     """Plain text, optionally with command buttons.

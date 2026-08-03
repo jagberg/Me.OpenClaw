@@ -41,6 +41,16 @@ services:
       # using the product's own client instead of re-deriving its protocol.
       # It is still NOT the Gmail credential, which remains app-only.
       OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN:?the app needs the gateway token to send}"
+      # The fast outbound path: the claims plugin's own HTTP route inside the
+      # gateway, which dispatches `message.action` in-process. Same host and port
+      # as the WebSocket URL above -- the gateway serves both on one listener --
+      # and the DNS name is fine here because the ws:// loopback rule that forced
+      # the literal IP is a CLI check, not an HTTP one.
+      #
+      # Blank falls back to the CLI, which still works and still costs ~9s a
+      # message. Measured 2026-08-03: ~6.6s of that is the CLI initialising with
+      # no network contact at all, so nothing about scheduling can recover it.
+      OPENCLAW_GATEWAY_HTTP_URL: "http://172.28.0.20:18789"
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
