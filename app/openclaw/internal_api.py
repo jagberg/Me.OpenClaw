@@ -11,6 +11,7 @@ guarantee. A rejected request is logged loudly: a rejection that looked like
 "no request arrived" is exactly the silent failure the project's rules forbid.
 """
 
+import concurrent.futures
 import logging
 import threading
 import uuid
@@ -268,10 +269,8 @@ async def command(
 
     sent, failed = 0, []
     target = db.registered_chat_id()
-    for card in outcome["cards"]:
-        if target is None:
-            failed.append("no registered chat")
-            break
+
+    def deliver(card: dict) -> str | None:
         try:
             if card.get("png") is not None:
                 gateway_client.send_card(str(target), card["png"], caption=card.get("caption", ""),
@@ -279,11 +278,31 @@ async def command(
             else:
                 gateway_client.send_message(str(target), card["text"],
                                             buttons=card.get("buttons") or None)
-            sent += 1
+            return None
         except Exception as exc:  # noqa: BLE001
             # Never silent: a card that did not arrive must not read as one that did.
             logger.error("card delivery failed for /%s correlation=%s: %s", name, correlation, exc)
-            failed.append(str(exc))
+            return str(exc)
+
+    cards = outcome["cards"]
+    if target is None:
+        failed.append("no registered chat")
+    elif cards:
+        # **The summary alone is ordered.** Every send spawns the gateway CLI,
+        # and each spawn re-does the WebSocket handshake, device auth and scope
+        # negotiation -- measured at ~2.5s from inside this container on
+        # 2026-08-03, which is why /actions arrived a card at a time with
+        # visible gaps. The first card is the summary and has to land first;
+        # the tap cards after it carry no order between them, so they go
+        # together and the whole run costs one handshake's wall time instead of
+        # one per card.
+        head, rest = cards[0], cards[1:]
+        outcomes = [deliver(head)]
+        if rest:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(rest))) as pool:
+                outcomes.extend(pool.map(deliver, rest))
+        failed.extend(o for o in outcomes if o is not None)
+        sent = sum(1 for o in outcomes if o is None)
 
     text = outcome["text"]
     if failed:
@@ -293,6 +312,40 @@ async def command(
     logger.info("command /%s cards=%s failed=%s correlation=%s", name, sent, len(failed), correlation)
     return {"status": "ok" if not failed else "partial", "route": f"command/{name}",
             "correlation_id": correlation, "result": text}
+
+
+@router.post("/telegram/ack")
+async def telegram_ack(
+    request: Request,
+    x_openclaw_secret: str | None = Header(default=None),
+    x_correlation_id: str | None = Header(default=None),
+):
+    """React to an inbound message so a slow answer does not feel dead.
+
+    Posted by the plugin's `message_received` hook, which fires on receipt and
+    before command routing — the only place a **command's** message id is
+    available. `before_dispatch` runs after routing, and a command handler's
+    own context carries no id (16.2, confirmed live 2026-08-03 when every
+    correlation id came through with the counter fallback).
+
+    Never fails a caller: `notify.ack` returns a bool. Losing the ack is
+    strictly better than delaying or breaking the real handler.
+    """
+    from . import notify
+
+    correlation = _correlation_id(x_correlation_id)
+    rejected = _guard(request, x_openclaw_secret, "telegram/ack", correlation)
+    if rejected is not None:
+        return rejected
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    if not commands_is_authorized(body.get("username")):
+        return {"status": "ok", "route": "telegram/ack", "correlation_id": correlation,
+                "acked": False, "reason": "unauthorized"}
+    acked = notify.ack(body.get("message_id"), chat_id=body.get("chat_id"))
+    return {"status": "ok", "route": "telegram/ack", "correlation_id": correlation, "acked": acked}
 
 
 @router.post("/telegram/claim")
@@ -339,12 +392,8 @@ async def telegram_claim(
                 "claimed": False, "reason": "unauthorized"}
 
     chat_id = body.get("chat_id") or db.registered_chat_id()
-    # 👍 before deciding, not after: the ack exists so a slow answer does not
-    # feel dead, and whether a flow claims the message is irrelevant to that.
-    # It never raises, so a failed reaction cannot cost us the claim check.
-    from . import notify
-
-    notify.ack(body.get("message_id"), chat_id=chat_id)
+    # No ack here: `message_received` fires earlier and covers every inbound
+    # message including commands, so acking in both places would react twice.
     try:
         card = pending_flows.claim_text(chat_id, text)
     except Exception as exc:  # noqa: BLE001 — fail open, loudly

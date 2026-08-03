@@ -5174,6 +5174,45 @@ def test_a_confirm_with_a_junk_id_changes_nothing_and_says_so():
     assert _claim_count_snapshot() == before
 
 
+def test_the_summary_card_lands_before_the_rest_and_the_rest_go_together():
+    """Every send spawns the gateway CLI, and each spawn redoes the WebSocket
+    handshake, device auth and scope negotiation — measured at ~2.5s from
+    inside the app container on 2026-08-03. Serially, `/actions` arrived a card
+    at a time with visible gaps (Justin, live).
+
+    The summary has to be first; the tap cards after it carry no order between
+    them. So: one ordered send, then the rest concurrently."""
+    import concurrent.futures
+    import threading
+    import time as _time
+
+    order, lock = [], threading.Lock()
+
+    def deliver(card):
+        with lock:
+            order.append(("start", card["id"]))
+        _time.sleep(0.15)  # stand-in for the handshake
+        with lock:
+            order.append(("done", card["id"]))
+        return None
+
+    cards = [{"id": i} for i in range(5)]
+    head, rest = cards[0], cards[1:]
+    began = _time.time()
+    outcomes = [deliver(head)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(rest))) as pool:
+        outcomes.extend(pool.map(deliver, rest))
+    elapsed = _time.time() - began
+
+    assert all(o is None for o in outcomes), outcomes
+    # The summary is fully delivered before anything else starts.
+    first_done = order.index(("done", 0))
+    other_starts = [i for i, (phase, cid) in enumerate(order) if phase == "start" and cid != 0]
+    assert all(i > first_done for i in other_starts), order
+    # And the rest overlap rather than queueing: serial would be 5 x 0.15s.
+    assert elapsed < 0.15 * 3, f"the tap cards did not overlap: {elapsed:.2f}s"
+
+
 def test_a_tap_result_reaches_justin_even_when_the_edit_fails():
     """4.6 — a tap whose outcome vanished is indistinguishable from one that
     never registered, which is the failure ADR-0014 exists for. So the edit

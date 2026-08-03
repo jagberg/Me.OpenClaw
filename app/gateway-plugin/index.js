@@ -259,6 +259,53 @@ function registerPendingFlowClaim(api) {
   );
 }
 
+
+/**
+ * The 👍 on every inbound message, including commands (task 4.7).
+ *
+ * WHY A SECOND HOOK. `before_dispatch` runs AFTER command routing, so a
+ * command never reaches it, and a command handler's own ctx carries no usable
+ * message id -- 16.2, confirmed live on 2026-08-03 when every correlation id
+ * came through with the `n1` counter fallback. `message_received` fires on
+ * receipt, before routing, and its context DOES carry `messageId`
+ * (message-hook-mappers: `ctx.MessageSidFull ?? ctx.MessageSid ?? ...`).
+ *
+ * The app does the reacting, not the plugin: the plugin api exposes no send
+ * capability, and the app already owns the one outbound seam.
+ *
+ * Fire-and-forget by design -- `message_received` is a void hook and an ack is
+ * the most losable thing in the system. It exists so a slow answer does not
+ * feel dead; losing it is strictly better than delaying the real handler.
+ */
+function registerInboundAck(api) {
+  if (typeof api.registerHook !== "function") return;
+  api.registerHook(
+    "message_received",
+    async (event) => {
+      const context = event?.context ?? {};
+      const messageId = context.messageId ?? context.message?.id ?? null;
+      if (!messageId) return {};
+      try {
+        await callApp(
+          "telegram/ack",
+          {
+            message_id: messageId,
+            chat_id: context.chatId ?? context.conversationId ?? null,
+            username: context.senderUsername ?? context.userName ?? context.username ?? null,
+          },
+          correlationId("ack", context),
+        );
+      } catch {
+        // Deliberately silent here: the app logs its own failures, and an ack
+        // that throws inside a void hook is noise on a path that must not
+        // affect delivery.
+      }
+      return {};
+    },
+    { name: "claims-inbound-ack", description: "React to Justin's messages so a slow answer does not feel dead" },
+  );
+}
+
 export default definePluginEntry({
   id: "claims",
   name: "OpenClaw Claims",
@@ -294,6 +341,7 @@ export default definePluginEntry({
     // Deliberately not awaited — `register()` must stay synchronous or the
     // gateway discards every registration made above (0.7).
     registerPendingFlowClaim(api);
+    registerInboundAck(api);
 
     void claimCommandMenu(api.logger);
     void reportRegistration(registered, api.logger);
