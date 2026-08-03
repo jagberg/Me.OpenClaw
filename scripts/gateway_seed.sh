@@ -111,6 +111,24 @@ else
   echo "WARN: GROQ_API_KEY unset - the agent has no model; the preflight will fail on it"
 fi
 
+# Acknowledgement reactions, which the gateway does natively and this project
+# spent two deploys hand-rolling in the plugin instead.
+#
+# THE ACTUAL REASON THE THUMBS-UP NEVER APPEARED: the shipped default is
+# `ackReactionScope: "group-mentions"`, and Justin's chat is a DM. So it was
+# configured off for the only chat that exists here -- which is also why he never
+# saw it work in the pre-gateway version. No hook was ever going to fix that.
+#
+# "all" rather than "direct" so a group ever added gets it too. The emoji is a
+# JSON \u escape, not a literal: this file is read on a cp1252 console and a raw
+# emoji in the seed's echoed output is mojibake at best.
+oc config set messages.ackReactionScope '"all"'
+oc config set messages.ackReaction '"\ud83d\udc4d"'
+# Lifecycle reactions on the trigger message: queued -> thinking -> done/error.
+# Telegram requires this explicitly true; unset is not enough (Discord is the
+# only channel that infers it from ack reactions being active).
+oc config set messages.statusReactions.enabled true
+
 # The claims read surface. Service name, not host.docker.internal: the latter
 # resolves through the host and NATs the source address to loopback.
 oc config set mcp.servers.claims "{\"url\":\"http://app:8000/mcp\",\"transport\":\"streamable-http\",\"headers\":{\"X-OpenClaw-Secret\":\"$CLAIMS_INTERNAL_SECRET\"}}"

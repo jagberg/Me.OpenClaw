@@ -5779,28 +5779,31 @@ def test_the_fast_send_path_batches_one_call_keeps_order_and_still_logs_every_ca
     assert gateway_client.using_http_route() is False
 
 
-def test_the_ack_hook_is_the_one_the_gateway_actually_emits():
-    """This hook name has now been wrong twice, and both times the symptom was
-    silence — nothing to fail, nothing to notice until Justin said the 👍 had not
-    appeared. So the name is pinned here with the reason.
+def test_the_ack_is_the_gateways_own_and_the_scope_is_the_one_that_covers_a_dm():
+    """Two deploys were spent hand-rolling a 👍 in the plugin, on two different
+    hooks, and neither could have worked. The cause was never the hook: the
+    gateway ships this feature and its default `ackReactionScope` is
+    `group-mentions`, so it was configured off for the only chat here — a DM.
+    That is also why Justin never saw it work before the gateway.
 
-    `message_received` is emitted by `emitMessageReceivedHooks()` inside the
-    gateway's `dispatch-from-config`, guarded only by
-    `SuppressMessageReceivedHooks` and `hasHooks(...)`, and its context carries
-    the message id.
+    So the assertion is on the SEED, which is where the fix lives, plus the two
+    things the plugin must not go back to doing.
 
-    `inbound_claim` is not a general pre-dispatch hook: its only call site is
-    `runInboundClaimForPluginOutcome(pluginOwnedBinding.pluginId, …)`, so it runs
-    for the plugin that owns the conversation binding and for nobody else. This
-    plugin owns no binding, which is why it logged nothing across six hours of
-    real use."""
+    A tap is separately impossible for anyone to ack: it arrives as a callback
+    query, so there is no message to react to. `startTypingCue` is what covers
+    it, and that is asserted here too because it is the only feedback a tap has
+    beyond its reply."""
+    seed = (Path(__file__).resolve().parent.parent.parent / "scripts" / "gateway_seed.sh").read_text(encoding="utf-8")
+    assert "messages.ackReactionScope '\"all\"'" in seed, "the ack scope is not set to one that includes a DM"
+    assert "messages.ackReaction " in seed, "no ack emoji is configured"
+    assert "messages.statusReactions.enabled true" in seed, (
+        "Telegram needs statusReactions explicitly enabled — unset is not enough")
+
     plugin = (Path(__file__).resolve().parent.parent / "gateway-plugin" / "index.js").read_text(encoding="utf-8")
-    ack = plugin.split("function registerInboundAck", 1)
-    assert len(ack) == 2, "registerInboundAck is gone — the ack has no hook"
-    body = ack[1].split("function ", 1)[0]
-    assert '"message_received"' in body, "the ack is registered on a hook the gateway does not emit for us"
-    assert '"inbound_claim"' not in body, (
-        "inbound_claim only fires for the conversation binding's owner — this plugin owns none")
+    assert "registerInboundAck" not in plugin, (
+        "the hand-rolled ack is back; the gateway does this natively via messages.ackReaction")
+    assert "sendChatAction" in plugin and "startTypingCue" in plugin, (
+        "the typing cue is gone — a tap would then have no feedback until its reply lands")
 
 
 def test_the_plugin_declares_the_contract_its_in_process_send_depends_on():

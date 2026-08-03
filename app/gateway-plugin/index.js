@@ -263,81 +263,64 @@ function registerPendingFlowClaim(api) {
 
 
 /**
- * The 👍 on a TYPED message. Not on a tap — see below (task 4.7).
+ * "typing…" while a command runs — Justin's stated preference over any reaction.
  *
- * WHICH HOOK, AND WHY THE LAST TWO ANSWERS WERE WRONG. Settled 2026-08-03 by
- * reading the gateway's dispatch path instead of guessing from hook names:
+ * WHY THE PLUGIN AND NOT THE GATEWAY. The gateway does send a typing cue, from
+ * the Telegram ingress path, for every non-`room_event` inbound message, and it
+ * keeps typing alive for the length of an AGENT turn (`typing: { start:
+ * sendTyping }` on the reply pipeline). Neither reaches a command:
  *
- *   * `message_received` is emitted by `emitMessageReceivedHooks()` inside
- *     `dispatch-from-config`, guarded only by `SuppressMessageReceivedHooks`
- *     and `hasHooks("message_received")`. Its context carries the id
- *     (`ctx.MessageSidFull ?? ctx.MessageSid ?? ...` -> `messageId`). This is
- *     the hook to use.
- *   * `inbound_claim` is NOT a general pre-dispatch hook. The only call site is
- *     `runInboundClaimForPluginOutcome(pluginOwnedBinding.pluginId, …)` — it
- *     runs for the plugin that OWNS the conversation binding and nobody else.
- *     This plugin owns no binding, so it could never fire here. Zero log lines
- *     in six hours of real use, with logging unconditional at the top of the
- *     handler.
+ *   * a button TAP is a callback query, not a message, so there is no inbound
+ *     message to trigger the ingress cue at all — which is also why a tap gets
+ *     no ack reaction, no matter how it is configured;
+ *   * a typed `/actions` does get the single ingress cue, but Telegram expires
+ *     typing after ~5s and `/actions` takes ~6s, so it stops before the cards
+ *     land.
  *
- * The earlier claim that `message_received` "never fires for Telegram inbound"
- * was drawn from taps only, and taps never enter `dispatch-from-config` at all —
- * so it was evidence about commands, not about this hook.
+ * So the plugin re-sends `sendChatAction` every 4s for as long as the app is
+ * working, using the bot token it already holds for `setMyCommands`. Telegram's
+ * own API, no gateway surface needed, and it covers the tap path.
  *
- * A TAP CANNOT BE ACKED, and that is a platform fact rather than a gap here.
- * Commands are routed before dispatch, so neither `message_received` nor
- * `before_dispatch` sees them, and the ctx a plugin command handler receives
- * (`commands-CDhgE9eG.js`) has no message id in it — senderId, channel, args,
- * commandBody, sessionKey, from/to, thread ids, and nothing else. There is no id
- * to react to. A tap's feedback is its reply text, which is what it was before.
- *
- * The app does the reacting, not the plugin: the plugin api exposes no send
- * capability, and the app already owns the one outbound seam.
- *
- * Fire-and-forget by design -- `message_received` is a void hook and an ack is
- * the most losable thing in the system. It exists so a slow answer does not
- * feel dead; losing it is strictly better than delaying the real handler.
+ * Fire-and-forget and individually caught: a failed cue must never delay or
+ * break the command it is decorating.
  */
-function registerInboundAck(api) {
-  if (typeof api.registerHook !== "function") return;
-  api.registerHook(
-    "message_received",
-    async (event) => {
-      const context = event?.context ?? {};
-      const messageId = context.messageId ?? context.message?.id ?? null;
-      // INSTRUMENTED 2026-08-03, and it stays. The first version returned
-      // silently when there was no id, so "the hook never fired" and "the hook
-      // fired with no id" looked identical from the app side -- and the app side
-      // is all I can see. That is the silent no-op this project's rules forbid,
-      // and it cost two deploy cycles. One line, and the two cases are
-      // distinguishable forever.
-      api.logger?.info?.(
-        `claims: message_received keys=[${Object.keys(context).join(",")}] messageId=${String(messageId)}`,
-      );
-      if (!messageId) {
-        api.logger?.warn?.("claims: message_received carried no messageId -- no ack sent");
-        return {};
-      }
-      try {
-        await callApp(
-          "telegram/ack",
-          {
-            message_id: messageId,
-            chat_id: context.chatId ?? context.conversationId ?? null,
-            username: context.senderUsername ?? context.userName ?? context.username ?? null,
-          },
-          correlationId("ack", context),
-        );
-      } catch {
-        // Deliberately silent here: the app logs its own failures, and an ack
-        // that throws inside a void hook is noise on a path that must not
-        // affect delivery.
-      }
-      return {};
-    },
-    { name: "claims-inbound-ack", description: "React to Justin's messages so a slow answer does not feel dead" },
-  );
+function startTypingCue(chatId, logger) {
+  if (!BOT_TOKEN || !chatId) return () => {};
+  const cue = () => {
+    fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: Number(chatId), action: "typing" }),
+    }).catch((err) => logger?.warn?.(`claims: typing cue failed: ${String(err)}`));
+  };
+  cue();
+  // 4s, inside Telegram's ~5s expiry, so the indicator never blinks off mid-run.
+  const timer = setInterval(cue, 4000);
+  return () => clearInterval(timer);
 }
+
+/**
+ * NO CUSTOM ACK HOOK, DELIBERATELY.
+ *
+ * Two deploys went into hand-rolling a 👍 here -- first on `message_received`,
+ * then on `inbound_claim` -- and neither could have worked, for two reasons that
+ * had nothing to do with hooks:
+ *
+ *   1. The gateway already does this. `messages.ackReaction` +
+ *      `messages.ackReactionScope` are shipped config, and the default scope is
+ *      `group-mentions`. Justin's chat is a DM, so the feature was configured
+ *      off for the only chat that exists here. `scripts/gateway_seed.sh` now
+ *      sets it to "all", and turns on `messages.statusReactions` for the
+ *      queued -> thinking -> done lifecycle emoji.
+ *   2. A TAP can never be acked by anyone. It arrives as a callback query, not a
+ *      message, so there is no message to react to -- and the ctx a plugin
+ *      command handler receives (`commands-CDhgE9eG.js`) carries no message id
+ *      under any name. `startTypingCue` above is what covers the tap path.
+ *
+ * `/internal/telegram/ack` and `notify.ack` stay in the app: they are the
+ * PTB-era path, still exercised by the suite, and section 6 removes that half
+ * wholesale rather than piecemeal.
+ */
 
 /**
  * The fast outbound path: send from INSIDE the gateway (task 4.14).
@@ -491,7 +474,6 @@ function registerSendRoute(api) {
   });
   api.logger?.info?.("claims: in-process send route registered on /api/v1/claims/send");
 }
-
 export default definePluginEntry({
   id: "claims",
   name: "OpenClaw Claims",
@@ -508,6 +490,11 @@ export default definePluginEntry({
         handler: async (ctx) => {
           const args = ctx.args ?? "";
           const correlation = correlationId(name, ctx);
+          // A command ctx carries no message id, but it does carry the chat:
+          // `channelId`, else the DM's sender. CLAIMS_TELEGRAM_CHAT_ID is the
+          // floor -- one user, one chat.
+          const stopTyping = startTypingCue(
+            ctx.channelId ?? ctx.from ?? ctx.senderId ?? CHAT_ID, api.logger);
           try {
             const { status, text } = await callApp(`command/${name}`, { args }, correlation);
             if (status >= 400) {
@@ -518,6 +505,8 @@ export default definePluginEntry({
             return { text: text.slice(0, 3500) };
           } catch (err) {
             return { text: `/${name} could not reach the claims app: ${String(err)}` };
+          } finally {
+            stopTyping();
           }
         },
       });
@@ -527,7 +516,6 @@ export default definePluginEntry({
     // Deliberately not awaited — `register()` must stay synchronous or the
     // gateway discards every registration made above (0.7).
     registerPendingFlowClaim(api);
-    registerInboundAck(api);
     registerSendRoute(api);
 
     void claimCommandMenu(api.logger);
