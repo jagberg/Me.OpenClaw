@@ -629,7 +629,7 @@ def record_event(body: dict, correlation: str):
 
     logger.info("internal telegram/event starting correlation=%s update_id=%s", correlation, update_id)
     try:
-        recorded = message_log.record_inbound_raw(update_id, raw)
+        recorded = message_log.record_inbound_raw(update_id, raw, correlation=correlation)
     except Exception as exc:
         logger.error("internal telegram/event failed correlation=%s: %s", correlation, exc, exc_info=True)
         return JSONResponse(

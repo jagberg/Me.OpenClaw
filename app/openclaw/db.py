@@ -184,7 +184,12 @@ CREATE TABLE IF NOT EXISTS telegram_messages (
     app_version TEXT NOT NULL,
     received_at TEXT NOT NULL,
     processed_at TEXT,
-    error TEXT
+    error TEXT,
+    -- The id `internal_api` mints per gateway event, so a row can be joined to
+    -- the log lines that describe what happened to it. Task 10.14. Before this,
+    -- the join went through `update_id` and only worked while the log line that
+    -- pairs them was still in the container -- which it is not after a recreate.
+    correlation_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_telegram_messages_pending
@@ -269,6 +274,16 @@ _VET_CLAIMS_ADDED_COLUMNS = {
     "petcover_sr": "INTEGER",  # Petcover's per-document serial within a Condition Thread ("DC1-27-5628 Sr 3")
 }
 
+# Same mechanism, for the message log. `CREATE TABLE IF NOT EXISTS` will not add a
+# column to the live table, and the live table has 269 rows worth keeping -- so
+# this is the ALTER, run at startup, rather than a hand-run one against
+# app/data/openclaw.db. Safe to re-run: _migrate_added_columns reads PRAGMA
+# table_info first, and ADD COLUMN never rewrites existing rows (they read NULL,
+# which is honest -- those events had no correlation id recorded).
+_TELEGRAM_MESSAGES_ADDED_COLUMNS = {
+    "correlation_id": "TEXT",
+}
+
 # Echo's claim_email stays NULL until Justin supplies Bow Wow Insurance's process
 # (tasks.md 6.0) — claim_process_defined=0 blocks fill/draft for Echo's claims.
 SEED_PETS = """
@@ -301,6 +316,7 @@ def init_db(path: str | None = None) -> None:
         conn.executescript(SCHEMA)
         _migrate_added_columns(conn, "vet_claims", _VET_CLAIMS_ADDED_COLUMNS)
         _migrate_added_columns(conn, "pets", _PETS_ADDED_COLUMNS)
+        _migrate_added_columns(conn, "telegram_messages", _TELEGRAM_MESSAGES_ADDED_COLUMNS)
         conn.executescript(SEED_PETS)
 
 

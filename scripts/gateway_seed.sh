@@ -170,6 +170,27 @@ oc config set messages.ackReaction '"\ud83d\udc4d"'
 # reaction, added once, left alone (`removeAckAfterReply` is false).
 oc config set messages.statusReactions.enabled false
 
+# --- logging that outlives the container ------------------------------------
+# Task 13.5 / 9.x. The gateway's own log had two sinks and neither survived a
+# deploy: stdout (`docker compose logs`, gone when the container is recreated)
+# and `/tmp/openclaw/openclaw-<date>.log`, which is inside the container and
+# also gone. So "an access denial leaves no trace" was partly a retention
+# problem, not only a level problem -- and every deploy destroyed the evidence
+# for the previous one.
+#
+# `/home/node/.openclaw` is the state VOLUME, so a file there persists across
+# recreates with no new mount. Level pinned to info explicitly rather than left
+# to the shipped default: the ingress drop lines are info
+# (`dropping dm (not allowlisted)`, `skipping group message reason=not-allowed`),
+# so a default that ever moves to warn would silently take them with it.
+#
+# NOT set: `logging.redactSensitive`. It takes "off" or "tools" -- not the
+# boolean it reads like -- and the validator rejected `true` outright. Choosing
+# between those two without knowing which the default is would be guessing at a
+# control that decides whether tool payloads reach the log.
+oc config set logging.level '"info"'
+oc config set logging.file '"/home/node/.openclaw/logs/gateway.log"'
+
 # The claims read surface. Service name, not host.docker.internal: the latter
 # resolves through the host and NATs the source address to loopback.
 oc config set mcp.servers.claims "{\"url\":\"http://app:8000/mcp\",\"transport\":\"streamable-http\",\"headers\":{\"X-OpenClaw-Secret\":\"$CLAIMS_INTERNAL_SECRET\"}}"

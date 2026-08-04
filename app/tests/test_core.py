@@ -5903,6 +5903,83 @@ def test_chat_has_a_gemini_backend_and_the_agents_primary_is_the_reachable_provi
     assert groq_primary <= 1, "Groq must be at most the no-Gemini fallback, never the default primary"
 
 
+def test_the_gateways_log_is_configured_to_outlive_its_container():
+    """Task 13.5's real half. An access denial leaving no trace was read as a log
+    LEVEL problem; the durability half is worse and was the actual cause. The
+    gateway wrote to stdout (`docker compose logs`, destroyed when the container is
+    recreated) and to `/tmp/openclaw/openclaw-<date>.log`, inside the container and
+    destroyed with it — so every deploy erased the evidence for the one before, and
+    this session lost a real failure's text that way (`job_runs.last_error`).
+
+    `/home/node/.openclaw` is the state volume, so a file there survives. Asserted
+    on the seed because that is where the setting lives and nothing else would
+    notice its removal."""
+    seed = (Path(__file__).resolve().parent.parent.parent / "scripts" / "gateway_seed.sh").read_text(encoding="utf-8")
+    assert "logging.file" in seed, "the gateway log has no durable sink again"
+    assert "/home/node/.openclaw/logs/" in seed, (
+        "the log path is outside the state volume, so a recreate destroys it")
+    assert "/tmp/" not in seed.split("logging.file")[1][:200], "back to a container-local path"
+    # Level pinned rather than inherited: the ingress drop lines are info, so a
+    # shipped default moving to warn would silently take them with it.
+    assert "logging.level '\"info\"'" in seed
+
+
+def test_a_gateway_delivered_event_and_its_replies_carry_the_same_correlation_id():
+    """Task 10.14. An event now crosses gateway -> plugin -> app -> handler -> any
+    resulting send, and the log lines were the only place the id existed. Container
+    logs do not survive a recreate, so a week-old "did my tap register?" was
+    answerable only through `update_id` — which pairs with the correlation id in a
+    log line that is already gone.
+
+    Also covers the migration itself: the live table has hundreds of rows and
+    `CREATE TABLE IF NOT EXISTS` will not add a column to it, so the column arrives
+    via `_migrate_added_columns` at startup. Asserted against a table created
+    WITHOUT the column, because that is the live case and the fresh-DB case would
+    pass either way."""
+    import sqlite3 as _sqlite3
+
+    from openclaw import internal_api, message_log
+
+    # The live shape: the table exists, predates the column, and holds a row.
+    legacy = Path(_tmpdir) / "legacy-messages.db"
+    if legacy.exists():
+        legacy.unlink()
+    with _sqlite3.connect(legacy) as conn:
+        conn.execute("""CREATE TABLE telegram_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, update_id INTEGER UNIQUE, direction TEXT NOT NULL,
+            kind TEXT, summary TEXT, payload TEXT NOT NULL, app_version TEXT NOT NULL,
+            received_at TEXT NOT NULL, processed_at TEXT, error TEXT)""")
+        conn.execute("INSERT INTO telegram_messages (update_id, direction, payload, app_version, "
+                     "received_at) VALUES (1, 'in', '{}', 'old', 'then')")
+    db.init_db(str(legacy))
+    with _sqlite3.connect(legacy) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(telegram_messages)")}
+        assert "correlation_id" in cols, "the column was not migrated onto an existing table"
+        old_row = conn.execute("SELECT correlation_id FROM telegram_messages WHERE update_id = 1").fetchone()
+    assert old_row[0] is None, "a pre-existing row must read NULL, not a fabricated id"
+
+    # Now the real writers, on the suite's own DB.
+    db.init_db()
+    correlation = internal_api._correlation_id(None)
+    assert message_log.record_inbound_raw(9_100_001, {"message": {"text": "tap"}},
+                                          correlation=correlation) == 9_100_001
+    message_log.record_outbound("text", "reply to that tap", {"x": 1}, correlation=correlation)
+    # An unprompted send has no inbound event, so it carries no id rather than a
+    # made-up one — a fabricated link is worse than an absent one.
+    message_log.record_outbound("text", "daily nudge", {"x": 2})
+
+    with db.get_connection() as conn:
+        inbound = conn.execute(
+            "SELECT correlation_id FROM telegram_messages WHERE update_id = ?", (9_100_001,)).fetchone()
+        replied = conn.execute(
+            "SELECT correlation_id FROM telegram_messages WHERE summary = 'reply to that tap'").fetchone()
+        nudge = conn.execute(
+            "SELECT correlation_id FROM telegram_messages WHERE summary = 'daily nudge'").fetchone()
+    assert inbound["correlation_id"] == correlation
+    assert replied["correlation_id"] == correlation, "the reply cannot be joined to its cause"
+    assert nudge["correlation_id"] is None, "an unprompted send invented a correlation"
+
+
 def test_nothing_in_the_app_can_send_mail_and_no_tool_offers_to():
     """Task 10.3, guarding the first hard rule: Gmail DRAFTS only, never send.
 
@@ -6108,8 +6185,18 @@ def test_a_reminder_due_while_the_app_was_down_still_fires_and_says_how_late():
     now = datetime.now(timezone.utc)
     long_ago = now - timedelta(days=3)
     future = now + timedelta(hours=4)
-    reminders.schedule_reminder(task_id, long_ago)
-    reminders.schedule_reminder(task_id, future)
+    # Rows inserted directly, NOT via `schedule_reminder`. That helper still adds
+    # an APScheduler `date` job while the flag allows it, and this suite has the
+    # scheduler running — so for a past-dated reminder the job fires immediately
+    # and marks it `due` before the sweep looks, and the sweep then finds nothing.
+    # The first version of this test raced exactly that and failed intermittently
+    # on ordering. The sweep is what is under test; the legacy job is not.
+    with db.get_connection() as conn:
+        for when in (long_ago, future):
+            conn.execute(
+                "INSERT INTO reminders (task_id, scheduled_at, status, job_id, created_at) "
+                "VALUES (?, ?, 'scheduled', ?, ?)",
+                (task_id, when.isoformat(), f"sweep-test-{when.isoformat()}", now.isoformat()))
 
     assert reminders.sweep_due(now) == 1, "exactly the overdue one fires"
     # Idempotent: the second call marks nothing, so a duplicated cron delivery

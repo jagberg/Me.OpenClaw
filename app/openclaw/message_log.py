@@ -80,7 +80,8 @@ def record_inbound(update) -> int | None:
     return record_inbound_raw(update_id, raw, payload=payload)
 
 
-def record_inbound_raw(update_id: int | str, raw: dict, payload: str | None = None) -> int | str | None:
+def record_inbound_raw(update_id: int | str, raw: dict, payload: str | None = None,
+                       correlation: str | None = None) -> int | str | None:
     """The actual writer. Same row, same dedupe, whichever transport delivered it.
 
     The gateway path calls this directly: after the cutover the app never sees a
@@ -101,23 +102,27 @@ def record_inbound_raw(update_id: int | str, raw: dict, payload: str | None = No
     with db.get_connection() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO telegram_messages "
-            "(update_id, direction, kind, summary, payload, app_version, received_at) "
-            "VALUES (?, 'in', ?, ?, ?, ?, ?)",
-            (update_id, kind, summary, payload, config.APP_VERSION, _now()),
+            "(update_id, direction, kind, summary, payload, app_version, received_at, correlation_id) "
+            "VALUES (?, 'in', ?, ?, ?, ?, ?, ?)",
+            (update_id, kind, summary, payload, config.APP_VERSION, _now(), correlation),
         )
         if cur.rowcount == 0:
             return None
     return update_id
 
 
-def record_outbound(kind: str, summary: str, payload: dict) -> None:
+def record_outbound(kind: str, summary: str, payload: dict, correlation: str | None = None) -> None:
+    """`correlation` ties a reply to the inbound event that caused it, so a tap and
+    the cards it produced share one id. Optional because the unprompted sends --
+    the nudge, a claim notification -- have no inbound event to correlate with, and
+    inventing one would imply a causal link that does not exist."""
     with db.get_connection() as conn:
         conn.execute(
             "INSERT INTO telegram_messages "
-            "(direction, kind, summary, payload, app_version, received_at) "
-            "VALUES ('out', ?, ?, ?, ?, ?)",
+            "(direction, kind, summary, payload, app_version, received_at, correlation_id) "
+            "VALUES ('out', ?, ?, ?, ?, ?, ?)",
             (kind, (summary or "")[:_SUMMARY_LIMIT], json.dumps(payload, default=str),
-             config.APP_VERSION, _now()),
+             config.APP_VERSION, _now(), correlation),
         )
 
 

@@ -141,7 +141,8 @@ def _run(action: str, target: str, args: list[str], *, kind: str, summary: str,
     # Outbound logging stays on this path, so the gateway era keeps the same
     # audit trail and RL dataset the LoggedBot era had.
     with trace.step("log.outbound", correlation, kind=kind):
-        message_log.record_outbound(kind, summary, {**payload, "correlation_id": correlation})
+        message_log.record_outbound(kind, summary, {**payload, "correlation_id": correlation},
+                                    correlation=correlation)
 
     try:
         return json.loads(completed.stdout or "{}")
@@ -231,7 +232,8 @@ def send_cards(target: str, cards: list[dict], correlation: str | None = None,
             kind = "file" if card.get("png") is not None else "text"
             summary = card.get("caption") if kind == "file" else card.get("text")
             message_log.record_outbound(kind, summary or "", {
-                "buttons": card.get("buttons"), "correlation_id": correlation, "via": "plugin_route"})
+                "buttons": card.get("buttons"), "correlation_id": correlation, "via": "plugin_route"},
+                correlation=correlation)
 
     failures = answer.get("failures") or []
     if failures or not answer.get("ok"):
