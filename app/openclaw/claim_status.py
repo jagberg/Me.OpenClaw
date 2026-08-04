@@ -215,6 +215,35 @@ ANNUAL_CAP = 10000.00
 SETTLEMENT_TOLERANCE = 2.00
 
 
+def claimable_subtotal(invoice_data) -> tuple[float | None, bool]:
+    """A claim's claimable subtotal, and whether it is recorded at all.
+
+    The single reader of `invoice_data.claimable_amount` — the line-item
+    subtotal minus NON_CLAIMABLE_KEYWORDS, and this claim's share of a per-pet
+    split (ADR-0007, ADR-0019). Deliberately NO fallback to `invoice_data.amount`:
+    the invoice total is a different quantity, and substituting it is what
+    produced claim #2's "we expected $430.74" out of $580.74 − $150.00, a number
+    never submitted to Petcover as claimable.
+
+    Returns (value, recorded) rather than a bare None because a stored 0.0 is a
+    real answer (live: claim #20, invoice total $152.50, claimable $0.00) and a
+    None conflates it with the five claims that have no key at all.
+
+    Accepts the raw `invoice_data` column (JSON string or None) or an
+    already-parsed dict, so every caller can use it without re-parsing.
+    """
+    if invoice_data is None:
+        invoice = {}
+    elif isinstance(invoice_data, (str, bytes)):
+        invoice = json.loads(invoice_data) if invoice_data else {}
+    else:
+        invoice = invoice_data
+    value = invoice.get("claimable_amount")
+    if value is None:
+        return None, False
+    return float(value), True
+
+
 def _match_keywords(text: str) -> str | None:
     lowered = _normalize(text).lower()
     if any(kw in lowered for kw in IGNORE_KEYWORDS):
@@ -308,7 +337,24 @@ _APPROVAL_PATTERNS = {
     "paid_amount": r"Paid by us:?\s*\$?([\d,]+\.\d{2})",
     "fixed_excess_stated": r"(?:Less\s+)?Fixed excess:?\s*\$?(-?[\d,]+\.\d{2})",
     "age_contribution_stated": r"Age Contribution:?\s*\$?([\d,]+\.\d{2})",
+    # The letter's own deduction lines, both missing until 2026-08-04 while the
+    # settlement check computed an expectation that used neither. Non-claimable
+    # is written with U+2010 (`Non‑claimable amount $0.00`) — `_normalize` maps
+    # it, which is the whole reason that normalization exists.
+    "non_claimable_stated": r"Non-?claimable amount:?\s*\$?(-?[\d,]+\.\d{2})",
+    # Fifth deduction, $0.00 [0%] on all nine live letters. Captured because an
+    # uncaptured term is one that breaks the arithmetic silently the first time
+    # Petcover uses it — the exact failure Age Contribution just caused.
+    "percentage_excess_stated": r"Percentage Excess:?\s*\$?(-?[\d,]+\.\d{2})",
 }
+
+# The rate, not the dollars: `Age Contribution: $12.25 [35%]`. Absent bracket
+# means absent key — never a default, because defaulting 0.35 onto a letter that
+# states no percentage is exactly the modelling of Petcover's policy that
+# design.md's Decision 2 rejects.
+_AGE_CONTRIBUTION_PERCENT = re.compile(
+    r"Age Contribution:?\s*\$?[\d,]+\.\d{2}\s*\[\s*(\d+(?:\.\d+)?)\s*%", re.IGNORECASE
+)
 
 
 def extract_approval_amounts(text: str) -> dict:
@@ -321,6 +367,9 @@ def extract_approval_amounts(text: str) -> dict:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             result[key] = float(match.group(1).replace(",", ""))
+    percent = _AGE_CONTRIBUTION_PERCENT.search(text)
+    if percent:
+        result["age_contribution_percent"] = float(percent.group(1)) / 100
     return result
 
 
@@ -915,12 +964,37 @@ def process_reply(
     for claim in claims:
         if _already_recorded(claim["id"], event_type, email_id):
             continue  # re-read of mail already applied — nothing new to record or write
+        # Learn the reference and Sr BEFORE validating, not after. The check's
+        # thread-sibling query reads `claim["petcover_reference"]`, so on the
+        # letter that teaches it the query used to run with NULL and find no
+        # siblings — live on 2026-07-30, claim #2 was told "fresh $150 excess
+        # this policy year" one second after claim #8's letter in the same
+        # thread and policy year had stated a $150.00 excess. Nothing else in
+        # this loop changes order.
+        learned = []
+        learned_params = []
+        if reference and not claim["petcover_reference"]:
+            learned.append("petcover_reference = ?")
+            learned_params.append(reference)
+        if learn_sr and sr is not None and claim["petcover_sr"] is None:
+            learned.append("petcover_sr = ?")
+            learned_params.append(sr)
+        if learned:
+            with db.get_connection() as conn:
+                conn.execute(
+                    f"UPDATE vet_claims SET {', '.join(learned)}, updated_at = ? WHERE id = ?",
+                    (*learned_params, now, claim["id"]),
+                )
+                claim = conn.execute(
+                    "SELECT vet_claims.*, ? AS _txn_date FROM vet_claims WHERE id = ?",
+                    (claim["_txn_date"], claim["id"]),
+                ).fetchone()
         # Validate whenever a paid amount is actually stated — the newer
         # 'approved' email carries it; the older settled-with-PDF style
         # carries it directly in the settled email itself. Either way, the
         # dollar-less 'payment processed' settled email that FOLLOWS an
         # approval has nothing to validate and correctly no-ops here.
-        settlement_flag = _validate_settlement(claim, detail.get("paid_amount"), claim["_txn_date"])
+        settlement_flag = _validate_settlement(claim, detail, claim["_txn_date"])
         # The event and the state change are `apply_event`'s to make; what stays
         # here is the learning this reply enabled (reference, Sr) and the
         # settlement check. "unclassified" moving no state used to be an `if` in
@@ -929,12 +1003,6 @@ def process_reply(
         with db.get_connection() as conn:
             updates = ["updated_at = ?"]
             params = [now]
-            if reference and not claim["petcover_reference"]:
-                updates.append("petcover_reference = ?")
-                params.append(reference)
-            if learn_sr and sr is not None and claim["petcover_sr"] is None:
-                updates.append("petcover_sr = ?")
-                params.append(sr)
             # A refusal already flagged this claim, and it is the more serious of
             # the two: the state did not move at all. Don't overwrite it with a
             # settlement note — that number is still in the event's detail.
@@ -962,12 +1030,107 @@ def _policy_year_start(anniversary_mmdd: str, on: date) -> date:
     return this_year if on >= this_year else date(on.year - 1, mm, dd)
 
 
-def _validate_settlement(claim, paid_amount: float | None, txn_date_iso: str) -> str | None:
-    """Deterministic settlement check (ADR-0011, simplified per Justin): expected
-    = claimable − $150 excess, once per condition thread per policy year — the
-    policy year a CLAIM belongs to is judged by its own transaction date, never
-    by when the reply happened to arrive (two claims processed the same week
-    can be a year apart by transaction date, straddling the anniversary).
+# The three settlement findings, by flag prefix. One column holds one flag, so
+# the prefix is what tells the card, the dismissal and the waiting party which
+# finding they are looking at.
+SETTLEMENT_FLAG_PREFIXES = (
+    "settlement mismatch",             # Check A — Petcover's own arithmetic
+    "assessment difference",           # Check B — they assessed something else
+    "claimable subtotal not recorded",  # we cannot check B at all
+)
+
+
+def _settlement_check_kind(flag: str | None) -> str | None:
+    """Which check raised a flag. `assessment` is a question outstanding with
+    Petcover; everything else is Justin's own review."""
+    if not flag:
+        return None
+    if flag.startswith("assessment difference"):
+        return "assessment"
+    if flag.startswith(SETTLEMENT_FLAG_PREFIXES):
+        return "arithmetic"
+    return None
+
+
+def _check_petcovers_arithmetic(detail: dict, paid_amount: float) -> str | None:
+    """Check A — re-add the letter's own stated line items and see whether they
+    reach the amount it says was paid.
+
+    Arithmetic on given data, not a model of Petcover's policy (design.md
+    Decision 2): every input is a labelled field on the letter being validated,
+    including the percentage. Skipped entirely when the letter states no
+    percentage — the five `approved` events written before the age-contribution
+    pattern shipped take that path rather than being checked against a term
+    they never captured.
+
+    Verified against all nine live approval letters (2026-08-04), exact to the
+    cent, including `DC1-27-5628` Tr 8 — the only one with a non-zero
+    non-claimable amount ($580.74 − $135.00) × 0.65 = $289.73, and so the only
+    one that distinguishes this formula from the post-mortem's
+    `(claimed − excess) × 0.65`, which is wrong there by $87.75.
+    """
+    claimed = detail.get("claimed_amount")
+    age_percent = detail.get("age_contribution_percent")
+    if claimed is None or age_percent is None:
+        return None
+    excess = detail.get("fixed_excess_stated") or 0.0
+    non_claimable = detail.get("non_claimable_stated") or 0.0
+    # ponytail: percentage excess has been $0.00 [0%] on every letter seen, so
+    # where it sits in the order of operations is unverified. Deducted with the
+    # others; if one ever arrives non-zero and Check A fires on an otherwise
+    # sound letter, that placement is the first thing to re-read.
+    percentage_excess = detail.get("percentage_excess_stated") or 0.0
+    expected = (claimed - excess - non_claimable - percentage_excess) * (1 - age_percent)
+    if abs(paid_amount - expected) <= SETTLEMENT_TOLERANCE:
+        return None
+    extra = f", percentage excess ${percentage_excess:.2f}" if percentage_excess else ""
+    return (
+        "settlement mismatch — Petcover's own figures don't add up: they state claimed "
+        f"${claimed:.2f}, fixed excess ${excess:.2f}, non-claimable ${non_claimable:.2f}"
+        f"{extra} and age contribution {age_percent:.0%}, which comes to ${expected:.2f}, "
+        f"but they paid ${paid_amount:.2f} — review"
+    )
+
+
+def _check_what_petcover_assessed(claim, detail: dict, claimable: float) -> str | None:
+    """Check B — did Petcover assess the amount we actually submitted.
+
+    A separate finding from Check A with a different audience: their arithmetic
+    can be perfect on an amount that is not ours. Claim #8 is the live case —
+    $(351.50 − 150.00) × 0.65 = $130.97 to the cent, on a claim we submitted at
+    $446.50. Worded as a question because we cannot tell which invoice they
+    assessed and must not guess: every stated amount matches some real invoice of
+    ours, the amounts cross Condition Thread boundaries, and the letter carries
+    no invoice number or treatment date.
+    """
+    claimed = detail.get("claimed_amount")
+    if claimed is None or abs(claimed - claimable) <= SETTLEMENT_TOLERANCE:
+        return None
+    where = claim["petcover_reference"] or "no reference"
+    sr = claim["petcover_sr"]
+    return (
+        f"assessment difference — claim #{claim['id']} ({where} Sr {sr if sr is not None else '?'}): "
+        f"we submitted ${claimable:.2f}, Petcover states they assessed ${claimed:.2f}. "
+        "Their arithmetic on their own figure is correct — ask Petcover which invoice this assessed"
+    )
+
+
+def _validate_settlement(claim, detail: dict, txn_date_iso: str) -> str | None:
+    """Two independent checks over one settlement, never fused into one flag.
+
+    Fusing them is what made the real finding invisible: claim #8's live flag
+    read *expected $296.50, Petcover paid $130.97 (fresh $150 excess this policy
+    year)* — our number not theirs, an excess the letter had actually stated, and
+    no mention of the one thing that genuinely did not reconcile.
+
+    Check A asks whether Petcover's own figures add up; Check B asks whether they
+    assessed what we submitted. Both can fire; the column holds one flag, so A
+    wins — a supplier's arithmetic being wrong is the more serious of the two and
+    the figures for both are on the event either way.
+
+    When the letter states no line items (the older PDF style, `Amount Claimed` /
+    `Total Payable` only) the transaction-date-bucketed excess/cap fallback below
+    still runs — ADR-0011, ADR-0013.
 
     Closed-year default: our claim history for any policy year that has already
     ended is presumed incomplete (some vet spend never hits the tracked card,
@@ -976,19 +1139,32 @@ def _validate_settlement(claim, paid_amount: float | None, txn_date_iso: str) ->
     transaction falls in an already-closed year is assumed to have already
     passed the threshold: expected = full claimable, no excess deducted.
 
-    The flag is deliberately a plain mismatch check in EITHER direction — we
-    don't try to replicate Petcover's own internal math (e.g. their Age
-    Contribution co-pay), we just compare our simple expectation to what they
-    actually reported and surface any difference as a warning for Justin."""
+    Every flag is a warning to review in EITHER direction, never an assertion
+    that Petcover is wrong, and nothing here auto-disputes or sends mail."""
+    paid_amount = detail.get("paid_amount")
     if paid_amount is None:
         return None
-    invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
-    claimable = invoice.get("claimable_amount")
-    if claimable is None:
-        claimable = invoice.get("amount")
-    if claimable is None:
+    claimable, subtotal_recorded = claimable_subtotal(claim["invoice_data"])
+
+    if detail.get("claimed_amount") is not None and detail.get("age_contribution_percent") is not None:
+        # The letter states its own breakdown, so it — not our excess model —
+        # decides the expectation. The excess/cap path below never runs here.
+        arithmetic = _check_petcovers_arithmetic(detail, paid_amount)
+        if arithmetic:
+            return arithmetic
+        if not subtotal_recorded:
+            # No expectation is computed. Naming the letter's figures is what
+            # keeps the letter from being lost behind a silent None.
+            return (
+                f"claimable subtotal not recorded — claim #{claim['id']}: Petcover states they "
+                f"assessed ${detail['claimed_amount']:.2f} and paid ${paid_amount:.2f}, and their "
+                "figures add up, but nothing was recorded as this claim's claimable subtotal so "
+                "there is nothing to check it against — review"
+            )
+        return _check_what_petcover_assessed(claim, detail, claimable)
+
+    if not subtotal_recorded:
         return None  # nothing to compare against — don't fabricate an expectation
-    claimable = float(claimable)
 
     with db.get_connection() as conn:
         pet = conn.execute(
@@ -1043,14 +1219,24 @@ def _validate_settlement(claim, paid_amount: float | None, txn_date_iso: str) ->
                 if _in_year(r["txn_date"])
             )
             remaining_cap = max(0.0, ANNUAL_CAP - paid_this_year)
-            expected = claimable - (0.0 if excess_consumed else POLICY_EXCESS)
+            # A stated excess is a fact from the letter; the inferred one is our
+            # model of their policy. Where they state it, we neither infer nor
+            # narrate an inference — "fresh $150 excess this policy year" on a
+            # letter that printed $150.00 is a claim about our own reasoning
+            # dressed up as a finding about theirs.
+            stated_excess = detail.get("fixed_excess_stated")
+            if stated_excess is not None:
+                expected = claimable - stated_excess
+                reason = ""
+            else:
+                expected = claimable - (0.0 if excess_consumed else POLICY_EXCESS)
+                reason = (
+                    " (excess already used this policy year)"
+                    if excess_consumed
+                    else " (fresh $150 excess this policy year)"
+                )
             expected = max(0.0, min(expected, remaining_cap))
             note = ""
-            reason = (
-                " (excess already used this policy year)"
-                if excess_consumed
-                else " (fresh $150 excess this policy year)"
-            )
 
     if abs(paid_amount - expected) > SETTLEMENT_TOLERANCE:
         return f"settlement mismatch — we expected ${expected:.2f}, Petcover paid ${paid_amount:.2f}{reason}{note} — review"
@@ -1229,7 +1415,17 @@ def _apply_excess_and_cap(rows: list, excess, cap, anniversary: str | None = Non
     priced = []
     for r in rows:
         if r["claimable"] is None:
-            r["expected"] = {"available": False, "value": None, "note": "no invoice yet"}
+            # Two different absences, and "no invoice yet" is only true for one
+            # of them: five live claims (#2, #16, #18, #19, #21) DO have an
+            # invoice and simply never had a claimable subtotal recorded on it.
+            # Saying "no invoice yet" there sends Justin looking for a document
+            # he already has.
+            note = (
+                "invoice on file, but no claimable subtotal recorded"
+                if r.get("invoice_present")
+                else "no invoice yet"
+            )
+            r["expected"] = {"available": False, "value": None, "note": note}
         else:
             priced.append(r)
 
@@ -1263,17 +1459,25 @@ def _apply_excess_and_cap(rows: list, excess, cap, anniversary: str | None = Non
             absorbed = min(remaining_excess, amount)
             remaining_excess -= absorbed
             after_excess = amount - absorbed
+            # Petcover pays 65% of what's left (Justin, 2026-08-04: "Petcover
+            # only paying 65% of a claim"), which is the same figure their
+            # letters print as a 35% Age Contribution — a stated policy term, not
+            # a rate inferred from the letters. Applied after the excess and
+            # before the cap, the order the letters themselves use: on Tr 8,
+            # $(580.74 − 135.00) × 0.65 = $289.73 exactly.
+            payable = after_excess * config.PETCOVER_BENEFIT_RATE
             # bound the running per-year total by the annual cap
             used = year_totals.get(year, 0.0)
             allowed = max(0.0, cap - used)
-            value = round(min(after_excess, allowed), 2)
+            value = round(min(payable, allowed), 2)
             year_totals[year] = used + value
+            benefit = f", {config.PETCOVER_BENEFIT_RATE:.0%} benefit"
             if group_claimable < excess:
                 note = (
                     f"{condition or 'condition'} YTD ${group_claimable:.2f} < ${excess:.0f} excess"
                 )
             else:
-                note = f"est. after ${excess:.0f} excess"
+                note = f"est. after ${excess:.0f} excess{benefit}"
             row_id = id(p["row"])
             row_values[row_id] = row_values.get(row_id, 0.0) + value
             row_notes.setdefault(row_id, []).append(note)
@@ -1338,10 +1542,7 @@ def visit_ledger() -> list:
 
     claims_by_txn: dict[int, list] = {}
     for c in claim_rows:
-        invoice = json.loads(c["invoice_data"] or "{}")
-        claimable = invoice.get("claimable_amount")
-        if claimable is None:
-            claimable = invoice.get("amount")
+        claimable, claimable_recorded = claimable_subtotal(c["invoice_data"])
         claims_by_txn.setdefault(c["transaction_id"], []).append(
             {
                 "id": c["id"],
@@ -1354,6 +1555,12 @@ def visit_ledger() -> list:
                 "draft_id": c["draft_id"],
                 "flag": c["flag"],
                 "claimable": claimable,
+                # A recorded $0.00 and an absent key are different answers and
+                # both arrive here as a falsy `claimable`; only this flag tells
+                # a renderer which one it is holding.
+                "claimable_recorded": claimable_recorded,
+                # Which of the two absences this is — see _apply_excess_and_cap.
+                "invoice_present": bool(c["invoice_data"]),
                 "txn_date": c["txn_date"],
                 "annual_excess": c["annual_excess"],
                 "annual_cap": c["annual_cap"],
@@ -1471,18 +1678,71 @@ SUBMISSION_LEVEL_ACTIONS = ("mark_sent",)
 # equally finished but don't, so they aren't in TERMINAL_STATUSES.
 CLOSED_STATUSES = TERMINAL_STATUSES + ("below_excess", "absorbed")
 
-# What each kind means to Justin, and what stalls until he acts.
+# The only four things a card may say about who is blocked. Naming the wrong
+# party is how a chase never happens — the same reason `info_requested` carries
+# `owed_by` and never defaults it.
+PETCOVER_WAITING_ON_YOU = "Petcover is waiting on you"
+YOU_WAITING_ON_PETCOVER = "you're waiting on Petcover"
+YOU_WAITING_ON_THE_VET = "you're waiting on the vet"
+NOBODY_WAITING = "nobody is waiting — this is for your review"
+WAITING_PARTIES = (
+    PETCOVER_WAITING_ON_YOU,
+    YOU_WAITING_ON_PETCOVER,
+    YOU_WAITING_ON_THE_VET,
+    NOBODY_WAITING,
+)
+
+# What each kind means to Justin, what stalls until he acts, and who is actually
+# waiting. Three elements, all data on the kind — a phrase assembled at the card
+# site is how the Telegram card, the dashboard and the chat agent come to
+# disagree (ADR-0021, status_labels.py). Where one kind covers two situations the
+# third element is a dict and `waiting_party` resolves it; there is no default.
 _ACTION_META = {
-    "split_proposal": ("Confirm invoice split", "one invoice paid over several charges"),
-    "unmatch": ("Check invoice match", "a possible wrong/extra invoice is attached"),
-    "confirm_resolved": ("Confirm resolved", "Petcover is waiting on you"),
-    "mark_sent": ("Send Gmail draft", "Petcover reply tracking hasn't started"),
-    "invoice_request_sent": ("Invoice request sent?", "no invoice means no claim"),
-    "set_condition": ("Set condition", "the claim can't be drafted"),
-    "assign_pet": ("Assign pet", "the claim can't be filled"),
-    "dismiss_mismatch": ("Review settlement", "a paid-vs-expected difference is unreviewed"),
-    "blocked_insurer": ("Define claim process", "every claim for this pet is stuck"),
+    "split_proposal": ("Confirm invoice split", "one invoice paid over several charges", NOBODY_WAITING),
+    "unmatch": ("Check invoice match", "a possible wrong/extra invoice is attached", NOBODY_WAITING),
+    # Petcover asked for something. Who holds it decides who is blocked — the
+    # answer is already on the claim as `owed_by`, so it is read, not assumed.
+    "confirm_resolved": (
+        "Confirm resolved",
+        "a Petcover request is still open",
+        {"justin": PETCOVER_WAITING_ON_YOU, "vet": YOU_WAITING_ON_THE_VET},
+    ),
+    "mark_sent": ("Send Gmail draft", "Petcover reply tracking hasn't started", NOBODY_WAITING),
+    "invoice_request_sent": ("Invoice request sent?", "no invoice means no claim", YOU_WAITING_ON_THE_VET),
+    "set_condition": ("Set condition", "the claim can't be drafted", NOBODY_WAITING),
+    "assign_pet": ("Assign pet", "the claim can't be filled", NOBODY_WAITING),
+    # Justin's own words on the old card: "It also said Petcover is waiting on me
+    # but that doesn't seem to be the case if I have to just check the payment
+    # discrepancy". Arithmetic he can check himself; an assessment difference is
+    # a question already put to Petcover.
+    "dismiss_mismatch": (
+        "Review settlement",
+        "a paid-vs-expected difference is unreviewed",
+        {"arithmetic": NOBODY_WAITING, "assessment": YOU_WAITING_ON_PETCOVER},
+    ),
+    "blocked_insurer": ("Define claim process", "every claim for this pet is stuck", NOBODY_WAITING),
 }
+
+
+def waiting_party(kind: str, key: str | None = None) -> str:
+    """Who is blocked on this action. Raises rather than defaulting: a kind
+    added without a waiting party, or with a situation this map doesn't cover,
+    is a bug that must fail loudly instead of naming the wrong party."""
+    declared = _ACTION_META[kind][2]
+    if isinstance(declared, str):
+        return declared
+    if key not in declared:
+        raise KeyError(f"{kind} declares no waiting party for {key!r}")
+    return declared[key]
+
+
+def _waiting_key(kind: str, claim: dict) -> str | None:
+    """The discriminator for the kinds whose waiting party depends on the claim."""
+    if kind == "dismiss_mismatch":
+        return _settlement_check_kind(claim.get("flag")) or "arithmetic"
+    if kind == "confirm_resolved":
+        return "vet" if claim.get("owed_by") == "vet" else "justin"
+    return None
 
 _INSURER_UNDEFINED = "claim process not yet defined"
 
@@ -1522,7 +1782,7 @@ def _action_kind_from_row(claim: dict) -> str | None:
         return "invoice_request_sent"
     if flag.endswith(_INSURER_UNDEFINED):
         return "blocked_insurer"
-    if flag.startswith("settlement mismatch"):
+    if flag.startswith(SETTLEMENT_FLAG_PREFIXES):
         return "dismiss_mismatch"
     if claim["status"] in CLOSED_STATUSES:
         return None  # finished — an absorbed/below-excess claim needs nothing
@@ -1563,12 +1823,19 @@ def pending_actions() -> list[dict]:
             kind = _action_kind(claim, open_split_claim_ids, unresolved_event_claim_ids)
             if kind is None:
                 continue
-            title, blocks = _ACTION_META[kind]
+            title, blocks, _ = _ACTION_META[kind]
             actions.append(
                 {
                     "kind": kind,
                     "title": title,
                     "blocks": blocks,
+                    "waiting": waiting_party(kind, _waiting_key(kind, claim)),
+                    # Straight off the ledger row this loop is already walking —
+                    # a second calculation is a second answer that eventually
+                    # disagrees with the dashboard's.
+                    "claimable": claim["claimable"],
+                    "claimable_recorded": claim["claimable_recorded"],
+                    "expected": claim["expected"],
                     "claim_id": claim["id"],
                     "claim_ids": [claim["id"]],
                     "group_id": submission_group_id([claim["id"]]),
@@ -1736,6 +2003,7 @@ def claim_detail(claim_id: int) -> dict | None:
         ).fetchall()
 
     invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
+    claimable, claimable_recorded = claimable_subtotal(invoice)
     # Only the figures — the raw detail also holds subjects and bodies, which
     # would blow the chat turn's token budget for no answering power.
     # Plus who owes a requested document and what it is: the chip only has room
@@ -1746,6 +2014,9 @@ def claim_detail(claim_id: int) -> dict | None:
         "paid_amount",
         "fixed_excess_stated",
         "age_contribution_stated",
+        "age_contribution_percent",
+        "non_claimable_stated",
+        "percentage_excess_stated",
         "subject",
         "owed_by",
         "clinic",
@@ -1766,7 +2037,10 @@ def claim_detail(claim_id: int) -> dict | None:
         "merchant": claim["merchant"],
         "invoice_number": invoice.get("invoice_number"),
         "invoice_amount": invoice.get("amount"),
-        "claimable_amount": invoice.get("claimable_amount", invoice.get("amount")),
+        "claimable_amount": claimable,
+        # Explicit, so the agent answers "not recorded" instead of reading a
+        # null as zero or reaching for invoice_amount.
+        "claimable_amount_recorded": claimable_recorded,
         "items": invoice.get("items") or [],
         "events": [
             {
@@ -1873,20 +2147,57 @@ def dismiss_mismatch(claim_id: int) -> dict:
     log (ADR-0008) is the audit trail, and a silently-erased discrepancy is
     exactly the invisible failure the hard rules forbid."""
     with db.get_connection() as conn:
-        claim = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        claim = conn.execute(
+            "SELECT flag, invoice_data FROM vet_claims WHERE id = ?", (claim_id,)
+        ).fetchone()
         if claim is None:
             return {"ok": False, "message": f"No claim #{claim_id} found."}
-        if not (claim["flag"] or "").startswith("settlement mismatch"):
+        if not (claim["flag"] or "").startswith(SETTLEMENT_FLAG_PREFIXES):
             return {
                 "ok": False,
-                "message": f"Claim #{claim_id} has no settlement mismatch to review.",
+                "message": f"Claim #{claim_id} has no settlement difference to review.",
             }
         dismissed = claim["flag"]
+        # The letter's figures, from the event that carried them. Prose in
+        # `dismissed_flag` is not a record: event 58 holds claim #2's entire
+        # finding as a sentence, and nothing can query a sentence.
+        stated = {}
+        for row in conn.execute(
+            "SELECT detail FROM claim_status_events WHERE claim_id = ? "
+            "AND event_type IN ('approved', 'settled') ORDER BY id",
+            (claim_id,),
+        ):
+            figures = json.loads(row["detail"] or "{}")
+            if figures.get("paid_amount") is not None:
+                stated = figures
         conn.execute(
             "UPDATE vet_claims SET flag = NULL, updated_at = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), claim_id),
         )
-    _record_event(claim_id, "mismatch_dismissed", None, {"dismissed_flag": dismissed})
+    claimable, recorded = claimable_subtotal(claim["invoice_data"])
+    check = _settlement_check_kind(dismissed)
+    _record_event(
+        claim_id,
+        "mismatch_dismissed",
+        None,
+        {
+            "dismissed_flag": dismissed,
+            "check": check,
+            "claimed_amount": stated.get("claimed_amount"),
+            "paid_amount": stated.get("paid_amount"),
+            "fixed_excess_stated": stated.get("fixed_excess_stated"),
+            "non_claimable_stated": stated.get("non_claimable_stated"),
+            "claimable_subtotal": claimable,
+            "claimable_subtotal_recorded": recorded,
+        },
+    )
+    if check == "assessment":
+        # Justin has read it; Petcover still hasn't answered. Dismissal clears
+        # the card, not the question — the claim stays in the review queue.
+        return {
+            "ok": True,
+            "message": f"Claim #{claim_id}: noted. It stays in the review queue until Petcover answers.",
+        }
     return {"ok": True, "message": f"Claim #{claim_id}: settlement difference marked reviewed."}
 
 
@@ -1929,6 +2240,14 @@ def dashboard_lists() -> dict:
     for event in events:
         if event["claim_id"] is None or event["event_type"] == "unclassified":
             review_queue.append(event)
+        # A dismissed ASSESSMENT difference is a question outstanding with
+        # Petcover, not a thing Justin has resolved — so dismissal clears the
+        # card and this keeps the question on a surface. An arithmetic dismissal
+        # is Justin saying "I checked this", and correctly disappears.
+        elif event["event_type"] == "mismatch_dismissed" and (
+            json.loads(event["detail"] or "{}").get("check") == "assessment"
+        ):
+            review_queue.append(event)
         if event["claim_id"] is not None:
             events_by_claim.setdefault(event["claim_id"], []).append(event)
 
@@ -1953,13 +2272,11 @@ def dashboard_lists() -> dict:
         for event in claim_events:
             if event["event_type"] == "settled":
                 detail = json.loads(event["detail"] or "{}")
-                invoice = json.loads(claim["invoice_data"] or "{}")
-                # our own record of what was claimed, not Petcover's figure
-                claimed = (
-                    invoice.get("claimable_amount")
-                    or invoice.get("amount")
-                    or detail.get("claimed_amount")
-                )
+                # Our own record of what was claimed, and NOTHING in its place:
+                # the invoice total is a different quantity and Petcover's own
+                # figure is the thing this row exists to compare against, so
+                # falling back to either turns a difference into an agreement.
+                claimed, _ = claimable_subtotal(claim["invoice_data"])
                 settled_reconciliation.append(
                     {
                         "claim": claim,

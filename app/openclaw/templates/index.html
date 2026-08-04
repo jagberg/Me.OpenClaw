@@ -143,7 +143,7 @@
     <td>{% if claim.pet_name %}<span class="pet"><i></i>{{ claim.pet_name }}</span>{% else %}<span class="na">no pet</span>{% endif %}</td>
     <td>{{ claim.condition_text or '' }}{% if claim.flag and claim.flag != 'invoice_request_drafted' %}<span class="sub flagnote">{{ claim.flag }}</span>{% endif %}</td>
     <td class="num ceil">{% if charge is not none %}${{ '%.2f'|format(charge|abs) }}{% else %}&mdash;{% endif %}</td>
-    <td class="num">{% if claim.claimable is not none %}${{ '%.2f'|format(claim.claimable) }}{% else %}<span class="na">&mdash;</span>{% endif %}</td>
+    <td class="num">{% if claim.claimable is not none %}${{ '%.2f'|format(claim.claimable) }}{% else %}<span class="na">Not recorded</span>{% endif %}</td>
     <td class="num">{{ expected_cell(claim) }}</td>
     <td>{{ status_chip(claim) }}</td>
     <td class="ref">{{ claim.reference or '&mdash;'|safe }}</td>
@@ -286,10 +286,24 @@
         {% for e in unclassified %}
         <li class="inline">
           <span class="muted">{{ e.event_type }} ({{ e.created_at[:10] }})</span>
+          {% if e.claim_id %}
+          {# Already linked: an open question with Petcover, not an orphan email.
+             Show what the difference was made of — the link form would be a
+             no-op here and link_event refuses an already-linked event. #}
+          {% set d = e.detail|from_json %}
+          <span>claim #{{ e.claim_id }}: we submitted
+            {{ '$%.2f'|format(d.claimable_subtotal) if d.claimable_subtotal is not none else 'not recorded' }},
+            Petcover assessed
+            {{ '$%.2f'|format(d.claimed_amount) if d.claimed_amount is not none else 'not stated' }},
+            paid
+            {{ '$%.2f'|format(d.paid_amount) if d.paid_amount is not none else 'not stated' }}
+            — waiting on Petcover</span>
+          {% else %}
           <form class="inline" method="post" action="/events/{{ e.id }}/link">
             <input type="text" name="claim_id" placeholder="claim id" size="6" required>
             <button type="submit">Link to claim</button>
           </form>
+          {% endif %}
         </li>
         {% endfor %}
       </ul>

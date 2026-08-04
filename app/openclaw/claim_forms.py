@@ -615,16 +615,26 @@ def check_split(claim_id: int, shares: list[tuple[int, float | None]]) -> dict:
                 f"(status: {claim['status']}) — that correction has to go to "
                 "them, it can't be split here.",
             }
-        invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
-        subtotal = invoice.get("claimable_amount")
-        if subtotal is None:
-            subtotal = invoice.get("amount")
-        if subtotal is None:
+        from . import claim_status  # local: claim_status imports this module
+
+        # A split apportions the CLAIMABLE subtotal between pets (ADR-0019), and
+        # the invoice total is a different number — it still carries the
+        # non-claimable lines. Splitting the total silently wrote a wrong
+        # claimable share into every resulting claim, so an unrecorded subtotal
+        # refuses here and says what is missing rather than substituting.
+        subtotal, recorded = claim_status.claimable_subtotal(claim["invoice_data"])
+        if not recorded:
+            if not claim["invoice_data"]:
+                return {
+                    "ok": False,
+                    "message": f"Claim #{claim_id} has no invoice amount on file to split.",
+                }
             return {
                 "ok": False,
-                "message": f"Claim #{claim_id} has no invoice amount on file to split.",
+                "message": f"Claim #{claim_id} has an invoice but no claimable subtotal recorded, "
+                "and the invoice total isn't a stand-in for one — re-match the invoice so the "
+                "claimable lines are worked out before splitting it between pets.",
             }
-        subtotal = float(subtotal)
 
         if len(shares) < 2:
             return {"ok": False, "message": "A split needs at least two pets."}

@@ -428,3 +428,32 @@ never once asserts *the app can actually send a message*. A check that pushed a
 real message through `gateway_client` at deploy time would have caught this
 before a human tapped anything. That is the gap worth closing regardless of
 which option wins.
+
+## From petcover-settlement-reconciliation (2026-08-04)
+
+- ~~Should the dashboard's expected-reimbursement estimate net the 35% age
+  contribution?~~ **Decided 2026-08-04 by Justin: yes.** 65% is the policy's own
+  benefit rate, not a percentage inferred from the letters, so the
+  "no fabricated deduction" rule it seemed to contradict never applied. The
+  ledger now nets `config.PETCOVER_BENEFIT_RATE` after the excess and before the
+  cap. Echo (no Petcover figures on file) is untouched. See the change's
+  `dashboard-visit-ledger` delta and design.md Decision 3's reversal note.
+  Remaining open piece: whether the rate should ever be per-pet — that needs a
+  column, which on the live DB means a hand-run `ALTER TABLE`, so it waits for a
+  second insured pet.
+- **The closed-policy-year disagreement, open since 2026-07-25**: the dashboard
+  drains the $150 excess for closed years and settlement validation does not.
+  Worth settling in the same conversation as the age contribution — two open
+  disagreements about the same numbers is one too many.
+- **Five `approved` events lack `age_contribution_stated`** (ids 18, 21, 22, 54,
+  55) because the extraction pattern shipped after they were written. Today's
+  code reads it from those same five emails, but `_already_recorded` blocks a
+  re-read from backfilling and that is correct (ADR-0020): re-reading mail is not
+  a repair tool. The gap is permanent in the log and Check A skips those events
+  rather than checking them against a term they never captured.
+- **Four Petcover serials we hold no claim for**: `DC1-26-5992` Tr 3 and Tr 4,
+  `DC1-27-5628` Tr 8, `DC1-26-5993` Tr 1 — approvals totalling $4,181.70 claimed
+  / $2,532.85 paid. Not correctable from data we hold (see
+  `petcover-questions.md` items 8–11); a re-read will route them by
+  `_claim_for_sr`'s oldest-transaction heuristic, which is exactly the heuristic
+  in question, so the routing wants checking once Petcover answers.

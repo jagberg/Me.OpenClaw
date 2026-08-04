@@ -119,11 +119,9 @@ def _ensure_gmail_auth(send_fn=None) -> bool:
 
 
 # marketing.au@ deliberately excluded — not claims-relevant (design.md).
-PETCOVER_STATUS_SENDERS = [
-    "claims.au@petcovergroup.com",
-    "requiredinfo.au@petcovergroup.com",
-    "accounts.au@petcovergroup.com",
-]
+# Lives in config because `gmail_ingest` has to skip these senders too and
+# importing pipeline from there would be circular (pipeline imports gmail_ingest).
+PETCOVER_STATUS_SENDERS = config.PETCOVER_STATUS_SENDERS
 
 # A specific Gmail draft can't be deep-linked on mobile (the #drafts/<id>
 # anchor is desktop-web only, and Gmail's app URL scheme has no open-draft-by-id
@@ -396,8 +394,7 @@ def notify_split_proposals(send_fn=None) -> None:
 _REVIEW_FLAG_MARKERS = (
     "isn't a per-visit itemised invoice",
     "invoice attachment unreadable",
-    "settlement mismatch",
-)
+) + claim_status.SETTLEMENT_FLAG_PREFIXES
 
 
 def _latest_settled_email_id(claim_id: int) -> str | None:
@@ -423,7 +420,7 @@ def _review_pdf(group) -> tuple[str, bytes] | None:
     best-effort."""
     lead = group[0]
     email_id = lead["matched_email_id"]
-    if lead["flag"] and "settlement mismatch" in lead["flag"]:
+    if lead["flag"] and lead["flag"].startswith(claim_status.SETTLEMENT_FLAG_PREFIXES):
         email_id = _latest_settled_email_id(lead["id"]) or email_id
     if not email_id and lead["flag"] and "unreadable — " in lead["flag"]:
         subject = lead["flag"].split("unreadable — ", 1)[1]
