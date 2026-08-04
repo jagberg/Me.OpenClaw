@@ -5903,6 +5903,76 @@ def test_chat_has_a_gemini_backend_and_the_agents_primary_is_the_reachable_provi
     assert groq_primary <= 1, "Groq must be at most the no-Gemini fallback, never the default primary"
 
 
+def test_nothing_in_the_app_can_send_mail_and_no_tool_offers_to():
+    """Task 10.3, guarding the first hard rule: Gmail DRAFTS only, never send.
+
+    Two halves, because there are two ways to break it. The code half greps for
+    Gmail's send call rather than for the word "send" — `bot.send_message` is a
+    legitimate Telegram send and a guard that trips on it gets deleted within a
+    week. The inventory half matters because the agent cannot be argued out of a
+    capability it has: if a send tool is on the surface, prompt wording is all
+    that stands between a model and an outgoing email."""
+    from openclaw import mcp_server
+
+    offenders = []
+    for path in (Path(__file__).resolve().parent.parent / "openclaw").glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for pattern in ("messages().send", "messages() .send", ".send(userId", "drafts().send"):
+            # Only real call sites: this file's own prose says "never send()", and
+            # so do several module docstrings.
+            for line in text.splitlines():
+                if pattern in line and not line.lstrip().startswith("#"):
+                    offenders.append(f"{path.name}: {line.strip()[:80]}")
+    assert not offenders, f"a Gmail send call exists: {offenders}"
+
+    named = [t["name"] for t in mcp_server.TOOLS]
+    for tool in named:
+        assert "send" not in tool and "email" not in tool and "mail" not in tool, (
+            f"the agent's tool surface offers {tool} — a send capability cannot be prompted away")
+    # And the drafting path IS present, so this test cannot pass by the whole
+    # Gmail integration having been deleted. `drafts().create` lives in
+    # claim_forms and invoice_matching, NOT in gmail_client — which is where this
+    # assertion first looked, and it failed for that reason rather than for a real
+    # one. Scan the package.
+    package = "\n".join(
+        p.read_text(encoding="utf-8")
+        for p in (Path(__file__).resolve().parent.parent / "openclaw").glob("*.py"))
+    assert "drafts().create" in package, "no draft path left — this guard would then be vacuous"
+
+
+def test_an_overlapping_internal_call_says_skipped_and_never_reads_as_a_run():
+    """The `skipped` body of `/internal/*` — three responses, and this was the one
+    with no assertion (named in section 10's own gap list).
+
+    It matters because cron fires on a fixed cadence and a tick can outlast it: a
+    skipped run that answered `ok` would make an overlap indistinguishable from
+    work done, and `job_runs.last_ok_at` would advance on a run that never ran."""
+    from openclaw import internal_api
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM job_runs WHERE route = 'tick'")
+    internal_api.record_run("tick", "last_ok_at")
+    before = internal_api.scheduler_health()["jobs"]["tick"]["last_ok_at"]
+
+    ran = []
+    lock = internal_api._locks.setdefault("tick", __import__("threading").Lock())
+    lock.acquire()  # stand in for a tick still running
+    try:
+        body = internal_api._run("tick", lambda: ran.append(1), "corr-test")
+    finally:
+        lock.release()
+
+    assert body["status"] == "skipped", body
+    assert body["reason"] == "already running", body
+    assert body["correlation_id"] == "corr-test", body
+    assert ran == [], "the job body ran anyway — the lock bought nothing"
+
+    after = internal_api.scheduler_health()["jobs"]["tick"]
+    assert after["last_ok_at"] == before, "a skipped run advanced last_ok_at"
+    assert after["last_skipped_at"], "the skip was not recorded, so a stuck lock looks healthy"
+
+
 def test_extraction_walks_the_model_chain_under_every_provider_including_gemini():
     """Task 10.13, and it caught a live regression rather than confirming one.
 

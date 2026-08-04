@@ -111,6 +111,23 @@ API is unestablished.
 
   Live afterwards: `PASS exactly one Telegram poller — the gateway`, app log `Telegram updater disabled — the gateway owns the channel`, `/health` `polling_alive: null`, gateway `enabled, configured, running, connected, mode:polling, token:env`, twelve commands registered with no collisions. The preflight's only remaining FAIL is Groq's daily budget again — a quota result, not a cutover one.
 - [ ] 4.11 Verify live against the real chat: one claim taken from notification through condition tap, pet assign, mark sent, and confirm resolved. Record which claim id was used.
+
+  **The sequence to run** (written 2026-08-04 at Justin's request; nothing here can be faked from this side, because a tap is a Telegram callback and there is no way to originate one). Run it in one sitting so the log window is contiguous, and note the claim id used.
+
+  | # | Do this in Telegram | Expected | What it proves |
+  |---|---|---|---|
+  | 1 | `/actions` | Summary card first, then one card per outstanding action, all within ~6s | The burst path and the in-gateway send route (not the CLI) |
+  | 2 | Tap **Set condition** on a claim that needs one | A force-reply prompt naming the claim | `pending_flows` starts, durable across the three requests |
+  | 3 | Type the condition in plain words (e.g. `kennel cough`) | Card comes back with the condition on it | The typed words reach `condition_text` with **no model in between** — the hard rule |
+  | 4 | Tap **Assign pet** where the pet is ambiguous, pick one | Card updates with the pet | Pet assignment from a tap, not inference |
+  | 5 | Tap **Mark sent** on a submission | One confirmation; claims sharing the `draft_id` all move | Batch semantics survived the cutover |
+  | 6 | Tap the same **Mark sent** again | Refused as already confirmed, no second mutation | Single-use taps — Telegram redelivers, and a double mark-sent is a second Petcover submission |
+  | 7 | Tap **Confirm resolved** on a needs-action item | Item leaves the action list | Needs-action persists until an explicit confirm (ADR-0008) |
+  | 8 | Send a plain sentence (not a command), e.g. `what's outstanding?` | An answer naming claim `#id`s, and a 👍 on your message | The agent runs on Gemini, and the native ack works for typed messages |
+
+  Two things NOT to expect, both established: a 👍 on `/actions` or on any tap (a slash command never enters the ingress path that creates the ack, and a tap has no message to react to — typing is the feedback there), and instant delivery of a multi-card burst (Telegram's own ~1 message/second/chat floor).
+
+  Afterwards, say the claim id and roughly when. I read `telegram_messages`, the app log and the gateway log for that window and record what actually happened — including 4.12 (a mid-handler crash leaves the row unprocessed and startup replays it) and 4.13 (a duplicated delivery commits no duplicate mutation), which are observations on this same run rather than separate exercises.
 - [ ] 4.12 Verify a mid-handler crash leaves the row unprocessed and the replay queue re-runs it at startup.
 - [ ] 4.13 Verify a duplicated gateway delivery commits no duplicate mutation.
 
@@ -206,18 +223,22 @@ All additions go in `app/tests/test_core.py` (assert-based, no pytest) and must 
 
 - [x] 10.1 Stub the gateway CLI at a single seam so every send/edit/react path is testable without a daemon; assert the suite passes with the gateway absent.
 - [x] 10.2 **DONE — the same assertion as 19a.7, which was ticked while this stayed open** (eval, 2026-08-02). One test, `test_mcp_inventory_has_no_dangerous_tool`, satisfies both; two checkboxes for one assertion is how a reader concludes there are two guards. Kept as a cross-reference rather than deleted, since both section 10 and section 19a are meant to be readable alone. Original: Regression: agent tool inventory contains no filesystem, shell, browser, mailbox-search or secret-returning tool.
-- [ ] 10.3 Regression: no send path — `send()` absent from `app/openclaw/`, no send tool in the inventory.
+- [x] 10.3 **DONE 2026-08-04** — `test_nothing_in_the_app_can_send_mail_and_no_tool_offers_to`. Greps for Gmail's *send call* rather than the word "send": `bot.send_message` is a legitimate Telegram send, and a guard that trips on it gets deleted within a week. Also asserts no tool on the agent's surface is named send/email/mail — a capability cannot be prompted away — and that `drafts().create` still exists, so the guard cannot pass by the Gmail integration having been removed. (Written wrong first: the vacuity check looked in `gmail_client.py`, where drafting does not live.)
 - [ ] 10.4 Regression: every outbound claim message carries its `#id` (existing test, re-pointed at the gateway path).
 - [ ] 10.5 Regression: a `propose_*` tool commits nothing; only the confirm callback commits. Include the case where the model's text asserts it is already done.
 - [ ] 10.6 Regression: the two-pets-named refusal, asserted with the live 2026-07-27 message text.
 - [ ] 10.7 Regression: split with no per-item amounts is refused, no $0 rows.
-- [ ] 10.8 Regression: pending free-text flow consumes its reply and the agent never receives it as a turn.
+- [x] 10.8 **Already covered** by `test_a_pending_condition_flow_claims_the_next_typed_message_and_then_releases` (written for 4.3/12.2): `claim_text` returns a card while the flow is pending and `None` before and after, which is exactly "consumed, and the agent never sees it". Cross-referenced rather than duplicated.
 - [ ] 10.9 Regression: caption-vs-text append on document and photo messages.
 - [ ] 10.10 Regression: authorization rejects any other username even when the gateway delivered the event; case-insensitive compare still passes.
 - [x] 10.11 Regression: two concurrent `/internal/tick` calls never both enter `pipeline.run_once`.
 - [ ] 10.12 Regression: duplicate gateway delivery commits no duplicate mutation; unprocessed row replays at startup.
-- [ ] 10.13 Regression: daily-budget fallback still walks models for `extract()` after `chat()` is deleted.
+- [x] 10.13 **DONE 2026-08-04, and it found a live regression rather than confirming one** — `test_extraction_walks_the_model_chain_under_every_provider_including_gemini`. `llm.extract` delegated to `gemini.extract` whenever `LLM_PROVIDER=gemini`; harmless while Gemini was a rollback option, but when Groq's network block made Gemini the default, invoice extraction started pinning ONE model and retrying it three times with backoff — the right answer to a per-minute cap and a useless one to a per-day cap, i.e. the exact failure ADR-0017 exists to prevent, back through the side door. Fixed in `1f58b45`: `extract()` goes through `chat()` for every provider, `gemini.extract` is deleted, and `_is_daily_budget_exhausted` now recognises Gemini's spelling — read off a real 429, whose message says only "you exceeded your current quota" while the useful part sits in `details[].violations[].quotaId` (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`). The test asserts both directions: a per-day violation walks, a per-minute-only one does not.
 - [ ] 10.14 Regression: correlation id present on the `telegram_messages` row for a gateway-delivered event.
+
+  **Cannot be asserted as written: `telegram_messages` has no correlation column** (checked 2026-08-04 — the columns are id, update_id, direction, kind, summary, payload, app_version, received_at, processed_at, error). Adding one is a live `ALTER TABLE` on an existing table, which is a decision for Justin rather than a test to write.
+
+  What exists instead, and may be enough: `internal_api` logs `correlation=<id> update_id=<n>` on the same line, and `telegram_messages.update_id` is UNIQUE — so a gateway-delivered event can be joined from log to row through the update id today. Two options, neither taken unilaterally: accept that indirection and reword this task, or add the column and backfill nothing.
 - [x] 10.16 **Added.** Guard test: nothing outside `gateway_client` imports `subprocess` or reads `config.OPENCLAW_CLI`. Converts the one-seam rule from convention into enforcement — the gap the module map rates as only *partial* for `LoggedBot`. Match the USAGE form (`config.OPENCLAW_CLI`), not the bare name: `config.py` defines the setting and a guard that fires on its own definition site gets trained away.
 - [ ] 10.15 Run the full suite at the end of every phase, not only at phase 6. Record pass/fail in this file with the actual output on failure.
 
@@ -315,7 +336,7 @@ today, so it went to `openspec/BACKLOG.md` instead.
 
   - `gateway_client._run`: 4 failure modes, 3 asserted. `TimeoutExpired` (`gateway_client.py:115-116`) unasserted.
   - `internal_api.record_event`: 4 outcomes, 3 asserted. The 500-on-write-failure (`internal_api.py:253-259`) is unasserted, and it is exactly the failure posture its own docstring is built on.
-  - `internal_api._run`: 3 responses, 0 asserted. The `skipped` body (`internal_api.py:114-115`) is never checked — that is the body a caller sees when `run_exclusive` refuses an overlapping tick.
+  - `internal_api._run`: 3 responses, 0 asserted. The `skipped` body (`internal_api.py:114-115`) is never checked — that is the body a caller sees when `run_exclusive` refuses an overlapping tick. **CLOSED 2026-08-04** — `test_an_overlapping_internal_call_says_skipped_and_never_reads_as_a_run` asserts the body, that the job function did not run, and that `job_runs.last_ok_at` did NOT advance while `last_skipped_at` did (a route that only ever skips is a stuck lock and must not read as healthy).
   - `message_log._describe`: the media branch has 3 outcomes and 2 asserted; the `<other>` fallback (voice, sticker, video) is unasserted, and the `edit:` prefix is asserted on `text` but not on `command`.
   - `internal_api.plugin_hello`'s `lstrip("/")` normalisation (`internal_api.py:177`) is never exercised — the test pokes `_plugin_report` directly and skips the route.
   - **(f)** Task 19a.4 claims the byte budget was asserted "using the longest real case (a condition selection)". It was not: the fixture is synthetic padding, and no production-built command string is measured anywhere. Section 4 builds the first real one — measure that, and correct 19a.4's claim rather than leaving it.
