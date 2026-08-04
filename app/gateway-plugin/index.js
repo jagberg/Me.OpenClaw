@@ -99,8 +99,15 @@ async function callApp(route, body, correlationId) {
  * in the same second, which a constant did not.
  */
 let sequence = 0;
+// The counter is module-level, so it RESETS on every plugin reload -- and the
+// plugin reloads on every deploy. Before the epoch prefix, `tg-actions-n1` was
+// emitted again after each restart: two different taps, identical correlation
+// id, in the log and (once the app began writing inbound rows) as a UNIQUE key
+// collision that silently dropped the newer row. The prefix is per process, so
+// ids stay short and stay unique across restarts.
+const RUN = Date.now().toString(36).slice(-4);
 function correlationId(name, ctx) {
-  const anchor = ctx?.messageId ?? ctx?.message?.id ?? `n${++sequence}`;
+  const anchor = ctx?.messageId ?? ctx?.message?.id ?? `${RUN}n${++sequence}`;
   return `tg-${name}-${anchor}`;
 }
 

@@ -157,9 +157,20 @@ def tee_inbound(correlation: str, text: str, username: str | None, chat_id=None)
     both transports, and a `/`-prefixed text already yields kind `command`, so
     these rows carry the same vocabulary the PTB era wrote. No new `kind` value.
 
+    **A suffix, because a correlation id is NOT unique across restarts.** The
+    plugin mints `tg-<verb>-n<counter>` from a MODULE-LEVEL counter (`let sequence
+    = 0`), which resets every time the plugin reloads — i.e. on every deploy. So
+    `tg-actions-n1` recurs exactly, and with `record_inbound_raw`'s
+    `INSERT OR IGNORE` on a UNIQUE column a repeat would write NO row for the new
+    tap and then let `settle_inbound` stamp the pre-restart row instead. Caught
+    while answering "did the synthetic id cause a regression?" — the honest answer
+    was yes, one I introduced. The row id therefore carries a random suffix and is
+    only an identity; `correlation_id` is the join key, and it lives in its own
+    column now (10.14).
+
     Returns the synthetic id, for the caller to settle.
     """
-    inbound_id = f"cmd:{correlation}"
+    inbound_id = f"cmd:{correlation}:{uuid.uuid4().hex[:8]}"
     try:
         message_log.record_inbound_raw(
             inbound_id,

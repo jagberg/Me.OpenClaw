@@ -5946,8 +5946,8 @@ def test_a_gateway_command_writes_an_inbound_row_and_settles_it():
 
     # A command, as the plugin delivers one.
     inbound_id = internal_api.tee_inbound("tg-dismiss-t1", "/dismiss 2", "jagberg", chat_id=4242)
-    assert inbound_id == "cmd:tg-dismiss-t1", inbound_id
-    rows = _rows("cmd:tg-dismiss-t1")
+    assert inbound_id.startswith("cmd:tg-dismiss-t1:"), inbound_id
+    rows = _rows("cmd:tg-dismiss-t1%")
     assert len(rows) == 1, f"the command left no inbound row: {rows}"
     row = rows[0]
     assert row["direction"] == "in"
@@ -5959,7 +5959,7 @@ def test_a_gateway_command_writes_an_inbound_row_and_settles_it():
     assert row["processed_at"] is None, "settling is the caller's job, not the tee's"
 
     internal_api.settle_inbound(inbound_id)
-    row = _rows("cmd:tg-dismiss-t1")[0]
+    row = _rows("cmd:tg-dismiss-t1%")[0]
     assert row["processed_at"] is not None, "an unsettled row sits in a queue nothing drains"
     assert row["error"] is None
 
@@ -5967,14 +5967,14 @@ def test_a_gateway_command_writes_an_inbound_row_and_settles_it():
     # that already carries an error, so settling second would leave it pending.
     failed_id = internal_api.tee_inbound("tg-mark-t2", "/mark 7 sent", "jagberg", chat_id=4242)
     internal_api.settle_inbound(failed_id, "boom")
-    row = _rows("cmd:tg-mark-t2")[0]
+    row = _rows("cmd:tg-mark-t2%")[0]
     assert row["processed_at"] is not None, "a failed command was left in the replay queue"
     assert row["error"] == "boom", row["error"]
 
     # A typed message goes through the other tee and must NOT read as a command.
     typed_id = internal_api.tee_inbound("tg-text-t3", "kennel cough", "jagberg", chat_id=4242)
     internal_api.settle_inbound(typed_id)
-    row = _rows("cmd:tg-text-t3")[0]
+    row = _rows("cmd:tg-text-t3%")[0]
     assert row["kind"] == "text", row["kind"]
 
     # Both routes must actually call it — the defect this replaces was a helper
@@ -5982,6 +5982,28 @@ def test_a_gateway_command_writes_an_inbound_row_and_settles_it():
     source = (Path(__file__).resolve().parent.parent / "openclaw" / "internal_api.py").read_text(encoding="utf-8")
     assert source.count("tee_inbound(") >= 3, "a tee point stopped calling the tee"
     assert source.count("settle_inbound(") >= 4, "a path settles nothing, so its row stays queued"
+
+    # THE COLLISION CASE, which the first version of this got wrong. The plugin's
+    # correlation counter is module-level and resets on every plugin reload, so
+    # `tg-actions-n1` recurs after each deploy. Two taps with the SAME correlation
+    # must still produce two rows: with `INSERT OR IGNORE` on a UNIQUE column, a
+    # shared id meant the second tap wrote nothing and then settled the first
+    # tap's row instead.
+    a = internal_api.tee_inbound("tg-actions-n1", "/actions", "jagberg", chat_id=4242)
+    b = internal_api.tee_inbound("tg-actions-n1", "/actions", "jagberg", chat_id=4242)
+    assert a != b, "a repeated correlation produced one id, so a tap would be swallowed"
+    rows = _rows("cmd:tg-actions-n1%")
+    assert len(rows) == 2, f"a restart-repeated correlation lost a row: {rows}"
+    assert {r["correlation_id"] for r in rows} == {"tg-actions-n1"}, "the join key was mangled to make it unique"
+    internal_api.settle_inbound(a)
+    settled = {r["update_id"]: r["processed_at"] for r in _rows("cmd:tg-actions-n1%")}
+    assert settled[a] is not None and settled[b] is None, (
+        f"settling one tap touched the other: {settled}")
+
+    # And the plugin no longer emits an id that repeats across restarts.
+    plugin = (Path(__file__).resolve().parent.parent / "gateway-plugin" / "index.js").read_text(encoding="utf-8")
+    assert "const RUN =" in plugin and "${RUN}n${++sequence}" in plugin, (
+        "the plugin's correlation counter is back to resetting to n1 on every reload")
 
 
 def test_a_duplicated_gateway_delivery_commits_exactly_one_mutation():
