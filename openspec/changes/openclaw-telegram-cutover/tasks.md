@@ -38,6 +38,20 @@ live bot's replacement goes in the deploy worktree's `app/.env`.
 - [x] 3.4 **DONE 2026-08-02** — `test_the_mcp_surface_refuses_a_split_with_no_amounts_rather_than_writing_zero_rows`; the refusal queues nothing and sends no button, so it is a true no-op. Port the no-per-item-amounts split refusal; assert no $0 rows are produced.
 - [x] 3.5 **DONE 2026-08-02** — `test_every_mutating_tool_takes_an_explicit_claim_id`. Assert every mutating tool accepts an explicit claim id, and that current-claim-from-reply is supplied to the turn.
 - [ ] 3.6 Set the agent's tool-iteration cap explicitly in config; verify reaching it yields a best answer with visible truncation rather than a silent stop.
+
+  **Not possible as written — there is no such config key (checked 2026-08-04).** The task was written while `llm.chat`'s own `max_iterations=4` was the bound; the gateway runs the loop now, and its config schema has no equivalent. Every candidate in the shipped bundle is something else:
+
+  | Symbol | What it actually bounds |
+  |---|---|
+  | `MAX_RUN_LOOP_ITERATIONS` | model **retries/failover** attempts (`resolveMaxRunRetryIterations`), not tool rounds |
+  | `maxToolCalls` | code-mode headless scripts and cron trigger scripts only |
+  | `maxTurns` | agent-to-agent ping-pong, xAI search, Claude Code ACP passthrough |
+  | `MAX_TOOL_FAILURES = 8` | how many failures a compaction summary lists |
+  | `tools.codeMode.maxPendingToolCalls` | code mode again |
+
+  Enumerated from `agents.defaults.*` (≈175 keys) and `tools.*`; nothing caps the chat loop's tool rounds. What does bound a long turn is the context budget plus compaction, and those degrade rather than stop.
+
+  So the task needs re-scoping rather than doing: either accept the product's bound (and record that "visible truncation" is not available), or ask upstream. **Left open deliberately, not silently** — the original wording would otherwise read as an unfinished chore rather than a wrong premise. Practical exposure today is low: twelve read tools over a single-user claim history, and no observed long-loop turn.
 - [x] 3.7 **DONE 2026-08-02** — `test_a_proposal_writes_a_pending_row_and_changes_no_claim_data` snapshots `vet_claims` around the call and compares, rather than reading the model's sentence. Verify a proposal reported as done by the model has in fact changed nothing in the DB.
 
 ## 4. Telegram cutover
