@@ -5919,6 +5919,76 @@ def test_chat_has_a_gemini_backend_and_the_agents_primary_is_the_reachable_provi
     assert groq_primary <= 1, "Groq must be at most the no-Gemini fallback, never the default primary"
 
 
+def test_a_duplicated_gateway_delivery_commits_exactly_one_mutation():
+    """Task 10.12, and the only §10 item with a money consequence: a second
+    mark-sent is a second Petcover submission for one set of invoices.
+
+    Telegram redelivers, ADR-0014's replay re-runs unsettled rows, and after the
+    cutover a tap crosses two runtimes — so a duplicate is normal traffic, not an
+    edge case. Three layers have to hold, and each is asserted through the real
+    function rather than by inspecting a flag:
+
+      1. the log row dedupes, so the replay queue never holds the same event twice
+      2. `claim_status.mark_sent` refuses a claim that is no longer `drafted`
+      3. `proposals.commit` is single-use
+
+    Layer 1 alone is not enough, which is the point of testing all three: the
+    dedupe only covers a *redelivery of the same update*, and two distinct taps on
+    two cards of the same batch are two different updates."""
+    from openclaw import claim_status, message_log, proposals
+
+    _fresh_db()
+
+    # 1. Same update, delivered twice.
+    raw = {"message": {"text": "/mark 1 sent"}}
+    first = message_log.record_inbound_raw(9_200_001, raw, correlation="dup-a")
+    second = message_log.record_inbound_raw(9_200_001, raw, correlation="dup-b")
+    assert first == 9_200_001, first
+    assert second is None, "a redelivered update was queued a second time"
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT COUNT(*) c FROM telegram_messages WHERE update_id = ?", (9_200_001,)).fetchone()["c"]
+    assert rows == 1, f"{rows} rows for one update"
+
+    # 2. Two taps on one batch: two different updates, one draft, one submission.
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="drafted", draft_id="draft-dup")
+        _insert_claim(conn, 1, "2026-06-02", status="drafted", draft_id="draft-dup")
+        ids = [r["id"] for r in conn.execute("SELECT id FROM vet_claims ORDER BY id")]
+
+    one = claim_status.mark_sent(ids[0])
+    assert one["ok"] is True, one
+    # The sibling card's tap. A batch is one email, so this claim is already sent.
+    two = claim_status.mark_sent(ids[1])
+    assert two["ok"] is False, "the sibling tap advanced a claim a second time"
+    assert "sent" in two["message"].lower(), two
+
+    with db.get_connection() as conn:
+        statuses = [r["status"] for r in conn.execute(
+            "SELECT status FROM vet_claims ORDER BY id")]
+        events = conn.execute(
+            "SELECT COUNT(*) c FROM claim_status_events WHERE event_type = 'sent'").fetchone()["c"]
+    assert statuses == ["sent", "sent"], statuses
+    # One submission, one event per claim — never two for the same claim, which is
+    # what a duplicate Petcover email would look like in the log.
+    assert events == len(ids), f"{events} sent events for {len(ids)} claims"
+
+    # 3. A confirm tap, redelivered.
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-03", status="drafted", draft_id="draft-solo")
+        solo = conn.execute("SELECT id FROM vet_claims ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    pid = proposals.record("mark_sent", label=f"mark #{solo} sent", claim_id=solo, origin="chat")
+    first_tap = proposals.commit(pid)
+    second_tap = proposals.commit(pid)
+    assert first_tap["ok"] is True, first_tap
+    assert second_tap["ok"] is False and "already confirmed" in second_tap["message"].lower(), second_tap
+    with db.get_connection() as conn:
+        solo_events = conn.execute(
+            "SELECT COUNT(*) c FROM claim_status_events WHERE claim_id = ? AND event_type = 'sent'",
+            (solo,)).fetchone()["c"]
+    assert solo_events == 1, f"the redelivered confirm wrote {solo_events} sent events"
+
+
 def test_the_gateways_log_is_configured_to_outlive_its_container():
     """Task 13.5's real half. An access denial leaving no trace was read as a log
     LEVEL problem; the durability half is worse and was the actual cause. The
