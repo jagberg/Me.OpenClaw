@@ -42,7 +42,7 @@ _PROVIDERS = {
     "groq": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", config.GROQ_API_KEY),
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini", config.OPENAI_API_KEY),
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai",
-               "gemini-2.5-flash", config.GEMINI_API_KEY),
+               config.GEMINI_MODEL or "gemini-2.5-flash", config.GEMINI_API_KEY),
 }
 
 # Groq's daily token budget is PER MODEL ("Rate limit reached for model
@@ -138,11 +138,30 @@ def _is_request_shape_error(exc: Exception) -> bool:
 
 
 def _is_daily_budget_exhausted(exc: Exception) -> bool:
-    """Groq's per-day token cap, distinct from the per-minute one. Only the 429
-    body says which — the rate-limit headers never mention TPD at all, which is
-    how it went undocumented long enough to take the agent down (ADR-0016)."""
+    """A per-DAY cap, which no amount of waiting fixes today — as distinct from a
+    per-minute one, where waiting is the only cure. Only the 429 *body* says
+    which; the rate-limit headers never mention the daily cap at all, which is how
+    it went undocumented long enough to take the agent down (ADR-0016).
+
+    Two providers, two spellings, both read off a real response rather than
+    guessed:
+      Groq   — "Rate limit reached for model … on tokens per day (TPD): Limit
+               100000, Used 97968"
+      Gemini — HTTP 429 `RESOURCE_EXHAUSTED`, whose message says only "You
+               exceeded your current quota"; the useful part is in
+               `details[].violations[].quotaId`, e.g.
+               `GenerateRequestsPerDayPerProjectPerModel-FreeTier`.
+
+    Gemini reports per-minute AND per-day violations in the SAME response when
+    both are spent, so this deliberately treats the presence of a per-day
+    violation as decisive: switching to another model's budget is right in that
+    case, and waiting is not. Captured live 2026-08-04 — the response carried
+    `GenerateContentInputTokensPerModelPerMinute-FreeTier`,
+    `GenerateRequestsPerMinutePerProjectPerModel-FreeTier` *and*
+    `GenerateRequestsPerDayPerProjectPerModel-FreeTier` together.
+    """
     text = str(exc).lower()
-    return "tokens per day" in text or "(tpd)" in text
+    return "tokens per day" in text or "(tpd)" in text or "perday" in text
 
 
 def _try_model(client, model: str, messages: list, tools, purpose: str):
@@ -297,19 +316,21 @@ def extract_vision(prompt: str, image_jpeg: bytes, purpose: str = "vision_extrac
 
 def extract(prompt: str, purpose: str = "extraction") -> str:
     """Single-message completion — the drop-in for the old gemini.extract().
-    Delegates to the legacy Gemini backend when LLM_PROVIDER=gemini.
 
-    That delegation stays even though `gemini` is now an OpenAI-compatible entry
-    too: this path carries `gemini.py`'s rate limiter and `llm_calls` logging,
-    and invoice extraction is the one LLM caller whose output is cached forever
-    (`email_extractions`). Changing which client produces it is a change nobody
-    asked for. `chat()` is the half that had no Gemini backend at all."""
-    if config.LLM_PROVIDER == "gemini":
-        from . import gemini
+    ONE path for every provider, and the special case that used to sit here was a
+    silent regression worth recording. Until 2026-08-04 this delegated to
+    `gemini.extract` whenever `LLM_PROVIDER=gemini`, which was harmless while
+    Gemini was only a rollback option. The moment Gemini became the *default*
+    (Groq blocked the network — ADR-0009's amendment), invoice extraction lost
+    ADR-0017's per-model daily walk: `gemini._generate` pins
+    `config.GEMINI_MODEL` and retries THAT model three times with backoff, which
+    is precisely the wrong response to a per-day cap and the exact failure ADR-0017
+    exists to prevent. Task 10.13 was written to catch this and had not been done.
 
-        try:
-            return gemini.extract(prompt, purpose)
-        except gemini.GeminiUnavailableError as exc:
-            # callers handle one failure type regardless of provider
-            raise LLMUnavailableError(str(exc)) from exc
+    So extraction goes through `chat()` like everything else and gets the chain.
+    Nothing is lost by it: `_try_model` uses the same `_RateLimiter` and the same
+    `_log_call` that `gemini.py` provides — they are imported from there — so
+    `llm_calls` still records every call. `extract_vision` stays on the SDK
+    because vision has no OpenAI-compatible equivalent here (ADR-0010).
+    """
     return chat([{"role": "user", "content": prompt}], purpose=purpose)["text"]

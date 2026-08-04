@@ -56,11 +56,13 @@ def _is_rate_limited(exc: Exception) -> bool:
     return status == 429 or "429" in str(exc)
 
 
-def extract(prompt: str, purpose: str = "extraction") -> str:
-    """Send a prompt to Gemini 2.5 Flash. Raises GeminiUnavailableError on unrecoverable failure."""
-    return _generate(prompt, purpose)
-
-
+# The text-only `extract()` that used to live here is GONE (2026-08-04), and the
+# deletion is the fix rather than tidying. `llm.extract` delegated to it whenever
+# LLM_PROVIDER=gemini, and `_generate` below pins ONE model and retries it —
+# correct for a per-minute cap, useless for a per-day one. When Gemini became the
+# default provider that silently cost invoice extraction ADR-0017's multi-model
+# walk. Text extraction now goes through `llm.chat`, which has the chain; this
+# module keeps the vision path, which has no OpenAI-compatible equivalent.
 def extract_image(prompt: str, image_jpeg: bytes, purpose: str = "vision_extraction") -> str:
     """Prompt + one JPEG page image — the OCR fallback for scanned invoice PDFs
     (Groq has no vision models on this account, so this stays Gemini-only)."""

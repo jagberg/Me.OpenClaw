@@ -5903,6 +5903,70 @@ def test_chat_has_a_gemini_backend_and_the_agents_primary_is_the_reachable_provi
     assert groq_primary <= 1, "Groq must be at most the no-Gemini fallback, never the default primary"
 
 
+def test_extraction_walks_the_model_chain_under_every_provider_including_gemini():
+    """Task 10.13, and it caught a live regression rather than confirming one.
+
+    `llm.extract` used to delegate to `gemini.extract` whenever
+    LLM_PROVIDER=gemini. Harmless while Gemini was a rollback option; the day it
+    became the default (Groq blocked the network) invoice extraction silently lost
+    ADR-0017's per-model daily walk, because `gemini._generate` pins ONE model and
+    retries it three times with backoff — the correct answer to a per-minute cap
+    and a useless one to a per-day cap.
+
+    Asserted by COUNTING the models tried, not by checking which module was
+    imported: the point is the walk, and a future refactor could keep the walk
+    while moving the code."""
+    from openclaw import llm
+
+    tried = []
+    tpd = Exception(
+        "429 RESOURCE_EXHAUSTED: You exceeded your current quota. "
+        "violations: [{'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'}]"
+    )
+
+    # Gemini's per-day 429 must classify as daily-exhausted, or the chain never
+    # walks. Its message says only "you exceeded your current quota" — the useful
+    # part is the quotaId, captured from a real response on 2026-08-04.
+    assert llm._is_daily_budget_exhausted(tpd), "Gemini's per-day quota is not recognised"
+    # And a purely per-minute Gemini 429 must NOT trigger a model switch: waiting
+    # is the only cure there, and switching burns a second model's budget.
+    assert not llm._is_daily_budget_exhausted(Exception(
+        "429 RESOURCE_EXHAUSTED: violations: "
+        "[{'quotaId': 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier'}]"))
+
+    class _Client:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(model, **kwargs):
+                    tried.append(model)
+                    if len(tried) < 3:
+                        raise tpd
+                    class _M:
+                        content = f"extracted by {model}"
+                        tool_calls = None
+                    return type("R", (), {"choices": [type("C", (), {"message": _M()})()]})
+
+    original_provider, original_client = config.LLM_PROVIDER, llm._client
+    original_key = llm._PROVIDERS["gemini"]
+    try:
+        config.LLM_PROVIDER = "gemini"
+        # A key must be present or _openai_client refuses before any model is tried.
+        llm._PROVIDERS["gemini"] = (original_key[0], original_key[1], "test-key")
+        llm._client = _Client()
+        text = llm.extract("read this invoice", purpose="test")
+    finally:
+        config.LLM_PROVIDER = original_provider
+        llm._PROVIDERS["gemini"] = original_key
+        llm._client = original_client
+
+    assert len(tried) == 3, (
+        f"extraction stopped at {tried} — a per-day cap was retried instead of walked")
+    assert tried[0] == llm._PROVIDERS["gemini"][1], f"primary first: {tried}"
+    assert tried[1:] == list(llm._FALLBACK_MODELS["gemini"])[:2], f"then the chain, in order: {tried}"
+    assert "extracted by" in text
+
+
 def test_the_cron_declarations_cover_every_job_apscheduler_ran_at_the_cadence_config_says():
     """Task 5.1. Two copies of a schedule is the duplication this repo keeps
     getting bitten by, so the numbers in `scripts/gateway_cron.sh` are asserted
