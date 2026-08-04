@@ -126,6 +126,16 @@ nobody is waiting — this is for your review · every claim for this pet is stu
 - [x] 8.4 Two existing ledger assertions updated ($50.00 → $32.50; $100.00 → $65.00) with the reason in a comment. A settled claim's actual paid amount still overrides the estimate untouched, and a claim wholly inside the excess is still $0.00.
 - [ ] 8.5 Re-render the live cards after deploy to confirm the estimate matches what Petcover pays — claim #8's card read `Expected payment: $296.50` in 6.1 above and should now read `$192.72` (`round()` on $192.725 lands down — the estimate is a rounded projection, not money, so a cent either way is not worth exact-decimal arithmetic).
 
+## 9. Petcover's own status table (29/07/2026), and what it corrected
+
+- [x] 9.1 Read the table read-only (`19fab5f3b534416c`, 29/07 10:56 AEST). It states claim reference, **Sr number, treatment date**, amount payable and status for every claim since 2023 — the treatment date being exactly what the approval letters omit.
+- [x] 9.2 Checked our serial map against it: **wrong on every serial we hold, 0 for 10.** Each letter's stated `claimed_amount` matches its *true* claim's invoice to the cent (7/7). So Check B's five "assessment differences" are our own mis-assignment, not Petcover assessing something else.
+- [x] 9.3 `_check_what_petcover_assessed` now names the claim whose invoice the figure actually is, and says the serial is likely on the wrong claim — instead of sending Justin to ask Petcover, which is the wrong party. It still refuses to re-route: that is a money-affecting write.
+- [x] 9.4 `process_reply` records `sr_assigned_by: "heuristic: oldest un-serialized claim"` when the serial was guessed. The log could not previously distinguish a guessed link from a cited one, which is why 0-for-10 went unnoticed.
+- [x] 9.5 **Root cause of the table never being seen**: `gmail_client._message_text` had no HTML fallback, so an HTML-only mail degraded to Gmail's `snippet` — 198 characters, indistinguishable from a genuinely short email. Fixed with a table-aware HTML-to-text fallback; `text/plain` still wins where it exists.
+- [x] 9.6 Three tests: `test_an_html_only_email_yields_its_table_not_a_snippet`, `test_an_assessment_difference_names_whose_invoice_the_figure_actually_is`, `test_a_guessed_serial_is_recorded_as_a_guess`.
+- [ ] 9.7 **Correct the live serial map** (claim → reference + Sr) from the table's treatment dates. Not done: it rewrites money-affecting links on nine claims and is Justin's call. It also changes the order of 0.4 — a re-read done first will attach real settlements using the same 0-for-10 heuristic.
+
 ## 7. Documentation
 
 - [x] 7.1 `post-mortem.md` re-read and corrected where the code and the mailbox contradicted it — four more letters, the fifth deduction line, five substitution sites not three, the `Blocks:`-line attribution, and the delivery failure that explains the silence since 30/07.

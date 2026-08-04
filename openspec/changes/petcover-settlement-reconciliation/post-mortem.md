@@ -231,3 +231,59 @@ not a thing to correct here.
 artifact before theorising — was applied to five letters and stopped there. Reading *all* of them cost
 one query and overturned a formula, added a term, and surfaced a delivery failure. "Read the artifact"
 is not done until the set is bounded.
+
+## The mapping is not undeterminable. Petcover sent it, and we already had it.
+
+**This supersedes "We cannot determine the correct mapping and should not try" above.** That paragraph
+is wrong, and the evidence refuting it was in the mailbox before this investigation started.
+
+On **2026-07-29 10:56 AEST** Petcover answered a request Justin made on 25/07 with a table of every
+claim lodged since 2023: claim reference, **Sr number**, **treatment date**, date advised, amount
+payable, loss cause and status. The treatment date per serial is exactly the field the approval
+letters omit, and it resolves the mapping completely.
+
+Against it, **every serial we hold is on the wrong claim**:
+
+| serial | treatment date | Petcover's amount | our claim with that date | we assigned it to |
+|---|---|---|---|---|
+| `DC1-26-5993` Sr 1 | 2026-02-23 | $944.50 | **#13** | (unassigned) |
+| `DC1-27-5628` Sr 8 | 2026-06-19 | $580.74 | **#2** | (unassigned) |
+| `DC1-26-5992` Sr 1 | 2026-05-18 | $351.50 | **#6** | #8 |
+| `DC1-27-5628` Sr 7 | 2026-04-17 | $132.50 | **#7** | #13 |
+| `DC1-27-5628` Sr 6 | 2025-07-28 | $45.00 | **#22** | #6 |
+| `DC1-27-5628` Sr 5 | 2026-04-02 | $446.50 | **#8** | #7 |
+| `DC1-26-5978` Sr 1 | 2025-08-08 | $44.75 | **#21** | #22 |
+| `DC1-27-5628` Sr 3 | 2025-09-26 | $45.00 | **#18** | #19 |
+| `DC1-27-5628` Sr 2 | 2025-09-11 | $35.00 | **#19** | #21 |
+
+Every letter's stated `claimed_amount` matches its **true** claim's invoice to the cent, seven for
+seven. So the section above titled "How a letter's numbers ended up describing a different claim" has
+its answer: they did not. Petcover assessed our invoices correctly; we filed their serials against the
+wrong claims, and the disagreement was ours the whole time.
+
+Two specific corrections to that section's reasoning:
+
+- *"The amounts cross thread boundaries — so no permutation of serials within a thread explains it."*
+  True, and the wrong conclusion was drawn from it. The correct mapping **also** crosses thread
+  boundaries: claim #22 belongs to `DC1-27-5628` Sr 6 while we filed it under `DC1-26-5978`, and #21
+  is the reverse. Permutation-within-a-thread failed because the error is not within a thread.
+- *"The approval letter states no invoice number and no treatment date."* Correct about the letter,
+  and it hid the fact that a different Petcover document states the treatment date for every serial.
+  The letters were re-read three times; the answer was in a reply nobody re-opened.
+
+`_claim_for_sr`'s "oldest-transaction claim not yet serialized" heuristic is now measured rather than
+suspected: **0 for 10**. It is documented as an inference, and the log did not distinguish an inferred
+link from a cited one — it now records `sr_assigned_by` when the serial was guessed.
+
+**Why the app never saw the table.** `gmail_client.full_message_text` extracted 198 characters from
+it. The mail has no `text/plain` part, and `_message_text` fell through to Gmail's `snippet` — a
+truncated body that reads exactly like a short email, with nothing saying it had been truncated. The
+one document that would have prevented every wrong conclusion in this post-mortem was in the mailbox,
+was fetched, and was silently reduced to a greeting. That is the "a silent result is not a finding"
+rule failing on our own side of the boundary rather than the supplier's.
+
+**And it changes the recovery plan.** Re-reading the five lost letters routes them by the same 0-for-10
+heuristic, so it would attach real settlements to wrong claims. The serial map wants correcting first,
+or the re-read wants doing in the knowledge that its links need fixing afterwards. Either way it is
+Justin's call — re-routing settlements moves money — and this document should stop implying the
+information to decide it does not exist.

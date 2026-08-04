@@ -929,6 +929,14 @@ def process_reply(
         claims = correlate_ack(text)
 
     detail = {"subject": subject}
+    if learn_sr:
+        # Say that the serial was GUESSED. `_claim_for_sr` picks the
+        # oldest-transaction un-serialized claim, which is a heuristic over
+        # Petcover's ordering and nothing they ever confirmed — and against their
+        # 2026-07-29 status table it was wrong on every serial we hold. Recording
+        # how the link was made is what lets a wrong one be found later; the log
+        # currently cannot distinguish a guess from a citation.
+        detail["sr_assigned_by"] = "heuristic: oldest un-serialized claim"
     if event_type == "info_requested":
         # Which party owes the document decides Justin's next move: chase the vet,
         # or supply it himself. Nothing recorded this before — process_reply never
@@ -1092,26 +1100,66 @@ def _check_petcovers_arithmetic(detail: dict, paid_amount: float) -> str | None:
     )
 
 
+def _claims_whose_invoice_matches(amount: float, exclude_claim_id: int) -> list[int]:
+    """Which other claims of ours are worth exactly this much.
+
+    Petcover's stated figure is never a mystery number — on 2026-08-04, all
+    seven letters carrying one matched some real claim of ours to the cent. What
+    was wrong was which claim we had put under that serial, so the useful thing
+    to tell Justin is whose invoice the figure actually is.
+    """
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, invoice_data FROM vet_claims WHERE id != ? AND invoice_data IS NOT NULL",
+            (exclude_claim_id,),
+        ).fetchall()
+    matches = []
+    for row in rows:
+        value, recorded = claimable_subtotal(row["invoice_data"])
+        if not recorded:
+            value = (json.loads(row["invoice_data"] or "{}") or {}).get("amount")
+        if value is not None and abs(float(value) - amount) <= 0.005:
+            matches.append(row["id"])
+    return matches
+
+
 def _check_what_petcover_assessed(claim, detail: dict, claimable: float) -> str | None:
-    """Check B — did Petcover assess the amount we actually submitted.
+    """Check B — does the amount Petcover assessed match what we submitted under
+    this serial.
 
     A separate finding from Check A with a different audience: their arithmetic
-    can be perfect on an amount that is not ours. Claim #8 is the live case —
-    $(351.50 − 150.00) × 0.65 = $130.97 to the cent, on a claim we submitted at
-    $446.50. Worded as a question because we cannot tell which invoice they
-    assessed and must not guess: every stated amount matches some real invoice of
-    ours, the amounts cross Condition Thread boundaries, and the letter carries
-    no invoice number or treatment date.
+    can be perfect on an amount that is not this claim's. Claim #8 is the live
+    case — $(351.50 − 150.00) × 0.65 = $130.97 to the cent, against a claim we
+    submitted at $446.50.
+
+    **What this most likely means is that OUR serial map is wrong, not their
+    assessment.** Petcover's status table of 2026-07-29 states a treatment date
+    per serial, and against it every one of our serial assignments was on the
+    wrong claim while every stated amount matched its true claim's invoice
+    exactly (7/7). `_claim_for_sr` assigns a serial to "the oldest-transaction
+    claim not yet serialized", a heuristic over Petcover's ordering that nothing
+    ever confirmed. So this flag names the claim whose invoice the figure really
+    is, and still refuses to re-route: that is a money-affecting write and
+    Justin's call.
     """
     claimed = detail.get("claimed_amount")
     if claimed is None or abs(claimed - claimable) <= SETTLEMENT_TOLERANCE:
         return None
     where = claim["petcover_reference"] or "no reference"
     sr = claim["petcover_sr"]
+    elsewhere = _claims_whose_invoice_matches(claimed, claim["id"])
+    if elsewhere:
+        whose = ", ".join(f"#{i}" for i in elsewhere)
+        cause = (
+            f"${claimed:.2f} is claim {whose}'s invoice exactly, so the serial is most likely "
+            "on the wrong claim here — check the treatment date before re-routing anything"
+        )
+    else:
+        cause = "no invoice of ours matches that figure — ask Petcover which invoice this assessed"
     return (
         f"assessment difference — claim #{claim['id']} ({where} Sr {sr if sr is not None else '?'}): "
         f"we submitted ${claimable:.2f}, Petcover states they assessed ${claimed:.2f}. "
-        "Their arithmetic on their own figure is correct — ask Petcover which invoice this assessed"
+        f"Their arithmetic on their own figure is correct — {cause}"
     )
 
 

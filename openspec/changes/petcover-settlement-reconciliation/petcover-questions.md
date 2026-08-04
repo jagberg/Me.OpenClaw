@@ -90,6 +90,36 @@ dispute the sums** — the question is only ever *which invoice*.
    anniversary?** It is 35% on all five letters. Confirming it lets us show a correct expected payment
    before a settlement arrives instead of a figure that is always about a third too high.
 
+## STOP — most of this list is already answered (2026-08-04)
+
+**Petcover answered the mapping question on 2026-07-29 at 10:56, before this list was written.**
+Justin asked on 25/07 for "a detailed table from 23 SEP 2024 until today"; the reply
+(`19fab5f3b534416c`) is a table of every claim lodged since 2023 with claim reference, **Sr number**,
+**treatment date**, date advised, amount payable, loss cause and status. The app never surfaced it
+because the mail is HTML-only and the body extractor fell through to a 198-character snippet — now
+fixed.
+
+That table resolves questions 1–6 and 8–11 without asking anything. It shows our serial→claim map is
+wrong on every serial, that each letter's stated amount matches its **true** claim's invoice exactly,
+and it supplies the treatment date the approval letters omit. Before sending anything, re-read it.
+
+What is left to ask is much smaller, and different in kind:
+
+- **A confirmation, not a question.** Send our corrected mapping (claim id → reference + Sr, with
+  invoice number and treatment date) and ask them to confirm it, rather than asking them to derive it
+  again. They have already done the work once.
+- **`DC1-27-5628` Sr 8 was "Further Information Required" with $377.48 payable on 29/07**, and the
+  03/08 approval letter settles it at $289.73 with $135.00 non-claimable. Worth asking what the
+  further information was and whether it is now closed — $377.48 is exactly $580.74 × 0.65, i.e. their
+  figure *before* the $135.00 was excluded.
+- **Question 7 stands** (is the 35% fixed for Ari's age band, does it change at anniversary), except
+  the framing changes: Justin has confirmed 65% as the policy's benefit rate, so this is asking
+  whether the rate is stable, not what it is.
+
+The list below was written on the assumption that the mapping was undeterminable. It is kept for the
+record and because the specific amounts are still worth naming in any conversation — but do not send
+it as-is.
+
 ## Added 2026-08-04, after sweeping the whole mailbox
 
 The five letters this list was written from were not all of them — there are ten. The new ones add

@@ -451,9 +451,14 @@ which option wins.
   re-read from backfilling and that is correct (ADR-0020): re-reading mail is not
   a repair tool. The gap is permanent in the log and Check A skips those events
   rather than checking them against a term they never captured.
-- **Four Petcover serials we hold no claim for**: `DC1-26-5992` Tr 3 and Tr 4,
-  `DC1-27-5628` Tr 8, `DC1-26-5993` Tr 1 — approvals totalling $4,181.70 claimed
-  / $2,532.85 paid. Not correctable from data we hold (see
-  `petcover-questions.md` items 8–11); a re-read will route them by
-  `_claim_for_sr`'s oldest-transaction heuristic, which is exactly the heuristic
-  in question, so the routing wants checking once Petcover answers.
+- **Correct the live serial→claim map.** Petcover's status table of 2026-07-29
+  (`19fab5f3b534416c`) states a treatment date per serial, and against it every
+  serial we hold is on the wrong claim (0 for 10), while every letter's stated
+  amount matches its true claim's invoice to the cent (7 for 7). The true map is
+  written out in the change's post-mortem. Not applied: it rewrites
+  money-affecting links on nine claims and is Justin's call. **Sequencing note:**
+  the recovery re-read of the five lost approval letters routes by the same
+  0-for-10 heuristic, so doing it first attaches real settlements to wrong claims
+  — correct the map first, or accept that the new links need fixing too.
+  Supersedes the earlier "not correctable from data we hold", which was written
+  before that table was read.

@@ -8056,6 +8056,107 @@ def test_petcover_letters_are_never_taken_by_the_task_ingest():
     assert not gmail_ingest._belongs_to_the_claims_service({"From": "reception@theshirevet.com.au"})
     assert not gmail_ingest._belongs_to_the_claims_service({"From": "marketing.au@petcovergroup.com"})
 
+
+def test_an_html_only_email_yields_its_table_not_a_snippet():
+    """Petcover's 29/07/2026 status table — the only document that states a
+    treatment date per claim serial, and the thing that proved every serial we
+    hold sits on the wrong claim — has no text/plain part. The extractor used to
+    fall through to `snippet`, which is 198 characters of pleasantries, and
+    nothing said the body had been truncated."""
+    import base64 as _b64
+
+    from openclaw import gmail_client
+
+    body = (
+        "<html><body><p>Good morning Justin,</p><table>"
+        "<tr><th>Claim no.</th><th>Sr no.</th><th>Treatment Date</th><th>Amount Payable</th></tr>"
+        "<tr><td>DC1&#8208;27&#8208;5628</td><td>8</td><td>19/06/2026</td><td>$377.48</td></tr>"
+        "<tr><td>DC1&#8208;26&#8208;5992</td><td>1</td><td>18/05/2026</td><td>$130.97</td></tr>"
+        "</table><script>var x = '<td>not content</td>';</script></body></html>"
+    )
+    message = {
+        "snippet": "Good morning Justin, We hope this email finds you well",
+        "payload": {
+            "mimeType": "multipart/related",
+            "parts": [
+                {"mimeType": "multipart/alternative", "parts": [
+                    {"mimeType": "text/html", "body": {
+                        "data": _b64.urlsafe_b64encode(body.encode()).decode()}},
+                ]},
+                {"mimeType": "image/png", "filename": "image001.png",
+                 "body": {"attachmentId": "abc"}},
+            ],
+        },
+    }
+    text = gmail_client._message_text(message)
+    assert "DC1‐27‐5628 | 8 | 19/06/2026 | $377.48" in text, text
+    assert "18/05/2026" in text and "$130.97" in text
+    assert "not content" not in text, "script contents leaked into the body"
+    # text/plain still wins when there is one — the HTML path is a fallback, not
+    # a replacement.
+    message["payload"]["parts"][0]["parts"].insert(
+        0, {"mimeType": "text/plain", "body": {"data": _b64.urlsafe_b64encode(b"plain wins").decode()}}
+    )
+    assert gmail_client._message_text(message) == "plain wins"
+
+
+def test_an_assessment_difference_names_whose_invoice_the_figure_actually_is():
+    """Petcover's stated figure has never been a mystery number: on 2026-08-04
+    every letter carrying one matched some real claim of ours to the cent, and
+    what was wrong was which claim sat under the serial. Telling Justin to "ask
+    Petcover which invoice this assessed" sends him to the wrong party."""
+    _fresh_db()
+    import json as _json
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (_anniversary_days_ago(300), aari))
+        txn = _relative_date(100)
+        mine = _insert_claim(conn, aari, txn, status="acknowledged", reference="DC1-26-5992", sr=1,
+                             amount=-446.50,
+                             invoice_data=_json.dumps({"claimable_amount": 446.50}))
+        theirs = _insert_claim(conn, aari, _relative_date(140), status="acknowledged",
+                               amount=-351.50,
+                               invoice_data=_json.dumps({"claimable_amount": 351.50}))
+    detail = {
+        "claimed_amount": 351.50, "fixed_excess_stated": 150.00, "non_claimable_stated": 0.00,
+        "age_contribution_percent": 0.35, "paid_amount": 130.97,
+    }
+    flag = claim_status._validate_settlement(_claim_row(mine), detail, txn)
+    assert flag and flag.startswith("assessment difference"), flag
+    assert f"#{theirs}'s invoice" in flag, flag
+    assert "serial is most likely on the wrong claim" in flag
+    assert "ask Petcover which invoice" not in flag
+
+    # No claim of ours is worth that figure -> it really is a question for them.
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims WHERE id = ?", (theirs,))
+    flag = claim_status._validate_settlement(_claim_row(mine), detail, txn)
+    assert "ask Petcover which invoice this assessed" in flag, flag
+
+
+def test_a_guessed_serial_is_recorded_as_a_guess():
+    """`_claim_for_sr` picks the oldest un-serialized claim — a heuristic over
+    Petcover's ordering that their 2026-07-29 status table contradicted on every
+    serial we hold. The log could not tell a guessed link from a cited one."""
+    _fresh_db()
+    import json as _json
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        _insert_claim(conn, aari, _relative_date(60), status="sent", condition="Arthritis",
+                      amount=-132.50, invoice_data=_json.dumps({"claimable_amount": 132.50}))
+
+    claim_status.process_reply(
+        "mail-guessed-sr",
+        "PetCover - Acknowledgement Letter",
+        "Claim Reference: DC1-27-5628 Sr 7\nCondition: Illness (Arthritis)\nAri",
+    )
+    with db.get_connection() as conn:
+        rows = [
+            _json.loads(r["detail"] or "{}")
+            for r in conn.execute("SELECT detail FROM claim_status_events ORDER BY id")
+        ]
+    assert any("heuristic" in (d.get("sr_assigned_by") or "") for d in rows), rows
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

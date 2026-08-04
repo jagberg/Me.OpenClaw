@@ -55,15 +55,28 @@ multiplicative form above is kept because it verifies the rate the letter *state
 trusting a dollar figure to be internally consistent, and $2.00 of tolerance absorbs the half-cent
 rounding it introduces (`(944.50 − 150) × 0.65 = 516.425` against their $516.42).
 
-**Check B — did Petcover assess what we submitted.** `claimed_amount` SHALL be compared to this
-claim's recorded claimable subtotal (see `claimable-subtotal-provenance` — never the invoice total,
-and no comparison at all when the subtotal is unrecorded). A difference greater than
-`SETTLEMENT_TOLERANCE` flags the claim as an **assessment difference**, worded as a question for
-Petcover rather than an assertion that either side is wrong, and naming: this claim's id, its
-reference and serial, the amount we submitted, and the amount Petcover states it assessed. The
-system SHALL NOT infer which invoice Petcover assessed, SHALL NOT re-route the settlement, and
-SHALL NOT rewrite any historical row — re-routing a settlement moves money and is Justin's decision
-after Petcover answers.
+**Check B — does the assessed amount match what we submitted under this serial.** `claimed_amount`
+SHALL be compared to this claim's recorded claimable subtotal (see `claimable-subtotal-provenance` —
+never the invoice total, and no comparison at all when the subtotal is unrecorded). A difference
+greater than `SETTLEMENT_TOLERANCE` flags the claim as an **assessment difference**, naming: this
+claim's id, its reference and serial, the amount we submitted, and the amount Petcover states it
+assessed. The system SHALL NOT re-route the settlement and SHALL NOT rewrite any historical row —
+re-routing a settlement moves money and is Justin's decision.
+
+**The flag SHALL name the likelier cause, and it is usually ours.** Where another claim's invoice
+matches Petcover's stated figure exactly, the flag SHALL say so and point at our serial→claim map
+rather than telling Justin to ask Petcover; only where no invoice of ours matches is it a question for
+them. Evidence, 2026-08-04: Petcover's status table of 2026-07-29 states a **treatment date per
+serial**, and against it every serial we hold was on the wrong claim (0 for 10) while every letter's
+stated amount matched its true claim's invoice to the cent (7 for 7). `_claim_for_sr` assigns a serial
+to "the oldest-transaction claim not yet serialized" — an inference over Petcover's ordering that
+nothing confirmed — so the disagreement this check surfaces is, on all live evidence, our own.
+Correspondingly, an event whose serial was assigned by that heuristic SHALL record the fact
+(`sr_assigned_by`), because the log could not previously distinguish a guessed link from a cited one.
+
+This revises the original requirement's instruction to word the flag "as a question for Petcover".
+That wording came from a conclusion — *"we cannot determine the correct mapping and should not try"* —
+which the status table refutes: the mapping is determinable, from a document already in the mailbox.
 
 **The letter's stated excess wins.** When `fixed_excess_stated` is present on the event, the system
 SHALL use it and SHALL NOT emit the phrase "fresh $150 excess this policy year" or its

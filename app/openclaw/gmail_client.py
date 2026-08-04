@@ -1,5 +1,7 @@
 import base64
+import html
 import os
+import re
 from io import BytesIO
 
 from google.auth.transport.requests import Request
@@ -45,14 +47,49 @@ def _decode_part(data: str) -> str:
     return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
 
 
+def _walk_parts(part: dict):
+    yield part
+    for child in part.get("parts") or []:
+        yield from _walk_parts(child)
+
+
+_TAGS = re.compile(r"<[^>]+>")
+_BLOCK_END = re.compile(r"(?i)</t[dh]>")
+_ROW_END = re.compile(r"(?i)</tr>|<br\s*/?>|</p>|</div>|</h[1-6]>")
+_SCRIPTS = re.compile(r"(?is)<(script|style).*?</\1>")
+
+
+def _html_to_text(raw: str) -> str:
+    """Enough HTML to read a table. Cells become ' | ', rows become newlines.
+
+    Not a parser and not trying to be — the point is that a claims-relevant mail
+    with no text/plain part still yields its figures instead of a 198-character
+    snippet. Live case: Petcover's 29/07/2026 status table, the only document
+    that states a treatment date per claim serial, is HTML-only.
+    """
+    text = _SCRIPTS.sub("", raw)
+    text = _BLOCK_END.sub(" | ", text)
+    text = _ROW_END.sub("\n", text)
+    text = _TAGS.sub("", text)
+    text = html.unescape(text)
+    lines = [re.sub(r"[ \t\xa0]+", " ", line).strip(" |").strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 def _message_text(message: dict) -> str:
-    """Best-effort plain-text body extraction; falls back to the snippet if no
-    text/plain part is found."""
+    """Best-effort body extraction: text/plain, else the HTML part rendered down
+    to text, else the snippet.
+
+    The HTML fallback exists because "no text/plain part" used to degrade to a
+    snippet silently — a truncated body that reads exactly like a short email.
+    """
     payload = message.get("payload", {})
-    parts = payload.get("parts") or [payload]
-    for part in parts:
+    for part in _walk_parts(payload):
         if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
             return _decode_part(part["body"]["data"])
+    for part in _walk_parts(payload):
+        if part.get("mimeType") == "text/html" and part.get("body", {}).get("data"):
+            return _html_to_text(_decode_part(part["body"]["data"]))
     return message.get("snippet", "")
 
 
