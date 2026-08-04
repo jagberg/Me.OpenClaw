@@ -132,6 +132,71 @@ def record_run(route: str, column: str, error: str | None = None) -> None:
         logger.warning("could not record the %s run of %s: %s", column, route, exc)
 
 
+def tee_inbound(correlation: str, text: str, username: str | None, chat_id=None) -> str:
+    """Write the inbound row for a gateway-delivered command or typed message.
+
+    Task 4.2, and it closes a gap that was live for a day: nothing wrote an
+    inbound row after the cutover, so `telegram_messages` had only outbound rows
+    and ADR-0014's "did my tap register?" was answerable solely from container
+    logs — which is the dependency ADR-0014 exists to remove.
+
+    **The id is synthetic, and that is a deliberate trade (Justin, 2026-08-04).**
+    A plugin command ctx carries no message id and no update id — not under
+    another name, they are simply absent from the object the gateway builds — so
+    Telegram's own `update_id` is unavailable on this path. The correlation id is
+    minted per delivery and is already threaded through every log line and every
+    outbound row, so it is the closest thing to an event identity we have. What
+    that costs: a Telegram redelivery of the same tap arrives with a NEW
+    correlation and therefore writes a SECOND row, where a real `update_id` would
+    have deduped. That is an audit-trail wrinkle rather than a money risk — the
+    data-layer guards are what stop a double mutation, and they held live on
+    2026-08-04 when two Dismiss taps six seconds apart produced exactly one
+    `mismatch_dismissed` event.
+
+    Shaped as a Telegram update on purpose. `_describe` is the one classifier for
+    both transports, and a `/`-prefixed text already yields kind `command`, so
+    these rows carry the same vocabulary the PTB era wrote. No new `kind` value.
+
+    Returns the synthetic id, for the caller to settle.
+    """
+    inbound_id = f"cmd:{correlation}"
+    try:
+        message_log.record_inbound_raw(
+            inbound_id,
+            {"message": {"text": text,
+                         "from": {"username": username or ""},
+                         "chat": {"id": chat_id if chat_id is not None else db.registered_chat_id()}}},
+            correlation=correlation,
+        )
+    except Exception as exc:  # noqa: BLE001 — a lost log row must not lose the tap
+        logger.warning("could not tee inbound %s: %s", inbound_id, exc)
+    return inbound_id
+
+
+def settle_inbound(inbound_id: str, error: str | None = None) -> None:
+    """Settle the row this request created, successfully or not.
+
+    **Always settled, never left pending, and that is not laziness.** `pending()`
+    is the replay queue, and after the cutover NOTHING DRAINS IT:
+    `message_log.replay_pending` rebuilds a python-telegram-bot `Update` and calls
+    `application.process_update`, and its only caller is `telegram_bot.py` — off
+    since the cutover and deleted by section 6. So a row left unprocessed would
+    not "replay later"; it would sit in a queue with no consumer, and `/health`'s
+    `queued` count would read as work pending that will never happen. A misleading
+    signal is worse than an honest gap.
+
+    Order matters: `mark_processed` refuses a row that already carries an error
+    (deliberately — that rule is what kept failed PTB updates in the queue), so
+    settle first and annotate second, exactly as the replay path does.
+    """
+    try:
+        message_log.mark_processed(inbound_id)
+        if error:
+            message_log.mark_failed(inbound_id, error)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not settle inbound %s: %s", inbound_id, exc)
+
+
 def _run(route: str, fn, correlation: str):
     logger.info("internal %s starting correlation=%s", route, correlation)
     record_run(route, "last_started_at")
@@ -396,10 +461,14 @@ async def command(
         return JSONResponse({"error": "invalid json"}, status_code=400)
 
     username = body.get("username") or config.TELEGRAM_USERNAME
+    args = body.get("args") or ""
+    # BEFORE dispatch, so the row exists even if the handler dies (task 4.2).
+    inbound_id = tee_inbound(correlation, f"/{name} {args}".strip(), username)
     try:
         with trace.step("command.dispatch", correlation, command=name):
-            outcome = commands.dispatch(name, body.get("args") or "", username)
+            outcome = commands.dispatch(name, args, username)
     except Exception as exc:  # noqa: BLE001 — a tap that failed must say so
+        settle_inbound(inbound_id, str(exc))
         logger.error("command %s failed correlation=%s: %s", name, correlation, exc, exc_info=True)
         return JSONResponse({"status": "error", "route": f"command/{name}",
                              "correlation_id": correlation, "result": f"/{name} failed: {exc}"},
@@ -465,6 +534,10 @@ async def command(
     elif sent and not text:
         text = f"Sent {sent} card(s)."
     logger.info("command /%s cards=%s failed=%s correlation=%s", name, sent, len(failed), correlation)
+    # The command ran either way; a card that did not arrive is annotated on the
+    # row rather than hidden, so "it registered" and "you saw the answer" stay
+    # distinguishable in the dataset.
+    settle_inbound(inbound_id, f"{len(failed)} card(s) did not send: {failed[0]}" if failed else None)
     return {"status": "ok" if not failed else "partial", "route": f"command/{name}",
             "correlation_id": correlation, "result": text}
 
@@ -553,13 +626,20 @@ async def telegram_claim(
     chat_id = body.get("chat_id") or db.registered_chat_id()
     # No ack here: `message_received` fires earlier and covers every inbound
     # message including commands, so acking in both places would react twice.
+    #
+    # But DO log it. `before_dispatch` runs after command routing, so this route
+    # sees exactly the typed messages the command route does not — the two tees
+    # together cover the inbound side without double-writing either kind.
+    inbound_id = tee_inbound(correlation, text, username, chat_id=chat_id)
     try:
         card = pending_flows.claim_text(chat_id, text)
     except Exception as exc:  # noqa: BLE001 — fail open, loudly
+        settle_inbound(inbound_id, str(exc))
         logger.error("pending-flow claim check failed correlation=%s: %s", correlation, exc, exc_info=True)
         return {"status": "error", "route": "telegram/claim", "correlation_id": correlation,
                 "claimed": False, "reason": str(exc)}
 
+    settle_inbound(inbound_id)
     if card is None:
         return {"status": "ok", "route": "telegram/claim", "correlation_id": correlation,
                 "claimed": False}

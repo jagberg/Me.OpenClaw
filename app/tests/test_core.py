@@ -5919,6 +5919,71 @@ def test_chat_has_a_gemini_backend_and_the_agents_primary_is_the_reachable_provi
     assert groq_primary <= 1, "Groq must be at most the no-Gemini fallback, never the default primary"
 
 
+def test_a_gateway_command_writes_an_inbound_row_and_settles_it():
+    """Task 4.2. For a day after the cutover NOTHING wrote an inbound row: six of
+    Justin's live commands and taps produced zero `direction=in` rows, so
+    ADR-0014's audit trail had only its outbound half and "did my tap register?"
+    was answerable solely from container logs — which are destroyed on recreate.
+
+    The defect was invisible because task 4.2 was ticked for registering a hook
+    while the tee named in its own sentence was never wired. So this test asserts
+    the ROW, not the wiring.
+
+    Settled immediately and deliberately: `pending()` is the replay queue and
+    nothing drains it after the cutover — `replay_pending` rebuilds a
+    python-telegram-bot Update and its only caller is `telegram_bot.py`, which is
+    off and is deleted by section 6. A row left unprocessed would read as work
+    pending that will never happen."""
+    from openclaw import internal_api
+
+    db.init_db()
+
+    def _rows(pattern):
+        with db.get_connection() as conn:
+            return conn.execute(
+                "SELECT update_id, direction, kind, summary, processed_at, error, correlation_id "
+                "FROM telegram_messages WHERE update_id LIKE ? ORDER BY id", (pattern,)).fetchall()
+
+    # A command, as the plugin delivers one.
+    inbound_id = internal_api.tee_inbound("tg-dismiss-t1", "/dismiss 2", "jagberg", chat_id=4242)
+    assert inbound_id == "cmd:tg-dismiss-t1", inbound_id
+    rows = _rows("cmd:tg-dismiss-t1")
+    assert len(rows) == 1, f"the command left no inbound row: {rows}"
+    row = rows[0]
+    assert row["direction"] == "in"
+    # The SAME vocabulary the PTB era wrote — `_describe` classifies a
+    # slash-prefixed text as `command`, so no new kind value enters the dataset.
+    assert row["kind"] == "command", row["kind"]
+    assert row["summary"] == "/dismiss 2", row["summary"]
+    assert row["correlation_id"] == "tg-dismiss-t1", "the row cannot be joined to its outbound cards"
+    assert row["processed_at"] is None, "settling is the caller's job, not the tee's"
+
+    internal_api.settle_inbound(inbound_id)
+    row = _rows("cmd:tg-dismiss-t1")[0]
+    assert row["processed_at"] is not None, "an unsettled row sits in a queue nothing drains"
+    assert row["error"] is None
+
+    # A failure settles AND annotates. Order matters: mark_processed refuses a row
+    # that already carries an error, so settling second would leave it pending.
+    failed_id = internal_api.tee_inbound("tg-mark-t2", "/mark 7 sent", "jagberg", chat_id=4242)
+    internal_api.settle_inbound(failed_id, "boom")
+    row = _rows("cmd:tg-mark-t2")[0]
+    assert row["processed_at"] is not None, "a failed command was left in the replay queue"
+    assert row["error"] == "boom", row["error"]
+
+    # A typed message goes through the other tee and must NOT read as a command.
+    typed_id = internal_api.tee_inbound("tg-text-t3", "kennel cough", "jagberg", chat_id=4242)
+    internal_api.settle_inbound(typed_id)
+    row = _rows("cmd:tg-text-t3")[0]
+    assert row["kind"] == "text", row["kind"]
+
+    # Both routes must actually call it — the defect this replaces was a helper
+    # that existed with no caller.
+    source = (Path(__file__).resolve().parent.parent / "openclaw" / "internal_api.py").read_text(encoding="utf-8")
+    assert source.count("tee_inbound(") >= 3, "a tee point stopped calling the tee"
+    assert source.count("settle_inbound(") >= 4, "a path settles nothing, so its row stays queued"
+
+
 def test_a_duplicated_gateway_delivery_commits_exactly_one_mutation():
     """Task 10.12, and the only §10 item with a money consequence: a second
     mark-sent is a second Petcover submission for one set of invoices.
