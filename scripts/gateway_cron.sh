@@ -48,10 +48,13 @@ oc() { node /app/openclaw.mjs "$@"; }
 # drift, because two copies of a schedule is exactly the sort of duplication that
 # disagrees silently six months later.
 #
-# UTC, deliberately reproducing what APScheduler did rather than fixing it in
-# passing: the app container's local time is UTC, so "hour 9" has always meant
-# 09:00 UTC, which is evening in Sydney. Changing it is a behaviour change Justin
-# has not asked for -- noted in openspec/BACKLOG.md instead.
+# SYDNEY, not UTC, and this is a deliberate behaviour CHANGE (Justin, 2026-08-04).
+# APScheduler ran these in the app container's local time, which is UTC, so
+# "hour 9" meant 09:00 UTC -- 7pm or 8pm in Sydney depending on daylight saving.
+# A morning nudge that arrives in the evening is the wrong nudge. Cron takes an
+# IANA zone, so DST is handled by the gateway rather than by an offset that would
+# drift twice a year.
+TZ_NAME="${CLAIMS_CRON_TZ:-Australia/Sydney}"
 TICK_EVERY="${CLAIMS_TICK_EVERY:-15m}"
 INGEST_EVERY="${CLAIMS_INGEST_EVERY:-5m}"
 NUDGE_CRON="${CLAIMS_NUDGE_CRON:-0 9 * * *}"
@@ -87,9 +90,9 @@ add_every() {
 
 add_cron() {
   oc cron add --agent main --name "$1" --declaration-key "$2" --display-name "$3" \
-    --cron "$4" --tz UTC --command "$(post "$5")" \
+    --cron "$4" --tz "$TZ_NAME" --command "$(post "$5")" \
     --no-deliver --timeout-seconds 600 >/dev/null
-  echo "  declared $1 (cron $4 UTC)"
+  echo "  declared $1 (cron $4 $TZ_NAME)"
 }
 
 # 600s timeouts: a tick that matches claims makes LLM and Gmail calls, and the

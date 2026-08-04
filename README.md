@@ -127,7 +127,7 @@ merged and has no caller until the cutover.
 
 **Cut over:** Telegram polling and the chat agent (the gateway holds the token; the app's updater
 is off), and scheduling — five cron entries in the gateway drive `/internal/tick`, `/internal/ingest`,
-`/internal/nudge`, `/internal/vet-nudge` and `/internal/expire-queue`. Reminders are the one job cron
+`/internal/nudge`, `/internal/vet-nudge` and `/internal/expire-queue`. The calendar jobs run at 09:00 **Australia/Sydney** — under APScheduler they ran in the container's UTC, so a morning nudge arrived that evening. Reminders are the one job cron
 cannot express (a one-shot at an arbitrary minute), so they sweep on the tick.
 
 **Unchanged:** everything the sections above describe. See [docs/gateway-deploy.md](docs/gateway-deploy.md) — especially the list of what the

@@ -5935,6 +5935,17 @@ def test_the_cron_declarations_cover_every_job_apscheduler_ran_at_the_cadence_co
     assert f"0 {config.ACTION_NUDGE_HOUR} * * {weekday[config.VET_NUDGE_DAY]}" in cron, (
         f"the weekly cron day disagrees with VET_NUDGE_DAY={config.VET_NUDGE_DAY}")
 
+    # Sydney, not UTC. APScheduler ran these in the app container's local time,
+    # which is UTC, so "hour 9" delivered a MORNING nudge at 7-8pm Sydney. Changed
+    # deliberately 2026-08-04 (Justin), and asserted because reverting it would be
+    # invisible: the cron expression would still read `0 9 * * *` and still fire
+    # daily, just at the wrong end of his day.
+    assert "Australia/Sydney" in cron, "the daily jobs are back on UTC — 9am becomes evening in Sydney"
+    assert "--tz UTC" not in cron
+    # An IANA zone rather than a fixed offset, so DST is the gateway's problem
+    # rather than something that drifts by an hour twice a year.
+    assert "+10" not in cron and "+11" not in cron
+
     # The secret must reach the app as an unexpanded variable. Interpolating it
     # into the payload would persist it in the gateway's cron store and echo it
     # back from `cron get`, `cron list` and the run log.

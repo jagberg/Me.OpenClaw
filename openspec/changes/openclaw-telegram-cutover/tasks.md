@@ -104,9 +104,11 @@ API is unestablished.
 
 **Cut over 2026-08-04, `2490ab9`/`35db686+deploy`. Preflight 12 of 12, `owner: gateway cron`, no APScheduler lines in the app log.** Justin's two calls: reminders piggyback the 15-minute tick rather than getting a minute-resolution cron entry, and a late reminder always fires and says how late.
 
-- [x] 5.1 **DONE.** Five entries, not three: `claims.tick` (every 15m), `claims.ingest` (5m), `claims.nudge` (`0 9 * * *` UTC), `claims.vet-nudge` (`0 9 * * 1`), `claims.expire` (`0 9 * * *`), declared by `scripts/gateway_cron.sh` and asserted by the new `cron entries declared` preflight check.
+- [x] 5.1 **DONE.** Five entries, not three: `claims.tick` (every 15m), `claims.ingest` (5m), `claims.nudge` (`0 9 * * *`), `claims.vet-nudge` (`0 9 * * 1`), `claims.expire` (`0 9 * * *`) — the three calendar jobs in **Australia/Sydney**, an IANA zone so the gateway handles DST, declared by `scripts/gateway_cron.sh` and asserted by the new `cron entries declared` preflight check.
 
   **Two of the five had no endpoint at all** — the weekly vet chase and the queue expiry were in-process only, so the cutover as originally written would have stopped both silently. `/internal/vet-nudge` and `/internal/expire-queue` added.
+
+  **A behaviour change, asked for and taken (Justin, 2026-08-04):** APScheduler fired these in the app container's local time, which is UTC, so a "9am" nudge arrived at 7-8pm Sydney. Cron takes an IANA zone, so this is now genuinely 09:00 local. Asserted in `test_core.py` because a revert would be invisible — the expression still reads `0 9 * * *` and still fires daily, just at the wrong end of the day.
 
   Facts checked against the product rather than assumed: `cron.add` is a gateway RPC, so this cannot live in the pre-boot seed (`config get cron` returns scheduler settings — `enabled`, `retry`, `runLog`, `maxConcurrentRuns` — and no job definitions; the plugin SDK exposes no cron surface). Payload kinds are agent turn / shell command / system event, so a deterministic call is `--command` + curl. `--declaration-key` is the product's own idempotency handle, which is why a redeploy re-asserts the same five rather than adding five more.
 
