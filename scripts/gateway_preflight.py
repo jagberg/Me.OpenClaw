@@ -203,6 +203,22 @@ def check_turn_size(gw: Gateway, session_key: str) -> list[Result]:
                 "100k/day per model and it resets at midnight UTC. Retrying will not help; the agent "
                 "and the app's extraction calls share this key (task 17.6)"),
                 sized.skip("no turn to measure")]
+        # Gemini says neither, and that ambiguity cost a wrong reading on
+        # 2026-08-04: the deploy failed on `FailoverError: API rate limit
+        # reached`, which is the gateway's single `rate_limit` bucket talking and
+        # says nothing about WHICH limit. It was per-minute — the same key had
+        # just served a probe turn — and a repeat 70 seconds later answered fine.
+        #
+        # So name the ambiguity instead of implying a diagnosis. The two responses
+        # are opposite (retry now vs wait for reset), and the only way to tell them
+        # apart is the provider's own quota detail: a per-day 429 carries a
+        # `quotaId` containing `PerDay`, a per-minute one does not.
+        if "rate limit" in detail.lower() or "resource_exhausted" in detail.lower():
+            return [served.fail(
+                f"rate limited, and the gateway does not say which limit: {detail[:160]}. "
+                "Per-MINUTE clears in about a minute — re-run before treating this as a "
+                "failure. Per-DAY does not; check the 429's quotaId for `PerDay`"),
+                sized.skip("no turn to measure")]
         return [served.fail(f"no turn completed: {exc}"), sized.skip("no turn to measure")]
 
     meta = (payload.get("result") or {}).get("meta") or {}
