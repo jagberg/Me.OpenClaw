@@ -130,8 +130,26 @@ fi
 # `finish_reason: length` with EMPTY content and a 200. A silent-looking empty
 # reply is the failure mode to expect if a caller caps output tightly.
 if [ -n "$GEMINI_API_KEY" ]; then
-  oc config set models.providers.gemini "{\"baseUrl\":\"https://generativelanguage.googleapis.com/v1beta/openai\",\"api\":\"openai-completions\",\"apiKey\":\"$GEMINI_API_KEY\",\"models\":[{\"id\":\"gemini-2.5-flash\",\"name\":\"Gemini 2.5 Flash\",\"input\":[\"text\"],\"contextWindow\":1048576}]}"
+  # FOUR models, not one, and the reason is a live failure rather than caution.
+  # 2026-08-04: a day of deploys and probes exhausted
+  # `GenerateRequestsPerDayPerProjectPerModel-FreeTier` for gemini-2.5-flash, and
+  # the deploy failed on `model serves a turn` with the gateway reporting only
+  # "API rate limit reached". With one model declared there was nowhere to go --
+  # the gateway cannot fail over to a model its provider entry never mentions.
+  #
+  # This is ADR-0017's walk, rebuilt on the gateway side. `llm.py` has had it for
+  # the app since July and it is why invoice extraction kept working through the
+  # same exhaustion. Same chain, same order, and every link was probed against a
+  # `claims__*`-shaped tool before being written down (see llm._FALLBACK_MODELS).
+  oc config set models.providers.gemini "{\"baseUrl\":\"https://generativelanguage.googleapis.com/v1beta/openai\",\"api\":\"openai-completions\",\"apiKey\":\"$GEMINI_API_KEY\",\"models\":[{\"id\":\"gemini-2.5-flash\",\"name\":\"Gemini 2.5 Flash\",\"input\":[\"text\"],\"contextWindow\":1048576},{\"id\":\"gemini-3.6-flash\",\"name\":\"Gemini 3.6 Flash\",\"input\":[\"text\"],\"contextWindow\":1048576},{\"id\":\"gemini-3.5-flash-lite\",\"name\":\"Gemini 3.5 Flash Lite\",\"input\":[\"text\"],\"contextWindow\":1048576},{\"id\":\"gemini-3.1-flash-lite\",\"name\":\"Gemini 3.1 Flash Lite\",\"input\":[\"text\"],\"contextWindow\":1048576}]}"
   oc config set agents.defaults.model.primary '"gemini/gemini-2.5-flash"'
+  # The daily quota is PER MODEL, so moving models is the only cure for a spent
+  # day -- waiting cannot help until the reset. The gateway classifies every quota
+  # error into one `rate_limit` bucket and treats it as transient (ADR-0009's
+  # accepted gap), so it will still waste retries on the exhausted model before
+  # moving; a chain turns that from "the agent is dead until tomorrow" into "the
+  # agent answers on a weaker model and says so".
+  oc config set agents.defaults.model.fallbacks '["gemini/gemini-3.6-flash","gemini/gemini-3.5-flash-lite","gemini/gemini-3.1-flash-lite"]'
 elif [ -n "$GROQ_API_KEY" ]; then
   oc config set agents.defaults.model.primary '"groq/llama-3.3-70b-versatile"'
   echo "WARN: GEMINI_API_KEY unset - falling back to Groq, which is network-blocked here; the preflight will fail on it"

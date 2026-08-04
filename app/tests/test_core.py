@@ -5896,6 +5896,22 @@ def test_chat_has_a_gemini_backend_and_the_agents_primary_is_the_reachable_provi
 
     seed = (Path(__file__).resolve().parent.parent.parent / "scripts" / "gateway_seed.sh").read_text(encoding="utf-8")
     assert "models.providers.gemini" in seed, "the gateway has no Gemini provider configured"
+
+    # The gateway needs the SAME chain the app has, and for the same reason: the
+    # daily quota is per model, so a spent primary is only survivable by moving.
+    # Learned live 2026-08-04 — a day of deploys exhausted
+    # GenerateRequestsPerDayPerProjectPerModel-FreeTier for gemini-2.5-flash and the
+    # deploy failed with one model declared and nowhere to go.
+    #
+    # Asserted as a SET relationship against llm._FALLBACK_MODELS rather than as a
+    # literal list: two hand-maintained copies of a model chain is the duplication
+    # this repo keeps getting caught by.
+    for model in llm._FALLBACK_MODELS["gemini"]:
+        assert f'"gemini/{model}"' in seed, f"{model} is in the app's chain but not the gateway's fallbacks"
+        assert f'\\"id\\":\\"{model}\\"' in seed, (
+            f"{model} is a fallback the provider entry never declares — the gateway "
+            "cannot fail over to a model it does not know")
+    assert "agents.defaults.model.fallbacks" in seed, "the agent has no fallback list"
     assert "generativelanguage.googleapis.com/v1beta/openai" in seed, seed[:0]
     assert "agents.defaults.model.primary '\"gemini/gemini-2.5-flash\"'" in seed, (
         "the agent's primary is not the provider this network can reach")
