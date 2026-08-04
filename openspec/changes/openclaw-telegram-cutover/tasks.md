@@ -83,7 +83,18 @@ API is unestablished.
 
 
 - [x] 4.1 **DONE 2026-08-02** — `config.TELEGRAM_UPDATER_ENABLED`, default on; `notify.using_gateway()` is its inverse and the one place the transports diverge. Put the Python updater behind a config flag, defaulting on, so it can be disabled without deleting code. **DECIDED: the flag stays for one week of real daily use after cutover** (Justin, 2026-08-01), then section 6 removes it. Rollback is one env var and a restart, ~30s. A week is what it takes for the failures only real use finds — a caption that will not edit, buttons that will not attach to a card, a tap that quietly reached the LLM.
-- [x] 4.2 **DONE 2026-08-03 (hermetic).** The plugin registers `before_dispatch` via `api.registerHook` and forwards to `/internal/telegram/claim`; it holds no claims logic and fails open, so a failed check sends the message to the agent rather than losing it. Not yet observed claiming a live message. Write the thin Node event-bridge plugin: forwards inbound messages, edits and callback queries to `/internal/telegram/event`. No claims logic in the plugin.
+- [~] 4.2 **PARTLY DONE, and the tick was wrong until 2026-08-04.** What exists: the plugin registers `before_dispatch` via `api.registerHook` and forwards to `/internal/telegram/claim`; it holds no claims logic and fails open, so a failed check sends the message to the agent rather than losing it. Observed claiming a live message — Justin's typed sentence on 2026-08-04 reached the agent and was acked.
+
+  **What does NOT exist, though this task's own sentence names it: nothing forwards inbound messages, edits or callback queries to `/internal/telegram/event`.** The endpoint is built and unit-tested; the plugin never calls it. Found by reading the log after Justin's live run (2026-08-04 08:43–09:12): six commands and taps, and **zero inbound rows** in `telegram_messages` — the last sixteen rows are all `direction=out`.
+
+  Consequences, none of them cosmetic:
+  - ADR-0014's audit trail has no inbound half since the cutover. "Did my tap register?" is answerable only from the app log, which is what ADR-0014 exists to stop relying on.
+  - The replay queue is permanently empty, so **4.12 cannot be verified at all** — nothing is ever queued to replay.
+  - The RL dataset lost its input side; outbound rows have no matching inbound.
+
+  **Why it is not a one-line fix.** A tap and a slash command never enter `dispatch-from-config`, which is what emits `message_received` (established the same session while chasing the ack), so a hook-based tee would miss exactly the events that matter. The plugin's command handler *can* post the tee itself — but a plugin command ctx carries **no message id and no update id** (enumerated from `commands-CDhgE9eG.js`), and `record_inbound_raw` dedupes on `update_id UNIQUE`. So a faithful row is not available from that path; the choice is between a row with a NULL/synthetic id (audit trail yes, dedupe and replay no) and leaving the gap.
+
+  Original task text, kept: Write the thin Node event-bridge plugin: forwards inbound messages, edits and callback queries to `/internal/telegram/event`. No claims logic in the plugin.
 - [x] 4.3 **DONE 2026-08-03** — `pending_flows.claim_text` is the one decision, called by both transports; the state moved from two module dicts into the `pending_flows` table for the same reason proposals did. Route the pending-free-text-flow check before the agent turn, so condition entry still consumes its reply and the agent never sees it.
 - [x] 4.4 **DONE 2026-08-02** — every outbound now goes through `notify.py`, which routes by the flag. `pipeline` no longer calls `telegram_bot.send_*_sync` at all. Port outbound notification sends to `gateway_client`, including batched-claim messages, lifecycle notifications and the daily nudge. Every message keeps its `#id`.
 - [x] 4.5 **DONE 2026-08-02** — cards are built once in `commands` (gateway button shape) and rendered by both transports; `telegram_bot._action_keyboard` converts rather than duplicating. Five commands became eleven, because every card button's verb must be registered or its tap reaches the model. Port card delivery: history cards, actions summary, per-item tap-to-resolve cards, PDF review alerts — all with working buttons.
@@ -128,8 +139,23 @@ API is unestablished.
   Two things NOT to expect, both established: a 👍 on `/actions` or on any tap (a slash command never enters the ingress path that creates the ack, and a tap has no message to react to — typing is the feedback there), and instant delivery of a multi-card burst (Telegram's own ~1 message/second/chat floor).
 
   Afterwards, say the claim id and roughly when. I read `telegram_messages`, the app log and the gateway log for that window and record what actually happened — including 4.12 (a mid-handler crash leaves the row unprocessed and startup replays it) and 4.13 (a duplicated delivery commits no duplicate mutation), which are observations on this same run rather than separate exercises.
+
+  **RUN 1 — 2026-08-04 08:43–09:12 (`e92a79d+deploy`), by Justin. Four of six steps; two had nothing to act on.**
+
+  | Step | Result |
+  |---|---|
+  | `/actions` | 5 cards, one burst, `http.send_cards ms=5686` — all five in the same second (08:43:46), summary card included. The ~1s/message Telegram floor is the whole cost |
+  | `/history` | 1 card, `ms=3084`, page 1/2 rendered |
+  | Assign pet, claim #4 | `pet` command dispatched in 65ms; `vet_claims.pet_id = 2` written at 09:07:46. Real mutation, correct |
+  | Dismiss #2, twice | **This is 4.13, live.** Both taps reached the app (`tg-dismiss-n4` 09:09:15, `tg-dismiss-n5` 09:09:22, both HTTP 200) and the log holds **exactly one** `mismatch_dismissed` event. The second returned `"Claim #2 has no settlement mismatch to review."` — a visible refusal, not a silent no-op |
+  | Plain sentence to the agent | Answered, and the native 👍 arrived — the ack works for typed messages, as established |
+  | Mark sent / typed condition | **Not exercised: nothing to act on.** No claim is in `drafted` (so no submission to mark), and all seven condition-less claims are Echo's Bow Wow ones, which surface as `blocked_insurer` rather than `set_condition`. The money case (double mark-sent = second Petcover submission) therefore remains unit-tested only — 10.12 |
+
+  Correlation ids appear on every outbound row of the run (`tg-actions-n1`, `tg-history-n2`), which is 10.14 working live one day after being added. What the run also found is that **no inbound row was written at all** — see 4.2.
 - [ ] 4.12 Verify a mid-handler crash leaves the row unprocessed and the replay queue re-runs it at startup.
-- [ ] 4.13 Verify a duplicated gateway delivery commits no duplicate mutation.
+
+  **Blocked by 4.2, not merely unverified.** Nothing writes an inbound row on the gateway path, so the replay queue is empty by construction and there is no row for a crash to leave unprocessed. The mechanism itself is unit-tested (`test_replay_pending_reruns_only_unprocessed_and_settles_them`); what cannot be shown is that it has anything to act on in production. Do not tick this until 4.2's tee exists.
+- [x] 4.13 **DONE 2026-08-04, live.** Justin tapped Dismiss on claim #2 twice. Both taps reached `/internal/command/dismiss` (correlations `tg-dismiss-n4`, `tg-dismiss-n5`, six seconds apart, both HTTP 200) and `claim_status_events` holds exactly one `mismatch_dismissed` row. The second tap answered `"Claim #2 has no settlement mismatch to review."` — visible, and no second mutation. Note the guard that held here is `dismiss_mismatch`'s own precondition check, NOT the log-row dedupe (which never ran, since no inbound row is written — 4.2).
 
 ## 5. Scheduling
 
