@@ -6037,6 +6037,21 @@ def test_a_scheduler_that_stopped_firing_is_a_value_on_health_not_an_absence():
     internal_api.record_run("nudge", "last_skipped_at")
     health = internal_api.scheduler_health()
     assert health["jobs"]["ingest"]["last_error"] == "boom"
+
+    # The error text must SURVIVE the next run starting. The first version cleared
+    # it on every write, so the following start erased it — found live, with
+    # `/health` showing `last_error_at` set and `last_error: null` after the
+    # container holding the matching log line had been recreated. The diagnostic
+    # was simply gone.
+    internal_api.record_run("ingest", "last_started_at")
+    assert internal_api.scheduler_health()["jobs"]["ingest"]["last_error"] == "boom", (
+        "a run starting wiped the previous failure's reason")
+    internal_api.record_run("ingest", "last_skipped_at")
+    assert internal_api.scheduler_health()["jobs"]["ingest"]["last_error"] == "boom"
+    # A success clears it: a stale error beside a fresh last_ok_at reads as an
+    # outage that is still happening.
+    internal_api.record_run("ingest", "last_ok_at")
+    assert internal_api.scheduler_health()["jobs"]["ingest"].get("last_error") is None
     assert health["jobs"]["nudge"]["last_skipped_at"]
     assert health["jobs"]["nudge"]["last_ok_at"] is None, "a skip is not a success"
 

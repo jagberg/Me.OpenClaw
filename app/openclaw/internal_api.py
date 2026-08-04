@@ -104,13 +104,30 @@ def record_run(route: str, column: str, error: str | None = None) -> None:
     """
     assert column in ("last_started_at", "last_ok_at", "last_error_at", "last_skipped_at"), column
     now = datetime.now(timezone.utc).isoformat()
+    # WHICH WRITES TOUCH last_error, and why it is not "all of them".
+    #
+    # First cut cleared it on every write, including `last_started_at` — so the
+    # NEXT run's start erased the previous run's error text. Found live 2026-08-04:
+    # `/health` reported `last_error_at: 03:12:27` with `last_error: null`, and the
+    # container holding the matching log line had since been recreated, so the
+    # reason those runs failed is simply gone. A record that deletes the diagnostic
+    # it exists to keep is worse than no record.
+    #
+    # A success clears it (the fault is over, and a stale error next to a fresh
+    # `last_ok_at` reads as an outage that is still happening). A start and a skip
+    # leave it alone.
+    if column == "last_error_at":
+        error_sql, error_arg = ", last_error = ?", (error or "")[:300]
+    elif column == "last_ok_at":
+        error_sql, error_arg = ", last_error = ?", None
+    else:
+        error_sql, error_arg = "", None
     try:
         with db.get_connection() as conn:
             conn.execute("INSERT OR IGNORE INTO job_runs (route) VALUES (?)", (route,))
+            params = (now, error_arg, route) if error_sql else (now, route)
             conn.execute(
-                f"UPDATE job_runs SET {column} = ?, last_error = ? WHERE route = ?",
-                (now, (error or "")[:300] if column == "last_error_at" else None, route),
-            )
+                f"UPDATE job_runs SET {column} = ?{error_sql} WHERE route = ?", params)
     except Exception as exc:  # noqa: BLE001 — see docstring
         logger.warning("could not record the %s run of %s: %s", column, route, exc)
 
