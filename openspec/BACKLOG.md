@@ -451,6 +451,16 @@ which option wins.
   re-read from backfilling and that is correct (ADR-0020): re-reading mail is not
   a repair tool. The gap is permanent in the log and Check A skips those events
   rather than checking them against a term they never captured.
+- **Recover the five lost approval letters.** `poll_petcover_status(reread=True,
+  since=2026-07-24)`. A live write, so Justin's call, and it must run *after* the
+  settlement fix deploys or the recovered letters are flagged by the formula that
+  fix replaces. `process_reply` skips already-logged (email, claim, event)
+  triples, so it records only what is new and cannot resurrect claim #2's
+  dismissal. Sequenced after the serial-map correction below — see that entry.
+- **Confirm the estimate after deploy.** Claim #8's card read
+  `Expected payment: $296.50` before the 65% rate landed and should read
+  `$192.72` after. Read-only check; the whole point of the change is that this
+  figure now matches what Petcover pays.
 - **Correct the live serial→claim map.** Petcover's status table of 2026-07-29
   (`19fab5f3b534416c`) states a treatment date per serial, and against it every
   serial we hold is on the wrong claim (0 for 10), while every letter's stated

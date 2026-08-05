@@ -143,4 +143,14 @@ nobody is waiting — this is for your review · every claim for this pet is stu
 - [x] 7.3 `README.md`: the pipeline diagram names the two checks, and a new paragraph explains what each asks, that the claim amount is always the recorded claimable subtotal, and why Petcover's mail is excluded from task capture.
 - [x] 7.4 `openspec/BACKLOG.md`: both Open Questions, the five under-recorded `approved` events, and the four unclaimed serials ($4,181.70 claimed / $2,532.85 paid).
 - [x] 7.5 Delta specs updated with what was actually verified (`settlement-validation`, `claimable-subtotal-provenance`) and one added (`email-ingestion`). Sync into `openspec/specs/` before archiving.
-- [x] 7.6 No ADR created or amended.
+- [x] 7.6 No ADR created or amended. Flagged in `design.md`'s decision log: both reversals here (the 65% rate; Check B's re-aim) would surprise a newcomer, which is normally the test for writing one. Justin's call.
+- [x] 7.7 `design.md` carries a **decision log** — five dated entries for what changed after the design was agreed, each with its reasoning and the trade-off accepted, plus what is unrecorded and deliberately not invented (`_claim_for_sr`'s ordering rationale).
+- [x] 7.8 Root `CLAUDE.md` gains five hard-won rules (the 65% rate and its deduction order, the serial map being 0-for-10 with Petcover's table as the authority, the shared `processed_emails` lockout, the HTML-only body gap). `app/openclaw/CLAUDE.md` gains a **sixth row in the collapse table** — the claimable-subtotal accessor, noting the guard found 2 of the 5 sites that reading had missed — plus three gotchas.
+
+## Caveats a reader should not have to rediscover
+
+- **The suite was run with the main checkout's interpreter**, not this worktree's — there is no `.venv` here and one was not created. Same code, same tests; different venv from the deploy image.
+- **`ruff` is not installed in that venv**, so the rebase onto master's `ruff format` pass was resolved by hand against `line-length = 100`. Formatting is eyeballed, not tool-verified — run `ruff format --check` before merge.
+- **`percentage_excess_stated`'s position in the deduction order is unverified.** $0.00 on all ten letters.
+- **The estimate is a rounded projection, not money.** `round()` puts claim #8 at $192.72 where exact arithmetic gives $192.725.
+- **Nothing in this change corrects the live serial map**, so Check B will fire on five claims whose real defect is our own assignment. That is the intended behaviour until the map is fixed — the flag says so.

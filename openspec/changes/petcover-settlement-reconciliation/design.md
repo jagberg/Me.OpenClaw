@@ -192,6 +192,77 @@ no event type, so an older build reads every row it wrote.
 
 The five under-recorded `approved` events stay as they are and are documented as a historical gap.
 
+## Decision log
+
+Everything above is the design as agreed. This log is what changed after it was written and why —
+five material changes, all on 2026-08-04, all from reading real data rather than from a better idea.
+The superseded reasoning stays where it was written, marked in place, rather than being tidied away.
+
+### 2026-08-04 — Check A deducts a fifth term, `percentage_excess_stated`
+
+**Decision:** capture and deduct `Percentage Excess`, which every approval letter states.
+**Reasoning:** the design listed four terms because five letters were read; ten exist, and all ten
+print this line. $0.00 [0%] every time so far.
+**Trade-off accepted:** where it sits in the order of operations is **unverified** — it has never been
+non-zero, so nothing distinguishes deducting it before or after the age contribution. Deducted with the
+others, with the ceiling named in `_check_petcovers_arithmetic`'s comment.
+**Supersedes:** the four-term formula in `settlement-validation`'s Check A.
+
+### 2026-08-04 — Check A's deduction order is proven, not assumed
+
+**Decision:** keep `(claimed − excess − non_claimable − percentage_excess) × (1 − rate)`.
+**Reasoning:** `DC1-27-5628` Tr 8 is the only letter of ten with a non-zero non-claimable amount
+($135.00), so it is the only one that can tell formulas apart. It gives $289.73 exactly; the
+post-mortem's `(claimed − excess) × 0.65` gives $377.48, wrong by $87.75.
+**Trade-off accepted:** the multiplicative form re-derives a figure the letter already prints in
+dollars, so it carries half-cent rounding ($516.425 against their $516.42). Absorbed by the existing
+$2.00 tolerance rather than switching to exact-decimal arithmetic.
+**Supersedes:** the post-mortem's formula table, corrected there in place.
+
+### 2026-08-04 — the ledger estimate nets the 65% benefit rate (reverses Decision 3)
+
+**Decision:** apply `config.PETCOVER_BENEFIT_RATE` after the excess and before the cap.
+**Reasoning:** Decision 3's premise — that any rate on the dashboard would be *invented* — is false.
+Justin: "Petcover only paying 65% of a claim". It is the policy's own term, known independently of the
+letters, so `dashboard-visit-ledger`'s rule against a *fabricated* deduction never covered it.
+**Trade-off accepted:** one global constant for one insured pet. A second insurer, or a rate that moves
+at an anniversary, needs a per-pet column — which on this live DB means a hand-run `ALTER TABLE`.
+**Supersedes:** Decision 3 above (marked in place) and `dashboard-visit-ledger`'s prior requirement
+(new delta explains why it is not contradicted).
+
+### 2026-08-04 — Check B points at our own serial map, not at Petcover
+
+**Decision:** where another claim's invoice matches Petcover's stated figure exactly, say so and name
+that claim; only ask Petcover where no invoice of ours matches.
+**Reasoning:** Petcover's status table of 2026-07-29 states a treatment date per serial. Against it our
+serial→claim map is wrong on all 10 serials we hold, while every letter's stated amount matches its
+true claim's invoice to the cent (7/7). "Ask Petcover which invoice this assessed" sends Justin to the
+wrong party.
+**Trade-off accepted:** the flag now asserts something about our own data quality, which will read as
+noise on the day `_claim_for_sr` is finally fixed. Still refuses to re-route — that moves money.
+**Supersedes:** the post-mortem's "we cannot determine the correct mapping and should not try", and
+`settlement-validation`'s instruction to word the flag as a question for Petcover. Both marked in place.
+
+### 2026-08-04 — a per-pet split refuses when the claimable subtotal is unrecorded
+
+**Decision:** `claim_forms.apportion_between_pets` returns an error naming what is missing.
+**Reasoning:** it apportioned the invoice total, writing a share of a number that still carries the
+non-claimable lines into every resulting claim. Found by the guard test, not by review.
+**Trade-off accepted:** a live regression in capability — claim #16 (Echo, invoice on file, no recorded
+subtotal) can no longer be split until its invoice is re-matched. Visible failure preferred over a
+silently wrong claimable share. Justin can override this to flag-and-allow.
+**Supersedes:** n/a — this site was not in the design at all.
+
+### Unrecorded, flagged rather than invented
+
+- **Why `_claim_for_sr` chose oldest-transaction ordering** is not recorded anywhere. It is described as
+  a heuristic over Petcover's ordering; whether anything ever supported that, or it was simply the
+  first tie-break to hand, is unknown. Do not reconstruct a rationale for it — it is now measured
+  0-for-10 and wants replacing, and the replacement should not inherit an invented justification.
+- **Whether an ADR is wanted** for the two reversals here (the 65% rate; Check B's re-aim) is Justin's
+  call. Both would surprise a competent newcomer, which is the usual test for writing one, and this
+  change deliberately creates and amends none.
+
 ## Open Questions
 
 Both are Justin's to decide; neither blocks implementation.
