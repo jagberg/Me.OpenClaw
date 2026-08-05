@@ -8,12 +8,13 @@ extract() only, as a rollback path — and serves extract_vision() regardless of
 provider (sole vision-capable backend, ADR-0010). Cerebras was removed
 2026-07-23: its free inference tier is sold out for this account (ADR-0009).
 """
+
 import json
 import logging
 import time
 
 from . import config
-from .gemini import _RateLimiter, _log_call  # reuse limiter + call logging (and the tests' anchor)
+from .gemini import _log_call, _RateLimiter  # reuse limiter + call logging (and the tests' anchor)
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +42,11 @@ BASE_BACKOFF_SECONDS = 2
 _PROVIDERS = {
     "groq": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", config.GROQ_API_KEY),
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini", config.OPENAI_API_KEY),
-    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai",
-               config.GEMINI_MODEL or "gemini-2.5-flash", config.GEMINI_API_KEY),
+    "gemini": (
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        config.GEMINI_MODEL or "gemini-2.5-flash",
+        config.GEMINI_API_KEY,
+    ),
 }
 
 # Groq's daily token budget is PER MODEL ("Rate limit reached for model
@@ -94,7 +98,9 @@ _client = None
 def _resolve() -> tuple[str, str, str]:
     prov = config.LLM_PROVIDER
     if prov not in _PROVIDERS:
-        raise LLMUnavailableError(f"Unknown LLM_PROVIDER {prov!r} (expected one of {list(_PROVIDERS)})")
+        raise LLMUnavailableError(
+            f"Unknown LLM_PROVIDER {prov!r} (expected one of {list(_PROVIDERS)})"
+        )
     base_url, default_model, api_key = _PROVIDERS[prov]
     return base_url, (config.LLM_MODEL or default_model), api_key
 
@@ -262,15 +268,23 @@ def _assistant_turn(message) -> dict:
             {
                 "id": call.id,
                 "type": "function",
-                "function": {"name": call.function.name, "arguments": call.function.arguments or "{}"},
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments or "{}",
+                },
             }
             for call in (message.tool_calls or [])
         ],
     }
 
 
-def chat(messages: list, tools: list | None = None, tool_impls: dict | None = None,
-         purpose: str = "chat", max_iterations: int = 4) -> dict:
+def chat(
+    messages: list,
+    tools: list | None = None,
+    tool_impls: dict | None = None,
+    purpose: str = "chat",
+    max_iterations: int = 4,
+) -> dict:
     """Bounded tool-calling loop over an OpenAI-compatible provider.
 
     tool_impls maps a tool name -> callable(**args) -> str (the tool's result

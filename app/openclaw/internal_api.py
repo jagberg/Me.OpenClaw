@@ -126,8 +126,7 @@ def record_run(route: str, column: str, error: str | None = None) -> None:
         with db.get_connection() as conn:
             conn.execute("INSERT OR IGNORE INTO job_runs (route) VALUES (?)", (route,))
             params = (now, error_arg, route) if error_sql else (now, route)
-            conn.execute(
-                f"UPDATE job_runs SET {column} = ?{error_sql} WHERE route = ?", params)
+            conn.execute(f"UPDATE job_runs SET {column} = ?{error_sql} WHERE route = ?", params)
     except Exception as exc:  # noqa: BLE001 — see docstring
         logger.warning("could not record the %s run of %s: %s", column, route, exc)
 
@@ -174,9 +173,13 @@ def tee_inbound(correlation: str, text: str, username: str | None, chat_id=None)
     try:
         message_log.record_inbound_raw(
             inbound_id,
-            {"message": {"text": text,
-                         "from": {"username": username or ""},
-                         "chat": {"id": chat_id if chat_id is not None else db.registered_chat_id()}}},
+            {
+                "message": {
+                    "text": text,
+                    "from": {"username": username or ""},
+                    "chat": {"id": chat_id if chat_id is not None else db.registered_chat_id()},
+                }
+            },
             correlation=correlation,
         )
     except Exception as exc:  # noqa: BLE001 — a lost log row must not lose the tap
@@ -217,7 +220,9 @@ def _run(route: str, fn, correlation: str):
         # Never swallow. The caller is a cron entry with no human watching it,
         # so the only place this can surface is the log.
         level = logging.WARNING if pipeline._is_transient(exc) else logging.ERROR
-        logger.log(level, "internal %s failed correlation=%s: %s", route, correlation, exc, exc_info=True)
+        logger.log(
+            level, "internal %s failed correlation=%s: %s", route, correlation, exc, exc_info=True
+        )
         record_run(route, "last_error_at", str(exc))
         return JSONResponse(
             {"status": "error", "route": route, "correlation_id": correlation, "reason": str(exc)},
@@ -230,8 +235,12 @@ def _run(route: str, fn, correlation: str):
         # only ever skips is a stuck lock, and it must not read as healthy.
         logger.info("internal %s skipped, already running correlation=%s", route, correlation)
         record_run(route, "last_skipped_at")
-        return {"status": "skipped", "route": route, "correlation_id": correlation,
-                "reason": "already running"}
+        return {
+            "status": "skipped",
+            "route": route,
+            "correlation_id": correlation,
+            "reason": "already running",
+        }
     logger.info("internal %s done correlation=%s result=%s", route, correlation, outcome)
     record_run(route, "last_ok_at")
     return {"status": "ok", "route": route, "correlation_id": correlation, "result": outcome}
@@ -315,18 +324,28 @@ async def plugin_hello(
 
     commands = sorted({str(c).lstrip("/") for c in (body.get("commands") or [])})
     _plugin_report.clear()
-    _plugin_report.update({
-        "plugin": body.get("plugin") or "unknown",
-        "version": body.get("version"),
-        "commands": commands,
-        "reported_at": datetime.now(timezone.utc).isoformat(),
-    })
+    _plugin_report.update(
+        {
+            "plugin": body.get("plugin") or "unknown",
+            "version": body.get("version"),
+            "commands": commands,
+            "reported_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
     # INFO, not DEBUG: this line is how you tell a plugin that ran from one that
     # loaded and did nothing, and the difference is a whole broken tap path.
-    logger.info("gateway plugin %s registered %s correlation=%s",
-                _plugin_report["plugin"], commands or "NOTHING", correlation)
-    return {"status": "ok", "route": "plugin/hello", "correlation_id": correlation,
-            "commands": commands}
+    logger.info(
+        "gateway plugin %s registered %s correlation=%s",
+        _plugin_report["plugin"],
+        commands or "NOTHING",
+        correlation,
+    )
+    return {
+        "status": "ok",
+        "route": "plugin/hello",
+        "correlation_id": correlation,
+        "commands": commands,
+    }
 
 
 def plugin_report() -> dict:
@@ -373,9 +392,13 @@ def scheduler_health() -> dict:
     owner = "in-process scheduler" if config.SCHEDULER_ENABLED else "gateway cron"
     try:
         with db.get_connection() as conn:
-            rows = {r["route"]: r for r in conn.execute(
-                "SELECT route, last_started_at, last_ok_at, last_error_at, last_error, "
-                "last_skipped_at FROM job_runs").fetchall()}
+            rows = {
+                r["route"]: r
+                for r in conn.execute(
+                    "SELECT route, last_started_at, last_ok_at, last_error_at, last_error, "
+                    "last_skipped_at FROM job_runs"
+                ).fetchall()
+            }
     except Exception as exc:  # noqa: BLE001 — see docstring
         return {"owner": owner, "error": f"could not read job_runs: {exc}"}
 
@@ -481,9 +504,15 @@ async def command(
     except Exception as exc:  # noqa: BLE001 — a tap that failed must say so
         settle_inbound(inbound_id, str(exc))
         logger.error("command %s failed correlation=%s: %s", name, correlation, exc, exc_info=True)
-        return JSONResponse({"status": "error", "route": f"command/{name}",
-                             "correlation_id": correlation, "result": f"/{name} failed: {exc}"},
-                            status_code=500)
+        return JSONResponse(
+            {
+                "status": "error",
+                "route": f"command/{name}",
+                "correlation_id": correlation,
+                "result": f"/{name} failed: {exc}",
+            },
+            status_code=500,
+        )
 
     sent, failed = 0, []
     target = db.registered_chat_id()
@@ -491,8 +520,12 @@ async def command(
     def deliver(index_card: tuple[int, dict]) -> str | None:
         index, card = index_card
         try:
-            with trace.step("command.deliver", correlation, card=index,
-                            kind="png" if card.get("png") is not None else "text"):
+            with trace.step(
+                "command.deliver",
+                correlation,
+                card=index,
+                kind="png" if card.get("png") is not None else "text",
+            ):
                 _deliver_one(card)
             return None
         except Exception as exc:  # noqa: BLE001
@@ -502,11 +535,16 @@ async def command(
 
     def _deliver_one(card: dict) -> None:
         if card.get("png") is not None:
-            gateway_client.send_card(str(target), card["png"], caption=card.get("caption", ""),
-                                     buttons=card.get("buttons") or None)
+            gateway_client.send_card(
+                str(target),
+                card["png"],
+                caption=card.get("caption", ""),
+                buttons=card.get("buttons") or None,
+            )
         else:
-            gateway_client.send_message(str(target), card["text"],
-                                        buttons=card.get("buttons") or None)
+            gateway_client.send_message(
+                str(target), card["text"], buttons=card.get("buttons") or None
+            )
 
     cards = outcome["cards"]
     if target is None:
@@ -520,7 +558,9 @@ async def command(
                 gateway_client.send_cards(str(target), cards, correlation=correlation)
             sent = len(cards)
         except Exception as exc:  # noqa: BLE001
-            logger.error("in-gateway send failed for /%s correlation=%s: %s", name, correlation, exc)
+            logger.error(
+                "in-gateway send failed for /%s correlation=%s: %s", name, correlation, exc
+            )
             failed.append(str(exc))
     elif cards:
         # **All at once, including the rendered summary card.** Every send costs
@@ -544,13 +584,21 @@ async def command(
         text = (text + f"\n⚠️ {len(failed)} card(s) did not send: {failed[0]}").strip()
     elif sent and not text:
         text = f"Sent {sent} card(s)."
-    logger.info("command /%s cards=%s failed=%s correlation=%s", name, sent, len(failed), correlation)
+    logger.info(
+        "command /%s cards=%s failed=%s correlation=%s", name, sent, len(failed), correlation
+    )
     # The command ran either way; a card that did not arrive is annotated on the
     # row rather than hidden, so "it registered" and "you saw the answer" stay
     # distinguishable in the dataset.
-    settle_inbound(inbound_id, f"{len(failed)} card(s) did not send: {failed[0]}" if failed else None)
-    return {"status": "ok" if not failed else "partial", "route": f"command/{name}",
-            "correlation_id": correlation, "result": text}
+    settle_inbound(
+        inbound_id, f"{len(failed)} card(s) did not send: {failed[0]}" if failed else None
+    )
+    return {
+        "status": "ok" if not failed else "partial",
+        "route": f"command/{name}",
+        "correlation_id": correlation,
+        "result": text,
+    }
 
 
 @router.post("/telegram/ack")
@@ -585,8 +633,13 @@ async def telegram_ack(
     except Exception:  # noqa: BLE001
         return JSONResponse({"error": "invalid json"}, status_code=400)
     if not commands_is_authorized(body.get("username")):
-        return {"status": "ok", "route": "telegram/ack", "correlation_id": correlation,
-                "acked": False, "reason": "unauthorized"}
+        return {
+            "status": "ok",
+            "route": "telegram/ack",
+            "correlation_id": correlation,
+            "acked": False,
+            "reason": "unauthorized",
+        }
     acked = notify.ack(body.get("message_id"), chat_id=body.get("chat_id"))
     return {"status": "ok", "route": "telegram/ack", "correlation_id": correlation, "acked": acked}
 
@@ -631,8 +684,13 @@ async def telegram_claim(
         # Not this app's user. Claim nothing and say so — the gateway can do
         # what it likes with a stranger's message, but no flow of Justin's may
         # consume it.
-        return {"status": "ok", "route": "telegram/claim", "correlation_id": correlation,
-                "claimed": False, "reason": "unauthorized"}
+        return {
+            "status": "ok",
+            "route": "telegram/claim",
+            "correlation_id": correlation,
+            "claimed": False,
+            "reason": "unauthorized",
+        }
 
     chat_id = body.get("chat_id") or db.registered_chat_id()
     # No ack here: `message_received` fires earlier and covers every inbound
@@ -646,18 +704,34 @@ async def telegram_claim(
         card = pending_flows.claim_text(chat_id, text)
     except Exception as exc:  # noqa: BLE001 — fail open, loudly
         settle_inbound(inbound_id, str(exc))
-        logger.error("pending-flow claim check failed correlation=%s: %s", correlation, exc, exc_info=True)
-        return {"status": "error", "route": "telegram/claim", "correlation_id": correlation,
-                "claimed": False, "reason": str(exc)}
+        logger.error(
+            "pending-flow claim check failed correlation=%s: %s", correlation, exc, exc_info=True
+        )
+        return {
+            "status": "error",
+            "route": "telegram/claim",
+            "correlation_id": correlation,
+            "claimed": False,
+            "reason": str(exc),
+        }
 
     settle_inbound(inbound_id)
     if card is None:
-        return {"status": "ok", "route": "telegram/claim", "correlation_id": correlation,
-                "claimed": False}
+        return {
+            "status": "ok",
+            "route": "telegram/claim",
+            "correlation_id": correlation,
+            "claimed": False,
+        }
     logger.info("pending flow claimed a message correlation=%s", correlation)
-    return {"status": "ok", "route": "telegram/claim", "correlation_id": correlation,
-            "claimed": True, "reply": card.get("text") or card.get("prompt") or "",
-            "buttons": card.get("buttons") or []}
+    return {
+        "status": "ok",
+        "route": "telegram/claim",
+        "correlation_id": correlation,
+        "claimed": True,
+        "reply": card.get("text") or card.get("prompt") or "",
+        "buttons": card.get("buttons") or [],
+    }
 
 
 def commands_is_authorized(username: str | None) -> bool:
@@ -697,7 +771,9 @@ async def telegram_event(
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001 — a malformed body is the caller's bug, and it is not ours to guess at
-        logger.warning("internal telegram/event got an unparseable body correlation=%s", correlation)
+        logger.warning(
+            "internal telegram/event got an unparseable body correlation=%s", correlation
+        )
         return JSONResponse({"error": "invalid json"}, status_code=400)
     return record_event(body, correlation)
 
@@ -718,20 +794,34 @@ def record_event(body: dict, correlation: str):
         logger.warning("internal telegram/event has no update_id correlation=%s", correlation)
         return JSONResponse({"error": "update_id required"}, status_code=400)
 
-    logger.info("internal telegram/event starting correlation=%s update_id=%s", correlation, update_id)
+    logger.info(
+        "internal telegram/event starting correlation=%s update_id=%s", correlation, update_id
+    )
     try:
         recorded = message_log.record_inbound_raw(update_id, raw, correlation=correlation)
     except Exception as exc:
-        logger.error("internal telegram/event failed correlation=%s: %s", correlation, exc, exc_info=True)
+        logger.error(
+            "internal telegram/event failed correlation=%s: %s", correlation, exc, exc_info=True
+        )
         return JSONResponse(
-            {"status": "error", "route": "telegram/event", "correlation_id": correlation,
-             "reason": str(exc)},
+            {
+                "status": "error",
+                "route": "telegram/event",
+                "correlation_id": correlation,
+                "reason": str(exc),
+            },
             status_code=500,
         )
     # `duplicate` is not an error — Telegram redelivers, and the gateway's own
     # spool may replay. Say which happened rather than reporting a bare ok, so a
     # redelivery storm is visible in the log instead of looking like traffic.
     status = "ok" if recorded is not None else "duplicate"
-    logger.info("internal telegram/event %s correlation=%s update_id=%s", status, correlation, update_id)
-    return {"status": status, "route": "telegram/event", "correlation_id": correlation,
-            "update_id": update_id}
+    logger.info(
+        "internal telegram/event %s correlation=%s update_id=%s", status, correlation, update_id
+    )
+    return {
+        "status": status,
+        "route": "telegram/event",
+        "correlation_id": correlation,
+        "update_id": update_id,
+    }

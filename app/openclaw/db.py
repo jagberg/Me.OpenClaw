@@ -358,8 +358,10 @@ def registered_chat_id() -> int | None:
     from . import config
 
     with get_connection() as conn:
-        row = conn.execute("SELECT chat_id FROM telegram_registrations WHERE username = ?",
-                           (config.TELEGRAM_USERNAME,)).fetchone()
+        row = conn.execute(
+            "SELECT chat_id FROM telegram_registrations WHERE username = ?",
+            (config.TELEGRAM_USERNAME,),
+        ).fetchone()
     return row["chat_id"] if row else None
 
 
@@ -379,7 +381,8 @@ def latest_inbound_text() -> str:
     with get_connection() as conn:
         row = conn.execute(
             "SELECT summary FROM telegram_messages WHERE direction = 'in' AND kind IN ('text', 'command') "
-            "ORDER BY id DESC LIMIT 1").fetchone()
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
     return (row["summary"] or "") if row else ""
 
 

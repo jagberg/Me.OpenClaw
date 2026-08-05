@@ -1,18 +1,31 @@
-from datetime import datetime, timedelta, timezone
-
 import http.client
 import json
 import logging
 import os
 import signal
 import socket
+from datetime import datetime, timedelta, timezone
 
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
-from . import (claim_forms, claim_status, commands, config, db, gmail_client, gmail_ingest,
-               invoice_matching, llm, message_log, notify, reminders, status_labels,
-               telegram_bot, vet_detection)
+from . import (
+    claim_forms,
+    claim_status,
+    commands,
+    config,
+    db,
+    gmail_client,
+    gmail_ingest,
+    invoice_matching,
+    llm,
+    message_log,
+    notify,
+    reminders,
+    status_labels,
+    telegram_bot,
+    vet_detection,
+)
 from .scheduler import scheduler
 
 logger = logging.getLogger(__name__)
@@ -28,6 +41,7 @@ def _is_transient(exc: Exception) -> bool:
         return exc.resp.status in (429, 500, 502, 503, 504)
     return False
 
+
 # Gmail auth-death alerting (ADR-0015; the mechanism was decided 2026-07-23 and
 # these comments cited ADR-0011 by mistake — that ADR is about Petcover
 # correlation). When the OAuth token dies
@@ -40,7 +54,9 @@ _GMAIL_AUTH_RECOVERY_MSG = "✅ Gmail access restored — the pipeline is readin
 _POLLING_ALERT = "telegram_polling"
 
 
-def _alert_rate_limited(kind: str, message: str, cap: int = _MAX_AUTH_ALERTS_24H, send_fn=None) -> bool:
+def _alert_rate_limited(
+    kind: str, message: str, cap: int = _MAX_AUTH_ALERTS_24H, send_fn=None
+) -> bool:
     """Send an ops alert to Telegram at most `cap` times per rolling 24h.
     ops_alerts is the ledger, so a container restart can't reset the count and
     re-spam. Returns whether it actually sent."""
@@ -52,7 +68,9 @@ def _alert_rate_limited(kind: str, message: str, cap: int = _MAX_AUTH_ALERTS_24H
             "SELECT COUNT(*) FROM ops_alerts WHERE kind = ? AND sent_at >= ?", (kind, cutoff)
         ).fetchone()[0]
         if recent < cap:
-            conn.execute("INSERT INTO ops_alerts (kind, sent_at) VALUES (?, ?)", (kind, now.isoformat()))
+            conn.execute(
+                "INSERT INTO ops_alerts (kind, sent_at) VALUES (?, ?)", (kind, now.isoformat())
+            )
     if recent >= cap:
         logger.warning("%s alert cap (%s/24h) reached, staying quiet", kind, cap)
         return False
@@ -99,8 +117,13 @@ def _ensure_gmail_auth(send_fn=None) -> bool:
         send(_GMAIL_AUTH_RECOVERY_MSG)
     return True
 
+
 # marketing.au@ deliberately excluded — not claims-relevant (design.md).
-PETCOVER_STATUS_SENDERS = ["claims.au@petcovergroup.com", "requiredinfo.au@petcovergroup.com", "accounts.au@petcovergroup.com"]
+PETCOVER_STATUS_SENDERS = [
+    "claims.au@petcovergroup.com",
+    "requiredinfo.au@petcovergroup.com",
+    "accounts.au@petcovergroup.com",
+]
 
 # A specific Gmail draft can't be deep-linked on mobile (the #drafts/<id>
 # anchor is desktop-web only, and Gmail's app URL scheme has no open-draft-by-id
@@ -111,8 +134,15 @@ DRAFT_SEARCH_LINK = "https://mail.google.com/mail/u/0/#search/in%3Adrafts+subjec
 # Statuses worth pushing to Justin's phone. Urgent = he has to act (blocked
 # claim, insurer waiting on him); the rest are informational lifecycle updates.
 NOTIFY_STATUSES = (
-    "matched", "drafted", "info_requested", "suspended", "acknowledged",
-    "approved", "below_excess", "settled", "declined",
+    "matched",
+    "drafted",
+    "info_requested",
+    "suspended",
+    "acknowledged",
+    "approved",
+    "below_excess",
+    "settled",
+    "declined",
 )
 
 
@@ -190,12 +220,21 @@ def _summarize_drafted(group) -> str:
     gid = claim_status.submission_group_id(c["id"] for c in group)
     header = f"{pet}'s vet claim {gid} — ready to send ({count} item{'s' if count > 1 else ''}, ${total:.2f})"
     return "\n".join(
-        [header, *lines, f'Open the Gmail app → Drafts (subject "Vet claim — {pet}"):', DRAFT_SEARCH_LINK]
+        [
+            header,
+            *lines,
+            f'Open the Gmail app → Drafts (subject "Vet claim — {pet}"):',
+            DRAFT_SEARCH_LINK,
+        ]
     )
 
 
 def _needs_condition(claim) -> bool:
-    return claim["status"] == "matched" and bool(claim["flag"]) and "condition" in claim["flag"].lower()
+    return (
+        claim["status"] == "matched"
+        and bool(claim["flag"])
+        and "condition" in claim["flag"].lower()
+    )
 
 
 def _invoice_lines(claim) -> list[str]:
@@ -269,7 +308,11 @@ def _summarize_group(group) -> str | None:
         detail = _latest_settlement_detail(group[0]["id"])
         claimed, paid = detail.get("claimed_amount"), detail.get("paid_amount")
         base = f"{label}: approved by Petcover"
-        base += f" — claimed ${claimed:.2f}, paid ${paid:.2f}." if claimed is not None and paid is not None else "."
+        base += (
+            f" — claimed ${claimed:.2f}, paid ${paid:.2f}."
+            if claimed is not None and paid is not None
+            else "."
+        )
         flag = group[0]["flag"]
         return f"⚠ {base}\n{flag}" if flag and "mismatch" in flag else base
     if status == "declined":
@@ -334,7 +377,9 @@ def notify_split_proposals(send_fn=None) -> None:
             try:
                 document = claim_forms.invoice_segment_pdf(proposal["email_id"], total)
             except Exception as exc:
-                logger.warning("merge-proposal pdf fetch failed (proposal %s): %s", proposal["id"], exc)
+                logger.warning(
+                    "merge-proposal pdf fetch failed (proposal %s): %s", proposal["id"], exc
+                )
         if document:
             notify.send_document(text, document[1], document[0], buttons=markup)
         else:
@@ -348,7 +393,11 @@ def notify_split_proposals(send_fn=None) -> None:
 
 # Flags whose alert should carry the offending PDF so Justin can review it
 # from the message itself.
-_REVIEW_FLAG_MARKERS = ("isn't a per-visit itemised invoice", "invoice attachment unreadable", "settlement mismatch")
+_REVIEW_FLAG_MARKERS = (
+    "isn't a per-visit itemised invoice",
+    "invoice attachment unreadable",
+    "settlement mismatch",
+)
 
 
 def _latest_settled_email_id(claim_id: int) -> str | None:
@@ -379,9 +428,13 @@ def _review_pdf(group) -> tuple[str, bytes] | None:
     if not email_id and lead["flag"] and "unreadable — " in lead["flag"]:
         subject = lead["flag"].split("unreadable — ", 1)[1]
         service = gmail_client.build_service()
-        messages = service.users().messages().list(
-            userId="me", q=f'subject:"{subject}" has:attachment', maxResults=1
-        ).execute().get("messages", [])
+        messages = (
+            service.users()
+            .messages()
+            .list(userId="me", q=f'subject:"{subject}" has:attachment', maxResults=1)
+            .execute()
+            .get("messages", [])
+        )
         email_id = messages[0]["id"] if messages else None
     if not email_id:
         return None
@@ -422,7 +475,8 @@ def notify_claim_states(send_fn=None) -> None:
 
     for group in groups.values():
         changed = any(
-            c["status"] != c["telegram_notified_status"] or c["flag"] != c["telegram_notified_flag"] for c in group
+            c["status"] != c["telegram_notified_status"] or c["flag"] != c["telegram_notified_flag"]
+            for c in group
         )
         if not changed:
             continue
@@ -436,18 +490,27 @@ def notify_claim_states(send_fn=None) -> None:
         if lead["status"] == "drafted":
             markup = commands._action_buttons({"kind": "mark_sent", "claim_id": lead["id"]})
         elif lead["status"] == "matched" and suspicious:
-            markup = commands._action_buttons({"kind": "unmatch", "claim_id": lead["id"]})  # bad match — fix it first
+            markup = commands._action_buttons(
+                {"kind": "unmatch", "claim_id": lead["id"]}
+            )  # bad match — fix it first
         elif lead["status"] == "matched" and lead["pet_id"] is None:
-            markup = commands._action_buttons({"kind": "assign_pet", "claim_id": lead["id"]})  # assign pet first
+            markup = commands._action_buttons(
+                {"kind": "assign_pet", "claim_id": lead["id"]}
+            )  # assign pet first
         elif _needs_condition(lead) and lead["pet_id"]:
             markup = commands._action_buttons(
-                {"kind": "set_condition", "claim_id": lead["id"], "pet_id": lead["pet_id"]})
+                {"kind": "set_condition", "claim_id": lead["id"], "pet_id": lead["pet_id"]}
+            )
         else:
             markup = None
         # Review alerts carry the offending PDF itself. Only when using the
         # real sender — a test send_fn spy stays a plain text call.
         document = None
-        if send_fn is None and lead["flag"] and any(m in lead["flag"] for m in _REVIEW_FLAG_MARKERS):
+        if (
+            send_fn is None
+            and lead["flag"]
+            and any(m in lead["flag"] for m in _REVIEW_FLAG_MARKERS)
+        ):
             try:
                 document = _review_pdf(group)
             except Exception as exc:
@@ -507,7 +570,12 @@ def reconcile_sent_invoice_requests() -> dict:
     now = datetime.now(timezone.utc).isoformat()
     for row in rows:
         try:
-            message = service.users().messages().get(userId="me", id=row["draft_id"], format="minimal").execute()
+            message = (
+                service.users()
+                .messages()
+                .get(userId="me", id=row["draft_id"], format="minimal")
+                .execute()
+            )
         except HttpError as exc:
             if exc.resp.status == 404:
                 # The draft was deleted from Gmail — retrying forever just spams
@@ -521,15 +589,29 @@ def reconcile_sent_invoice_requests() -> dict:
                         "updated_at = ? WHERE id = ?",
                         (now, row["id"]),
                     )
-                logger.warning("reconcile: draft %s for claim %s no longer exists — cleared", row["draft_id"], row["id"])
+                logger.warning(
+                    "reconcile: draft %s for claim %s no longer exists — cleared",
+                    row["draft_id"],
+                    row["id"],
+                )
                 result["stale_drafts"].append(row["id"])
             else:
-                logger.warning("reconcile: couldn't fetch draft %s for claim %s: %s", row["draft_id"], row["id"], exc)
+                logger.warning(
+                    "reconcile: couldn't fetch draft %s for claim %s: %s",
+                    row["draft_id"],
+                    row["id"],
+                    exc,
+                )
             continue
         except Exception as exc:
             # Can't confirm either way this cycle — retry next tick. Not silent:
             # a persistent failure (auth expiry, bad id) stays visible in logs.
-            logger.warning("reconcile: couldn't fetch draft %s for claim %s: %s", row["draft_id"], row["id"], exc)
+            logger.warning(
+                "reconcile: couldn't fetch draft %s for claim %s: %s",
+                row["draft_id"],
+                row["id"],
+                exc,
+            )
             continue
         labels = message.get("labelIds", [])
         if "SENT" in labels and "DRAFT" not in labels:
@@ -554,7 +636,7 @@ def nudge_stale_actions() -> dict:
     two drafted claims sat unsent for three days in silence. This is the
     state-based counterpart: one message covering everything old, rather than
     re-notifying per claim."""
-    from . import claim_card, claim_status, telegram_bot
+    from . import claim_card, claim_status
 
     actions = claim_status.pending_actions()
     stale = [a for a in actions if a["actionable"] and a["age_days"] >= config.ACTION_NUDGE_DAYS]
@@ -592,7 +674,9 @@ def _visit_line(invoice_matching, requested_date: str | None) -> str:
     parts = []
     for h in hits:
         who = f"claim #{h['claim_id']}" if h["claim_id"] else "no claim on file"
-        number = f"invoice {h['invoice_number']}" if h["invoice_number"] else "invoice number unknown"
+        number = (
+            f"invoice {h['invoice_number']}" if h["invoice_number"] else "invoice number unknown"
+        )
         how = h.get("matched_on") or "invoice date"
         parts.append(f"{number} ({who}, matched on its {how})")
     return f"visit: {requested_date} — " + ", ".join(parts)
@@ -609,7 +693,7 @@ def nudge_unanswered_vet_requests(send_fn=None) -> dict:
 
     Silent when there is nothing outstanding: a weekly "nothing to do" is how a
     channel becomes one Justin stops reading."""
-    from . import claim_status, invoice_matching, telegram_bot
+    from . import claim_status, invoice_matching
 
     outstanding = claim_status.unanswered_vet_requests()
     if not outstanding:
@@ -620,7 +704,9 @@ def nudge_unanswered_vet_requests(send_fn=None) -> dict:
         document = r["requested_document"] or "document not stated in the letter"
         clinic = r["clinic"] or "clinic unknown"
         contact = f" ({r['clinic_email']})" if r["clinic_email"] else ""
-        age = f"{r['days_outstanding']}d ago" if r["days_outstanding"] is not None else "date unknown"
+        age = (
+            f"{r['days_outstanding']}d ago" if r["days_outstanding"] is not None else "date unknown"
+        )
         lines.append(
             f" • #{r['claim_id']} {r['pet_name'] or 'no pet'} — {clinic}{contact}\n"
             f"   needs: {document}\n"
@@ -655,7 +741,9 @@ def _maybe_draft_invoice_request(claim) -> None:
 
 def _latest_event_id() -> int:
     with db.get_connection() as conn:
-        row = conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM claim_status_events").fetchone()
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS max_id FROM claim_status_events"
+        ).fetchone()
     return row["max_id"]
 
 
@@ -698,16 +786,26 @@ def poll_petcover_status(reread: bool = False, since: str | None = None) -> dict
     for sender in PETCOVER_STATUS_SENDERS:
         page_token = None
         while True:
-            response = service.users().messages().list(
-                userId="me",
-                q=f"from:{sender} after:{since or config.PETCOVER_STATUS_SINCE}",
-                maxResults=100,
-                pageToken=page_token,
-            ).execute()
+            response = (
+                service.users()
+                .messages()
+                .list(
+                    userId="me",
+                    q=f"from:{sender} after:{since or config.PETCOVER_STATUS_SINCE}",
+                    maxResults=100,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
             for item in response.get("messages", []):
                 if not reread and gmail_ingest._already_processed(item["id"]):
                     continue
-                message = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
+                message = (
+                    service.users()
+                    .messages()
+                    .get(userId="me", id=item["id"], format="full")
+                    .execute()
+                )
                 unprocessed.append(message)
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -725,7 +823,9 @@ def poll_petcover_status(reread: bool = False, since: str | None = None) -> dict
         # owes any requested document (claims.au@ sends both kinds, so the sender
         # cannot answer that).
         recipients = ", ".join(filter(None, (headers.get("To", ""), headers.get("Cc", ""))))
-        claim_status.process_reply(message["id"], subject, body, headers.get("From", ""), recipients)
+        claim_status.process_reply(
+            message["id"], subject, body, headers.get("From", ""), recipients
+        )
         if not reread:
             gmail_ingest._mark_processed(message["id"], None)
 
@@ -800,7 +900,9 @@ def _watchdog_telegram_polling(exit_fn=None) -> bool:
     triggered a restart."""
     if telegram_bot.polling_alive() is not False:
         return False
-    logger.error("Telegram polling is DOWN — inbound messages are being lost. Restarting the process.")
+    logger.error(
+        "Telegram polling is DOWN — inbound messages are being lost. Restarting the process."
+    )
     try:
         _alert_rate_limited(
             _POLLING_ALERT,
@@ -838,7 +940,10 @@ def compare_state_projection() -> list[dict]:
         logger.warning(
             "state projection: %d claim(s) disagree with the stored status: %s",
             len(disagreements),
-            "; ".join(f"#{d['claim_id']} stored={d['stored']} projected={d['projected']}" for d in disagreements),
+            "; ".join(
+                f"#{d['claim_id']} stored={d['stored']} projected={d['projected']}"
+                for d in disagreements
+            ),
         )
     return disagreements
 
@@ -871,8 +976,12 @@ def run_once() -> None:
         try:
             matched = invoice_matching.match_claim(claim)
         except llm.LLMUnavailableError as exc:
-            logger.warning("matching: LLM unavailable, skipping remaining matching this tick: %s", exc)
-            invoice_matching._flag_claim(claim["id"], f"invoice extraction unavailable — {str(exc)[:120]}")
+            logger.warning(
+                "matching: LLM unavailable, skipping remaining matching this tick: %s", exc
+            )
+            invoice_matching._flag_claim(
+                claim["id"], f"invoice extraction unavailable — {str(exc)[:120]}"
+            )
             break
         except Exception as exc:
             # ERROR means Justin must act. A dropped Gmail connection is retried
@@ -880,7 +989,11 @@ def run_once() -> None:
             # it was previously logging a full stack trace and reading like a
             # crisis (real case: IncompleteRead on claim 5).
             if _is_transient(exc):
-                logger.warning("matching: claim %s hit a transient error, retrying next tick: %s", claim["id"], exc)
+                logger.warning(
+                    "matching: claim %s hit a transient error, retrying next tick: %s",
+                    claim["id"],
+                    exc,
+                )
             else:
                 logger.exception("matching: claim %s failed", claim["id"])
             invoice_matching._flag_claim(claim["id"], f"invoice matching error — {str(exc)[:120]}")

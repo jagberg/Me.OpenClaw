@@ -31,7 +31,6 @@ is a no-op rather than a second synthetic history).
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -84,7 +83,9 @@ def plan() -> list[dict]:
     """One row per claim needing a backfill. Reads only."""
     rows = []
     with db.get_connection() as conn:
-        claims = conn.execute("SELECT id, status, updated_at FROM vet_claims ORDER BY id").fetchall()
+        claims = conn.execute(
+            "SELECT id, status, updated_at FROM vet_claims ORDER BY id"
+        ).fetchall()
         already = {
             r["claim_id"]
             for r in conn.execute(
@@ -95,13 +96,15 @@ def plan() -> list[dict]:
     for claim in claims:
         if projected.get(claim["id"]) == claim["status"]:
             continue  # genuine history — do not touch it
-        rows.append({
-            "claim_id": claim["id"],
-            "status": claim["status"],
-            "projected": projected.get(claim["id"]),
-            "updated_at": claim["updated_at"],
-            "already_backfilled": claim["id"] in already,
-        })
+        rows.append(
+            {
+                "claim_id": claim["id"],
+                "status": claim["status"],
+                "projected": projected.get(claim["id"]),
+                "updated_at": claim["updated_at"],
+                "already_backfilled": claim["id"] in already,
+            }
+        )
     return rows
 
 
@@ -118,15 +121,19 @@ def apply(rows: list[dict]) -> int:
                 "SELECT status FROM vet_claims WHERE id = ?", (row["claim_id"],)
             ).fetchone()
             if current is None or current["status"] != row["status"]:
-                print(f"  REFUSED #{row['claim_id']}: status moved since the plan "
-                      f"({row['status']} -> {current['status'] if current else 'gone'})")
+                print(
+                    f"  REFUSED #{row['claim_id']}: status moved since the plan "
+                    f"({row['status']} -> {current['status'] if current else 'gone'})"
+                )
                 continue
             conn.execute(
                 "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
                 "VALUES (?, 'state_backfilled', NULL, ?, ?)",
-                (row["claim_id"],
-                 json.dumps({"backfilled": True, "reason": REASON, "status": row["status"]}),
-                 row["updated_at"]),
+                (
+                    row["claim_id"],
+                    json.dumps({"backfilled": True, "reason": REASON, "status": row["status"]}),
+                    row["updated_at"],
+                ),
             )
             written += 1
     return written
@@ -134,7 +141,9 @@ def apply(rows: list[dict]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--apply", action="store_true", help="write the events (container-side only)")
+    parser.add_argument(
+        "--apply", action="store_true", help="write the events (container-side only)"
+    )
     args = parser.parse_args()
 
     _refuse_phantom_db()
@@ -142,13 +151,17 @@ def main() -> int:
     print(f"{len(rows)} claim(s) need a backfill\n")
     for row in rows:
         note = "  [already backfilled]" if row["already_backfilled"] else ""
-        print(f"  #{row['claim_id']:<3} stored={row['status']:<15} projected={row['projected']:<15}"
-              f" at={row['updated_at']}{note}")
+        print(
+            f"  #{row['claim_id']:<3} stored={row['status']:<15} projected={row['projected']:<15}"
+            f" at={row['updated_at']}{note}"
+        )
 
     if not args.apply:
         # ASCII only: the Windows console is cp1252 and an em-dash prints as a
         # replacement character, which is how a clean run reads like a failure.
-        print("\nDRY RUN - nothing written. Re-run with --apply inside the container, after a backup.")
+        print(
+            "\nDRY RUN - nothing written. Re-run with --apply inside the container, after a backup."
+        )
         return 0
 
     # These INSERTs write no status themselves; the point is that the fold can now
@@ -159,7 +172,9 @@ def main() -> int:
     remaining = claim_status.state_projection_disagreements()
     print(f"\nwrote {written} event(s); disagreements now: {len(remaining)}")
     for row in remaining:
-        print(f"  STILL DISAGREES #{row['claim_id']} stored={row['stored']} projected={row['projected']}")
+        print(
+            f"  STILL DISAGREES #{row['claim_id']} stored={row['stored']} projected={row['projected']}"
+        )
     return 0 if not remaining else 1
 
 

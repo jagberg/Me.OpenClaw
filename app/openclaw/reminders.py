@@ -20,6 +20,7 @@ Lateness is reported instead of hidden (Justin's call, 2026-08-04): the sweep lo
 how overdue each one was, and the dashboard says so, so a reminder that surfaces
 three days late is not mistaken for one set this morning.
 """
+
 import logging
 from datetime import datetime, timezone
 
@@ -89,8 +90,7 @@ def sweep_due(now: datetime | None = None) -> int:
         if not rows:
             return 0
         conn.execute(
-            "UPDATE reminders SET status = 'due' "
-            "WHERE status = 'scheduled' AND scheduled_at <= ?",
+            "UPDATE reminders SET status = 'due' WHERE status = 'scheduled' AND scheduled_at <= ?",
             (now.isoformat(),),
         )
 

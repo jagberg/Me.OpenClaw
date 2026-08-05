@@ -14,6 +14,7 @@ record a *proposed action* that the Telegram layer renders as a Confirm button;
 the write happens only on the tap (telegram_bot._execute_action). That harness
 gate — not the model's good behaviour — is what enforces the hard rules.
 """
+
 import json
 import re
 from datetime import datetime, timezone
@@ -109,6 +110,7 @@ def system_prompt() -> str:
         "explicit YYYY-MM-DD ranges to the tools; state the range you used in your answer."
     )
 
+
 # ---- data access (explicit safe columns only; no bank/owner/secret fields) ----
 
 _CLAIMS_SQL = """
@@ -131,8 +133,16 @@ def _in_range(txn_date, since, until) -> bool:
     return not (until and day > until[:10])
 
 
-def _find_claims(pet=None, reference=None, status=None, merchant=None, unassigned=False,
-                 since=None, until=None, claim_id=None):
+def _find_claims(
+    pet=None,
+    reference=None,
+    status=None,
+    merchant=None,
+    unassigned=False,
+    since=None,
+    until=None,
+    claim_id=None,
+):
     with db.get_connection() as conn:
         rows = conn.execute(_CLAIMS_SQL).fetchall()
     out = []
@@ -218,7 +228,9 @@ def _pets_named_in(text: str) -> list[str]:
     """Which pets on file this message names. Word-boundary matched so 'Echo'
     doesn't fire on 'echoed'."""
     names = db.list_pet_names()
-    return [name for name in names if re.search(rf"\b{re.escape(name)}\b", text or "", re.IGNORECASE)]
+    return [
+        name for name in names if re.search(rf"\b{re.escape(name)}\b", text or "", re.IGNORECASE)
+    ]
 
 
 def _build_impls(proposals: list, user_text: str = "") -> dict:
@@ -301,10 +313,14 @@ def _build_impls(proposals: list, user_text: str = "") -> dict:
         if claim_id is not None:
             candidates = [c for c in candidates if c["id"] == int(claim_id)]
         elif merchant:
-            candidates = [c for c in candidates if merchant.lower() in (c["txn_merchant"] or "").lower()]
+            candidates = [
+                c for c in candidates if merchant.lower() in (c["txn_merchant"] or "").lower()
+            ]
         if not candidates:
             scope = f" for '{merchant}'" if merchant else (f" for #{claim_id}" if claim_id else "")
-            return f"No claims are awaiting an invoice match{scope}, so there was nothing to re-check."
+            return (
+                f"No claims are awaiting an invoice match{scope}, so there was nothing to re-check."
+            )
 
         matched, still_waiting, failed = [], [], []
         for claim in candidates:
@@ -339,11 +355,15 @@ def _build_impls(proposals: list, user_text: str = "") -> dict:
         except Exception as exc:  # visible failure, never a silent "all clear"
             return f"Couldn't check Petcover mail: {exc}. Tell Justin it failed."
         if not result["checked"]:
-            return ("No Petcover emails have arrived that weren't already processed. This only "
-                    "checks NEW mail — it does not mean Petcover has never replied.")
+            return (
+                "No Petcover emails have arrived that weren't already processed. This only "
+                "checks NEW mail — it does not mean Petcover has never replied."
+            )
         changed = ", ".join(f"#{i}" for i in result["claims_changed"]) or "none"
-        return (f"Processed {result['checked']} new Petcover email(s), recording "
-                f"{result['events']} event(s). Claims affected: {changed}.")
+        return (
+            f"Processed {result['checked']} new Petcover email(s), recording "
+            f"{result['events']} event(s). Claims affected: {changed}."
+        )
 
     def submissions_awaiting_reply():
         """What's been sent to Petcover and whether an answer came back."""
@@ -392,8 +412,7 @@ def _build_impls(proposals: list, user_text: str = "") -> dict:
             lines.append(f"FLAG: {detail['flag']}")
         for e in detail["events"]:
             figures = " ".join(
-                f"{k}=${v}" for k, v in e.items()
-                if k.endswith("_amount") or k.endswith("_stated")
+                f"{k}=${v}" for k, v in e.items() if k.endswith("_amount") or k.endswith("_stated")
             )
             lines.append(f"  {e['at'][:10]} {e['event_type']}{' ' + figures if figures else ''}")
         return "\n".join(lines)
@@ -456,19 +475,24 @@ def _build_impls(proposals: list, user_text: str = "") -> dict:
         # choice next turn.
         named = _pets_named_in(user_text)
         if len(named) > 1:
-            return (f"That message names {' and '.join(named)}. One invoice covering several pets is a "
-                    "SPLIT, not an assignment: call propose_split_between_pets with each pet's share. If "
-                    "he gave no amounts, ask him — never invent one. Assign a pet only when a single pet "
-                    "is named.")
+            return (
+                f"That message names {' and '.join(named)}. One invoice covering several pets is a "
+                "SPLIT, not an assignment: call propose_split_between_pets with each pet's share. If "
+                "he gave no amounts, ask him — never invent one. Assign a pet only when a single pet "
+                "is named."
+            )
         with db.get_connection() as conn:
-            pet = conn.execute("SELECT id, name FROM pets WHERE name = ? COLLATE NOCASE", (pet_name,)).fetchone()
+            pet = conn.execute(
+                "SELECT id, name FROM pets WHERE name = ? COLLATE NOCASE", (pet_name,)
+            ).fetchone()
             known = [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
         if pet is None:
             return f"No pet named '{pet_name}'. Known pets: {', '.join(known)}."
         # unassigned=True only when there's no id: with an id Justin has named
         # the claim, and re-assigning an already-assigned one is legitimate.
-        rows = _find_claims(reference=reference, merchant=merchant, claim_id=claim_id,
-                            unassigned=claim_id is None)
+        rows = _find_claims(
+            reference=reference, merchant=merchant, claim_id=claim_id, unassigned=claim_id is None
+        )
         target, why = _single_target(rows)
         label = f"{_summary_line(target)} → assign {pet['name']}" if target else None
         return _propose("assign_pet", rows, arg=pet["id"], label=label)
@@ -487,8 +511,9 @@ def _build_impls(proposals: list, user_text: str = "") -> dict:
         with db.get_connection() as conn:
             for entry in pets_and_amounts or []:
                 name = (entry.get("pet") or "").strip()
-                pet = conn.execute("SELECT id, name FROM pets WHERE name = ? COLLATE NOCASE",
-                                   (name,)).fetchone()
+                pet = conn.execute(
+                    "SELECT id, name FROM pets WHERE name = ? COLLATE NOCASE", (name,)
+                ).fetchone()
                 if pet is None:
                     known = [r["name"] for r in conn.execute("SELECT name FROM pets ORDER BY name")]
                     return f"No pet named '{name}'. Known pets: {', '.join(known)}."
@@ -498,8 +523,10 @@ def _build_impls(proposals: list, user_text: str = "") -> dict:
         if len(shares) < 2:
             return "A split needs at least two pets. Ask Justin which pets share the invoice."
         if sum(1 for _pet_id, amount in shares if amount is None) > 1:
-            return ("Only one share can be left out — ask Justin for the missing amounts. Never invent "
-                    "a share.")
+            return (
+                "Only one share can be left out — ask Justin for the missing amounts. Never invent "
+                "a share."
+            )
         # Dry run against the real guards: ceiling, status, duplicate pets.
         check = claim_forms.check_split(int(claim_id), shares)
         if not check["ok"]:
@@ -507,13 +534,18 @@ def _build_impls(proposals: list, user_text: str = "") -> dict:
         label = f"#{claim_id} split: " + ", ".join(
             f"{pets_name} ${amount:.2f}" for pets_name, amount in zip(names, check["amounts"])
         )
-        proposals.append({"action": "split_pets", "claim_id": int(claim_id), "label": label,
-                          "arg": shares})
-        return (f"Proposed {label}. Tell Justin the pets and each share in dollars, then ask him to tap "
-                "Confirm. Say it is not done yet.")
+        proposals.append(
+            {"action": "split_pets", "claim_id": int(claim_id), "label": label, "arg": shares}
+        )
+        return (
+            f"Proposed {label}. Tell Justin the pets and each share in dollars, then ask him to tap "
+            "Confirm. Say it is not done yet."
+        )
 
     def propose_mark_resolved(pet=None, reference=None, claim_id=None):
-        return _propose("mark_resolved", _find_claims(pet=pet, reference=reference, claim_id=claim_id))
+        return _propose(
+            "mark_resolved", _find_claims(pet=pet, reference=reference, claim_id=claim_id)
+        )
 
     def propose_create_task(description):
         """Gated rather than immediate for two reasons: it spends an LLM call
@@ -522,24 +554,34 @@ def _build_impls(proposals: list, user_text: str = "") -> dict:
         if not description or not description.strip():
             return "No task text supplied. Ask Justin what the task is — never invent one."
         description = description.strip()
-        proposals.append({"action": "create_task", "label": f"new task: {description}",
-                          "arg": description})
+        proposals.append(
+            {"action": "create_task", "label": f"new task: {description}", "arg": description}
+        )
         return f"Proposed new task: {description}. Tell Justin and ask him to tap Confirm."
 
     def propose_close_task(task_id, outcome):
         if not outcome or not outcome.strip():
             return "No outcome supplied. Ask Justin what happened — never invent an outcome."
         with db.get_connection() as conn:
-            task = conn.execute("SELECT id, description, status FROM tasks WHERE id = ?",
-                                (int(task_id),)).fetchone()
+            task = conn.execute(
+                "SELECT id, description, status FROM tasks WHERE id = ?", (int(task_id),)
+            ).fetchone()
         if task is None:
             return f"No task #{task_id} found. Ask Justin which task he means."
         if task["status"] == "closed":
             return f"Task #{task['id']} is already closed."
-        proposals.append({"action": "close_task", "task_id": task["id"], "arg": outcome.strip(),
-                          "label": f"close task #{task['id']}: {outcome.strip()}"})
-        return (f"Proposed closing task #{task['id']} ({task['description']}) with that outcome. "
-                "Tell Justin and ask him to tap Confirm.")
+        proposals.append(
+            {
+                "action": "close_task",
+                "task_id": task["id"],
+                "arg": outcome.strip(),
+                "label": f"close task #{task['id']}: {outcome.strip()}",
+            }
+        )
+        return (
+            f"Proposed closing task #{task['id']} ({task['description']}) with that outcome. "
+            "Tell Justin and ask him to tap Confirm."
+        )
 
     return {
         "query_claims": query_claims,
@@ -582,63 +624,148 @@ _MERCHANT = {"type": "string", "description": "vet/merchant name (partial ok)"}
 _CLAIM_ID = {"type": "integer", "description": "the claim's id — use it whenever you know it"}
 
 TOOLS = [
-    _fn("query_claims", "List claims filtered by status, pet, vet and/or transaction-date range.",
-        {"status": {"type": "string", "description": "e.g. pending_match, matched, drafted, sent, acknowledged, "
-                    "info_requested, suspended, approved, settled, declined"},
-         "pet": _PET, "merchant": _MERCHANT, "since": _SINCE, "until": _UNTIL}),
-    _fn("pending_actions", "THE list of everything waiting on Justin, with claim ids, amounts and age. "
+    _fn(
+        "query_claims",
+        "List claims filtered by status, pet, vet and/or transaction-date range.",
+        {
+            "status": {
+                "type": "string",
+                "description": "e.g. pending_match, matched, drafted, sent, acknowledged, "
+                "info_requested, suspended, approved, settled, declined",
+            },
+            "pet": _PET,
+            "merchant": _MERCHANT,
+            "since": _SINCE,
+            "until": _UNTIL,
+        },
+    ),
+    _fn(
+        "pending_actions",
+        "THE list of everything waiting on Justin, with claim ids, amounts and age. "
         "Use this for any 'what do I need to do / what's outstanding / what's blocked' question; "
-        "pass since/until to scope it to a transaction period.", {"since": _SINCE, "until": _UNTIL}),
+        "pass since/until to scope it to a transaction period.",
+        {"since": _SINCE, "until": _UNTIL},
+    ),
     # Named "…invoice_requests" but the model still grabbed it for "what CLAIM
     # emails were sent" (live, 2026-07-25) and answered "nothing to verify"
     # while 5 submissions sat awaiting Petcover. Both descriptions now say who
     # the mail went TO, which is the only thing that separates them.
-    _fn("reconcile_sent_invoice_requests",
+    _fn(
+        "reconcile_sent_invoice_requests",
         "Emails to the VET asking for a missing invoice: check Gmail for those drafts Justin has "
-        "since sent. NOT for questions about claims sent to Petcover.", {}),
-    _fn("rematch_claims", "Re-run invoice matching now for claims still awaiting an invoice, "
+        "since sent. NOT for questions about claims sent to Petcover.",
+        {},
+    ),
+    _fn(
+        "rematch_claims",
+        "Re-run invoice matching now for claims still awaiting an invoice, "
         "optionally just one vet's or one claim. Use for 'go through the emails from <vet>'.",
-        {"merchant": _MERCHANT, "claim_id": {"type": "integer"}}),
-    _fn("poll_petcover_now", "Pick up NEW Petcover replies now and report which claims changed. "
-        "Sees only mail not processed before — never report 'nothing new' as 'no reply exists'.", {}),
-    _fn("submissions_awaiting_reply",
+        {"merchant": _MERCHANT, "claim_id": {"type": "integer"}},
+    ),
+    _fn(
+        "poll_petcover_now",
+        "Pick up NEW Petcover replies now and report which claims changed. "
+        "Sees only mail not processed before — never report 'nothing new' as 'no reply exists'.",
+        {},
+    ),
+    _fn(
+        "submissions_awaiting_reply",
         "Claims sent to PETCOVER and whether a reply came back, one entry per submission. Use for "
-        "'what claim emails were sent / what's awaiting a response / has Petcover replied'.", {}),
-    _fn("claim_detail", "One claim in full by id: invoice items, claimable, flag, and every reply "
+        "'what claim emails were sent / what's awaiting a response / has Petcover replied'.",
+        {},
+    ),
+    _fn(
+        "claim_detail",
+        "One claim in full by id: invoice items, claimable, flag, and every reply "
         "with its dollar figures. Use for 'why is claim #N like this'.",
-        {"claim_id": {"type": "integer"}}, required=["claim_id"]),
-    _fn("claim_history", "Show a claim's Petcover reply/status-event history, found by pet and/or reference.",
-        {"pet": _PET, "reference": _REF}),
-    _fn("list_tasks", "List Justin's non-claim tasks (household admin, follow-ups).",
-        {"status": {"type": "string", "description": "open or closed"}}),
-    _fn("propose_mark_sent", "Propose marking a drafted claim as sent (starts Petcover reply tracking). "
-        "Queues a confirmation; does not act.", {"pet": _PET, "reference": _REF, "claim_id": _CLAIM_ID}),
-    _fn("propose_set_condition", "Propose setting the condition being claimed for. Queues a confirmation.",
-        {"condition_text": {"type": "string", "description": "the condition, supplied by the user"},
-         "pet": _PET, "reference": _REF, "claim_id": _CLAIM_ID}, required=["condition_text"]),
-    _fn("propose_assign_pet", "Propose assigning a pet to an unattributed vet transaction. Queues a confirmation.",
-        {"pet_name": {"type": "string"}, "reference": _REF, "claim_id": _CLAIM_ID,
-         "merchant": {"type": "string", "description": "vet/merchant name to locate the unassigned claim"}},
-        required=["pet_name"]),
+        {"claim_id": {"type": "integer"}},
+        required=["claim_id"],
+    ),
+    _fn(
+        "claim_history",
+        "Show a claim's Petcover reply/status-event history, found by pet and/or reference.",
+        {"pet": _PET, "reference": _REF},
+    ),
+    _fn(
+        "list_tasks",
+        "List Justin's non-claim tasks (household admin, follow-ups).",
+        {"status": {"type": "string", "description": "open or closed"}},
+    ),
+    _fn(
+        "propose_mark_sent",
+        "Propose marking a drafted claim as sent (starts Petcover reply tracking). "
+        "Queues a confirmation; does not act.",
+        {"pet": _PET, "reference": _REF, "claim_id": _CLAIM_ID},
+    ),
+    _fn(
+        "propose_set_condition",
+        "Propose setting the condition being claimed for. Queues a confirmation.",
+        {
+            "condition_text": {
+                "type": "string",
+                "description": "the condition, supplied by the user",
+            },
+            "pet": _PET,
+            "reference": _REF,
+            "claim_id": _CLAIM_ID,
+        },
+        required=["condition_text"],
+    ),
+    _fn(
+        "propose_assign_pet",
+        "Propose assigning a pet to an unattributed vet transaction. Queues a confirmation.",
+        {
+            "pet_name": {"type": "string"},
+            "reference": _REF,
+            "claim_id": _CLAIM_ID,
+            "merchant": {
+                "type": "string",
+                "description": "vet/merchant name to locate the unassigned claim",
+            },
+        },
+        required=["pet_name"],
+    ),
     # One invoice, two pets. Amounts come from Justin; the remainder of a
     # two-pet split is the only figure this may leave out.
-    _fn("propose_split_between_pets", "ONE invoice covering SEVERAL PETS: propose a claim per pet, each "
+    _fn(
+        "propose_split_between_pets",
+        "ONE invoice covering SEVERAL PETS: propose a claim per pet, each "
         "with its dollar share. Not for splitting by condition. Queues a confirmation.",
-        {"claim_id": _CLAIM_ID,
-         "pets_and_amounts": {"type": "array", "description": "one entry per pet; omit an amount only if "
-                              "he didn't state it, and only for one pet",
-                              "items": {"type": "object", "properties": {
-                                  "pet": {"type": "string"}, "amount": {"type": "number"}}}}},
-        required=["claim_id", "pets_and_amounts"]),
-    _fn("propose_mark_resolved", "Propose confirming an info-request/suspension has been dealt with. "
-        "Queues a confirmation.", {"pet": _PET, "reference": _REF, "claim_id": _CLAIM_ID}),
-    _fn("propose_create_task", "Propose saving a non-claim task Justin wants remembered. Queues a "
-        "confirmation.", {"description": {"type": "string", "description": "the task, in his words"}},
-        required=["description"]),
-    _fn("propose_close_task", "Propose closing a task with what actually happened. Queues a "
+        {
+            "claim_id": _CLAIM_ID,
+            "pets_and_amounts": {
+                "type": "array",
+                "description": "one entry per pet; omit an amount only if "
+                "he didn't state it, and only for one pet",
+                "items": {
+                    "type": "object",
+                    "properties": {"pet": {"type": "string"}, "amount": {"type": "number"}},
+                },
+            },
+        },
+        required=["claim_id", "pets_and_amounts"],
+    ),
+    _fn(
+        "propose_mark_resolved",
+        "Propose confirming an info-request/suspension has been dealt with. Queues a confirmation.",
+        {"pet": _PET, "reference": _REF, "claim_id": _CLAIM_ID},
+    ),
+    _fn(
+        "propose_create_task",
+        "Propose saving a non-claim task Justin wants remembered. Queues a confirmation.",
+        {"description": {"type": "string", "description": "the task, in his words"}},
+        required=["description"],
+    ),
+    _fn(
+        "propose_close_task",
+        "Propose closing a task with what actually happened. Queues a "
         "confirmation; never invent the outcome.",
-        {"task_id": {"type": "integer"}, "outcome": {"type": "string", "description": "what happened, "
-         "supplied by Justin"}}, required=["task_id", "outcome"]),
+        {
+            "task_id": {"type": "integer"},
+            "outcome": {"type": "string", "description": "what happened, supplied by Justin"},
+        },
+        required=["task_id", "outcome"],
+    ),
 ]
 
 
@@ -651,8 +778,9 @@ _history: dict[int, list] = {}
 HISTORY_TURNS = 6
 
 
-def handle_message(text: str, chat_id: int | None = None,
-                   claim_id: int | None = None) -> tuple[str, dict | None]:
+def handle_message(
+    text: str, chat_id: int | None = None, claim_id: int | None = None
+) -> tuple[str, dict | None]:
     """Run one chat turn. Returns (reply_text, proposed_action_or_None). The
     proposal, if any, is what the Telegram layer turns into a Confirm button.
 
@@ -663,12 +791,22 @@ def handle_message(text: str, chat_id: int | None = None,
     impls = _build_impls(proposals, user_text=text)
     prior = _history.get(chat_id, []) if chat_id is not None else []
     context = (
-        [{"role": "system", "content": f"Justin is replying to the card for claim #{claim_id}. "
-          f"Unless he names a different claim, that is the one he means: pass claim_id={claim_id}."}]
-        if claim_id is not None else []
+        [
+            {
+                "role": "system",
+                "content": f"Justin is replying to the card for claim #{claim_id}. "
+                f"Unless he names a different claim, that is the one he means: pass claim_id={claim_id}.",
+            }
+        ]
+        if claim_id is not None
+        else []
     )
-    messages = [{"role": "system", "content": system_prompt()}, *prior, *context,
-                {"role": "user", "content": text}]
+    messages = [
+        {"role": "system", "content": system_prompt()},
+        *prior,
+        *context,
+        {"role": "user", "content": text},
+    ]
     # Left at the default 4. It was briefly raised to 6 for headroom, before a
     # live 429 revealed a 100k tokens/DAY cap (config.py) that header-only
     # measurement had missed: at ~2.6k tokens a request, extra iterations are
@@ -685,6 +823,10 @@ def handle_message(text: str, chat_id: int | None = None,
     if result.get("model") and result["model"] != primary:
         reply = f"⚠️ {primary} is out of daily tokens — answered with {result['model']}.\n\n{reply}"
     if chat_id is not None:
-        turns = [*prior, {"role": "user", "content": text}, {"role": "assistant", "content": result["text"] or ""}]
+        turns = [
+            *prior,
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": result["text"] or ""},
+        ]
         _history[chat_id] = turns[-HISTORY_TURNS * 2 :]
     return reply, (proposals[-1] if proposals else None)

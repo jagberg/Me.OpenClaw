@@ -37,16 +37,24 @@ logger = logging.getLogger(__name__)
 # Every action `execute` knows. Enumerated rather than derived so the MCP
 # inventory test can assert that no propose_* tool reaches a verb this does not
 # implement, and so an unknown action is a named failure instead of a no-op.
-ACTIONS = ("mark_sent", "set_condition", "assign_pet", "mark_resolved",
-           "split_pets", "create_task", "close_task")
+ACTIONS = (
+    "mark_sent",
+    "set_condition",
+    "assign_pet",
+    "mark_resolved",
+    "split_pets",
+    "create_task",
+    "close_task",
+)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def record(action: str, *, label: str, claim_id=None, task_id=None, arg=None,
-           origin: str = "chat") -> int:
+def record(
+    action: str, *, label: str, claim_id=None, task_id=None, arg=None, origin: str = "chat"
+) -> int:
     """Persist a proposal and return its id. Commits nothing.
 
     The id is what a confirm button carries, so it must stay short: a `command`
@@ -62,15 +70,24 @@ def record(action: str, *, label: str, claim_id=None, task_id=None, arg=None,
         cur = conn.execute(
             "INSERT INTO pending_proposals (origin, action, claim_id, task_id, arg, label, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (origin, action, claim_id, task_id,
-             None if arg is None else json.dumps(arg), label, _now()),
+            (
+                origin,
+                action,
+                claim_id,
+                task_id,
+                None if arg is None else json.dumps(arg),
+                label,
+                _now(),
+            ),
         )
         return int(cur.lastrowid)
 
 
 def get(proposal_id: int) -> dict | None:
     with db.get_connection() as conn:
-        row = conn.execute("SELECT * FROM pending_proposals WHERE id = ?", (int(proposal_id),)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM pending_proposals WHERE id = ?", (int(proposal_id),)
+        ).fetchone()
     if row is None:
         return None
     out = dict(row)
@@ -91,18 +108,24 @@ def commit(proposal_id: int) -> dict:
     if proposal["confirmed_at"]:
         # Single-use. Telegram redelivers, and a double tap on a mark-sent would
         # be a second Petcover submission for one set of invoices.
-        return {"ok": False,
-                "message": f"Already confirmed at {proposal['confirmed_at']}: {proposal['result']}"}
+        return {
+            "ok": False,
+            "message": f"Already confirmed at {proposal['confirmed_at']}: {proposal['result']}",
+        }
     try:
         message = execute(proposal)
     except Exception as exc:  # noqa: BLE001 — visible failure, never a silent no-op
-        logger.error("proposal #%s (%s) failed: %s", proposal_id, proposal["action"], exc, exc_info=True)
+        logger.error(
+            "proposal #%s (%s) failed: %s", proposal_id, proposal["action"], exc, exc_info=True
+        )
         # Deliberately NOT stamped confirmed: the write did not happen, so the
         # proposal is still open and the tap can be retried.
         return {"ok": False, "message": f"Couldn't apply that — {exc}. Nothing was changed."}
     with db.get_connection() as conn:
-        conn.execute("UPDATE pending_proposals SET confirmed_at = ?, result = ? WHERE id = ?",
-                     (_now(), message, int(proposal_id)))
+        conn.execute(
+            "UPDATE pending_proposals SET confirmed_at = ?, result = ? WHERE id = ?",
+            (_now(), message, int(proposal_id)),
+        )
     logger.info("proposal #%s committed (%s): %s", proposal_id, proposal["action"], message)
     return {"ok": True, "message": message}
 

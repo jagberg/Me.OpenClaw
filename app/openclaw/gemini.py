@@ -102,4 +102,6 @@ def _generate(contents, purpose: str) -> str:
             _log_call(purpose, False, latency_ms, str(exc))
             break
 
-    raise GeminiUnavailableError(f"Gemini request failed after retries: {last_error}") from last_error
+    raise GeminiUnavailableError(
+        f"Gemini request failed after retries: {last_error}"
+    ) from last_error

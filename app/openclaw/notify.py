@@ -63,7 +63,8 @@ def _to_ptb_markup(buttons: list[dict] | None):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(b["label"], callback_data=f"cmd:{b['command']}")] for b in buttons])
+        [[InlineKeyboardButton(b["label"], callback_data=f"cmd:{b['command']}")] for b in buttons]
+    )
 
 
 def send_text(text: str, buttons: list[dict] | None = None) -> bool:
@@ -104,7 +105,8 @@ def send_card(caption: str, image: bytes, buttons: list[dict] | None = None) -> 
                     # Same fast path the command route takes. One card, so the
                     # win here is ~9s -> ~1s rather than N rounds -> one.
                     gateway_client.send_cards(
-                        target, [{"png": image, "caption": caption, "buttons": buttons}])
+                        target, [{"png": image, "caption": caption, "buttons": buttons}]
+                    )
                 else:
                     gateway_client.send_card(target, image, caption=caption, buttons=buttons)
             else:
@@ -117,8 +119,9 @@ def send_card(caption: str, image: bytes, buttons: list[dict] | None = None) -> 
     return True
 
 
-def send_document(caption: str, document: bytes, filename: str,
-                  buttons: list[dict] | None = None) -> bool:
+def send_document(
+    caption: str, document: bytes, filename: str, buttons: list[dict] | None = None
+) -> bool:
     """The PDF a review alert is about. Telegram caps captions at 1024 — the
     document is the point, so the caption is what gets truncated."""
     target = _target()
@@ -129,13 +132,16 @@ def send_document(caption: str, document: bytes, filename: str,
             if using_gateway():
                 from . import gateway_client, media_outbox
 
-                path = media_outbox.publish(document, suffix=".pdf", stem=filename.rsplit(".", 1)[0])
+                path = media_outbox.publish(
+                    document, suffix=".pdf", stem=filename.rsplit(".", 1)[0]
+                )
                 gateway_client.send_file(target, path, caption=caption[:1024], buttons=buttons)
             else:
                 from . import telegram_bot
 
-                telegram_bot.send_document_sync(caption, document, filename,
-                                                reply_markup=_to_ptb_markup(buttons))
+                telegram_bot.send_document_sync(
+                    caption, document, filename, reply_markup=_to_ptb_markup(buttons)
+                )
     except Exception as exc:  # noqa: BLE001
         logger.error("outbound document dropped: %s", exc, exc_info=True)
         return False

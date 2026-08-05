@@ -95,7 +95,9 @@ def handle_pet(username: str | None, claim_id: int, pet_name: str) -> dict:
     if not is_authorized(username):
         return {"ok": False, "message": "Not authorized."}
     with db.get_connection() as conn:
-        pet = conn.execute("SELECT * FROM pets WHERE name = ? COLLATE NOCASE", (pet_name,)).fetchone()
+        pet = conn.execute(
+            "SELECT * FROM pets WHERE name = ? COLLATE NOCASE", (pet_name,)
+        ).fetchone()
     if pet is None:
         return {"ok": False, "message": f"No pet named '{pet_name}'."}
     return claim_forms.assign_pet(claim_id, pet["id"])
@@ -145,8 +147,10 @@ def handle_notvet(username: str | None, pattern: str) -> dict:
     added = db.add_non_vet_pattern(pattern)
     normalised = pattern.strip().lower()
     if added:
-        return {"ok": True,
-                "message": f"Added to non-vet list: '{normalised}'. Matching charges won't become claims."}
+        return {
+            "ok": True,
+            "message": f"Added to non-vet list: '{normalised}'. Matching charges won't become claims.",
+        }
     return {"ok": True, "message": f"'{normalised}' is already on the non-vet list."}
 
 
@@ -196,10 +200,10 @@ def merge_buttons(proposal_id: int) -> list[dict]:
     """Confirm/reject for a one-invoice-several-charges merge. No per-claim
     pick: which claim carries the invoice is bookkeeping — Petcover sees the
     invoice, never the bank charges — and the larger charge carries it."""
-    return [_command_button("✅ Merge — one invoice, one claim", f"/merge {proposal_id}"),
-            _command_button("❌ Not the same invoice", f"/reject {proposal_id}")]
-
-
+    return [
+        _command_button("✅ Merge — one invoice, one claim", f"/merge {proposal_id}"),
+        _command_button("❌ Not the same invoice", f"/reject {proposal_id}"),
+    ]
 
 
 # --- text builders, moved verbatim from `telegram_bot` 2026-08-02 -------------
@@ -218,6 +222,7 @@ def _esc_html(s: str) -> str:
     """HTML-escape for message bodies. quote=False because none of this goes
     into an attribute — escaping apostrophes would render "hasn&#x27;t"."""
     return html.escape(s or "", quote=False)
+
 
 _ACTION_EMOJI = {
     "split_proposal": "🔀",
@@ -247,19 +252,23 @@ def _action_card_text(action: dict) -> str:
             f"{action['group_id']} · {len(members)} claims · ${abs(action['amount']):,.2f}",
         ]
         lines += [
-            f"  • #{m['claim_id']} {m['date']} · {_esc(claim_card._vet_name(m["merchant"]))}"
+            f"  • #{m['claim_id']} {m['date']} · {_esc(claim_card._vet_name(m['merchant']))}"
             f" · ${abs(m['amount']):,.2f}{' · ' + _esc(m['condition_text']) if m['condition_text'] else ''}"
             for m in members
         ]
-        lines.append(f"{_esc(action['pet_name'] or '')} · oldest {action['date']} ({action['age_days']}d ago)")
+        lines.append(
+            f"{_esc(action['pet_name'] or '')} · oldest {action['date']} ({action['age_days']}d ago)"
+        )
     else:
         lines = [
             head,
-            f"Claim #{action['claim_id']} · {_esc(claim_card._vet_name(action["merchant"]))}"
+            f"Claim #{action['claim_id']} · {_esc(claim_card._vet_name(action['merchant']))}"
             f" · ${abs(action['amount']):,.2f}",
         ]
         who = " · ".join(filter(None, [action["pet_name"], action["condition_text"]]))
-        lines.append(f"{_esc(who) + ' · ' if who else ''}{action['date']} ({action['age_days']}d ago)")
+        lines.append(
+            f"{_esc(who) + ' · ' if who else ''}{action['date']} ({action['age_days']}d ago)"
+        )
     lines.append(f"Blocks: {_esc(action['blocks'])}")
     if action["kind"] == "assign_pet":
         # The buttons can only say ONE pet. An invoice covering two needs a share
@@ -300,8 +309,9 @@ def history_card(page: int = 1) -> dict | None:
     total_pages = max(1, -(-len(rows) // per_page))
     page = max(1, min(page, total_pages))
     start = (page - 1) * per_page
-    png = claim_card.render(rows[start:start + per_page], page=page, total_rows=len(rows),
-                            agg=claim_card.totals(rows))
+    png = claim_card.render(
+        rows[start : start + per_page], page=page, total_rows=len(rows), agg=claim_card.totals(rows)
+    )
     buttons = []
     if page > 1:
         buttons.append(_command_button("◀ Prev", f"/history {page - 1}"))
@@ -322,7 +332,9 @@ def _action_buttons(action: dict) -> list[dict]:
     if kind == "mark_sent":
         return [_command_button("✅ Mark sent", f"/mark {claim_id} sent")]
     if kind == "assign_pet":
-        return [_command_button(f"🐾 {name}", f"/pet {claim_id} {name}") for name in db.list_pet_names()]
+        return [
+            _command_button(f"🐾 {name}", f"/pet {claim_id} {name}") for name in db.list_pet_names()
+        ]
     if kind == "confirm_resolved":
         return [_command_button("✅ Resolved", f"/resolve {claim_id}")]
     if kind == "unmatch":
@@ -336,10 +348,12 @@ def _action_buttons(action: dict) -> list[dict]:
         # on a plugin conditionally claiming an inbound text message — task 0.10,
         # unverified. Until it is, the card says to reply, which is what the
         # pre-gateway flow did anyway once "Other" was tapped.
-        return [_command_button(text[:24], f"/mark {claim_id} {text}")
-                for text in prior_conditions(action.get("pet_id"))
-                if text.strip().lower() not in RESERVED_MARK_WORDS
-                and len(f"/mark {claim_id} {text}".encode("utf-8")) <= 58][:4]
+        return [
+            _command_button(text[:24], f"/mark {claim_id} {text}")
+            for text in prior_conditions(action.get("pet_id"))
+            if text.strip().lower() not in RESERVED_MARK_WORDS
+            and len(f"/mark {claim_id} {text}".encode("utf-8")) <= 58
+        ][:4]
     return []
 
 
@@ -372,7 +386,12 @@ def actions_cards() -> list[dict]:
     with trace.step("actions.pending"):
         actions = claim_status.pending_actions()
     if not actions:
-        return [{"text": "Nothing waiting on you — every claim is with Petcover or closed.", "buttons": []}]
+        return [
+            {
+                "text": "Nothing waiting on you — every claim is with Petcover or closed.",
+                "buttons": [],
+            }
+        ]
 
     tappable = [a for a in actions if a["actionable"]]
     shown = tappable[:ACTION_CARD_CAP]
@@ -380,11 +399,15 @@ def actions_cards() -> list[dict]:
 
     notes = [f"{len(tappable)} to action, {len(blocked)} blocked"]
     if len(tappable) > len(shown):
-        notes.append(f"+{len(tappable) - len(shown)} more — run /actions again once these are cleared.")
+        notes.append(
+            f"+{len(tappable) - len(shown)} more — run /actions again once these are cleared."
+        )
     if blocked:
         total = sum(abs(a["amount"]) for a in blocked)
-        notes.append(f"🚫 {len(blocked)} claims blocked · ${total:,.2f} — {blocked[0]['flag'] or 'blocked'}. "
-                     "No button can fix this; it needs the insurer's claim process on file.")
+        notes.append(
+            f"🚫 {len(blocked)} claims blocked · ${total:,.2f} — {blocked[0]['flag'] or 'blocked'}. "
+            "No button can fix this; it needs the insurer's claim process on file."
+        )
 
     tap_cards = [{"text": _action_card_text(a), "buttons": _action_buttons(a)} for a in shown]
     if not tap_cards:
@@ -446,8 +469,11 @@ def dispatch(name: str, args: str, username: str | None) -> dict:
         except ValueError:
             page = 1
         card = history_card(page)
-        return ({"text": "No vet claims in the last 12 months.", "cards": []} if card is None
-                else {"text": "", "cards": [card]})
+        return (
+            {"text": "No vet claims in the last 12 months.", "cards": []}
+            if card is None
+            else {"text": "", "cards": [card]}
+        )
 
     if name == "actions":
         return {"text": "", "cards": actions_cards()}
@@ -471,7 +497,10 @@ def dispatch(name: str, args: str, username: str | None) -> dict:
         conditions = prior_conditions(flow["state"]["pet_id"])
         if not 0 <= index < len(conditions):
             return {"text": f"No prior condition #{index}.", "cards": []}
-        return {"text": "", "cards": [pending_flows.record_item(username_chat(username), conditions[index])]}
+        return {
+            "text": "",
+            "cards": [pending_flows.record_item(username_chat(username), conditions[index])],
+        }
 
     if name in ("merge", "reject"):
         if claim_id is None:
@@ -486,8 +515,10 @@ def dispatch(name: str, args: str, username: str | None) -> dict:
             return {"text": handle_mark(username, claim_id, rest)["message"], "cards": []}
         if name == "pet":
             if not rest:
-                return {"text": f"/pet needs a pet name. Known pets: {', '.join(db.list_pet_names())}",
-                        "cards": []}
+                return {
+                    "text": f"/pet needs a pet name. Known pets: {', '.join(db.list_pet_names())}",
+                    "cards": [],
+                }
             return {"text": handle_pet(username, claim_id, rest)["message"], "cards": []}
         if name == "resolve":
             return {"text": handle_resolved(username, claim_id)["message"], "cards": []}

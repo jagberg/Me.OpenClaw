@@ -53,7 +53,9 @@ async def lifespan(app: FastAPI):
     # Every logged message is stamped with this, so a wrong version silently
     # mislabels the training data — say so rather than shipping "unknown".
     if config.APP_VERSION == "unknown":
-        logger.warning("APP_VERSION is 'unknown' — built without scripts/deploy.ps1; messages will be mistagged.")
+        logger.warning(
+            "APP_VERSION is 'unknown' — built without scripts/deploy.ps1; messages will be mistagged."
+        )
     else:
         logger.info("OpenClaw starting, version %s", config.APP_VERSION)
     db.init_db()

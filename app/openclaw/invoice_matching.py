@@ -411,17 +411,27 @@ def _pet_id_by_name(patient: str | None) -> int | None:
     if not patient:
         return None
     with db.get_connection() as conn:
-        row = conn.execute("SELECT id FROM pets WHERE name = ? COLLATE NOCASE", (patient.strip(),)).fetchone()
+        row = conn.execute(
+            "SELECT id FROM pets WHERE name = ? COLLATE NOCASE", (patient.strip(),)
+        ).fetchone()
     return row["id"] if row else None
 
 
-def _mark_matched(claim_id: int, email_id: str, invoice: dict, flag: str | None = None,
-                  pet_id: int | None = None) -> None:
+def _mark_matched(
+    claim_id: int, email_id: str, invoice: dict, flag: str | None = None, pet_id: int | None = None
+) -> None:
     with db.get_connection() as conn:
         conn.execute(
             "UPDATE vet_claims SET matched_email_id = ?, invoice_data = ?, "
             "flag = ?, pet_id = COALESCE(?, pet_id), updated_at = ? WHERE id = ?",
-            (email_id, json.dumps(invoice), flag, pet_id, datetime.now(timezone.utc).isoformat(), claim_id),
+            (
+                email_id,
+                json.dumps(invoice),
+                flag,
+                pet_id,
+                datetime.now(timezone.utc).isoformat(),
+                claim_id,
+            ),
         )
     # State last, so a refused transition's flag survives the `flag = ?` above
     # rather than being wiped by the very write that caused the refusal.
@@ -449,32 +459,56 @@ def _apply_match(claim, chosen: dict, pool: list[dict]) -> bool:
     if complement is None:
         remainder = _unexplained_remainder(total, claim["txn_amount"])
         flag = f"possible additional invoice — unexplained ${remainder:.2f}" if remainder else None
-        _mark_matched(claim["id"], chosen["email_id"], invoice,
-                      flag, pet_id=_pet_for(invoice, chosen["text"], claim))
+        _mark_matched(
+            claim["id"],
+            chosen["email_id"],
+            invoice,
+            flag,
+            pet_id=_pet_for(invoice, chosen["text"], claim),
+        )
         return True
 
     other = dict(complement["invoice"])
     other["claimable_amount"] = claimable_amount(other)
-    note = (f"one ${abs(claim['txn_amount']):.2f} charge paid two invoices: "
-            f"${total:.2f} + ${float(other['amount']):.2f}")
+    note = (
+        f"one ${abs(claim['txn_amount']):.2f} charge paid two invoices: "
+        f"${total:.2f} + ${float(other['amount']):.2f}"
+    )
     invoice = {**invoice, "charge_note": note}
     other["charge_note"] = note
-    _mark_matched(claim["id"], chosen["email_id"], invoice, None,
-                  pet_id=_pet_for(invoice, chosen["text"], claim))
+    _mark_matched(
+        claim["id"],
+        chosen["email_id"],
+        invoice,
+        None,
+        pet_id=_pet_for(invoice, chosen["text"], claim),
+    )
     now = datetime.now(timezone.utc).isoformat()
     with db.get_connection() as conn:
         sibling_id = conn.execute(
             "INSERT INTO vet_claims (transaction_id, pet_id, matched_email_id, invoice_data, status, "
             "created_at, updated_at) VALUES (?, ?, ?, ?, 'matched', ?, ?)",
-            (claim["transaction_id"], _pet_id_by_name(other.get("patient")) or _single_pet_in_text(complement["text"]),
-             complement["email_id"], json.dumps(other), now, now),
+            (
+                claim["transaction_id"],
+                _pet_id_by_name(other.get("patient")) or _single_pet_in_text(complement["text"]),
+                complement["email_id"],
+                json.dumps(other),
+                now,
+                now,
+            ),
         ).lastrowid
     # The sibling is INSERTed straight at 'matched' (it is born matched — the
     # apportionment is what created it), but it still needs the event, or its
     # projection has nothing to fold and disagrees with the column forever.
-    claim_status.apply_event(sibling_id, "matched", {"apportioned_from": claim["id"]}, complement["email_id"])
-    logger.info("claim %s: charge covers two invoices — claim %s created for the second (%s)",
-                claim["id"], sibling_id, note)
+    claim_status.apply_event(
+        sibling_id, "matched", {"apportioned_from": claim["id"]}, complement["email_id"]
+    )
+    logger.info(
+        "claim %s: charge covers two invoices — claim %s created for the second (%s)",
+        claim["id"],
+        sibling_id,
+        note,
+    )
     return True
 
 
@@ -537,30 +571,36 @@ def find_visit_by_date(iso_date: str) -> list[dict]:
         for row in rows:
             invoice = json.loads(row["invoice_data"] or "{}")
             if iso_date in _invoice_dates(invoice):
-                found.append({
-                    "claim_id": row["id"],
-                    "pet_name": row["pet_name"],
-                    "merchant": row["merchant"],
-                    "invoice_number": invoice.get("invoice_number"),
-                    "amount": invoice.get("amount"),
-                    "date": iso_date,
-                    "matched_on": _date_source(invoice, iso_date),
-                })
-        if found:
-            return found
-        for row in conn.execute("SELECT message_id, extracted_json FROM email_extractions").fetchall():
-            for invoice in json.loads(row["extracted_json"] or "[]"):
-                if isinstance(invoice, dict) and iso_date in _invoice_dates(invoice):
-                    found.append({
-                        "claim_id": None,
-                        "pet_name": invoice.get("patient"),
-                        "merchant": None,
+                found.append(
+                    {
+                        "claim_id": row["id"],
+                        "pet_name": row["pet_name"],
+                        "merchant": row["merchant"],
                         "invoice_number": invoice.get("invoice_number"),
                         "amount": invoice.get("amount"),
                         "date": iso_date,
                         "matched_on": _date_source(invoice, iso_date),
-                        "email_id": row["message_id"],
-                    })
+                    }
+                )
+        if found:
+            return found
+        for row in conn.execute(
+            "SELECT message_id, extracted_json FROM email_extractions"
+        ).fetchall():
+            for invoice in json.loads(row["extracted_json"] or "[]"):
+                if isinstance(invoice, dict) and iso_date in _invoice_dates(invoice):
+                    found.append(
+                        {
+                            "claim_id": None,
+                            "pet_name": invoice.get("patient"),
+                            "merchant": None,
+                            "invoice_number": invoice.get("invoice_number"),
+                            "amount": invoice.get("amount"),
+                            "date": iso_date,
+                            "matched_on": _date_source(invoice, iso_date),
+                            "email_id": row["message_id"],
+                        }
+                    )
     return found
 
 
@@ -572,7 +612,8 @@ def _already_claimed(invoice: dict, claim_id: int) -> bool:
     amount+date."""
     with db.get_connection() as conn:
         rows = conn.execute(
-            "SELECT invoice_data FROM vet_claims WHERE id != ? AND invoice_data IS NOT NULL", (claim_id,)
+            "SELECT invoice_data FROM vet_claims WHERE id != ? AND invoice_data IS NOT NULL",
+            (claim_id,),
         ).fetchall()
     number = invoice.get("invoice_number")
     for row in rows:
@@ -581,13 +622,16 @@ def _already_claimed(invoice: dict, claim_id: int) -> bool:
             if str(number) == str(other["invoice_number"]):
                 return True
             continue
-        if other.get("amount") == invoice.get("amount") and other.get("date") == invoice.get("date"):
+        if other.get("amount") == invoice.get("amount") and other.get("date") == invoice.get(
+            "date"
+        ):
             return True
     return False
 
 
-def _pick_invoice(invoices: list, txn_amount: float, txn_date: date, claim_id: int | None = None,
-                  text: str = "") -> dict | None:
+def _pick_invoice(
+    invoices: list, txn_amount: float, txn_date: date, claim_id: int | None = None, text: str = ""
+) -> dict | None:
     """The best-fitting invoice in the email: under the charge ceiling, date
     near the transaction, not already carried by another claim — preferring
     the closest amount then the closest date, so an exact match beats another
@@ -599,7 +643,9 @@ def _pick_invoice(invoices: list, txn_amount: float, txn_date: date, claim_id: i
         total = float(invoice["amount"])
         if not _within_ceiling(total, txn_amount):
             continue
-        if not _invoice_date_plausible(invoice, txn_date) and not _paid_on_charge_date(text, invoice, txn_date):
+        if not _invoice_date_plausible(invoice, txn_date) and not _paid_on_charge_date(
+            text, invoice, txn_date
+        ):
             continue
         if claim_id is not None and _already_claimed(invoice, claim_id):
             continue
@@ -623,7 +669,11 @@ def _oversized_candidate(invoices: list, txn_amount: float, txn_date: date) -> d
         if invoice.get("amount") is None:
             continue
         total = float(invoice["amount"])
-        if _invoice_date_plausible(invoice, txn_date) and invoice.get("date") and not _within_ceiling(total, txn_amount):
+        if (
+            _invoice_date_plausible(invoice, txn_date)
+            and invoice.get("date")
+            and not _within_ceiling(total, txn_amount)
+        ):
             return invoice
     return None
 
@@ -635,8 +685,9 @@ def _invoice_identity(invoice: dict) -> tuple:
     return ("n", number) if number else ("ad", invoice.get("amount"), str(invoice.get("date"))[:10])
 
 
-def _complement_for(chosen: dict, pool: list[dict], txn_amount: float, txn_date: date,
-                    claim_id: int) -> dict | None:
+def _complement_for(
+    chosen: dict, pool: list[dict], txn_amount: float, txn_date: date, claim_id: int
+) -> dict | None:
     """The OTHER invoice this one charge also paid for.
 
     One card charge can settle several invoices at once — most often one per pet,
@@ -668,7 +719,8 @@ def _complement_for(chosen: dict, pool: list[dict], txn_amount: float, txn_date:
         if not _within_ceiling(total, txn_amount):
             continue
         if not _invoice_date_plausible(invoice, txn_date) and not _paid_on_charge_date(
-                entry.get("text", ""), invoice, txn_date):
+            entry.get("text", ""), invoice, txn_date
+        ):
             continue  # the pool holds a year of bulk-email invoices; most aren't this visit
         if _already_claimed(invoice, claim_id):
             continue
@@ -729,7 +781,9 @@ def match_claim(claim) -> bool:
             seen.add(item["id"])
             if item["id"] in rejected:
                 continue  # Justin unmatched this invoice — don't re-grab it
-            message = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
+            message = (
+                service.users().messages().get(userId="me", id=item["id"], format="full").execute()
+            )
             if "SENT" in message.get("labelIds", []):
                 continue  # own outgoing mail is never an invoice (second layer past -from:me)
             text = gmail_client.full_message_text(service, message)
@@ -754,7 +808,10 @@ def match_claim(claim) -> bool:
                 ):
                     invoices = _vision_invoices(item["id"])
                     if not invoices:
-                        headers = {h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])}
+                        headers = {
+                            h["name"]: h["value"]
+                            for h in message.get("payload", {}).get("headers", [])
+                        }
                         unreadable_subject = headers.get("Subject", "(no subject)")
             if not invoices:
                 continue
@@ -768,11 +825,16 @@ def match_claim(claim) -> bool:
             if chosen is not None:
                 # Already have this claim's invoice; still scanning only to find
                 # the one that explains the rest of the charge.
-                if _complement_for(chosen, pool, claim["txn_amount"], txn_date, claim["id"]) is not None:
+                if (
+                    _complement_for(chosen, pool, claim["txn_amount"], txn_date, claim["id"])
+                    is not None
+                ):
                     break
                 continue
 
-            invoice = _pick_invoice(invoices, claim["txn_amount"], txn_date, claim_id=claim["id"], text=text)
+            invoice = _pick_invoice(
+                invoices, claim["txn_amount"], txn_date, claim_id=claim["id"], text=text
+            )
             if invoice is None:
                 if oversized is None:
                     candidate = _oversized_candidate(invoices, claim["txn_amount"], txn_date)
@@ -780,14 +842,22 @@ def match_claim(claim) -> bool:
                         # keep the amounts the email/PDF text mentions — the
                         # invoice's own payment lines listing both bank charges
                         # is the strongest merge evidence (see _propose_split)
-                        oversized = {**candidate, "_email_id": item["id"], "_text_amounts": _text_amounts(text)}
+                        oversized = {
+                            **candidate,
+                            "_email_id": item["id"],
+                            "_text_amounts": _text_amounts(text),
+                        }
                 continue
             chosen = {"email_id": item["id"], "invoice": invoice, "text": text}
             # Fully explained by this one invoice (or explained bar a surcharge):
             # the old behaviour, and the common case — stop scanning.
             if _unexplained_remainder(float(invoice["amount"]), claim["txn_amount"]) is None:
                 break
-        if chosen is not None and _complement_for(chosen, pool, claim["txn_amount"], txn_date, claim["id"]) is not None:
+        if (
+            chosen is not None
+            and _complement_for(chosen, pool, claim["txn_amount"], txn_date, claim["id"])
+            is not None
+        ):
             break
 
     if chosen is not None:
@@ -813,7 +883,10 @@ _TEXT_AMOUNT_RE = re.compile(r"-?\$?\s?\d[\d,]*\.\d{2}\b")
 def _text_amounts(text: str) -> list[float]:
     """Every money-looking number in the email/PDF text, as positive floats —
     an invoice's payment section lists each card payment (e.g. ': -1970.40')."""
-    return [abs(float(m.replace("$", "").replace(",", "").strip())) for m in _TEXT_AMOUNT_RE.findall(text)]
+    return [
+        abs(float(m.replace("$", "").replace(",", "").strip()))
+        for m in _TEXT_AMOUNT_RE.findall(text)
+    ]
 
 
 def _propose_split(claim, oversized: dict) -> str | None:
@@ -837,7 +910,11 @@ def _propose_split(claim, oversized: dict) -> str | None:
             (claim["id"], claim["txn_merchant"]),
         ).fetchall()
     match = next(
-        (s for s in siblings if _within_ceiling(total, -(abs(claim["txn_amount"]) + abs(s["amount"])))),
+        (
+            s
+            for s in siblings
+            if _within_ceiling(total, -(abs(claim["txn_amount"]) + abs(s["amount"])))
+        ),
         None,
     )
     if match is None:
@@ -934,7 +1011,10 @@ def resolve_split_proposal(proposal_id: int, chosen_claim_id: int) -> dict:
             return {"ok": False, "message": "That split proposal is gone or already resolved."}
         claim_ids = json.loads(proposal["claim_ids"])
         if chosen_claim_id not in claim_ids:
-            return {"ok": False, "message": f"Claim #{chosen_claim_id} isn't part of this proposal."}
+            return {
+                "ok": False,
+                "message": f"Claim #{chosen_claim_id} isn't part of this proposal.",
+            }
         rows = conn.execute(
             f"SELECT vet_claims.id, vet_claims.status, bank_transactions.amount FROM vet_claims "
             f"JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
@@ -942,12 +1022,18 @@ def resolve_split_proposal(proposal_id: int, chosen_claim_id: int) -> dict:
             claim_ids,
         ).fetchall()
     if any(r["status"] != "pending_match" for r in rows):
-        return {"ok": False, "message": "A claim in this proposal already moved on — nothing changed."}
+        return {
+            "ok": False,
+            "message": "A claim in this proposal already moved on — nothing changed.",
+        }
     invoice = json.loads(proposal["invoice_json"])
     total = float(invoice["amount"])
     combined = sum(abs(r["amount"]) for r in rows)
     if not _within_ceiling(total, -combined):
-        return {"ok": False, "message": f"Invoice ${total:.2f} exceeds the charges combined (${combined:.2f}) — refusing."}
+        return {
+            "ok": False,
+            "message": f"Invoice ${total:.2f} exceeds the charges combined (${combined:.2f}) — refusing.",
+        }
 
     invoice.pop("payments_confirmed", None)
     invoice["claimable_amount"] = claimable_amount(invoice)
@@ -966,7 +1052,9 @@ def resolve_split_proposal(proposal_id: int, chosen_claim_id: int) -> dict:
             )
         conn.execute("UPDATE split_proposals SET status = 'resolved' WHERE id = ?", (proposal_id,))
     for other in others:
-        claim_status.apply_event(other, "absorbed", {"absorbed_into": chosen_claim_id, "invoice_total": total})
+        claim_status.apply_event(
+            other, "absorbed", {"absorbed_into": chosen_claim_id, "invoice_total": total}
+        )
     return {
         "ok": True,
         "message": f"Merged: claim #{chosen_claim_id} carries the ${total:.2f} invoice; "
@@ -1007,8 +1095,13 @@ def unmatch(claim_id: int) -> dict:
             "telegram_notified_status = NULL, telegram_notified_flag = NULL, updated_at = ? WHERE id = ?",
             (json.dumps(rejected), now, claim_id),
         )
-    claim_status.apply_event(claim_id, "unmatched", {"rejected_email_id": claim["matched_email_id"]})
-    return {"ok": True, "message": f"Claim #{claim_id}: wrong invoice rejected — re-searching Gmail for the right one."}
+    claim_status.apply_event(
+        claim_id, "unmatched", {"rejected_email_id": claim["matched_email_id"]}
+    )
+    return {
+        "ok": True,
+        "message": f"Claim #{claim_id}: wrong invoice rejected — re-searching Gmail for the right one.",
+    }
 
 
 def _lookup_vet_email(merchant: str) -> str | None:
@@ -1035,9 +1128,12 @@ def _lookup_vet_email(merchant: str) -> str | None:
         return None
 
     service = gmail_client.build_service()
-    message = service.users().messages().get(
-        userId="me", id=row["matched_email_id"], format="metadata", metadataHeaders=["From"]
-    ).execute()
+    message = (
+        service.users()
+        .messages()
+        .get(userId="me", id=row["matched_email_id"], format="metadata", metadataHeaders=["From"])
+        .execute()
+    )
     headers = {h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])}
     return headers.get("From")
 

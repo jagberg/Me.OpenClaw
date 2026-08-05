@@ -44,7 +44,9 @@ GMAIL_CREDENTIALS_PATH = os.environ.get("GMAIL_CREDENTIALS_PATH", "./data/creden
 GMAIL_TOKEN_PATH = os.environ.get("GMAIL_TOKEN_PATH", "./data/token.json")
 GMAIL_POLL_INTERVAL_MINUTES = _int_env("GMAIL_POLL_INTERVAL_MINUTES", 5)
 
-PETCOVER_TEMPLATE_PATH = os.environ.get("PETCOVER_TEMPLATE_PATH", "./data/petcover-claim-template.pdf")
+PETCOVER_TEMPLATE_PATH = os.environ.get(
+    "PETCOVER_TEMPLATE_PATH", "./data/petcover-claim-template.pdf"
+)
 # Status polling ignores Petcover emails older than this (Gmail after: format).
 # Guards against first-run backfill: without it the first poll would ingest
 # years of historical replies about long-settled claims and could mis-correlate
@@ -87,7 +89,12 @@ TELEGRAM_USERNAME = os.environ.get("TELEGRAM_USERNAME", "jagberg")
 # opposites and `scripts/gateway_preflight.py` fails the deploy if both poll or
 # neither does. Kept as a flag rather than a deletion for one week of real use
 # after cutover (task 4.1): rollback is this env var and a restart, ~30s.
-TELEGRAM_UPDATER_ENABLED = os.environ.get("TELEGRAM_UPDATER_ENABLED", "1").strip().lower()     not in ("0", "false", "no", "off")
+TELEGRAM_UPDATER_ENABLED = os.environ.get("TELEGRAM_UPDATER_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 # Which runtime schedules work. Default on = APScheduler in this process, the
 # pre-cutover state. Off hands the five cadences to the gateway's cron, which
@@ -100,7 +107,12 @@ TELEGRAM_UPDATER_ENABLED = os.environ.get("TELEGRAM_UPDATER_ENABLED", "1").strip
 # Justin would get two messages. The gateway's own convention agrees: cron jobs are
 # declarative (`--declaration-key`) and it has no notion of a second scheduler,
 # so per-job `cron disable` is its rollback and this flag is ours.
-SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "1").strip().lower()     not in ("0", "false", "no", "off")
+SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 # The OpenClaw gateway's side of the house. The gateway owns the bot token and
 # the agent loop; this app owns the claims domain and calls out to it. Two
@@ -117,7 +129,9 @@ INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET", "")
 # auth. Default is loopback only. A gateway running in its own compose service
 # is NOT loopback, so that deployment has to widen this deliberately.
 INTERNAL_API_ALLOW_HOSTS = {
-    h.strip() for h in os.environ.get("INTERNAL_API_ALLOW_HOSTS", "127.0.0.1,::1").split(",") if h.strip()
+    h.strip()
+    for h in os.environ.get("INTERNAL_API_ALLOW_HOSTS", "127.0.0.1,::1").split(",")
+    if h.strip()
 }
 # How outbound Telegram messages leave once the gateway owns the token. Every
 # send goes through gateway_client so there is one logged seam — the same reason
@@ -162,13 +176,13 @@ GATEWAY_VERSION = os.environ.get("GATEWAY_VERSION", "")
 # These are the ONLY bytes that cross the container boundary. Widening either to
 # reach `app/data` would undo the isolation the whole design rests on.
 MEDIA_OUTBOX_DIR = os.environ.get("MEDIA_OUTBOX_DIR", "/data/outbox")
-MEDIA_OUTBOX_GATEWAY_DIR = os.environ.get(
-    "MEDIA_OUTBOX_GATEWAY_DIR", "/home/node/.openclaw/media"
-)
+MEDIA_OUTBOX_GATEWAY_DIR = os.environ.get("MEDIA_OUTBOX_GATEWAY_DIR", "/home/node/.openclaw/media")
 
 # Twice-daily Google Drive DB backup (drive_backup.py). Folder ID is from
 # https://drive.google.com/drive/folders/1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2
-DRIVE_BACKUP_FOLDER_ID = os.environ.get("DRIVE_BACKUP_FOLDER_ID", "1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2")
+DRIVE_BACKUP_FOLDER_ID = os.environ.get(
+    "DRIVE_BACKUP_FOLDER_ID", "1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2"
+)
 DRIVE_BACKUP_PREFIX = os.environ.get("DRIVE_BACKUP_PREFIX", "OpenClawBettyVet")
 DRIVE_BACKUP_LOG_SUBFOLDER = os.environ.get("DRIVE_BACKUP_LOG_SUBFOLDER", "logs")
 # Durable local record: written even if Drive itself is unreachable, so a

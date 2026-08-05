@@ -48,17 +48,26 @@ def poll_once() -> None:
     APScheduler logs and retries next interval; unprocessed messages stay unmarked so they're
     retried too."""
     service = gmail_client.build_service()
-    response = service.users().messages().list(userId="me", maxResults=20, labelIds=["INBOX"]).execute()
+    response = (
+        service.users().messages().list(userId="me", maxResults=20, labelIds=["INBOX"]).execute()
+    )
 
     for item in response.get("messages", []):
         message_id = item["id"]
         if _already_processed(message_id):
             continue
 
-        message = service.users().messages().get(
-            userId="me", id=message_id, format="metadata",
-            metadataHeaders=["Subject", "From", "List-Unsubscribe"],
-        ).execute()
+        message = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=message_id,
+                format="metadata",
+                metadataHeaders=["Subject", "From", "List-Unsubscribe"],
+            )
+            .execute()
+        )
         headers = {h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])}
 
         task_id = None

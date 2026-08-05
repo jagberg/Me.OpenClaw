@@ -50,8 +50,8 @@ COMPONENT_CEILINGS = {
     # description edit between runs. The ceiling is set far above both on
     # purpose; treat either number as an order of magnitude, not a baseline.
     "toolSchemaChars": 8000,
-    "workspaceFileChars": 8000,    # measured 6,508 for the six shipped files
-    "skillChars": 100,             # skills are removed; anything here is a regression
+    "workspaceFileChars": 8000,  # measured 6,508 for the six shipped files
+    "skillChars": 100,  # skills are removed; anything here is a regression
 }
 
 # Must be off. Each grants filesystem, shell or browser reach, and 47 of 66
@@ -62,8 +62,15 @@ COMPONENT_CEILINGS = {
 # `memory-core` and `talk-voice` were outside the check that enforces
 # `gmail-isolation-boundary`, so the guard was narrower than the finding that
 # justified it. Both were running on the deployed gateway when this was found.
-BOUNDARY_PLUGINS = ("browser", "file-transfer", "phone-control", "canvas", "device-pair",
-                    "memory-core", "talk-voice")
+BOUNDARY_PLUGINS = (
+    "browser",
+    "file-transfer",
+    "phone-control",
+    "canvas",
+    "device-pair",
+    "memory-core",
+    "talk-voice",
+)
 
 # The gateway writes its command menu into exactly these scopes. The app owns
 # `chat`, which Telegram resolves first, and that only works while this list
@@ -134,13 +141,25 @@ class Gateway:
         self.shell_prefix = shlex.split(shell_prefix)
 
     def run(self, *args: str, timeout: int = 120) -> tuple[int, str, str]:
-        proc = subprocess.run(self.prefix + list(args), capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=timeout)
+        proc = subprocess.run(
+            self.prefix + list(args),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
 
     def shell(self, script: str, timeout: int = 60) -> tuple[int, str, str]:
-        proc = subprocess.run(self.shell_prefix + [script], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=timeout)
+        proc = subprocess.run(
+            self.shell_prefix + [script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
 
     def json(self, *args: str, timeout: int = 120):
@@ -184,8 +203,17 @@ def check_turn_size(gw: Gateway, session_key: str) -> list[Result]:
     """
     served, sized = Result("model serves a turn"), Result("turn size under ceiling")
     try:
-        payload = gw.json("agent", "--agent", "main", "--session-key", session_key,
-                          "--message", "hi", "--json", timeout=300)
+        payload = gw.json(
+            "agent",
+            "--agent",
+            "main",
+            "--session-key",
+            session_key,
+            "--message",
+            "hi",
+            "--json",
+            timeout=300,
+        )
     except Exception as exc:  # noqa: BLE001
         # A model id config ACCEPTS can still fail at runtime with
         # model_not_found — Groq did, before a custom provider entry existed.
@@ -198,11 +226,14 @@ def check_turn_size(gw: Gateway, session_key: str) -> list[Result]:
         # to, from the provider's own words.
         detail = str(exc)
         if "TPD" in detail or "tokens per day" in detail:
-            return [served.fail(
-                "the model's DAILY token budget is exhausted, not a config fault. Groq's ceiling is "
-                "100k/day per model and it resets at midnight UTC. Retrying will not help; the agent "
-                "and the app's extraction calls share this key (task 17.6)"),
-                sized.skip("no turn to measure")]
+            return [
+                served.fail(
+                    "the model's DAILY token budget is exhausted, not a config fault. Groq's ceiling is "
+                    "100k/day per model and it resets at midnight UTC. Retrying will not help; the agent "
+                    "and the app's extraction calls share this key (task 17.6)"
+                ),
+                sized.skip("no turn to measure"),
+            ]
         # Gemini says neither, and that ambiguity cost a wrong reading on
         # 2026-08-04: the deploy failed on `FailoverError: API rate limit
         # reached`, which is the gateway's single `rate_limit` bucket talking and
@@ -214,11 +245,14 @@ def check_turn_size(gw: Gateway, session_key: str) -> list[Result]:
         # apart is the provider's own quota detail: a per-day 429 carries a
         # `quotaId` containing `PerDay`, a per-minute one does not.
         if "rate limit" in detail.lower() or "resource_exhausted" in detail.lower():
-            return [served.fail(
-                f"rate limited, and the gateway does not say which limit: {detail[:160]}. "
-                "Per-MINUTE clears in about a minute — re-run before treating this as a "
-                "failure. Per-DAY does not; check the 429's quotaId for `PerDay`"),
-                sized.skip("no turn to measure")]
+            return [
+                served.fail(
+                    f"rate limited, and the gateway does not say which limit: {detail[:160]}. "
+                    "Per-MINUTE clears in about a minute — re-run before treating this as a "
+                    "failure. Per-DAY does not; check the 429's quotaId for `PerDay`"
+                ),
+                sized.skip("no turn to measure"),
+            ]
         return [served.fail(f"no turn completed: {exc}"), sized.skip("no turn to measure")]
 
     meta = (payload.get("result") or {}).get("meta") or {}
@@ -242,9 +276,13 @@ def check_turn_size(gw: Gateway, session_key: str) -> list[Result]:
         tokens = (agent_meta.get("contextBudgetStatus") or {}).get("estimatedPromptTokens")
         estimated = isinstance(tokens, int)
     if not isinstance(tokens, int):
-        return [served, sized.fail(
-            "the turn reported neither promptTokens nor estimatedPromptTokens; "
-            "cannot assert the ceiling")]
+        return [
+            served,
+            sized.fail(
+                "the turn reported neither promptTokens nor estimatedPromptTokens; "
+                "cannot assert the ceiling"
+            ),
+        ]
 
     failures = []
     if tokens > TURN_TOKEN_CEILING:
@@ -252,16 +290,19 @@ def check_turn_size(gw: Gateway, session_key: str) -> list[Result]:
 
     measured = {
         "toolSchemaChars": (report.get("tools") or {}).get("schemaChars", 0),
-        "workspaceFileChars": sum(f.get("injectedChars", 0)
-                                  for f in report.get("injectedWorkspaceFiles") or []),
+        "workspaceFileChars": sum(
+            f.get("injectedChars", 0) for f in report.get("injectedWorkspaceFiles") or []
+        ),
         "skillChars": (report.get("skills") or {}).get("chars", 0),
     }
     for key, ceiling in COMPONENT_CEILINGS.items():
         if measured[key] > ceiling:
             failures.append(f"{key} is {measured[key]}, ceiling {ceiling}")
 
-    detail = (f"{tokens} tokens{' (gateway estimate; the provider reported none)' if estimated else ''}; "
-              + ", ".join(f"{k}={v}" for k, v in measured.items()))
+    detail = (
+        f"{tokens} tokens{' (gateway estimate; the provider reported none)' if estimated else ''}; "
+        + ", ".join(f"{k}={v}" for k, v in measured.items())
+    )
     return [served, sized.fail("; ".join(failures)) if failures else sized.ok(detail)]
 
 
@@ -279,8 +320,7 @@ def check_cron_declared(gw: Gateway) -> Result:
     a curl does, on every tick, forever.
     """
     result = Result("cron entries declared")
-    expected = {"claims.tick", "claims.ingest", "claims.nudge",
-                "claims.vet-nudge", "claims.expire"}
+    expected = {"claims.tick", "claims.ingest", "claims.nudge", "claims.vet-nudge", "claims.expire"}
     try:
         payload = gw.json("cron", "list", "--json")
     except Exception as exc:  # noqa: BLE001
@@ -317,10 +357,12 @@ def check_boundary_plugins(gw: Gateway) -> Result:
     enabled set is partly implicit and cannot be read from config alone (13.2).
     """
     result = Result("boundary plugins disabled")
-    entries = (gw.config("plugins.entries") or {})
-    problems = [f"{p} is not explicitly disabled in config"
-                for p in BOUNDARY_PLUGINS
-                if (entries.get(p) or {}).get("enabled") is not False]
+    entries = gw.config("plugins.entries") or {}
+    problems = [
+        f"{p} is not explicitly disabled in config"
+        for p in BOUNDARY_PLUGINS
+        if (entries.get(p) or {}).get("enabled") is not False
+    ]
     try:
         loaded = set((gw.health().get("plugins") or {}).get("loaded") or [])
     except Exception as exc:  # noqa: BLE001
@@ -366,9 +408,15 @@ def check_isolation(gw: Gateway) -> Result:
     code, env, _ = gw.shell("env")
     if code != 0:
         return result.skip("could not read the gateway's environment")
-    leaked = sorted({line.split("=", 1)[0] for line in env.splitlines()
-                     for key in FORBIDDEN_GATEWAY_KEYS if line.upper().startswith(key)}
-                    - set(ALLOWED_GATEWAY_KEYS))
+    leaked = sorted(
+        {
+            line.split("=", 1)[0]
+            for line in env.splitlines()
+            for key in FORBIDDEN_GATEWAY_KEYS
+            if line.upper().startswith(key)
+        }
+        - set(ALLOWED_GATEWAY_KEYS)
+    )
     problems = [f"forbidden env: {leaked}"] if leaked else []
 
     code, mounts, _ = gw.shell("cat /proc/mounts")
@@ -406,7 +454,7 @@ def check_exactly_one_poller(gw: Gateway, app_health: dict | None) -> Result:
 
     app_polling = bool(app_health.get("polling_alive"))
     try:
-        telegram = ((gw.health().get("channels") or {}).get("telegram") or {})
+        telegram = (gw.health().get("channels") or {}).get("telegram") or {}
     except Exception as exc:  # noqa: BLE001
         return result.skip(f"could not read the gateway's channel state: {exc}")
     gateway_polling = bool(telegram.get("running"))
@@ -457,8 +505,21 @@ def check_app_can_send(app_container: str) -> Result:
     # Telegram, which is the point: the connect, the pairing and the scope are
     # all exercised and no message is delivered. A preflight that messaged
     # Justin every deploy would train him to ignore it.
-    probe = ["docker", "exec", app_container, "openclaw", "message", "send",
-             "--channel", "telegram", "--target", "0", "--message", "preflight", "--json"]
+    probe = [
+        "docker",
+        "exec",
+        app_container,
+        "openclaw",
+        "message",
+        "send",
+        "--channel",
+        "telegram",
+        "--target",
+        "0",
+        "--message",
+        "preflight",
+        "--json",
+    ]
     try:
         proc = subprocess.run(probe, capture_output=True, text=True, timeout=90)
     except FileNotFoundError:
@@ -472,20 +533,28 @@ def check_app_can_send(app_container: str) -> Result:
     # not a chat. Checked before the return code, because this is a failure
     # exit for a successful probe.
     if "chat not found" in lowered or "chat_id is empty" in lowered or "invalid" in lowered:
-        return result.ok("the gateway accepted a write-scoped send and Telegram refused the dummy target")
+        return result.ok(
+            "the gateway accepted a write-scoped send and Telegram refused the dummy target"
+        )
     if proc.returncode != 0:
         # The shapes seen live on 2026-08-03, named so the next person does not
         # have to re-derive any of them from an exit code.
         if "not found at" in lowered or "command not found" in lowered:
             return result.fail(f"the app has no gateway CLI: {blob[:180]}")
         if "more scopes than currently approved" in lowered or "scope upgrade" in lowered:
-            return result.fail("the app's device is paired but not approved for sending — "
-                               f"`openclaw devices approve <id>` on the gateway: {blob[:140]}")
+            return result.fail(
+                "the app's device is paired but not approved for sending — "
+                f"`openclaw devices approve <id>` on the gateway: {blob[:140]}"
+            )
         if "pairing" in lowered:
-            return result.fail("the app's device is not paired — "
-                               f"`openclaw devices approve <id>` on the gateway: {blob[:140]}")
+            return result.fail(
+                "the app's device is not paired — "
+                f"`openclaw devices approve <id>` on the gateway: {blob[:140]}"
+            )
         if "non-loopback" in lowered:
-            return result.fail(f"OPENCLAW_GATEWAY_URL must be a literal address, not a DNS name: {blob[:140]}")
+            return result.fail(
+                f"OPENCLAW_GATEWAY_URL must be a literal address, not a DNS name: {blob[:140]}"
+            )
         return result.fail(f"the write-scoped probe exited {proc.returncode}: {blob[:180]}")
     return result.ok("write-scoped send accepted by the gateway")
 
@@ -518,12 +587,17 @@ def check_menu_scopes(gw: Gateway) -> Result:
     # a false FAIL, which erodes a preflight as fast as a false PASS.
     code, out, _ = gw.shell(
         "sed -n '/TELEGRAM_COMMAND_MENU_SCOPES/,/^];/p' "
-        "/app/extensions/telegram/src/bot-native-command-menu.ts")
+        "/app/extensions/telegram/src/bot-native-command-menu.ts"
+    )
     if code != 0 or not out.strip():
         return result.skip("could not read the scope list from the shipped source")
-    found = {s for s in ("default", "all_group_chats", "all_private_chats", "chat") if f'"{s}"' in out}
+    found = {
+        s for s in ("default", "all_group_chats", "all_private_chats", "chat") if f'"{s}"' in out
+    }
     if found != EXPECTED_MENU_SCOPES:
-        return result.fail(f"the gateway now writes {sorted(found)}; the app's chat scope may be overwritten")
+        return result.fail(
+            f"the gateway now writes {sorted(found)}; the app's chat scope may be overwritten"
+        )
     return result.ok()
 
 
@@ -557,7 +631,7 @@ def check_button_commands(gw: Gateway, app_health: dict | None, commands: tuple)
     result = Result("button commands registered")
     if app_health is None:
         return result.skip("the app's /health was unreachable; registration is UNVERIFIED")
-    reported = (app_health.get("gateway_plugin") or {})
+    reported = app_health.get("gateway_plugin") or {}
     if not reported:
         return result.fail(
             "the plugin has not reported its commands - it may have loaded without running "
@@ -574,9 +648,13 @@ def check_button_commands(gw: Gateway, app_health: dict | None, commands: tuple)
     # Observed 2026-08-02 with a second plugin loaded — the boot report claimed
     # all five while three had actually been refused. Reading the log is the
     # only place that failure is visible.
-    code, log, _ = gw.shell("cat /tmp/openclaw/openclaw-*.log 2>/dev/null | grep -i 'command registration failed' | tail -20")
+    code, log, _ = gw.shell(
+        "cat /tmp/openclaw/openclaw-*.log 2>/dev/null | grep -i 'command registration failed' | tail -20"
+    )
     if code != 0:
-        return result.skip("registered, but the gateway log was unreadable so collisions are UNVERIFIED")
+        return result.skip(
+            "registered, but the gateway log was unreadable so collisions are UNVERIFIED"
+        )
     # The log file is JSON per line, so the command name arrives as \"mark\"
     # rather than "mark". Matching the unescaped form found nothing and the
     # check PASSED over three real collisions -- caught only by going and
@@ -593,18 +671,34 @@ def check_button_commands(gw: Gateway, app_health: dict | None, commands: tuple)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exec-prefix", default="docker compose exec -T gateway node openclaw.mjs",
-                        help="how to run the openclaw CLI inside the gateway container")
-    parser.add_argument("--shell-prefix", default="docker compose exec -T gateway sh -lc",
-                        help="how to run a shell inside the gateway container")
-    parser.add_argument("--session-key", default="preflight",
-                        help="MUST be unused; an existing session measures conversation, not surface")
-    parser.add_argument("--skip-turn", action="store_true",
-                        help="skip the agent turn (it spends tokens against a real provider budget)")
-    parser.add_argument("--app-container", default="meopenclaw-telegram-claimquery-app-1",
-                        help="container the app runs in; the send probe execs the gateway CLI there")
-    parser.add_argument("--app-health", default="http://127.0.0.1:8000/health",
-                        help="the Python app's health URL")
+    parser.add_argument(
+        "--exec-prefix",
+        default="docker compose exec -T gateway node openclaw.mjs",
+        help="how to run the openclaw CLI inside the gateway container",
+    )
+    parser.add_argument(
+        "--shell-prefix",
+        default="docker compose exec -T gateway sh -lc",
+        help="how to run a shell inside the gateway container",
+    )
+    parser.add_argument(
+        "--session-key",
+        default="preflight",
+        help="MUST be unused; an existing session measures conversation, not surface",
+    )
+    parser.add_argument(
+        "--skip-turn",
+        action="store_true",
+        help="skip the agent turn (it spends tokens against a real provider budget)",
+    )
+    parser.add_argument(
+        "--app-container",
+        default="meopenclaw-telegram-claimquery-app-1",
+        help="container the app runs in; the send probe execs the gateway CLI there",
+    )
+    parser.add_argument(
+        "--app-health", default="http://127.0.0.1:8000/health", help="the Python app's health URL"
+    )
     args = parser.parse_args()
 
     gw = Gateway(args.exec_prefix, args.shell_prefix)
@@ -627,8 +721,11 @@ def main() -> int:
     results.append(check_exactly_one_poller(gw, app_health))
     results.append(check_cron_declared(gw))
     results.append(check_boundary_plugins(gw))
-    results.append(check_access_policy({"telegram": gw.config("channels.telegram"),
-                                        "commands": gw.config("commands")}))
+    results.append(
+        check_access_policy(
+            {"telegram": gw.config("channels.telegram"), "commands": gw.config("commands")}
+        )
+    )
     results.append(check_media_roots(gw.config("media")))
     results.append(check_app_can_send(args.app_container))
     results.append(check_isolation(gw))

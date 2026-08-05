@@ -16,13 +16,22 @@ os.environ["DATABASE_PATH"] = os.path.join(_tmpdir, "test_telegram.db")
 os.environ.setdefault("GEMINI_API_KEY", "")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 
-from openclaw import claim_forms, claim_status, db, invoice_matching, pipeline, telegram_bot  # noqa: E402
+from openclaw import (  # noqa: E402
+    claim_forms,
+    claim_status,
+    db,
+    invoice_matching,
+    pipeline,
+    telegram_bot,
+)
 
 AUTHORIZED_USER = "jagberg"
 UNAUTHORIZED_USER = "someone_else"
 
 
-def _seed_matched_claim(merchant: str, condition_text: str | None = "ear infection", pet_name: str = "Aari") -> int:
+def _seed_matched_claim(
+    merchant: str, condition_text: str | None = "ear infection", pet_name: str = "Aari"
+) -> int:
     db.init_db()
     now = datetime.now(timezone.utc).isoformat()
     with db.get_connection() as conn:
@@ -108,7 +117,9 @@ def test_command_rejected_for_unauthorized_user():
     result = telegram_bot.handle_mark(UNAUTHORIZED_USER, claim_id, "should not apply")
     assert result["ok"] is False
     with db.get_connection() as conn:
-        row = conn.execute("SELECT condition_text FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        row = conn.execute(
+            "SELECT condition_text FROM vet_claims WHERE id = ?", (claim_id,)
+        ).fetchone()
     assert row["condition_text"] == "ear infection", "unauthorized /mark must not change the claim"
 
 
@@ -120,7 +131,9 @@ def test_mark_condition_matches_dashboard_path():
 
     _with_stubbed_claim_fill(run)
     with db.get_connection() as conn:
-        row = conn.execute("SELECT condition_text FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        row = conn.execute(
+            "SELECT condition_text FROM vet_claims WHERE id = ?", (claim_id,)
+        ).fetchone()
     assert row["condition_text"] == "broken leg"
 
 
@@ -153,7 +166,9 @@ def test_notification_dedup():
     # tests, so filter sent messages down to this test's own claim.
     claim_id = _seed_matched_claim("DEDUP VET", pet_name="DedupPet")
     with db.get_connection() as conn:
-        conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", ("condition text missing", claim_id))
+        conn.execute(
+            "UPDATE vet_claims SET flag = ? WHERE id = ?", ("condition text missing", claim_id)
+        )
     sent = []
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
@@ -164,11 +179,16 @@ def test_notification_dedup():
 def test_notification_fires_on_new_state():
     claim_id = _seed_matched_claim("NEW STATE VET", pet_name="NewStatePet")
     with db.get_connection() as conn:
-        conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", ("condition text missing", claim_id))
+        conn.execute(
+            "UPDATE vet_claims SET flag = ? WHERE id = ?", ("condition text missing", claim_id)
+        )
     sent = []
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     with db.get_connection() as conn:
-        conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", ("invoice missing itemized services", claim_id))
+        conn.execute(
+            "UPDATE vet_claims SET flag = ? WHERE id = ?",
+            ("invoice missing itemized services", claim_id),
+        )
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     own_sent = [t for t in sent if "NewStatePet" in t]
     assert len(own_sent) == 2, "a genuinely new flag/status must notify again"
@@ -179,7 +199,9 @@ def test_reviewed_mark_requires_drafted():
     result = claim_forms.mark_reviewed(claim_id)
     assert result["ok"] is False
     with db.get_connection() as conn:
-        row = conn.execute("SELECT reviewed_at FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        row = conn.execute(
+            "SELECT reviewed_at FROM vet_claims WHERE id = ?", (claim_id,)
+        ).fetchone()
     assert row["reviewed_at"] is None
 
 
@@ -199,7 +221,9 @@ def test_reviewed_mark_sets_timestamp_on_drafted():
 
     assert result["ok"] is True
     with db.get_connection() as conn:
-        row = conn.execute("SELECT reviewed_at FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        row = conn.execute(
+            "SELECT reviewed_at FROM vet_claims WHERE id = ?", (claim_id,)
+        ).fetchone()
     assert row["reviewed_at"] is not None
 
 
@@ -245,23 +269,38 @@ def test_notification_fires_on_info_requested():
     assert "suspend" not in own_sent[0].lower(), "a request is not a suspension"
 
 
-def _seed_unanswered_vet_request(pet_name: str, *, owed_by="vet", document="Consultation notes dated 18/05/2026",
-                                 txn_date="2026-07-01", resolved=False) -> int:
+def _seed_unanswered_vet_request(
+    pet_name: str,
+    *,
+    owed_by="vet",
+    document="Consultation notes dated 18/05/2026",
+    txn_date="2026-07-01",
+    resolved=False,
+) -> int:
     """A claim sitting on an unresolved information request, as the Monday nudge
     sees it. `resolved=True` adds the confirm-resolved that must remove it."""
     claim_id = _seed_matched_claim(f"{pet_name} VET", pet_name=pet_name)
     now = datetime.now(timezone.utc).isoformat()
-    detail = {"owed_by": owed_by, "clinic": f"{pet_name} Clinic", "clinic_email": f"info@{pet_name.lower()}.example",
-              "requested_document": document}
+    detail = {
+        "owed_by": owed_by,
+        "clinic": f"{pet_name} Clinic",
+        "clinic_email": f"info@{pet_name.lower()}.example",
+        "requested_document": document,
+    }
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET status = 'info_requested' WHERE id = ?", (claim_id,))
-        conn.execute("UPDATE bank_transactions SET date = ? WHERE id = "
-                     "(SELECT transaction_id FROM vet_claims WHERE id = ?)", (txn_date, claim_id))
+        conn.execute(
+            "UPDATE bank_transactions SET date = ? WHERE id = "
+            "(SELECT transaction_id FROM vet_claims WHERE id = ?)",
+            (txn_date, claim_id),
+        )
         # The invoice's own service date has to move with the charge: the deadline
         # is anchored on TREATMENT, so a claim whose charge is old but whose
         # invoice says last week is not past the deadline — and shouldn't look it.
-        conn.execute("UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
-                     (json.dumps({"date": txn_date, "amount": 100.0}), claim_id))
+        conn.execute(
+            "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
+            (json.dumps({"date": txn_date, "amount": 100.0}), claim_id),
+        )
         conn.execute(
             "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
             "VALUES (?, 'info_requested', ?, ?, ?)",
@@ -284,12 +323,16 @@ def test_monday_nudge_lists_every_unanswered_vet_request():
     kings = _seed_unanswered_vet_request("Kingspet")
     shire = _seed_unanswered_vet_request("Shirepet", document="Itemised invoice")
     sent = []
-    result = pipeline.nudge_unanswered_vet_requests(send_fn=lambda text, markup=None: sent.append(text))
+    result = pipeline.nudge_unanswered_vet_requests(
+        send_fn=lambda text, markup=None: sent.append(text)
+    )
     assert result["sent"] is True and len(sent) == 1, "one message, not one per claim"
     body = sent[0]
     for claim_id in (kings, shire):
         assert f"#{claim_id}" in body, "Justin acts by claim id"
-    assert "Consultation notes dated 18/05/2026" in body, "the full phrase, where there is room for it"
+    assert "Consultation notes dated 18/05/2026" in body, (
+        "the full phrase, where there is room for it"
+    )
     assert "Itemised invoice" in body
     assert "info@kingspet.example" in body, "the address he has to write to"
     assert "deadline" in body.lower()
@@ -313,8 +356,13 @@ def test_monday_nudge_names_the_invoice_the_requested_date_belongs_to():
         holds = conn.execute(
             "INSERT INTO vet_claims (transaction_id, pet_id, status, invoice_data, created_at, updated_at) "
             "VALUES (?, ?, 'settled', ?, ?, ?)",
-            (txn, pet, json.dumps({"date": "2026-05-18", "invoice_number": "1000229", "amount": 351.5}),
-             datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
+            (
+                txn,
+                pet,
+                json.dumps({"date": "2026-05-18", "invoice_number": "1000229", "amount": 351.5}),
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+            ),
         ).lastrowid
     sent = []
     pipeline.nudge_unanswered_vet_requests(send_fn=lambda text, markup=None: sent.append(text))
@@ -372,8 +420,11 @@ def test_info_request_notification_says_the_vet_was_asked():
         conn.execute(
             "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
             "VALUES (?, 'info_requested', 'm-inforeq', ?, ?)",
-            (claim_id, '{"owed_by": "vet", "clinic_email": "info@kingsvet.com.au"}',
-             datetime.now(timezone.utc).isoformat()),
+            (
+                claim_id,
+                '{"owed_by": "vet", "clinic_email": "info@kingsvet.com.au"}',
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
     sent = []
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
@@ -436,7 +487,9 @@ def test_second_tap_on_a_sent_batch_reads_as_a_no_op():
         conn.execute("UPDATE vet_claims SET status = 'acknowledged' WHERE id = ?", (a,))
     moved_on = telegram_bot.handle_sent(AUTHORIZED_USER, a)
     assert moved_on["ok"] is False
-    assert "acknowledged" in moved_on["message"] and "already marked sent" not in moved_on["message"]
+    assert (
+        "acknowledged" in moved_on["message"] and "already marked sent" not in moved_on["message"]
+    )
 
 
 def test_batch_action_card_is_one_card_naming_every_member():
@@ -453,7 +506,9 @@ def test_batch_action_card_is_one_card_naming_every_member():
     action = sends[0]
     text = telegram_bot._action_card_text(action)
     assert claim_status.submission_group_id([a, b]) in text
-    assert f"#{a}" in text and f"#{b}" in text, "group id supplements the claim ids, never replaces them"
+    assert f"#{a}" in text and f"#{b}" in text, (
+        "group id supplements the claim ids, never replaces them"
+    )
     keyboard = telegram_bot._action_keyboard(action)
     buttons = [btn for row in keyboard.inline_keyboard for btn in row]
     # `cmd:` wraps the gateway's own command string — one card builder, two
@@ -463,7 +518,9 @@ def test_batch_action_card_is_one_card_naming_every_member():
     with db.get_connection() as conn:
         statuses = [
             r["status"]
-            for r in conn.execute("SELECT status FROM vet_claims WHERE id IN (?, ?)", (a, b)).fetchall()
+            for r in conn.execute(
+                "SELECT status FROM vet_claims WHERE id IN (?, ?)", (a, b)
+            ).fetchall()
         ]
     assert statuses == ["sent", "sent"], "the single tap advances the whole submission"
 
@@ -503,8 +560,12 @@ def test_drafted_batch_notifies_once_with_button():
     # tapping the button (its command's claim id) advances the whole batch
     telegram_bot.handle_sent(AUTHORIZED_USER, int(command.split(" ")[1]))
     with db.get_connection() as conn:
-        statuses = [r["status"] for r in conn.execute(
-            "SELECT status FROM vet_claims WHERE id IN (?, ?)", (a, b)).fetchall()]
+        statuses = [
+            r["status"]
+            for r in conn.execute(
+                "SELECT status FROM vet_claims WHERE id IN (?, ?)", (a, b)
+            ).fetchall()
+        ]
     assert statuses == ["sent", "sent"]
 
 
@@ -517,7 +578,9 @@ def test_condition_prompt_lists_items_and_offers_prior_conditions():
             "UPDATE vet_claims SET flag = 'condition text missing — enter manually on dashboard' WHERE id = ?",
             (cid,),
         )
-        pet_id = conn.execute("SELECT pet_id FROM vet_claims WHERE id = ?", (cid,)).fetchone()["pet_id"]
+        pet_id = conn.execute("SELECT pet_id FROM vet_claims WHERE id = ?", (cid,)).fetchone()[
+            "pet_id"
+        ]
     captured = []
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: captured.append((text, markup)))
     mine = [(t, m) for t, m in captured if "CondPet" in t and "What condition?" in t]
@@ -527,13 +590,20 @@ def test_condition_prompt_lists_items_and_offers_prior_conditions():
     labels = [b["label"] for b in markup]
     assert "Arthritis" in labels, labels
     # "Other" is PTB-only until 12.2: a `command` button cannot carry free text.
-    ptb = telegram_bot._action_keyboard({"kind": "set_condition", "claim_id": cid, "pet_id": pet_id})
+    ptb = telegram_bot._action_keyboard(
+        {"kind": "set_condition", "claim_id": cid, "pet_id": pet_id}
+    )
     assert any("Other" in b.text for row in ptb.inline_keyboard for b in row), ptb
     # tapping the Arthritis button (its index) applies that condition
     conds = telegram_bot.prior_conditions(pet_id)
-    _with_stubbed_claim_fill(lambda: claim_forms.set_condition_text(cid, conds[conds.index("Arthritis")]))
+    _with_stubbed_claim_fill(
+        lambda: claim_forms.set_condition_text(cid, conds[conds.index("Arthritis")])
+    )
     with db.get_connection() as conn:
-        assert conn.execute("SELECT condition_text FROM vet_claims WHERE id = ?", (cid,)).fetchone()[0] == "Arthritis"
+        assert (
+            conn.execute("SELECT condition_text FROM vet_claims WHERE id = ?", (cid,)).fetchone()[0]
+            == "Arthritis"
+        )
 
 
 def test_suspicious_match_explains_why_and_offers_unmatch():
@@ -556,7 +626,8 @@ def test_suspicious_match_explains_why_and_offers_unmatch():
     assert result["ok"] is True
     with db.get_connection() as conn:
         r = conn.execute(
-            "SELECT status, matched_email_id, rejected_email_ids FROM vet_claims WHERE id = ?", (cid,)
+            "SELECT status, matched_email_id, rejected_email_ids FROM vet_claims WHERE id = ?",
+            (cid,),
         ).fetchone()
     assert r["status"] == "pending_match" and r["matched_email_id"] is None
     assert "wrongemail123" in r["rejected_email_ids"]
@@ -567,8 +638,17 @@ def test_invoice_items_reads_itemised_lines():
     with db.get_connection() as conn:
         conn.execute(
             "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
-            (json.dumps({"items": [{"description": "Consult", "amount": 140.0},
-                                   {"description": "Blood Profile", "amount": 135.0}]}), cid),
+            (
+                json.dumps(
+                    {
+                        "items": [
+                            {"description": "Consult", "amount": 140.0},
+                            {"description": "Blood Profile", "amount": 135.0},
+                        ]
+                    }
+                ),
+                cid,
+            ),
         )
     items = telegram_bot._invoice_items(cid)  # split-callback path — must not NameError on json
     assert [i["description"] for i in items] == ["Consult", "Blood Profile"]
@@ -580,10 +660,21 @@ def test_apply_item_conditions_groups_and_fills_rows():
     with db.get_connection() as conn:
         conn.execute(
             "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
-            (json.dumps({"date": "2026-06-19", "amount": 580.74, "services": "x",
-                         "items": [{"description": "Arthritis Package", "amount": 250.0},
-                                   {"description": "Blood Profile", "amount": 135.0},
-                                   {"description": "Consult", "amount": 140.0}]}), cid),
+            (
+                json.dumps(
+                    {
+                        "date": "2026-06-19",
+                        "amount": 580.74,
+                        "services": "x",
+                        "items": [
+                            {"description": "Arthritis Package", "amount": 250.0},
+                            {"description": "Blood Profile", "amount": 135.0},
+                            {"description": "Consult", "amount": 140.0},
+                        ],
+                    }
+                ),
+                cid,
+            ),
         )
     # Arthritis Package + Consult → Arthritis; Blood Profile → Raised ALT/ALP
     assignments = [
@@ -610,7 +701,10 @@ def test_apply_item_conditions_groups_and_fills_rows():
     rows = {captured[f"condition_{i}"]: captured[f"charge_{i}"] for i in (1, 2)}
     assert rows["Arthritis"] == 390.0 and rows["Raised ALT/ALP"] == 135.0
     with db.get_connection() as conn:
-        assert conn.execute("SELECT status FROM vet_claims WHERE id = ?", (cid,)).fetchone()[0] == "drafted"
+        assert (
+            conn.execute("SELECT status FROM vet_claims WHERE id = ?", (cid,)).fetchone()[0]
+            == "drafted"
+        )
 
 
 if __name__ == "__main__":

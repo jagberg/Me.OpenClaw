@@ -63,8 +63,9 @@ def _put(chat_id, kind: str, claim_id, state: dict) -> None:
 
 def get(chat_id, kind: str) -> dict | None:
     with db.get_connection() as conn:
-        row = conn.execute("SELECT * FROM pending_flows WHERE chat_id = ? AND kind = ?",
-                           (str(chat_id), kind)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM pending_flows WHERE chat_id = ? AND kind = ?", (str(chat_id), kind)
+        ).fetchone()
     if row is None:
         return None
     out = dict(row)
@@ -74,13 +75,18 @@ def get(chat_id, kind: str) -> dict | None:
 
 def clear(chat_id, kind: str) -> None:
     with db.get_connection() as conn:
-        conn.execute("DELETE FROM pending_flows WHERE chat_id = ? AND kind = ?", (str(chat_id), kind))
+        conn.execute(
+            "DELETE FROM pending_flows WHERE chat_id = ? AND kind = ?", (str(chat_id), kind)
+        )
 
 
 def start_condition(chat_id, claim_id: int) -> dict:
     """Justin tapped 'Other' — the next thing he types is the condition."""
     _put(chat_id, CONDITION, int(claim_id), {})
-    return {"prompt": "Reply to this message with the condition being claimed:", "force_reply": True}
+    return {
+        "prompt": "Reply to this message with the condition being claimed:",
+        "force_reply": True,
+    }
 
 
 def start_split(chat_id, claim_id: int, pet_id: int, items: list[dict]) -> dict:
@@ -98,7 +104,7 @@ def item_prompt(chat_id) -> dict | None:
     amount = f" (${float(item['amount']):.2f})" if item.get("amount") is not None else ""
     return {
         "prompt": f"Item {state['idx'] + 1}/{len(state['items'])}: {item['description']}{amount}\n"
-                  "Which condition?",
+        "Which condition?",
         "buttons": _item_buttons(state["pet_id"]),
     }
 
@@ -106,9 +112,11 @@ def item_prompt(chat_id) -> dict | None:
 def _item_buttons(pet_id: int) -> list[dict]:
     from . import commands
 
-    buttons = [{"label": text[:60], "command": f"/item {i}"}
-               for i, text in enumerate(commands.prior_conditions(pet_id)[:6])
-               if len(f"/item {i}".encode("utf-8")) <= 58]
+    buttons = [
+        {"label": text[:60], "command": f"/item {i}"}
+        for i, text in enumerate(commands.prior_conditions(pet_id)[:6])
+        if len(f"/item {i}".encode("utf-8")) <= 58
+    ]
     buttons.append({"label": "✏️ Type", "command": "/item type"})
     buttons.append({"label": "🚫 Not claimable", "command": "/item skip"})
     return buttons
@@ -164,7 +172,9 @@ def claim_text(chat_id, text: str) -> dict | None:
         flow = get(chat_id, SPLIT)
         state = dict(flow["state"], await_type=False)
         _put(chat_id, SPLIT, flow["claim_id"], state)
-        logger.info("pending flow: split item consumed a typed reply for claim #%s", flow["claim_id"])
+        logger.info(
+            "pending flow: split item consumed a typed reply for claim #%s", flow["claim_id"]
+        )
         return record_item(chat_id, text)
 
     flow = get(chat_id, CONDITION)
@@ -173,7 +183,9 @@ def claim_text(chat_id, text: str) -> dict | None:
         # Stored verbatim. No model between his words and `condition_text` —
         # the field the hard rules forbid inferring.
         result = claim_forms.set_condition_text(flow["claim_id"], text)
-        logger.info("pending flow: condition consumed a typed reply for claim #%s", flow["claim_id"])
+        logger.info(
+            "pending flow: condition consumed a typed reply for claim #%s", flow["claim_id"]
+        )
         return {"text": result["message"]}
 
     return None

@@ -25,9 +25,15 @@ ROWS_PER_PAGE = 12
 # load_default means a missing font degrades the look, never crashes the card.
 _FONT_CANDIDATES = {
     "sans": ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "C:/Windows/Fonts/arial.ttf"],
-    "sans_bold": ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "C:/Windows/Fonts/arialbd.ttf"],
+    "sans_bold": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ],
     "mono": ["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "C:/Windows/Fonts/consola.ttf"],
-    "mono_bold": ["/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", "C:/Windows/Fonts/consolab.ttf"],
+    "mono_bold": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        "C:/Windows/Fonts/consolab.ttf",
+    ],
 }
 
 
@@ -81,7 +87,9 @@ def _rrect(d: ImageDraw.ImageDraw, box, radius: float, fill) -> None:
     d.rounded_rectangle([c * S for c in box], radius=radius * S, fill=fill)
 
 
-def _text(d: ImageDraw.ImageDraw, xy, s: str, font, fill, anchor: str = "la", spacing: float = 0) -> None:
+def _text(
+    d: ImageDraw.ImageDraw, xy, s: str, font, fill, anchor: str = "la", spacing: float = 0
+) -> None:
     if not spacing:
         d.text((xy[0] * S, xy[1] * S), s, font=font, fill=fill, anchor=anchor)
         return
@@ -133,7 +141,11 @@ def _group_by_month(rows: list[dict]) -> list[tuple]:
             groups.append((key, []))
         groups[-1][1].append(row)
     return [
-        (datetime.strptime(key, "%Y-%m").strftime("%b %Y").upper(), sum(abs(r["amount"]) for r in group), group)
+        (
+            datetime.strptime(key, "%Y-%m").strftime("%b %Y").upper(),
+            sum(abs(r["amount"]) for r in group),
+            group,
+        )
         for key, group in groups
     ]
 
@@ -155,7 +167,11 @@ def totals(rows: list[dict]) -> dict:
         if expected.get("available") and expected.get("value"):
             outstanding += expected["value"]
             estimated = True
-    return {"reimbursed": reimbursed, "outstanding": outstanding, "outstanding_is_estimate": estimated}
+    return {
+        "reimbursed": reimbursed,
+        "outstanding": outstanding,
+        "outstanding_is_estimate": estimated,
+    }
 
 
 def render(
@@ -230,7 +246,12 @@ def render(
             label = row.get("label") or _status_label(row["status"])
             fg, chip_bg = _STATUS_COLOURS.get(row["status"], (DIM, LINE))
             d.ellipse([x0 * S, (y + 6) * S, (x0 + 7) * S, (y + 13) * S], fill=fg)
-            text((x0 + 17, y + 1), datetime.strptime(row["date"], "%Y-%m-%d").strftime("%d %b"), f_date, DIM)
+            text(
+                (x0 + 17, y + 1),
+                datetime.strptime(row["date"], "%Y-%m-%d").strftime("%d %b"),
+                f_date,
+                DIM,
+            )
             text((x0 + 72, y), _vet_name(row["merchant"]), f_vet, TXT)
             text((x1, y - 1), _money(abs(row["amount"])), f_amt, TXT, anchor="ra")
 
@@ -246,7 +267,12 @@ def render(
 
     footer_y = height - MARGIN - PAD - 10
     d.line([x0 * S, (footer_y - 14) * S, x1 * S, (footer_y - 14) * S], fill=LINE, width=S)
-    text((x0, footer_y), "Amounts are bank charges. Estimates exclude age contribution.", f_foot, FAINT)
+    text(
+        (x0, footer_y),
+        "Amounts are bank charges. Estimates exclude age contribution.",
+        f_foot,
+        FAINT,
+    )
 
     out = io.BytesIO()
     img.resize((W, height), Image.LANCZOS).save(out, format="PNG")
@@ -350,7 +376,9 @@ def render_actions_summary(actions: list[dict], shown: int | None = None) -> byt
 
     footer_y = height - MARGIN - PAD - 10
     d.line([x0 * S, (footer_y - 14) * S, x1 * S, (footer_y - 14) * S], fill=LINE, width=S)
-    _text(d, (x0, footer_y), "Oldest first — a visit is unclaimable once a year old.", f_foot, FAINT)
+    _text(
+        d, (x0, footer_y), "Oldest first — a visit is unclaimable once a year old.", f_foot, FAINT
+    )
 
     out = io.BytesIO()
     img.resize((W, height), Image.LANCZOS).save(out, format="PNG")

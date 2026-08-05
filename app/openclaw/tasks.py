@@ -13,7 +13,9 @@ Task: {description}
 
 
 def _extract_follow_up(description: str) -> datetime | None:
-    prompt = FOLLOW_UP_PROMPT.format(now=datetime.now(timezone.utc).isoformat(), description=description)
+    prompt = FOLLOW_UP_PROMPT.format(
+        now=datetime.now(timezone.utc).isoformat(), description=description
+    )
     raw = llm.extract(prompt, purpose="follow_up_extraction")
     # The model often wraps JSON in a ```json ... ``` markdown fence; pull out
     # the {...} object itself rather than relying on the fence format.
@@ -28,7 +30,9 @@ def _extract_follow_up(description: str) -> datetime | None:
         return None
 
 
-def create_task(description: str, source: str = "chat", source_message_id: str | None = None) -> int:
+def create_task(
+    description: str, source: str = "chat", source_message_id: str | None = None
+) -> int:
     """Raises llm.LLMUnavailableError if extraction fails — caller must surface it, not swallow it."""
     follow_up_at = _extract_follow_up(description)
 

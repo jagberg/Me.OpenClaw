@@ -97,6 +97,7 @@ _DASHES = dict.fromkeys(map(ord, "‐‑‒–—―−"), "-")
 def _normalize(text: str) -> str:
     return (text or "").translate(_DASHES)
 
+
 # Petcover's own emails have used a nickname inconsistent with our records at
 # least once (real: "Ari" for Aari) — checked in addition to the exact name.
 PET_NICKNAMES = {"Aari": ["Ari"]}
@@ -144,12 +145,14 @@ STATE_EVENTS = {
 # case inside process_reply's UPDATE — it is a review-queue entry, and writing it
 # to status would regress an acknowledged claim. Making that a property of the
 # event type rather than one writer's `if` is this whole change in miniature.
-STATELESS_EVENTS = frozenset({
-    "unclassified",
-    "confirmed_resolved",
-    "mismatch_dismissed",
-    "reference_detached",
-})
+STATELESS_EVENTS = frozenset(
+    {
+        "unclassified",
+        "confirmed_resolved",
+        "mismatch_dismissed",
+        "reference_detached",
+    }
+)
 
 # The third category, and it exists because `design.md` contradicts itself: Decision
 # 1 lists `state_backfilled` as stateless, Decision 8 has it carry the claim's
@@ -178,12 +181,23 @@ TRANSITIONS: dict[str | None, frozenset] = {
     "pending_match": frozenset({"matched", "absorbed"}),
     "matched": frozenset({"drafted", "pending_match", "matched", "absorbed"}),
     "drafted": frozenset({"sent", "matched", "pending_match"}),
-    "sent": frozenset({"acknowledged", "info_requested", "suspended", "approved",
-                       "settled", "declined", "below_excess"}),
-    "acknowledged": frozenset({"info_requested", "suspended", "approved",
-                               "settled", "declined", "below_excess"}),
-    "info_requested": frozenset({"suspended", "acknowledged", "approved",
-                                 "settled", "declined", "below_excess"}),
+    "sent": frozenset(
+        {
+            "acknowledged",
+            "info_requested",
+            "suspended",
+            "approved",
+            "settled",
+            "declined",
+            "below_excess",
+        }
+    ),
+    "acknowledged": frozenset(
+        {"info_requested", "suspended", "approved", "settled", "declined", "below_excess"}
+    ),
+    "info_requested": frozenset(
+        {"suspended", "acknowledged", "approved", "settled", "declined", "below_excess"}
+    ),
     "suspended": frozenset({"info_requested", "approved", "settled", "declined", "below_excess"}),
     "approved": frozenset({"settled"}),
     "below_excess": frozenset({"sent", "acknowledged", "approved", "settled", "declined"}),
@@ -330,7 +344,10 @@ def resolve_owed_by(recipients: str | None) -> dict:
     if not external:
         return {"owed_by": "justin", "clinic": None, "clinic_email": None}
     with db.get_connection() as conn:
-        contacts = {r["email"].lower(): r["merchant"] for r in conn.execute("SELECT merchant, email FROM vet_contacts")}
+        contacts = {
+            r["email"].lower(): r["merchant"]
+            for r in conn.execute("SELECT merchant, email FROM vet_contacts")
+        }
     for address in external:
         if address in contacts:
             return {"owed_by": "vet", "clinic": contacts[address], "clinic_email": address}
@@ -354,7 +371,9 @@ _BOILERPLATE = r"please note|you can reach us|in line with|kind regards|thank yo
 #   "please provide the following for us to review the claim Consult notes dated ..."
 # Dropping this consumption (a 2026-07-28 refactor did) yields
 # 'information in order for us to review the' as the document Justin chases.
-_ASK_FILLER = r"(?:\s*information)?(?:\s*in order)?(?:\s*for us)?(?:\s*to review(?:\s*the(?:\s*claim)?)?)?"
+_ASK_FILLER = (
+    r"(?:\s*information)?(?:\s*in order)?(?:\s*for us)?(?:\s*to review(?:\s*the(?:\s*claim)?)?)?"
+)
 _DOCUMENT_ASK = re.compile(
     rf"(?:we (?:need|require) a copy of|please provide the following){_ASK_FILLER}\s*[:\-]?\s*(.+?)"
     rf"(?=\s*(?:{_BOILERPLATE})|\Z)",
@@ -367,11 +386,26 @@ _DOCUMENT_ASK = re.compile(
 # unambiguous.
 _BOILERPLATE_LINE = re.compile(rf"^(?:{_BOILERPLATE})", re.IGNORECASE)
 _DOCUMENT_DATE = re.compile(r"\bdated\s+(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})\b", re.IGNORECASE)
-_DOCUMENT_DATE_WORDS = re.compile(r"\bdated\s+(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\b", re.IGNORECASE)
+_DOCUMENT_DATE_WORDS = re.compile(
+    r"\bdated\s+(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\b", re.IGNORECASE
+)
 _MONTHS = {
     m: i
     for i, name in enumerate(
-        ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"],
+        [
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ],
         start=1,
     )
     for m in (name, name[:3])
@@ -467,7 +501,9 @@ def find_claims_by_reference(reference: str) -> list:
     thread's non-terminal claims only — settled/declined claims are finished and
     a later reference-reuse letter must never reopen them."""
     with db.get_connection() as conn:
-        rows = conn.execute(f"{_CLAIM_SELECT} WHERE vc.petcover_reference = ?", (reference,)).fetchall()
+        rows = conn.execute(
+            f"{_CLAIM_SELECT} WHERE vc.petcover_reference = ?", (reference,)
+        ).fetchall()
     return [r for r in rows if r["status"] not in TERMINAL_STATUSES]
 
 
@@ -557,10 +593,13 @@ def _already_recorded(claim_id: int | None, event_type: str, email_id: str | Non
     if email_id is None:
         return False  # manual events (confirm_resolved, dismiss) have no email
     with db.get_connection() as conn:
-        return conn.execute(
-            "SELECT 1 FROM claim_status_events WHERE raw_email_id IS ? AND claim_id IS ? AND event_type = ?",
-            (email_id, claim_id, event_type),
-        ).fetchone() is not None
+        return (
+            conn.execute(
+                "SELECT 1 FROM claim_status_events WHERE raw_email_id IS ? AND claim_id IS ? AND event_type = ?",
+                (email_id, claim_id, event_type),
+            ).fetchone()
+            is not None
+        )
 
 
 def detach_reference(claim_id: int) -> dict:
@@ -600,7 +639,13 @@ def _record_event(claim_id: int | None, event_type: str, email_id: str | None, d
         cur = conn.execute(
             "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (claim_id, event_type, email_id, json.dumps(detail), datetime.now(timezone.utc).isoformat()),
+            (
+                claim_id,
+                event_type,
+                email_id,
+                json.dumps(detail),
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
         return cur.lastrowid
 
@@ -619,7 +664,9 @@ def transition_allowed(current: str | None, event_type: str) -> bool:
     return target is not None and target in TRANSITIONS.get(current, frozenset())
 
 
-def apply_event(claim_id: int, event_type: str, detail: dict | None = None, email_id: str | None = None) -> dict:
+def apply_event(
+    claim_id: int, event_type: str, detail: dict | None = None, email_id: str | None = None
+) -> dict:
     """The only writer of `vet_claims.status`.
 
     Appends the event unconditionally — the event happened, and hiding it is how
@@ -698,7 +745,11 @@ def _flag_claim(claim_id: int, reason: str) -> None:
             return  # already said; re-stating it on every tick is noise
         conn.execute(
             "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ?",
-            (f"{current}; {reason}" if current else reason, datetime.now(timezone.utc).isoformat(), claim_id),
+            (
+                f"{current}; {reason}" if current else reason,
+                datetime.now(timezone.utc).isoformat(),
+                claim_id,
+            ),
         )
 
 
@@ -852,7 +903,12 @@ def process_reply(
 
     if not claims:
         if not _already_recorded(None, event_type, email_id):
-            _record_event(None, event_type, email_id, {**detail, "flag": "needs manual link — no claim matched"})
+            _record_event(
+                None,
+                event_type,
+                email_id,
+                {**detail, "flag": "needs manual link — no claim matched"},
+            )
         return
 
     now = datetime.now(timezone.utc).isoformat()
@@ -885,11 +941,18 @@ def process_reply(
             if settlement_flag and not outcome["refused"]:
                 updates.append("flag = ?")
                 params.append(settlement_flag)
-            elif event_type == "acknowledged" and not reference and not claim["petcover_reference"] and not outcome["refused"]:
+            elif (
+                event_type == "acknowledged"
+                and not reference
+                and not claim["petcover_reference"]
+                and not outcome["refused"]
+            ):
                 # spec: never guess or discard — flag visibly instead
                 updates.append("flag = ?")
                 params.append("unclassified — reference format not recognized")
-            conn.execute(f"UPDATE vet_claims SET {', '.join(updates)} WHERE id = ?", (*params, claim["id"]))
+            conn.execute(
+                f"UPDATE vet_claims SET {', '.join(updates)} WHERE id = ?", (*params, claim["id"])
+            )
 
 
 def _policy_year_start(anniversary_mmdd: str, on: date) -> date:
@@ -928,7 +991,9 @@ def _validate_settlement(claim, paid_amount: float | None, txn_date_iso: str) ->
     claimable = float(claimable)
 
     with db.get_connection() as conn:
-        pet = conn.execute("SELECT policy_anniversary FROM pets WHERE id = ?", (claim["pet_id"],)).fetchone()
+        pet = conn.execute(
+            "SELECT policy_anniversary FROM pets WHERE id = ?", (claim["pet_id"],)
+        ).fetchone()
     anniversary = pet["policy_anniversary"] if pet else None
     txn_date = date.fromisoformat(txn_date_iso[:10])
 
@@ -948,14 +1013,18 @@ def _validate_settlement(claim, paid_amount: float | None, txn_date_iso: str) ->
             year_end = claim_year_start.replace(year=claim_year_start.year + 1)
             reference = claim["petcover_reference"]
             with db.get_connection() as conn:
-                thread_prior = conn.execute(
-                    "SELECT bt.date AS txn_date FROM claim_status_events e "
-                    "JOIN vet_claims v ON v.id = e.claim_id "
-                    "JOIN bank_transactions bt ON bt.id = v.transaction_id "
-                    "WHERE v.petcover_reference IS ? AND e.event_type IN ('approved', 'settled') "
-                    "AND e.claim_id != ?",
-                    (reference, claim["id"]),
-                ).fetchall() if reference else []
+                thread_prior = (
+                    conn.execute(
+                        "SELECT bt.date AS txn_date FROM claim_status_events e "
+                        "JOIN vet_claims v ON v.id = e.claim_id "
+                        "JOIN bank_transactions bt ON bt.id = v.transaction_id "
+                        "WHERE v.petcover_reference IS ? AND e.event_type IN ('approved', 'settled') "
+                        "AND e.claim_id != ?",
+                        (reference, claim["id"]),
+                    ).fetchall()
+                    if reference
+                    else []
+                )
                 pet_paid = conn.execute(
                     "SELECT bt.date AS txn_date, e.detail FROM claim_status_events e "
                     "JOIN vet_claims v ON v.id = e.claim_id "
@@ -977,7 +1046,11 @@ def _validate_settlement(claim, paid_amount: float | None, txn_date_iso: str) ->
             expected = claimable - (0.0 if excess_consumed else POLICY_EXCESS)
             expected = max(0.0, min(expected, remaining_cap))
             note = ""
-            reason = " (excess already used this policy year)" if excess_consumed else " (fresh $150 excess this policy year)"
+            reason = (
+                " (excess already used this policy year)"
+                if excess_consumed
+                else " (fresh $150 excess this policy year)"
+            )
 
     if abs(paid_amount - expected) > SETTLEMENT_TOLERANCE:
         return f"settlement mismatch — we expected ${expected:.2f}, Petcover paid ${paid_amount:.2f}{reason}{note} — review"
@@ -990,11 +1063,15 @@ def link_event(event_id: int, claim_id: int) -> bool:
     claim's status: a late-linked old email must not regress a settled claim.
     Returns False when the event or claim doesn't exist or is already linked."""
     with db.get_connection() as conn:
-        event = conn.execute("SELECT * FROM claim_status_events WHERE id = ?", (event_id,)).fetchone()
+        event = conn.execute(
+            "SELECT * FROM claim_status_events WHERE id = ?", (event_id,)
+        ).fetchone()
         claim = conn.execute("SELECT 1 FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
         if event is None or event["claim_id"] is not None or claim is None:
             return False
-        conn.execute("UPDATE claim_status_events SET claim_id = ? WHERE id = ?", (claim_id, event_id))
+        conn.execute(
+            "UPDATE claim_status_events SET claim_id = ? WHERE id = ?", (claim_id, event_id)
+        )
     return True
 
 
@@ -1003,9 +1080,14 @@ def mark_sent(claim_id: int) -> dict:
     the claim. A batch submission is several claims sharing one draft — sending
     that one email sends them all, so one action advances the whole group.
     Shared by the dashboard route and the Telegram /sent command."""
-    now = datetime.now(timezone.utc).isoformat()
+    # No timestamp is computed here on purpose: this function stopped writing
+    # vet_claims itself when apply_event became the only status writer, and
+    # apply_event stamps its own event row. A leftover `now` sat unused here
+    # until ruff flagged it.
     with db.get_connection() as conn:
-        claim = conn.execute("SELECT status, draft_id FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        claim = conn.execute(
+            "SELECT status, draft_id FROM vet_claims WHERE id = ?", (claim_id,)
+        ).fetchone()
         if claim is None:
             return {"ok": False, "message": f"No claim #{claim_id} found."}
         if claim["status"] != "drafted":
@@ -1022,7 +1104,10 @@ def mark_sent(claim_id: int) -> dict:
                     "message": f"Submission {submission_group_id(group)} ({_id_list(group)})"
                     " was already marked sent — nothing to do.",
                 }
-            return {"ok": False, "message": f"Claim #{claim_id} isn't drafted (status: {claim['status']})."}
+            return {
+                "ok": False,
+                "message": f"Claim #{claim_id} isn't drafted (status: {claim['status']}).",
+            }
         # Same `AND status = 'drafted'` selection the single group UPDATE used to
         # do — one tap still advances the whole submission — but resolved to ids
         # first, so each member's send is its own event.
@@ -1036,7 +1121,11 @@ def mark_sent(claim_id: int) -> dict:
             ]
         else:
             members = [claim_id]
-    count = sum(1 for member in members if apply_event(member, "sent", {"draft_id": claim["draft_id"]})["applied"])
+    count = sum(
+        1
+        for member in members
+        if apply_event(member, "sent", {"draft_id": claim["draft_id"]})["applied"]
+    )
     with db.get_connection() as conn:
         group = _sent_group_ids(conn, claim_id, claim["draft_id"])
     # Group id supplements the claim ids, never replaces them — Justin's commands
@@ -1077,7 +1166,9 @@ def confirm_resolved(claim_id: int) -> dict:
             (claim_id,),
         ).fetchall()
     types = [e["event_type"] for e in events]
-    last_flag = max((i for i, t in enumerate(types) if t in ("info_requested", "suspended")), default=None)
+    last_flag = max(
+        (i for i, t in enumerate(types) if t in ("info_requested", "suspended")), default=None
+    )
     if last_flag is None or "confirmed_resolved" in types[last_flag + 1 :]:
         return {"ok": False, "message": f"Claim #{claim_id} has nothing outstanding to confirm."}
     _record_event(claim_id, "confirmed_resolved", None, {})
@@ -1126,7 +1217,11 @@ def _apply_excess_and_cap(rows: list, excess, cap, anniversary: str | None = Non
     never guessed."""
     if excess is None or cap is None:
         for r in rows:
-            r["expected"] = {"available": False, "value": None, "note": "no policy excess/cap on file"}
+            r["expected"] = {
+                "available": False,
+                "value": None,
+                "note": "no policy excess/cap on file",
+            }
         return
 
     # A claim with no invoice matched yet has no claimable subtotal — nothing to
@@ -1148,7 +1243,9 @@ def _apply_excess_and_cap(rows: list, excess, cap, anniversary: str | None = Non
             for condition, amount in split.items():
                 parts.append({"row": r, "condition": condition, "amount": amount})
         else:
-            parts.append({"row": r, "condition": r["condition_text"] or "", "amount": r["claimable"] or 0})
+            parts.append(
+                {"row": r, "condition": r["condition_text"] or "", "amount": r["claimable"] or 0}
+            )
 
     by_condition: dict[tuple, list] = {}
     for p in parts:
@@ -1172,7 +1269,9 @@ def _apply_excess_and_cap(rows: list, excess, cap, anniversary: str | None = Non
             value = round(min(after_excess, allowed), 2)
             year_totals[year] = used + value
             if group_claimable < excess:
-                note = f"{condition or 'condition'} YTD ${group_claimable:.2f} < ${excess:.0f} excess"
+                note = (
+                    f"{condition or 'condition'} YTD ${group_claimable:.2f} < ${excess:.0f} excess"
+                )
             else:
                 note = f"est. after ${excess:.0f} excess"
             row_id = id(p["row"])
@@ -1274,12 +1373,19 @@ def visit_ledger() -> list:
             by_pet.setdefault(cl["pet_id"], []).append(cl)
     for pet_claims in by_pet.values():
         first = pet_claims[0]
-        _apply_excess_and_cap(pet_claims, first["annual_excess"], first["annual_cap"], first["policy_anniversary"])
+        _apply_excess_and_cap(
+            pet_claims, first["annual_excess"], first["annual_cap"], first["policy_anniversary"]
+        )
     # Settled claims override the estimate with what Petcover actually paid.
     for pet_claims in by_pet.values():
         for cl in pet_claims:
             if cl["settled_paid"] is not None:
-                cl["expected"] = {"available": True, "value": cl["settled_paid"], "note": "actual", "estimate": False}
+                cl["expected"] = {
+                    "available": True,
+                    "value": cl["settled_paid"],
+                    "note": "actual",
+                    "estimate": False,
+                }
 
     ledger = []
     for txn in txns:
@@ -1381,7 +1487,9 @@ _ACTION_META = {
 _INSURER_UNDEFINED = "claim process not yet defined"
 
 
-def _action_kind(claim: dict, open_split_claim_ids: set, unresolved_event_claim_ids: set) -> str | None:
+def _action_kind(
+    claim: dict, open_split_claim_ids: set, unresolved_event_claim_ids: set
+) -> str | None:
     """The single action a claim needs, or None when it's waiting on someone
     else (sent/acknowledged/approved = Petcover's turn) or finished."""
     if claim["id"] in open_split_claim_ids:
@@ -1437,9 +1545,15 @@ def pending_actions() -> list[dict]:
     claim that stays outstanding, which is how two drafted claims sat unsent for
     three days without a single reminder."""
     with db.get_connection() as conn:
-        open_splits = conn.execute("SELECT claim_ids FROM split_proposals WHERE status = 'open'").fetchall()
-    open_split_claim_ids = {cid for row in open_splits for cid in json.loads(row["claim_ids"] or "[]")}
-    unresolved_event_claim_ids = {entry["claim"]["id"] for entry in dashboard_lists()["needs_action"]}
+        open_splits = conn.execute(
+            "SELECT claim_ids FROM split_proposals WHERE status = 'open'"
+        ).fetchall()
+    open_split_claim_ids = {
+        cid for row in open_splits for cid in json.loads(row["claim_ids"] or "[]")
+    }
+    unresolved_event_claim_ids = {
+        entry["claim"]["id"] for entry in dashboard_lists()["needs_action"]
+    }
 
     today = datetime.now(timezone.utc).date()
     actions = []
@@ -1572,8 +1686,11 @@ def submissions_awaiting_reply() -> list[dict]:
 
     out = []
     for key, claims in groups.items():
-        newest = max((latest_event[c["id"]] for c in claims if c["id"] in latest_event),
-                     key=lambda e: e["created_at"], default=None)
+        newest = max(
+            (latest_event[c["id"]] for c in claims if c["id"] in latest_event),
+            key=lambda e: e["created_at"],
+            default=None,
+        )
         activity = newest["created_at"] if newest else max(c["updated_at"] for c in claims)
         out.append(
             {
@@ -1624,10 +1741,18 @@ def claim_detail(claim_id: int) -> dict | None:
     # Plus who owes a requested document and what it is: the chip only has room
     # for "consult notes", and the date in the full phrase is what identifies the
     # visit a clinic has to look up.
-    figure_keys = ("claimed_amount", "paid_amount", "fixed_excess_stated",
-                   "age_contribution_stated", "subject",
-                   "owed_by", "clinic", "clinic_email",
-                   "requested_document", "requested_document_date")
+    figure_keys = (
+        "claimed_amount",
+        "paid_amount",
+        "fixed_excess_stated",
+        "age_contribution_stated",
+        "subject",
+        "owed_by",
+        "clinic",
+        "clinic_email",
+        "requested_document",
+        "requested_document_date",
+    )
     return {
         "claim_id": claim["id"],
         "status": claim["status"],
@@ -1710,27 +1835,34 @@ def unanswered_vet_requests() -> list[dict]:
         if info.get("owed_by") != "vet":
             continue  # asked of Justin, or unrecorded — not a vet chase
         treated_on, from_invoice = treatment_date(row["invoice_data"], row["txn_date"])
-        days_left = config.INFO_REQUEST_DEADLINE_DAYS - (today - date.fromisoformat(treated_on)).days
+        days_left = (
+            config.INFO_REQUEST_DEADLINE_DAYS - (today - date.fromisoformat(treated_on)).days
+        )
         if days_left < 0:
             continue  # past the submission deadline — the register's problem now
-        out.append({
-            "claim_id": row["id"],
-            "pet_name": row["pet_name"],
-            "merchant": row["merchant"],
-            "clinic": info.get("clinic") or row["merchant"],
-            "clinic_email": info.get("clinic_email"),
-            "requested_document": info.get("requested_document"),
-            # Derived when the event predates the date parsing, so an older
-            # request still resolves to its visit without a backfill.
-            "requested_document_date": (
-                info.get("requested_document_date") or requested_document_date(info.get("requested_document"))
-            ),
-            "treated_on": treated_on,
-            "treatment_date_known": from_invoice,
-            "asked_at": row["asked_at"],
-            "days_outstanding": (today - date.fromisoformat(row["asked_at"][:10])).days if row["asked_at"] else None,
-            "days_left": days_left,
-        })
+        out.append(
+            {
+                "claim_id": row["id"],
+                "pet_name": row["pet_name"],
+                "merchant": row["merchant"],
+                "clinic": info.get("clinic") or row["merchant"],
+                "clinic_email": info.get("clinic_email"),
+                "requested_document": info.get("requested_document"),
+                # Derived when the event predates the date parsing, so an older
+                # request still resolves to its visit without a backfill.
+                "requested_document_date": (
+                    info.get("requested_document_date")
+                    or requested_document_date(info.get("requested_document"))
+                ),
+                "treated_on": treated_on,
+                "treatment_date_known": from_invoice,
+                "asked_at": row["asked_at"],
+                "days_outstanding": (today - date.fromisoformat(row["asked_at"][:10])).days
+                if row["asked_at"]
+                else None,
+                "days_left": days_left,
+            }
+        )
     out.sort(key=lambda r: r["days_left"])
     return out
 
@@ -1745,7 +1877,10 @@ def dismiss_mismatch(claim_id: int) -> dict:
         if claim is None:
             return {"ok": False, "message": f"No claim #{claim_id} found."}
         if not (claim["flag"] or "").startswith("settlement mismatch"):
-            return {"ok": False, "message": f"Claim #{claim_id} has no settlement mismatch to review."}
+            return {
+                "ok": False,
+                "message": f"Claim #{claim_id} has no settlement mismatch to review.",
+            }
         dismissed = claim["flag"]
         conn.execute(
             "UPDATE vet_claims SET flag = NULL, updated_at = ? WHERE id = ?",
@@ -1768,7 +1903,10 @@ def mark_invoice_request_sent(claim_id: int) -> dict:
             "UPDATE vet_claims SET invoice_request_sent_at = ?, flag = NULL, updated_at = ? WHERE id = ?",
             (now, now, claim_id),
         )
-    return {"ok": True, "message": f"Claim #{claim_id}: invoice request marked sent — watching for the reply."}
+    return {
+        "ok": True,
+        "message": f"Claim #{claim_id}: invoice request marked sent — watching for the reply.",
+    }
 
 
 def dashboard_lists() -> dict:
@@ -1801,7 +1939,11 @@ def dashboard_lists() -> dict:
         if claim is None:
             continue
         last_flag_idx = max(
-            (i for i, e in enumerate(claim_events) if e["event_type"] in ("info_requested", "suspended")),
+            (
+                i
+                for i, e in enumerate(claim_events)
+                if e["event_type"] in ("info_requested", "suspended")
+            ),
             default=None,
         )
         if last_flag_idx is not None and not any(
@@ -1813,9 +1955,17 @@ def dashboard_lists() -> dict:
                 detail = json.loads(event["detail"] or "{}")
                 invoice = json.loads(claim["invoice_data"] or "{}")
                 # our own record of what was claimed, not Petcover's figure
-                claimed = invoice.get("claimable_amount") or invoice.get("amount") or detail.get("claimed_amount")
+                claimed = (
+                    invoice.get("claimable_amount")
+                    or invoice.get("amount")
+                    or detail.get("claimed_amount")
+                )
                 settled_reconciliation.append(
-                    {"claim": claim, "claimed_amount": claimed, "paid_amount": detail.get("paid_amount")}
+                    {
+                        "claim": claim,
+                        "claimed_amount": claimed,
+                        "paid_amount": detail.get("paid_amount"),
+                    }
                 )
 
     return {

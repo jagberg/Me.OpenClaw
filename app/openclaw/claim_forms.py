@@ -14,7 +14,9 @@ from . import config, db, gmail_client
 
 # Shared by the single-claim and batch draft guards: Petcover requires the
 # itemised invoice attached, so a claim without one on file isn't draftable yet.
-_AWAITING_INVOICE_FLAG = "awaiting itemised invoice from vet — not drafting until it can be attached"
+_AWAITING_INVOICE_FLAG = (
+    "awaiting itemised invoice from vet — not drafting until it can be attached"
+)
 
 # Field map for Petcover's real fillable AcroForm (Petcover-AU-Claim-Vet-EN-V20211201),
 # verified against the actual file: field names are generic ("Text Field 90")
@@ -198,7 +200,9 @@ def _charge(invoice: dict, transaction) -> float:
     return abs(transaction["amount"])
 
 
-def _build_form_data(pet, transaction, invoice: dict, condition_text: str, continuation: bool | None = None) -> dict:
+def _build_form_data(
+    pet, transaction, invoice: dict, condition_text: str, continuation: bool | None = None
+) -> dict:
     return {
         **_shared_fields(pet, continuation),
         "condition_1": condition_text,
@@ -220,7 +224,9 @@ def _group_by_condition(item_conditions: list[dict]) -> dict[str, float]:
     return groups
 
 
-def _build_grouped_form_data(pet, transaction, item_conditions: list[dict], continuation: bool | None = None) -> dict:
+def _build_grouped_form_data(
+    pet, transaction, item_conditions: list[dict], continuation: bool | None = None
+) -> dict:
     data = _shared_fields(pet, continuation)
     treatment_date = transaction["date"]
     for i, (condition, amount) in enumerate(_group_by_condition(item_conditions).items(), start=1):
@@ -238,8 +244,13 @@ def apply_item_conditions(claim_id: int, item_conditions: list[dict]) -> dict:
     if not groups:
         return {"ok": False, "message": "Nothing claimable assigned."}
     if len(groups) > 4:
-        return {"ok": False, "message": f"{len(groups)} conditions — the Petcover form holds 4. Combine some."}
-    if sum(groups.values()) == 0:  # items had no per-item amounts — can't split the charge, don't fill $0 rows
+        return {
+            "ok": False,
+            "message": f"{len(groups)} conditions — the Petcover form holds 4. Combine some.",
+        }
+    if (
+        sum(groups.values()) == 0
+    ):  # items had no per-item amounts — can't split the charge, don't fill $0 rows
         return {
             "ok": False,
             "message": "These invoice items have no amounts extracted, so I can't split the charge. "
@@ -254,7 +265,10 @@ def apply_item_conditions(claim_id: int, item_conditions: list[dict]) -> dict:
             (json.dumps(item_conditions), "; ".join(groups), now, claim_id),
         )
     process_claim(claim_id)
-    return {"ok": True, "message": f"Claim #{claim_id}: {', '.join(f'{k} (${v:.2f})' for k, v in groups.items())}."}
+    return {
+        "ok": True,
+        "message": f"Claim #{claim_id}: {', '.join(f'{k} (${v:.2f})' for k, v in groups.items())}.",
+    }
 
 
 # A page starting a proper per-visit invoice: "INVOICE #411193" (MediPaws) or
@@ -317,10 +331,19 @@ def email_pdf_attachments(email_id: str) -> list[tuple[str, bytes]]:
     for part in gmail_client._iter_attachment_parts(message.get("payload", {})):
         if part.get("mimeType") != "application/pdf":
             continue
-        attachment = service.users().messages().attachments().get(
-            userId="me", messageId=email_id, id=part["body"]["attachmentId"]
-        ).execute()
-        attachments.append((part.get("filename") or "attachment.pdf", base64.urlsafe_b64decode(attachment["data"] + "==")))
+        attachment = (
+            service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=email_id, id=part["body"]["attachmentId"])
+            .execute()
+        )
+        attachments.append(
+            (
+                part.get("filename") or "attachment.pdf",
+                base64.urlsafe_b64decode(attachment["data"] + "=="),
+            )
+        )
     return attachments
 
 
@@ -420,7 +443,11 @@ def ensure_invoice_file(claim) -> None:
         # The invoice states its patient — reading a printed fact, not guessing.
         # Only assign when exactly ONE known pet is named in the segment.
         if claim["pet_id"] is None:
-            named = {n for n in all_pets if n.lower() in _patient_candidates("\n".join(page_texts[start : end + 1]))}
+            named = {
+                n
+                for n in all_pets
+                if n.lower() in _patient_candidates("\n".join(page_texts[start : end + 1]))
+            }
             if len(named) == 1:
                 assign_pet(claim["id"], all_pets[named.pop()])
         return
@@ -441,7 +468,10 @@ def process_claim_batch(claim_ids: list[int], continuation: bool | None = True) 
         raise ValueError("claim batch must be 1-4 claims")
 
     with db.get_connection() as conn:
-        claims = [conn.execute("SELECT * FROM vet_claims WHERE id = ?", (cid,)).fetchone() for cid in claim_ids]
+        claims = [
+            conn.execute("SELECT * FROM vet_claims WHERE id = ?", (cid,)).fetchone()
+            for cid in claim_ids
+        ]
         if any(c is None or c["status"] != "matched" for c in claims):
             return
         pet_ids = {c["pet_id"] for c in claims}
@@ -486,7 +516,9 @@ def process_claim_batch(claim_ids: list[int], continuation: bool | None = True) 
         data[f"first_signs_date_{i}"] = invoice.get("date") or txn["date"]
         data[f"charge_{i}"] = _charge(invoice, txn)
 
-    output_path = str(Path(config.CLAIM_OUTPUT_DIR) / f"claim-batch-{'-'.join(map(str, claim_ids))}.pdf")
+    output_path = str(
+        Path(config.CLAIM_OUTPUT_DIR) / f"claim-batch-{'-'.join(map(str, claim_ids))}.pdf"
+    )
     try:
         fill_petcover_form(data, output_path)
     except ClaimFillError as exc:
@@ -494,7 +526,9 @@ def process_claim_batch(claim_ids: list[int], continuation: bool | None = True) 
             _flag(c["id"], str(exc))
         return
 
-    attachment_paths = [output_path] + [c["invoice_file_path"] for c in claims if c["invoice_file_path"]]
+    attachment_paths = [output_path] + [
+        c["invoice_file_path"] for c in claims if c["invoice_file_path"]
+    ]
     try:
         draft_message_id = create_claim_draft(
             to=pet["claim_email"],
@@ -570,24 +604,36 @@ def check_split(claim_id: int, shares: list[tuple[int, float | None]]) -> dict:
             return {"ok": False, "message": f"No claim #{claim_id} found."}
         if claim["status"] not in _SPLITTABLE_STATUSES:
             if claim["status"] == "pending_match":
-                return {"ok": False, "message": f"Claim #{claim_id} has no invoice matched yet — "
-                                                "nothing to apportion until it does."}
-            return {"ok": False, "message": f"Claim #{claim_id} is already with the insurer "
-                                            f"(status: {claim['status']}) — that correction has to go to "
-                                            "them, it can't be split here."}
+                return {
+                    "ok": False,
+                    "message": f"Claim #{claim_id} has no invoice matched yet — "
+                    "nothing to apportion until it does.",
+                }
+            return {
+                "ok": False,
+                "message": f"Claim #{claim_id} is already with the insurer "
+                f"(status: {claim['status']}) — that correction has to go to "
+                "them, it can't be split here.",
+            }
         invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
         subtotal = invoice.get("claimable_amount")
         if subtotal is None:
             subtotal = invoice.get("amount")
         if subtotal is None:
-            return {"ok": False, "message": f"Claim #{claim_id} has no invoice amount on file to split."}
+            return {
+                "ok": False,
+                "message": f"Claim #{claim_id} has no invoice amount on file to split.",
+            }
         subtotal = float(subtotal)
 
         if len(shares) < 2:
             return {"ok": False, "message": "A split needs at least two pets."}
         if sum(1 for _pet_id, amount in shares if amount is None) > 1:
-            return {"ok": False, "message": "Only one share can be left unstated — a remainder is only "
-                                            "derivable when everything else is known. Ask for the amounts."}
+            return {
+                "ok": False,
+                "message": "Only one share can be left unstated — a remainder is only "
+                "derivable when everything else is known. Ask for the amounts.",
+            }
         pets = {}
         for pet_id, _amount in shares:
             pet = conn.execute("SELECT * FROM pets WHERE id = ?", (int(pet_id),)).fetchone()
@@ -599,18 +645,29 @@ def check_split(claim_id: int, shares: list[tuple[int, float | None]]) -> dict:
 
         stated = sum(float(amount) for _pet_id, amount in shares if amount is not None)
         if stated > subtotal + CENT:
-            return {"ok": False, "message": f"Those shares total ${stated:.2f}, more than the invoice's "
-                                            f"claimable ${subtotal:.2f} — the invoice is the ceiling."}
+            return {
+                "ok": False,
+                "message": f"Those shares total ${stated:.2f}, more than the invoice's "
+                f"claimable ${subtotal:.2f} — the invoice is the ceiling.",
+            }
         resolved = [
-            (int(pet_id), round(subtotal - stated, 2) if amount is None else round(float(amount), 2))
+            (
+                int(pet_id),
+                round(subtotal - stated, 2) if amount is None else round(float(amount), 2),
+            )
             for pet_id, amount in shares
         ]
         if any(amount <= 0 for _pet_id, amount in resolved):
-            return {"ok": False, "message": "Every share has to be more than $0 — a pet with nothing to "
-                                            "claim doesn't belong in the split."}
+            return {
+                "ok": False,
+                "message": "Every share has to be more than $0 — a pet with nothing to "
+                "claim doesn't belong in the split.",
+            }
     return {
         "ok": True,
-        "message": "; ".join(f"{pets[pet_id]['name']} ${amount:.2f}" for pet_id, amount in resolved),
+        "message": "; ".join(
+            f"{pets[pet_id]['name']} ${amount:.2f}" for pet_id, amount in resolved
+        ),
         "amounts": [amount for _pet_id, amount in resolved],
         "pet_names": [pets[pet_id]["name"] for pet_id, _amount in resolved],
         "subtotal": subtotal,
@@ -647,35 +704,49 @@ def split_between_pets(claim_id: int, shares: list[tuple[int, float | None]]) ->
         invoice = json.loads(claim["invoice_data"]) if claim["invoice_data"] else {}
         pets = {}
         for pet_id, _amount in shares:
-            pets[int(pet_id)] = conn.execute("SELECT * FROM pets WHERE id = ?", (int(pet_id),)).fetchone()
-        resolved = [(int(pet_id), amount) for (pet_id, _stated), amount
-                    in zip(shares, checked["amounts"])]
+            pets[int(pet_id)] = conn.execute(
+                "SELECT * FROM pets WHERE id = ?", (int(pet_id),)
+            ).fetchone()
+        resolved = [
+            (int(pet_id), amount) for (pet_id, _stated), amount in zip(shares, checked["amounts"])
+        ]
 
         # The claim keeps the first share; the rest become new claims on the SAME
         # transaction (one charge, one bank row — the ceiling applies to the sum).
         # condition_text is deliberately NOT copied: the other pet's condition is
         # not knowable from this one, and inventing it is forbidden.
         first_pet, first_amount = resolved[0]
-        results = [{"claim_id": claim_id, "pet_name": pets[first_pet]["name"], "amount": first_amount}]
+        results = [
+            {"claim_id": claim_id, "pet_name": pets[first_pet]["name"], "amount": first_amount}
+        ]
         for pet_id, amount in resolved[1:]:
             sibling_invoice = {**invoice, "claimable_amount": amount}
             cursor = conn.execute(
                 "INSERT INTO vet_claims (transaction_id, pet_id, matched_email_id, invoice_data, "
                 "invoice_file_path, status, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, 'matched', ?, ?)",
-                (claim["transaction_id"], pet_id, claim["matched_email_id"],
-                 json.dumps(sibling_invoice), claim["invoice_file_path"], now, now),
+                (
+                    claim["transaction_id"],
+                    pet_id,
+                    claim["matched_email_id"],
+                    json.dumps(sibling_invoice),
+                    claim["invoice_file_path"],
+                    now,
+                    now,
+                ),
             )
-            results.append({"claim_id": cursor.lastrowid, "pet_name": pets[pet_id]["name"], "amount": amount})
+            results.append(
+                {"claim_id": cursor.lastrowid, "pet_name": pets[pet_id]["name"], "amount": amount}
+            )
 
         note = "per-pet split of ${:.2f} claimable: {}".format(
-            subtotal, ", ".join(f"#{r['claim_id']} {r['pet_name']} ${r['amount']:.2f}" for r in results)
+            subtotal,
+            ", ".join(f"#{r['claim_id']} {r['pet_name']} ${r['amount']:.2f}" for r in results),
         )
         for result, (pet_id, amount) in zip(results, resolved):
             row_invoice = {**invoice, "claimable_amount": amount, "split_note": note}
             conn.execute(
-                "UPDATE vet_claims SET pet_id = ?, invoice_data = ?, "
-                "updated_at = ? WHERE id = ?",
+                "UPDATE vet_claims SET pet_id = ?, invoice_data = ?, updated_at = ? WHERE id = ?",
                 (pet_id, json.dumps(row_invoice), now, result["claim_id"]),
             )
         # A draft naming the pre-split amount must not stay sendable. Reset the
@@ -698,8 +769,11 @@ def split_between_pets(claim_id: int, shares: list[tuple[int, float | None]]) ->
         try:
             discard_claim_draft(superseded_draft)
         except Exception as exc:  # visible, never silent — the stale draft is a wrong claim
-            _flag(claim_id, f"split applied, but the earlier ${subtotal:.2f} Gmail draft could not be "
-                            f"deleted ({exc}) — delete it yourself before sending")
+            _flag(
+                claim_id,
+                f"split applied, but the earlier ${subtotal:.2f} Gmail draft could not be "
+                f"deleted ({exc}) — delete it yourself before sending",
+            )
 
     for result in results:
         process_claim(result["claim_id"])
@@ -717,15 +791,26 @@ def split_between_pets(claim_id: int, shares: list[tuple[int, float | None]]) ->
                 ).fetchone()["flag"]
                 conn.execute(
                     "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ?",
-                    (f"{shortfall}; {existing}" if existing else shortfall, now, result["claim_id"]),
+                    (
+                        f"{shortfall}; {existing}" if existing else shortfall,
+                        now,
+                        result["claim_id"],
+                    ),
                 )
 
     lines = ", ".join(f"#{r['claim_id']} {r['pet_name']} ${r['amount']:.2f}" for r in results)
     message = f"Claim #{claim_id} split across {len(results)} pets: {lines}."
     if unapportioned > CENT:
-        message += f" ${unapportioned:.2f} of the ${subtotal:.2f} claimable is unapportioned — flagged."
-    return {"ok": True, "message": message, "claims": results, "claimable_subtotal": subtotal,
-            "unapportioned": unapportioned}
+        message += (
+            f" ${unapportioned:.2f} of the ${subtotal:.2f} claimable is unapportioned — flagged."
+        )
+    return {
+        "ok": True,
+        "message": message,
+        "claims": results,
+        "claimable_subtotal": subtotal,
+        "unapportioned": unapportioned,
+    }
 
 
 def mark_reviewed(claim_id: int) -> dict:
@@ -746,7 +831,10 @@ def mark_reviewed(claim_id: int) -> dict:
             "UPDATE vet_claims SET reviewed_at = ?, updated_at = ? WHERE id = ?",
             (now, now, claim_id),
         )
-    return {"ok": True, "message": f"Claim #{claim_id} marked reviewed. Send the Gmail draft yourself when ready."}
+    return {
+        "ok": True,
+        "message": f"Claim #{claim_id} marked reviewed. Send the Gmail draft yourself when ready.",
+    }
 
 
 def process_and_report(claim_id: int) -> dict:
@@ -825,7 +913,9 @@ def process_claim(claim_id: int, continuation: bool | None = True) -> None:
     output_path = str(Path(config.CLAIM_OUTPUT_DIR) / f"claim-{claim_id}.pdf")
     if claim["item_conditions"]:
         # one invoice spanning several conditions → one form row per condition
-        data = _build_grouped_form_data(pet, transaction, json.loads(claim["item_conditions"]), continuation)
+        data = _build_grouped_form_data(
+            pet, transaction, json.loads(claim["item_conditions"]), continuation
+        )
     else:
         data = _build_form_data(pet, transaction, invoice, claim["condition_text"], continuation)
     try:
@@ -834,7 +924,9 @@ def process_claim(claim_id: int, continuation: bool | None = True) -> None:
         _flag(claim_id, str(exc))
         return
 
-    attachment_paths = [output_path] + ([claim["invoice_file_path"]] if claim["invoice_file_path"] else [])
+    attachment_paths = [output_path] + (
+        [claim["invoice_file_path"]] if claim["invoice_file_path"] else []
+    )
     try:
         draft_message_id = create_claim_draft(
             to=pet["claim_email"],

@@ -57,7 +57,11 @@ def step(name: str, correlation: str | None = None, **fields):
         raise
     finally:
         extra = "".join(f" {k}={v}" for k, v in fields.items())
-        logger.info("trace step=%s ms=%.0f%s%s%s", name,
-                    (time.perf_counter() - start) * 1000, extra,
-                    f" correlation={correlation}" if correlation else "",
-                    " failed=1" if failed else "")
+        logger.info(
+            "trace step=%s ms=%.0f%s%s%s",
+            name,
+            (time.perf_counter() - start) * 1000,
+            extra,
+            f" correlation={correlation}" if correlation else "",
+            " failed=1" if failed else "",
+        )
