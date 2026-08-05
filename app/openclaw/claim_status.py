@@ -333,7 +333,11 @@ def extract_settlement_amounts(text: str) -> dict:
 # comparison against our own expectation, never folded into it: Petcover's
 # own math (Age Contribution etc.) is theirs to get right, not ours to model.
 _APPROVAL_PATTERNS = {
-    "claimed_amount": r"Total amount claimed:?\s*\$?([\d,]+\.\d{2})",
+    # "Total amount claimed:" on an approval; the under-excess refusal drops the
+    # "Total" and was extracting nothing at all, which is why the letter that
+    # states $55.74 had no figure to route by and fell through to the ordering
+    # heuristic instead.
+    "claimed_amount": r"(?:Total a|A)mount claimed:?\s*\$?([\d,]+\.\d{2})",
     "paid_amount": r"Paid by us:?\s*\$?([\d,]+\.\d{2})",
     "fixed_excess_stated": r"(?:Less\s+)?Fixed excess:?\s*\$?(-?[\d,]+\.\d{2})",
     "age_contribution_stated": r"Age Contribution:?\s*\$?([\d,]+\.\d{2})",
@@ -616,12 +620,58 @@ def correlate_ack(text: str) -> list:
     return max(submissions.values(), key=lambda claims: max(c["updated_at"] for c in claims))
 
 
-def _claim_for_sr(submission_claims: list) -> object:
-    """Within a multi-claim submission, a per-Sr letter attaches to the oldest-
-    transaction claim not yet serialized — Petcover's serials run oldest-first,
-    and acks arrive in serial order (poll processes oldest-first)."""
+def stated_claim_amount(text: str) -> float | None:
+    """The amount a Petcover letter says it assessed, whichever template it uses.
+
+    Approval letters print `Total amount claimed:`, the older settled style
+    `Amount Claimed`, and the under-excess refusal just `Amount claimed:`. All
+    three identify the claim far better than any ordering heuristic can.
+    """
+    figures = extract_approval_amounts(text)
+    if figures.get("claimed_amount") is not None:
+        return figures["claimed_amount"]
+    return extract_settlement_amounts(text).get("claimed_amount")
+
+
+def _claim_for_sr(submission_claims: list, stated_amount: float | None = None) -> object | None:
+    """Which claim a per-Sr letter belongs to, or None when we cannot tell.
+
+    **The amount the letter states decides it.** Where exactly one claim in the
+    pool is worth what Petcover says they assessed, that is the claim — matched
+    to the cent against its recorded claimable subtotal, falling back to the
+    invoice total only for a claim that never had a subtotal recorded.
+
+    Returning None is the important half. This used to attach the letter to "the
+    oldest-transaction claim not yet serialized", on the reasoning that Petcover's
+    serials run oldest-first. Measured against Petcover's own status table on
+    2026-08-04 — the one that states a treatment date per serial — that heuristic
+    was wrong on **every serial we hold**, and on 2026-08-05 it took an
+    under-excess letter for a $55.74 arthritis claim and attached it to a
+    $2,521.46 ALT workup, moving a settled claim to `below_excess`. A guess that
+    is written as a fact and never checked is worse than no answer: an unlinked
+    event is visible on the dashboard and one click from correct.
+
+    So the ordering heuristic survives only where the letter states no amount at
+    all (acknowledgements), and even then it records `sr_assigned_by` so the log
+    can tell a guess from a citation.
+    """
     unserialized = [c for c in submission_claims if c["petcover_sr"] is None]
     pool = unserialized or submission_claims
+
+    if stated_amount is not None:
+        matches = []
+        for claim in pool:
+            value, recorded = claimable_subtotal(claim["invoice_data"])
+            if not recorded:
+                value = (json.loads(claim["invoice_data"] or "{}") or {}).get("amount")
+            if value is not None and abs(float(value) - stated_amount) <= 0.005:
+                matches.append(claim)
+        if len(matches) == 1:
+            return matches[0]
+        # Stated an amount, and nothing here is worth it — or two things are.
+        # Either way this letter is not ours to place.
+        return None
+
     return min(pool, key=lambda c: (c["_txn_date"] or "", c["id"]))
 
 
@@ -906,6 +956,10 @@ def process_reply(
 
     claims: list = []
     learn_sr = False
+    # What Petcover says this letter is worth. The strongest routing evidence we
+    # get, and free — it is already in the text being classified.
+    stated_amount = stated_claim_amount(text)
+    unmatched_reason = "needs manual link — no claim matched"
     if reference and sr is not None:
         exact = find_claim_by_reference_and_sr(reference, sr)
         if exact:
@@ -918,8 +972,16 @@ def process_reply(
             # claim). Assign to the oldest-transaction un-serialized claim.
             pool = correlate_ack(text) or find_claims_by_reference(reference)
             if pool:
-                claims = [_claim_for_sr(pool)]
-                learn_sr = True
+                chosen = _claim_for_sr(pool, stated_amount)
+                if chosen is not None:
+                    claims = [chosen]
+                    learn_sr = True
+                else:
+                    unmatched_reason = (
+                        f"needs manual link — {reference} Sr {sr} states ${stated_amount:,.2f} "
+                        f"and no claim awaiting a serial is worth that "
+                        f"(candidates: {', '.join('#' + str(c['id']) for c in pool)})"
+                    )
     elif reference:
         # Reference only: the thread's non-terminal claims, or — if none yet
         # hold the reference — the submission the ack is teaching it to.
@@ -964,7 +1026,7 @@ def process_reply(
                 None,
                 event_type,
                 email_id,
-                {**detail, "flag": "needs manual link — no claim matched"},
+                {**detail, "flag": unmatched_reason},
             )
         return
 
