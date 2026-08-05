@@ -348,3 +348,83 @@ out four times.
 codebase — `claim_status.py` 44 sites, `claim_forms.py` 31, `invoice_matching.py`
 30. A general data-access layer is a different proposal and would need its own
 change; do not let it ride in on this one.
+
+### ADR-0026 parked, and the privacy exposure that stays open (2026-08-03)
+
+Justin's call: leave ADR-0026 (LLM routes by purpose) at **proposed**. The
+routing shape is settled; the vision provider is not, and it is gated on two
+untested things in `docs/research/2026-08-02-free-llm-providers.md` — whether
+this account can obtain a Cerebras key, and whether any candidate's OCR holds up
+against a real scanned invoice from the corpus.
+
+**What parking accepts, stated plainly so it is not rediscovered as a surprise:**
+`extract_vision()` sends scanned vet invoices — name, address, pet names,
+itemised amounts — to Google's unpaid Gemini quota. Its terms, retrieved
+2026-08-02, say Google uses submitted content "to provide, improve, and develop"
+its models, that "human reviewers may read, annotate, and process your API input
+and output", and "Do not submit sensitive, confidential" data. Verified the same
+day: **Groq serves no vision model at all** (15 models, no `scout`, no
+`maverick`, no `-vl`), so there is no in-provider alternative to move to.
+
+Nothing is broken today and nothing is being done wrong by accident. This is a
+known exposure with a deliberate decision behind it, and the decision was to
+carry it until slice 2 ships rather than take on an unproven OCR path in the
+middle of a cutover — wrong OCR means a wrong claim amount sent to an insurer,
+which is the one purpose where a quality failure costs money rather than time.
+
+Revisit when: slice 2 is archived, or a Cerebras key becomes obtainable, or a
+vision-capable free tier appears whose terms do not permit human review.
+
+### The app cannot reach the gateway to send anything (found live 2026-08-03)
+
+**The cutover was rolled back on this.** First real `/actions` after the cutover
+returned, correctly and visibly:
+
+```
+{"status":"partial","route":"command/actions","correlation_id":"tg-actions-n1",
+ "result":"⚠️ 6 card(s) did not send: gateway CLI not found at 'openclaw'"}
+```
+
+`gateway_client` shells out to the `openclaw` CLI. **The CLI lives in the
+gateway container; the app container has no such binary and never did.** Slice 1
+merged `gateway_client` explicitly "with no caller", and every flag in it was
+verified against `openclaw message --help` *on the host*. Nothing ever ran it
+from where it actually has to run. Task 4.4 gave it its first caller, and the
+first real tap found this — which is the point of 4.11, but it means all
+outbound is broken under the cutover, not just cards.
+
+**What is already known, read from the gateway's shipped code:**
+
+- The app *can* reach the gateway over HTTP: `http://gateway:18789/health` from
+  inside the app container returns `{"ok":true,"status":"live"}`.
+- The CLI does not use a plain REST endpoint. `openclaw message send` calls
+  `callMessageGateway({gateway:{url,token,…}, method:"send", params:{to,
+  message, mediaUrl,…}})`, which goes through `callGatewayLeastPrivilege` →
+  `callGatewayWithScopes` — per-method operator scopes, idempotency keys, device
+  auth. Reimplementing that wire format in Python is re-deriving a proprietary
+  protocol, and this project's rules exist because of exactly that class of
+  guess.
+- The plugin api has **no** general send capability (`api-builder` exposes
+  `registerChannel` and `sendSessionAttachment`, nothing else outbound), so the
+  plugin cannot simply be asked to send on the app's behalf.
+- `OPENCLAW_GATEWAY_TOKEN` is given to the gateway by compose and **not** to the
+  app.
+
+**Options, none of them free:**
+
+1. **Put the CLI in the app image.** The product-supported client, so no
+   protocol is re-derived. Costs a Node runtime in a Python image and hands the
+   app a gateway token — widening a boundary ADR-0024 drew narrowly on purpose.
+2. **A plugin HTTP route.** `registerPluginHttpRoute` exists in the SDK. The app
+   POSTs to a route inside the gateway and the plugin sends. Keeps the token in
+   one place, but the plugin needs a send capability its `api` does not expose —
+   unverified how it would get one.
+3. **Return cards from the command handler.** Avoids app-initiated sends for the
+   command path only. Does nothing for the pipeline's unattended notifications,
+   which are most of the outbound traffic.
+
+**What the preflight missed, and should not have.** It asserts eleven things and
+never once asserts *the app can actually send a message*. A check that pushed a
+real message through `gateway_client` at deploy time would have caught this
+before a human tapped anything. That is the gap worth closing regardless of
+which option wins.

@@ -20,6 +20,7 @@ is not one. Read, then call, then write.
 
 Runs INSIDE the container. Dry-run by default; --apply commits. Backs up first.
 """
+
 import json
 import sqlite3
 import sys
@@ -41,15 +42,24 @@ def out(s=""):
 
 
 def item_dates(invoices):
-    return sum(1 for inv in invoices if isinstance(inv, dict)
-               for item in (inv.get("items") or []) if item.get("date"))
+    return sum(
+        1
+        for inv in invoices
+        if isinstance(inv, dict)
+        for item in (inv.get("items") or [])
+        if item.get("date")
+    )
 
 
 # --- phase 1: read, then get off the database -------------------------------
 ro = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
 ro.row_factory = sqlite3.Row
-cached = [(r["message_id"], json.loads(r["extracted_json"] or "[]"))
-          for r in ro.execute("SELECT message_id, extracted_json FROM email_extractions ORDER BY extracted_at")]
+cached = [
+    (r["message_id"], json.loads(r["extracted_json"] or "[]"))
+    for r in ro.execute(
+        "SELECT message_id, extracted_json FROM email_extractions ORDER BY extracted_at"
+    )
+]
 ro.close()
 out(f"{len(cached)} cached extraction(s) - one LLM extraction each")
 out()
@@ -66,17 +76,23 @@ for message_id, before in cached:
         failed += 1
         continue
     if not fresh:
-        out(f"{message_id}: text extraction returned nothing - KEPT old row ({len(before)} invoice(s))")
+        out(
+            f"{message_id}: text extraction returned nothing - KEPT old row ({len(before)} invoice(s))"
+        )
         kept += 1
         continue
     updates.append((message_id, fresh))
-    out(f"{message_id}: {len(before)} -> {len(fresh)} invoice(s), "
-        f"item dates {item_dates(before)} -> {item_dates(fresh)}")
+    out(
+        f"{message_id}: {len(before)} -> {len(fresh)} invoice(s), "
+        f"item dates {item_dates(before)} -> {item_dates(fresh)}"
+    )
 
 # --- phase 3: one short write transaction ----------------------------------
 out()
 if not APPLY:
-    out(f"DRY RUN - {len(updates)} row(s) would be replaced, {kept} kept, {failed} failed (LLM calls were still made)")
+    out(
+        f"DRY RUN - {len(updates)} row(s) would be replaced, {kept} kept, {failed} failed (LLM calls were still made)"
+    )
     sys.exit(0)
 
 rw = sqlite3.connect(DB, timeout=30)
@@ -89,7 +105,9 @@ out(f"backup written: {BACKUP}")
 now = datetime.now(timezone.utc).isoformat()
 with rw:
     for message_id, fresh in updates:
-        rw.execute("UPDATE email_extractions SET extracted_json = ?, extracted_at = ? WHERE message_id = ?",
-                   (json.dumps(fresh), now, message_id))
+        rw.execute(
+            "UPDATE email_extractions SET extracted_json = ?, extracted_at = ? WHERE message_id = ?",
+            (json.dumps(fresh), now, message_id),
+        )
 rw.close()
 out(f"COMMITTED - replaced {len(updates)}, kept {kept}, failed {failed}")

@@ -1,5 +1,6 @@
 """Runnable smoke checks — not a full suite. Run with: python tests/test_core.py"""
 
+import contextlib
 import os
 import sys
 import tempfile
@@ -21,14 +22,29 @@ os.environ["OPENAI_API_KEY"] = ""
 # Message-log rows are version-stamped; a known value lets the tests assert it.
 os.environ["APP_VERSION"] = "test-sha+test"
 
-from openclaw import claim_forms, claim_status, config, db, gemini, invoice_matching, llm, netbank_csv, reminders, status_labels, tasks, vet_detection  # noqa: E402
+from openclaw import (  # noqa: E402
+    claim_forms,
+    claim_status,
+    config,
+    db,
+    gemini,
+    invoice_matching,
+    llm,
+    netbank_csv,
+    reminders,
+    status_labels,
+    tasks,
+    vet_detection,
+)
 from openclaw.scheduler import scheduler  # noqa: E402
 
 
 def test_init_db_creates_tables():
     db.init_db()
     with db.get_connection() as conn:
-        names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        names = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
     assert {"tasks", "reminders", "llm_calls", "processed_emails"} <= names
 
 
@@ -175,11 +191,16 @@ def test_classify_acknowledgement_letter():
 
 
 def test_classify_suspended():
-    assert claim_status.classify("Petcover Claim DC1-27-5628 SR1 - Claim suspended", "") == "suspended"
+    assert (
+        claim_status.classify("Petcover Claim DC1-27-5628 SR1 - Claim suspended", "") == "suspended"
+    )
 
 
 def test_classify_info_requested():
-    assert claim_status.classify("GABR-0305-Request for consult note -First Request", "") == "info_requested"
+    assert (
+        claim_status.classify("GABR-0305-Request for consult note -First Request", "")
+        == "info_requested"
+    )
 
 
 def test_classify_settled():
@@ -187,15 +208,27 @@ def test_classify_settled():
 
 
 def test_classify_declined():
-    assert claim_status.classify("ELD-25-2728 - Declined - Invoices over 12 months", "") == "declined"
+    assert (
+        claim_status.classify("ELD-25-2728 - Declined - Invoices over 12 months", "") == "declined"
+    )
 
 
 def test_classify_automatic_reply_is_ignored_not_unclassified():
-    assert claim_status.classify("Automatic reply: Loki Goldberg - GOLD094 - Claim -23 Jun 2025 - 1", "") == "ignore"
+    assert (
+        claim_status.classify(
+            "Automatic reply: Loki Goldberg - GOLD094 - Claim -23 Jun 2025 - 1", ""
+        )
+        == "ignore"
+    )
 
 
 def test_classify_falls_back_to_body_when_subject_generic():
-    assert claim_status.classify("Re: your claim", "we require a copy of consult notes, claim suspended") == "suspended"
+    assert (
+        claim_status.classify(
+            "Re: your claim", "we require a copy of consult notes, claim suspended"
+        )
+        == "suspended"
+    )
 
 
 def test_extract_settlement_amounts_from_real_pdf_text():
@@ -234,21 +267,27 @@ def test_batch_claims_correlate_and_learn_reference_together():
     db.init_db()
     with db.get_connection() as conn:
         aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
-        claim_ids = [_insert_sent_claim(conn, aari, f"2025-08-{10 + i:02d}", "draft-batch-1") for i in range(3)]
+        claim_ids = [
+            _insert_sent_claim(conn, aari, f"2025-08-{10 + i:02d}", "draft-batch-1")
+            for i in range(3)
+        ]
 
     claim_status.process_reply(
-        "msg-ack-1", "PetCover - Acknowledgement Letter",
+        "msg-ack-1",
+        "PetCover - Acknowledgement Letter",
         "Pet Name: Aari Hi Justin, Claim Received - Claim Number DC1-99-0001 Thank you",
     )
     with db.get_connection() as conn:
         rows = conn.execute(
-            f"SELECT status, petcover_reference FROM vet_claims WHERE id IN ({','.join('?' * 3)})", claim_ids
+            f"SELECT status, petcover_reference FROM vet_claims WHERE id IN ({','.join('?' * 3)})",
+            claim_ids,
         ).fetchall()
     assert all(r["status"] == "acknowledged" for r in rows)
     assert all(r["petcover_reference"] == "DC1-99-0001" for r in rows)
 
     claim_status.process_reply(
-        "msg-settle-1", "PetCover Letter - Claim Settlement EFT Template",
+        "msg-settle-1",
+        "PetCover Letter - Claim Settlement EFT Template",
         "Claim Reference: DC1-99-0001 Amount Claimed $150.00 Total Payable : $100.00",
     )
     with db.get_connection() as conn:
@@ -272,23 +311,36 @@ def test_uncorrelated_reply_unlinked_then_manually_linked():
         claim_a = _insert_sent_claim(conn, aari, "2026-01-05", "draft-a")
 
     claim_status.process_reply(
-        "msg-uncorr-1", "First request for consult note",
+        "msg-uncorr-1",
+        "First request for consult note",
         "We recently received a claim for treatment provided to Rex. Please provide consult notes.",
     )
     with db.get_connection() as conn:
-        event = conn.execute("SELECT * FROM claim_status_events WHERE raw_email_id = 'msg-uncorr-1'").fetchone()
-        status_a = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
+        event = conn.execute(
+            "SELECT * FROM claim_status_events WHERE raw_email_id = 'msg-uncorr-1'"
+        ).fetchone()
+        status_a = conn.execute(
+            "SELECT status FROM vet_claims WHERE id = ?", (claim_a,)
+        ).fetchone()[0]
     assert event["claim_id"] is None, "unknown-pet reply must not be attached to any claim"
     assert event["event_type"] == "info_requested"
     assert status_a == "sent", "uncorrelated reply must not change any claim's status"
 
-    assert claim_status.link_event(event["id"], 999999) is False, "linking to a nonexistent claim must refuse"
+    assert claim_status.link_event(event["id"], 999999) is False, (
+        "linking to a nonexistent claim must refuse"
+    )
     assert claim_status.link_event(event["id"], claim_a) is True
     with db.get_connection() as conn:
-        event = conn.execute("SELECT * FROM claim_status_events WHERE id = ?", (event["id"],)).fetchone()
-        status_a = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
+        event = conn.execute(
+            "SELECT * FROM claim_status_events WHERE id = ?", (event["id"],)
+        ).fetchone()
+        status_a = conn.execute(
+            "SELECT status FROM vet_claims WHERE id = ?", (claim_a,)
+        ).fetchone()[0]
     assert event["claim_id"] == claim_a
-    assert status_a == "sent", "manual link must NOT rewrite the claim's status (late-linked old emails must not regress it)"
+    assert status_a == "sent", (
+        "manual link must NOT rewrite the claim's status (late-linked old emails must not regress it)"
+    )
 
 
 def test_ceiling_match_and_remainder():
@@ -338,10 +390,16 @@ def test_unclassified_reply_never_overwrites_status():
         "msg-uncls-1", "Petcover Claim DC1-88-0001 SR2", "A new template we have never seen before."
     )
     with db.get_connection() as conn:
-        event = conn.execute("SELECT * FROM claim_status_events WHERE raw_email_id='msg-uncls-1'").fetchone()
-        status = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()[0]
+        event = conn.execute(
+            "SELECT * FROM claim_status_events WHERE raw_email_id='msg-uncls-1'"
+        ).fetchone()
+        status = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()[
+            0
+        ]
     assert event["event_type"] == "unclassified"
-    assert event["claim_id"] == claim_id, "unclassified reply with a known reference still links for review"
+    assert event["claim_id"] == claim_id, (
+        "unclassified reply with a known reference still links for review"
+    )
     assert status == "acknowledged", "unclassified is a review-queue entry, not a lifecycle stage"
 
 
@@ -351,7 +409,9 @@ def test_parse_invoices_multi_and_legacy_shapes():
     assert [i["amount"] for i in parsed] == [141.87, 407.56]
     # legacy single-invoice object (old cache rows / model regression) still parses
     legacy = '```json\n{"date": "2026-06-19", "amount": 585.39, "items": []}\n```'
-    assert invoice_matching._parse_invoices(legacy) == [{"date": "2026-06-19", "amount": 585.39, "items": []}]
+    assert invoice_matching._parse_invoices(legacy) == [
+        {"date": "2026-06-19", "amount": 585.39, "items": []}
+    ]
     assert invoice_matching._parse_invoices("no json here") is None
     assert invoice_matching._parse_invoices('{"invoices": "garbage"}') is None
     assert invoice_matching._parse_invoices('{"invoices": []}') == []
@@ -362,20 +422,34 @@ def test_pick_invoice_from_bulk_reply_uses_ceiling_and_invoice_date():
     must pick its own invoice — not the $141.87 one (fits the ceiling but is a
     different visit, invoice dated 19 days earlier) and not the grand total."""
     from datetime import date as _date
+
     invoices = [
         {"date": "2026-06-17", "amount": 141.87},  # under ceiling, wrong visit date
         {"date": "2026-06-19", "amount": 585.39},  # over ceiling
         {"date": "2026-07-06", "amount": 407.56},  # the right one
-        {"date": None, "amount": 1134.82},         # grand total — over ceiling
+        {"date": None, "amount": 1134.82},  # grand total — over ceiling
     ]
     picked = invoice_matching._pick_invoice(invoices, -407.56, _date(2026, 7, 6))
     assert picked["amount"] == 407.56
     # nothing fits: every invoice over the ceiling
-    assert invoice_matching._pick_invoice([{"date": "2026-07-06", "amount": 999.0}], -407.56, _date(2026, 7, 6)) is None
+    assert (
+        invoice_matching._pick_invoice(
+            [{"date": "2026-07-06", "amount": 999.0}], -407.56, _date(2026, 7, 6)
+        )
+        is None
+    )
     # amount missing entirely: skipped, not crashed
-    assert invoice_matching._pick_invoice([{"date": "2026-07-06", "amount": None}], -407.56, _date(2026, 7, 6)) is None
+    assert (
+        invoice_matching._pick_invoice(
+            [{"date": "2026-07-06", "amount": None}], -407.56, _date(2026, 7, 6)
+        )
+        is None
+    )
     # missing invoice date can't be checked — allowed through (absence of evidence)
-    assert invoice_matching._pick_invoice([{"amount": 400.0}], -407.56, _date(2026, 7, 6))["amount"] == 400.0
+    assert (
+        invoice_matching._pick_invoice([{"amount": 400.0}], -407.56, _date(2026, 7, 6))["amount"]
+        == 400.0
+    )
 
 
 def test_build_queries_always_include_open_ended_window():
@@ -383,6 +457,7 @@ def test_build_queries_always_include_open_ended_window():
     searchable regardless of invoice_request_sent_at — every source gets an
     open-ended after: query; the narrow window stays for pre-charge arrivals."""
     from datetime import date as _date
+
     original_spouse = invoice_matching.config.SPOUSE_EMAIL
     invoice_matching.config.SPOUSE_EMAIL = "spouse@example.com"
     try:
@@ -391,24 +466,39 @@ def test_build_queries_always_include_open_ended_window():
         invoice_matching.config.SPOUSE_EMAIL = original_spouse
     merchant_queries = [q for q, needs_confirm in queries if not needs_confirm]
     spouse_queries = [q for q, needs_confirm in queries if needs_confirm]
-    assert any("after:" in q and "before:" not in q for q in merchant_queries), "merchant needs an open-ended window"
-    assert any("after:" in q and "before:" not in q for q in spouse_queries), "spouse forwards need an open-ended window"
-    assert any("before:" in q for q in merchant_queries), "narrow window must remain (invoice can arrive before the charge settles)"
-    assert all("NSW" not in q for q in merchant_queries), "state suffix must be stripped from search terms"
+    assert any("after:" in q and "before:" not in q for q in merchant_queries), (
+        "merchant needs an open-ended window"
+    )
+    assert any("after:" in q and "before:" not in q for q in spouse_queries), (
+        "spouse forwards need an open-ended window"
+    )
+    assert any("before:" in q for q in merchant_queries), (
+        "narrow window must remain (invoice can arrive before the charge settles)"
+    )
+    assert all("NSW" not in q for q in merchant_queries), (
+        "state suffix must be stripped from search terms"
+    )
     # real failure: Justin's own outgoing invoice-request emails list visit
     # dates + amounts — extraction read them as invoices and 12 claims matched
     # his own requests. Own mail must be excluded query-side.
-    assert all("-from:me" in q for q in merchant_queries), "own sent mail must never be an invoice candidate"
+    assert all("-from:me" in q for q in merchant_queries), (
+        "own sent mail must never be an invoice candidate"
+    )
 
 
 def test_extraction_cached_per_email_no_second_llm_call():
     db.init_db()
     calls = []
     original_extract = llm.extract
-    llm.extract = lambda *a, **k: calls.append(1) or '{"invoices": [{"date": "2026-01-20", "amount": 10.50, "items": []}]}'
+    llm.extract = (
+        lambda *a, **k: calls.append(1)
+        or '{"invoices": [{"date": "2026-01-20", "amount": 10.50, "items": []}]}'
+    )
     try:
         first = invoice_matching._invoices_for_email("cache-test-1", "some invoice text")
-        llm.extract = lambda *a, **k: (_ for _ in ()).throw(AssertionError("second extraction must come from cache"))
+        llm.extract = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("second extraction must come from cache")
+        )
         second = invoice_matching._invoices_for_email("cache-test-1", "some invoice text")
     finally:
         llm.extract = original_extract
@@ -424,7 +514,9 @@ def test_unparseable_extraction_not_cached_so_it_retries():
         assert invoice_matching._invoices_for_email("cache-test-2", "text") is None
     finally:
         llm.extract = original_extract
-    assert invoice_matching._cached_extraction("cache-test-2") is None, "failed parse must not be cached"
+    assert invoice_matching._cached_extraction("cache-test-2") is None, (
+        "failed parse must not be cached"
+    )
 
 
 def test_forward_confirms_vet_needs_word_boundary_and_distinctive_word():
@@ -467,6 +559,7 @@ def test_oversized_invoice_detected_for_manual_split():
     charges ($551.06 + $1,970.40, same day). Neither claim may match it —
     but it must be surfaced, not silently skipped."""
     from datetime import date as _date
+
     invoices = [{"date": "2026-04-13", "amount": 2521.46}]
     assert invoice_matching._pick_invoice(invoices, -551.06, _date(2026, 4, 13)) is None
     over = invoice_matching._oversized_candidate(invoices, -551.06, _date(2026, 4, 13))
@@ -474,7 +567,12 @@ def test_oversized_invoice_detected_for_manual_split():
     # an oversized invoice for a DIFFERENT visit is not this claim's business
     assert invoice_matching._oversized_candidate(invoices, -551.06, _date(2026, 6, 19)) is None
     # dateless big invoices can't be tied to the visit — never flagged
-    assert invoice_matching._oversized_candidate([{"date": None, "amount": 9999.0}], -551.06, _date(2026, 4, 13)) is None
+    assert (
+        invoice_matching._oversized_candidate(
+            [{"date": None, "amount": 9999.0}], -551.06, _date(2026, 4, 13)
+        )
+        is None
+    )
 
 
 def _insert_pending_claim(conn, merchant: str, amount: float, txn_date: str) -> int:
@@ -509,7 +607,8 @@ def test_split_proposal_created_resolved_and_sibling_absorbed():
             "SELECT vet_claims.*, bank_transactions.amount AS txn_amount, "
             "bank_transactions.merchant AS txn_merchant FROM vet_claims "
             "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
-            "WHERE vet_claims.id = ?", (claim_a,),
+            "WHERE vet_claims.id = ?",
+            (claim_a,),
         ).fetchone()
     flag = invoice_matching._propose_split(claim_row, oversized)
     assert flag and f"#{claim_b}" in flag, "flag must name the sibling claim"
@@ -527,9 +626,12 @@ def test_split_proposal_created_resolved_and_sibling_absorbed():
     with db.get_connection() as conn:
         chosen = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_b,)).fetchone()
         other = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()
-        proposal = conn.execute("SELECT status FROM split_proposals WHERE id = ?", (proposal["id"],)).fetchone()
+        proposal = conn.execute(
+            "SELECT status FROM split_proposals WHERE id = ?", (proposal["id"],)
+        ).fetchone()
     assert chosen["status"] == "matched" and chosen["matched_email_id"] == "email-split-1"
     import json as _json
+
     assert _json.loads(chosen["invoice_data"])["amount"] == 2521.46
     assert other["status"] == "absorbed" and f"#{claim_b}" in other["flag"]
     assert proposal["status"] == "resolved"
@@ -548,17 +650,26 @@ def test_merge_split_proposal_auto_picks_larger_charge():
         claim_small = _insert_pending_claim(conn, "MEDIPAWS TEST", -551.06, "2026-04-13")
         claim_large = _insert_pending_claim(conn, "MEDIPAWS TEST", -1970.40, "2026-04-13")
         import json as _json
+
         conn.execute(
             "INSERT INTO split_proposals (email_id, invoice_json, claim_ids, created_at) VALUES (?, ?, ?, ?)",
-            ("email-m-1", _json.dumps({"date": "2026-04-13", "amount": 2521.46, "items": []}),
-             _json.dumps([claim_small, claim_large]), datetime.now(timezone.utc).isoformat()),
+            (
+                "email-m-1",
+                _json.dumps({"date": "2026-04-13", "amount": 2521.46, "items": []}),
+                _json.dumps([claim_small, claim_large]),
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
         pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     result = invoice_matching.merge_split_proposal(pid)
     assert result["ok"], result["message"]
     with db.get_connection() as conn:
-        large = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_large,)).fetchone()[0]
-        small = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_small,)).fetchone()[0]
+        large = conn.execute(
+            "SELECT status FROM vet_claims WHERE id = ?", (claim_large,)
+        ).fetchone()[0]
+        small = conn.execute(
+            "SELECT status FROM vet_claims WHERE id = ?", (claim_small,)
+        ).fetchone()[0]
     assert large == "matched" and small == "absorbed", "larger charge must carry the invoice"
 
 
@@ -567,6 +678,7 @@ def test_append_result_falls_back_to_caption_on_document_message():
     edit_message_text raises BadRequest there, so the helper must edit the
     caption instead (real failure: merge tap 'did nothing')."""
     import asyncio
+
     from openclaw import telegram_bot
 
     class FakeQuery:
@@ -630,11 +742,18 @@ def test_message_log_keeps_a_failed_update_queued_for_replay():
     # A second arrival of the same update_id (Telegram redelivery) must not duplicate.
     assert message_log.record_inbound(Update(update_id=9001)) is None
     with db.get_connection() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM telegram_messages WHERE update_id = 9001").fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM telegram_messages WHERE update_id = 9001"
+            ).fetchone()[0]
+            == 1
+        )
 
 
-def _edited_reply_to_card_update(update_id=9401, text="This is actually split between echo and Aari. "
-                                                     "Aari cost was $35 out of this"):
+def _edited_reply_to_card_update(
+    update_id=9401,
+    text="This is actually split between echo and Aari. Aari cost was $35 out of this",
+):
     """The real 2026-07-27 payload shape (telegram_messages id 96): Justin EDITED
     his message, and it was a reply to the ASSIGN PET card for claim #1."""
     from telegram import Update
@@ -642,30 +761,44 @@ def _edited_reply_to_card_update(update_id=9401, text="This is actually split be
     from openclaw import config
 
     chat = {"id": 8995277418, "type": "private", "username": "jagberg"}
-    return Update.de_json({
-        "update_id": update_id,
-        "edited_message": {
-            "message_id": 233,
-            "date": 1785149076,
-            "edit_date": 1785149753,
-            "chat": chat,
-            "from": {"id": 1, "is_bot": False, "first_name": "Justin",
-                     "username": config.TELEGRAM_USERNAME or "jagberg"},
-            "text": text,
-            "reply_to_message": {
-                "message_id": 227,
-                "date": 1785148834,
+    return Update.de_json(
+        {
+            "update_id": update_id,
+            "edited_message": {
+                "message_id": 233,
+                "date": 1785149076,
+                "edit_date": 1785149753,
                 "chat": chat,
-                "from": {"id": 2, "is_bot": True, "first_name": "BettyVet", "username": "bettyvet_bot"},
-                "text": "🐾 ASSIGN PET\nClaim #1 · The Shire Veterinary Ca… · $407.56\n"
-                        "2026-07-06 (21d ago)\nBlocks: the claim can't be filled",
-                "reply_markup": {"inline_keyboard": [
-                    [{"text": "Aari", "callback_data": "setpet:1:1"}],
-                    [{"text": "Echo", "callback_data": "setpet:1:2"}],
-                ]},
+                "from": {
+                    "id": 1,
+                    "is_bot": False,
+                    "first_name": "Justin",
+                    "username": config.TELEGRAM_USERNAME or "jagberg",
+                },
+                "text": text,
+                "reply_to_message": {
+                    "message_id": 227,
+                    "date": 1785148834,
+                    "chat": chat,
+                    "from": {
+                        "id": 2,
+                        "is_bot": True,
+                        "first_name": "BettyVet",
+                        "username": "bettyvet_bot",
+                    },
+                    "text": "🐾 ASSIGN PET\nClaim #1 · The Shire Veterinary Ca… · $407.56\n"
+                    "2026-07-06 (21d ago)\nBlocks: the claim can't be filled",
+                    "reply_markup": {
+                        "inline_keyboard": [
+                            [{"text": "Aari", "callback_data": "setpet:1:1"}],
+                            [{"text": "Echo", "callback_data": "setpet:1:2"}],
+                        ]
+                    },
+                },
             },
         },
-    }, bot=None)
+        bot=None,
+    )
 
 
 def test_edited_message_is_handled_and_logged_not_crashed():
@@ -685,7 +818,8 @@ def test_edited_message_is_handled_and_logged_not_crashed():
 
     assert update.message is None, "the fixture must be a genuine edit, not a new message"
     assert message_log._describe(update.to_dict()) == (
-        "text", "edit: This is actually split between echo and Aari. Aari cost was $35 out of this"
+        "text",
+        "edit: This is actually split between echo and Aari. Aari cost was $35 out of this",
     ), message_log._describe(update.to_dict())
     assert telegram_bot._replied_to_claim_id(update.effective_message) == 1
 
@@ -732,28 +866,65 @@ def test_replied_to_claim_id_refuses_to_guess():
 
     def _reply_to(card: dict):
         chat = {"id": 1, "type": "private", "username": "jagberg"}
-        return Update.de_json({
-            "update_id": 9402,
-            "message": {"message_id": 2, "date": 1785149076, "chat": chat, "text": "do it",
-                        "from": {"id": 1, "is_bot": False, "first_name": "J"},
-                        "reply_to_message": {**card, "message_id": 1, "date": 1785148834, "chat": chat,
-                                             "from": {"id": 2, "is_bot": True, "first_name": "B"}}},
-        }, bot=None).effective_message
+        return Update.de_json(
+            {
+                "update_id": 9402,
+                "message": {
+                    "message_id": 2,
+                    "date": 1785149076,
+                    "chat": chat,
+                    "text": "do it",
+                    "from": {"id": 1, "is_bot": False, "first_name": "J"},
+                    "reply_to_message": {
+                        **card,
+                        "message_id": 1,
+                        "date": 1785148834,
+                        "chat": chat,
+                        "from": {"id": 2, "is_bot": True, "first_name": "B"},
+                    },
+                },
+            },
+            bot=None,
+        ).effective_message
 
-    two_claims = _reply_to({"text": "SEND GMAIL DRAFT\nS6+7 · 2 claims\n  • Claim #6 …\n  • Claim #7 …"})
+    two_claims = _reply_to(
+        {"text": "SEND GMAIL DRAFT\nS6+7 · 2 claims\n  • Claim #6 …\n  • Claim #7 …"}
+    )
     assert telegram_bot._replied_to_claim_id(two_claims) is None, "two ids named → no target"
 
-    proposal_token = _reply_to({"text": "Confirm this?", "reply_markup": {"inline_keyboard": [
-        [{"text": "✅ Confirm", "callback_data": "act:2"}]]}})
+    proposal_token = _reply_to(
+        {
+            "text": "Confirm this?",
+            "reply_markup": {
+                "inline_keyboard": [[{"text": "✅ Confirm", "callback_data": "act:2"}]]
+            },
+        }
+    )
     assert telegram_bot._replied_to_claim_id(proposal_token) is None, "act: token is not a claim id"
 
-    from_caption = _reply_to({"caption": "Review this settlement for claim #21",
-                              "document": {"file_id": "f", "file_unique_id": "u"}})
-    assert telegram_bot._replied_to_claim_id(from_caption) == 21, "PDF alerts carry it in the caption"
+    from_caption = _reply_to(
+        {
+            "caption": "Review this settlement for claim #21",
+            "document": {"file_id": "f", "file_unique_id": "u"},
+        }
+    )
+    assert telegram_bot._replied_to_claim_id(from_caption) == 21, (
+        "PDF alerts carry it in the caption"
+    )
 
-    no_parent = Update.de_json({"update_id": 9403, "message": {
-        "message_id": 3, "date": 1785149076, "chat": {"id": 1, "type": "private"}, "text": "hi",
-        "from": {"id": 1, "is_bot": False, "first_name": "J"}}}, bot=None).effective_message
+    no_parent = Update.de_json(
+        {
+            "update_id": 9403,
+            "message": {
+                "message_id": 3,
+                "date": 1785149076,
+                "chat": {"id": 1, "type": "private"},
+                "text": "hi",
+                "from": {"id": 1, "is_bot": False, "first_name": "J"},
+            },
+        },
+        bot=None,
+    ).effective_message
     assert telegram_bot._replied_to_claim_id(no_parent) is None
 
 
@@ -769,7 +940,9 @@ def test_logged_application_records_every_update_then_settles_it():
     _clear_message_log()
 
     original_token = config.TELEGRAM_BOT_TOKEN
-    config.TELEGRAM_BOT_TOKEN = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"  # never used, never dialled
+    config.TELEGRAM_BOT_TOKEN = (
+        "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"  # never used, never dialled
+    )
     try:
         app = telegram_bot.build_application()
         assert type(app).__name__ == "LoggedApplication", type(app).__name__
@@ -858,7 +1031,9 @@ def test_expire_queue_keeps_the_row_but_drops_it_from_the_queue():
     message_log.record_inbound(_fake_update(9201))
     message_log.record_inbound(_fake_update(9202))
     with db.get_connection() as conn:
-        conn.execute("UPDATE telegram_messages SET received_at = ? WHERE update_id = 9201", (stale,))
+        conn.execute(
+            "UPDATE telegram_messages SET received_at = ? WHERE update_id = 9201", (stale,)
+        )
 
     assert message_log.expire_queue() == 1
     assert [r["update_id"] for r in message_log.pending()] == [9202], "fresh row must stay queued"
@@ -877,7 +1052,9 @@ def test_message_log_records_outbound_and_exports_jsonl():
     _clear_message_log()
 
     message_log.record_inbound(_fake_update(9301))
-    message_log.record_outbound("send_message", "Claim #2 marked sent", {"chat_id": 1, "text": "Claim #2 marked sent"})
+    message_log.record_outbound(
+        "send_message", "Claim #2 marked sent", {"chat_id": 1, "text": "Claim #2 marked sent"}
+    )
 
     lines = [_json.loads(line) for line in message_log.iter_jsonl()]
     assert [line["direction"] for line in lines] == ["in", "out"], lines
@@ -894,13 +1071,18 @@ def test_transient_errors_are_warnings_not_action_required_errors():
     import socket
 
     from googleapiclient.errors import HttpError
+
     from openclaw import pipeline
 
     assert pipeline._is_transient(http.client.IncompleteRead(b""))
     assert pipeline._is_transient(socket.timeout())
     assert pipeline._is_transient(ConnectionResetError())
-    assert pipeline._is_transient(HttpError(type("R", (), {"status": 503, "reason": "busy"})(), b""))
-    assert not pipeline._is_transient(HttpError(type("R", (), {"status": 404, "reason": "gone"})(), b""))
+    assert pipeline._is_transient(
+        HttpError(type("R", (), {"status": 503, "reason": "busy"})(), b"")
+    )
+    assert not pipeline._is_transient(
+        HttpError(type("R", (), {"status": 404, "reason": "gone"})(), b"")
+    )
     assert not pipeline._is_transient(ValueError("real bug"))
 
 
@@ -915,8 +1097,13 @@ def test_watchdog_restarts_the_process_when_polling_is_dead():
         conn.execute("DELETE FROM ops_alerts WHERE kind = ?", (pipeline._POLLING_ALERT,))
 
     exits, sent = [], []
-    original_alive, original_send = telegram_bot.polling_alive, telegram_bot.send_message_sync
-    telegram_bot.send_message_sync = lambda msg: sent.append(msg)
+    # The watchdog's alert goes through the `notify` seam now, not straight at
+    # PTB — that is the whole point of the seam, and this alert must survive the
+    # transport switch or a dead updater stops announcing itself.
+    from openclaw import notify
+
+    original_alive, original_send = telegram_bot.polling_alive, notify.send_text
+    notify.send_text = lambda msg, buttons=None: sent.append(msg) or True
     try:
         telegram_bot.polling_alive = lambda: True
         assert pipeline._watchdog_telegram_polling(exit_fn=lambda: exits.append(1)) is False
@@ -932,7 +1119,7 @@ def test_watchdog_restarts_the_process_when_polling_is_dead():
         assert sent and "Telegram polling" in sent[0], sent
     finally:
         telegram_bot.polling_alive = original_alive
-        telegram_bot.send_message_sync = original_send
+        notify.send_text = original_send
 
 
 def test_unhandled_callback_data_reports_instead_of_silently_returning():
@@ -940,6 +1127,7 @@ def test_unhandled_callback_data_reports_instead_of_silently_returning():
     on_callback doing nothing — indistinguishable from a tap that never
     arrived, which is exactly how a morning of button presses vanished."""
     import asyncio
+
     from openclaw import config, telegram_bot
 
     class FakeQuery:
@@ -971,6 +1159,7 @@ def test_ack_reacts_thumbs_up_and_swallows_failures():
     """Every incoming user message gets an instant 👍 reaction receipt; a
     reaction failure must never break the real handler."""
     import asyncio
+
     from openclaw import telegram_bot
 
     class FakeMessage:
@@ -1001,18 +1190,29 @@ def test_reject_split_proposal_flags_and_never_reproposes():
         claim_a = _insert_pending_claim(conn, "MEDIPAWS TEST", -551.06, "2026-04-13")
         claim_b = _insert_pending_claim(conn, "MEDIPAWS TEST", -1970.40, "2026-04-13")
         import json as _json
+
         conn.execute(
             "INSERT INTO split_proposals (email_id, invoice_json, claim_ids, created_at) VALUES (?, ?, ?, ?)",
-            ("email-r-1", _json.dumps({"date": "2026-04-13", "amount": 2521.46}),
-             _json.dumps([claim_a, claim_b]), datetime.now(timezone.utc).isoformat()),
+            (
+                "email-r-1",
+                _json.dumps({"date": "2026-04-13", "amount": 2521.46}),
+                _json.dumps([claim_a, claim_b]),
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
         pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     result = invoice_matching.reject_split_proposal(pid)
     assert result["ok"]
     with db.get_connection() as conn:
-        flags = [r[0] for r in conn.execute(
-            "SELECT flag FROM vet_claims WHERE id IN (?, ?)", (claim_a, claim_b))]
-        status = conn.execute("SELECT status FROM split_proposals WHERE id = ?", (pid,)).fetchone()[0]
+        flags = [
+            r[0]
+            for r in conn.execute(
+                "SELECT flag FROM vet_claims WHERE id IN (?, ?)", (claim_a, claim_b)
+            )
+        ]
+        status = conn.execute("SELECT status FROM split_proposals WHERE id = ?", (pid,)).fetchone()[
+            0
+        ]
     assert status == "rejected"
     assert all(f and "match this charge manually" in f for f in flags)
     # a rejected pair must never be re-proposed
@@ -1021,12 +1221,17 @@ def test_reject_split_proposal_flags_and_never_reproposes():
             "SELECT vet_claims.*, bank_transactions.amount AS txn_amount, "
             "bank_transactions.merchant AS txn_merchant FROM vet_claims "
             "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
-            "WHERE vet_claims.id = ?", (claim_a,),
+            "WHERE vet_claims.id = ?",
+            (claim_a,),
         ).fetchone()
     oversized = {"date": "2026-04-13", "amount": 2521.46, "_email_id": "email-r-1"}
-    assert invoice_matching._propose_split(claim_row, oversized) is None, "rejected pair must not re-flag as a merge"
+    assert invoice_matching._propose_split(claim_row, oversized) is None, (
+        "rejected pair must not re-flag as a merge"
+    )
     with db.get_connection() as conn:
-        assert conn.execute("SELECT count(*) FROM split_proposals").fetchone()[0] == 1, "no new proposal after reject"
+        assert conn.execute("SELECT count(*) FROM split_proposals").fetchone()[0] == 1, (
+            "no new proposal after reject"
+        )
 
 
 def test_propose_split_detects_payment_records():
@@ -1043,15 +1248,22 @@ def test_propose_split_detects_payment_records():
             "SELECT vet_claims.*, bank_transactions.amount AS txn_amount, "
             "bank_transactions.merchant AS txn_merchant FROM vet_claims "
             "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
-            "WHERE vet_claims.id = ?", (claim_a,),
+            "WHERE vet_claims.id = ?",
+            (claim_a,),
         ).fetchone()
     # real payment-section shape: 'Eftpos/Visa/Mastercard : -1970.40'
     text_amounts = invoice_matching._text_amounts(
         "Total: $2521.46 Payment method: Eftpos/Visa/Mastercard : -1970.40 Eftpos/Visa/Mastercard : -551.06"
     )
-    oversized = {"date": "2026-04-13", "amount": 2521.46, "_email_id": "email-p-1", "_text_amounts": text_amounts}
+    oversized = {
+        "date": "2026-04-13",
+        "amount": 2521.46,
+        "_email_id": "email-p-1",
+        "_text_amounts": text_amounts,
+    }
     assert invoice_matching._propose_split(claim_row, oversized)
     import json as _json
+
     with db.get_connection() as conn:
         stored = _json.loads(conn.execute("SELECT invoice_json FROM split_proposals").fetchone()[0])
     assert stored["payments_confirmed"] is True
@@ -1072,7 +1284,8 @@ def test_split_proposal_not_created_when_charges_dont_explain_invoice():
             "SELECT vet_claims.*, bank_transactions.amount AS txn_amount, "
             "bank_transactions.merchant AS txn_merchant FROM vet_claims "
             "JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
-            "WHERE vet_claims.id = ?", (claim_a,),
+            "WHERE vet_claims.id = ?",
+            (claim_a,),
         ).fetchone()
     assert invoice_matching._propose_split(claim_row, oversized) is None
     with db.get_connection() as conn:
@@ -1081,6 +1294,7 @@ def test_split_proposal_not_created_when_charges_dont_explain_invoice():
 
 def test_notify_split_proposals_sends_picker_once():
     from openclaw import pipeline
+
     db.init_db()
     with db.get_connection() as conn:
         conn.execute("DELETE FROM vet_claims")
@@ -1089,10 +1303,15 @@ def test_notify_split_proposals_sends_picker_once():
         claim_a = _insert_pending_claim(conn, "MEDIPAWS TEST", -551.06, "2026-04-13")
         claim_b = _insert_pending_claim(conn, "MEDIPAWS TEST", -1970.40, "2026-04-13")
         import json as _json
+
         conn.execute(
             "INSERT INTO split_proposals (email_id, invoice_json, claim_ids, created_at) VALUES (?, ?, ?, ?)",
-            ("email-n-1", _json.dumps({"date": "2026-04-13", "amount": 2521.46}),
-             _json.dumps([claim_a, claim_b]), datetime.now(timezone.utc).isoformat()),
+            (
+                "email-n-1",
+                _json.dumps({"date": "2026-04-13", "amount": 2521.46}),
+                _json.dumps([claim_a, claim_b]),
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
     sent = []
     pipeline.notify_split_proposals(send_fn=lambda text, markup=None: sent.append((text, markup)))
@@ -1111,6 +1330,7 @@ def test_run_once_isolates_one_claims_failure():
     Petcover polling + notifications for days. One claim's crash must flag that
     claim only; later claims and every downstream stage still run."""
     from openclaw import pipeline
+
     db.init_db()
     with db.get_connection() as conn:
         conn.execute("DELETE FROM vet_claims")
@@ -1119,15 +1339,22 @@ def test_run_once_isolates_one_claims_failure():
         claim_b = _insert_pending_claim(conn, "HEALTHY VET", -60.0, "2026-07-02")
 
     attempted, stages = [], []
+
     def fake_match(claim):
         attempted.append(claim["id"])
         if claim["id"] == claim_a:
             raise RuntimeError("boom")
         return False
 
-    originals = (pipeline.vet_detection.classify_unflagged, pipeline.reconcile_sent_invoice_requests,
-                 pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
-                 pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth)
+    originals = (
+        pipeline.vet_detection.classify_unflagged,
+        pipeline.reconcile_sent_invoice_requests,
+        pipeline.invoice_matching.match_claim,
+        pipeline._maybe_draft_invoice_request,
+        pipeline.poll_petcover_status,
+        pipeline.notify_claim_states,
+        pipeline._ensure_gmail_auth,
+    )
     pipeline.vet_detection.classify_unflagged = lambda: stages.append("classify")
     pipeline._ensure_gmail_auth = lambda: True
     pipeline.reconcile_sent_invoice_requests = lambda: stages.append("reconcile")
@@ -1138,16 +1365,24 @@ def test_run_once_isolates_one_claims_failure():
     try:
         pipeline.run_once()
     finally:
-        (pipeline.vet_detection.classify_unflagged, pipeline.reconcile_sent_invoice_requests,
-         pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
-         pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth) = originals
+        (
+            pipeline.vet_detection.classify_unflagged,
+            pipeline.reconcile_sent_invoice_requests,
+            pipeline.invoice_matching.match_claim,
+            pipeline._maybe_draft_invoice_request,
+            pipeline.poll_petcover_status,
+            pipeline.notify_claim_states,
+            pipeline._ensure_gmail_auth,
+        ) = originals
 
     assert attempted == [claim_a, claim_b], "claim B must still be attempted after claim A crashes"
     assert "poll" in stages and "notify" in stages, "downstream stages must run despite the failure"
     assert f"draft:{claim_b}" in stages, "claim B continues through the normal no-match path"
     with db.get_connection() as conn:
         flag_a = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
-    assert flag_a and flag_a.startswith("invoice matching error"), "failure must be visible on the claim"
+    assert flag_a and flag_a.startswith("invoice matching error"), (
+        "failure must be visible on the claim"
+    )
 
 
 def test_run_once_llm_outage_skips_matching_but_runs_downstream():
@@ -1155,6 +1390,7 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
     rest), the first affected claim is flagged, downstream stages still run,
     and the flag clears on the next healthy attempt."""
     from openclaw import pipeline
+
     db.init_db()
     with db.get_connection() as conn:
         conn.execute("DELETE FROM vet_claims")
@@ -1163,13 +1399,20 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
         claim_b = _insert_pending_claim(conn, "VET TWO", -60.0, "2026-07-02")
 
     attempted, stages = [], []
+
     def unavailable_match(claim):
         attempted.append(claim["id"])
         raise llm.LLMUnavailableError("429 quota")
 
-    originals = (pipeline.vet_detection.classify_unflagged, pipeline.reconcile_sent_invoice_requests,
-                 pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
-                 pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth)
+    originals = (
+        pipeline.vet_detection.classify_unflagged,
+        pipeline.reconcile_sent_invoice_requests,
+        pipeline.invoice_matching.match_claim,
+        pipeline._maybe_draft_invoice_request,
+        pipeline.poll_petcover_status,
+        pipeline.notify_claim_states,
+        pipeline._ensure_gmail_auth,
+    )
     pipeline.vet_detection.classify_unflagged = lambda: None
     pipeline._ensure_gmail_auth = lambda: True
     pipeline.reconcile_sent_invoice_requests = lambda: None
@@ -1180,8 +1423,12 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
     try:
         pipeline.run_once()
         with db.get_connection() as conn:
-            flag_a = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
-            flag_b = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_b,)).fetchone()[0]
+            flag_a = conn.execute(
+                "SELECT flag FROM vet_claims WHERE id = ?", (claim_a,)
+            ).fetchone()[0]
+            flag_b = conn.execute(
+                "SELECT flag FROM vet_claims WHERE id = ?", (claim_b,)
+            ).fetchone()[0]
         assert attempted == [claim_a], "outage must stop further matching this tick"
         assert flag_a and flag_a.startswith("invoice extraction unavailable")
         assert flag_b is None, "unattempted claims must not be flagged"
@@ -1192,12 +1439,20 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
         pipeline.invoice_matching.match_claim = lambda claim: attempted.append(claim["id"]) or False
         pipeline.run_once()
         with db.get_connection() as conn:
-            flag_a = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
+            flag_a = conn.execute(
+                "SELECT flag FROM vet_claims WHERE id = ?", (claim_a,)
+            ).fetchone()[0]
         assert flag_a is None, "recovered claim must not carry a stale outage flag"
     finally:
-        (pipeline.vet_detection.classify_unflagged, pipeline.reconcile_sent_invoice_requests,
-         pipeline.invoice_matching.match_claim, pipeline._maybe_draft_invoice_request,
-         pipeline.poll_petcover_status, pipeline.notify_claim_states, pipeline._ensure_gmail_auth) = originals
+        (
+            pipeline.vet_detection.classify_unflagged,
+            pipeline.reconcile_sent_invoice_requests,
+            pipeline.invoice_matching.match_claim,
+            pipeline._maybe_draft_invoice_request,
+            pipeline.poll_petcover_status,
+            pipeline.notify_claim_states,
+            pipeline._ensure_gmail_auth,
+        ) = originals
 
 
 # Real-shape page texts (from MediPaws' actual PDFs): a per-visit invoice page
@@ -1226,7 +1481,9 @@ def test_find_invoice_segment_picks_right_page_and_pet():
     # pet unknown: amount alone picks the segment
     assert claim_forms.find_invoice_segment(pages, 1328.25, None) == (1, 1)
     # grouped thousands formatting still matches
-    assert claim_forms.find_invoice_segment(["Tax Invoice\nPatient: Aari\nTotal: $2,521.46"], 2521.46, "Aari") == (0, 0)
+    assert claim_forms.find_invoice_segment(
+        ["Tax Invoice\nPatient: Aari\nTotal: $2,521.46"], 2521.46, "Aari"
+    ) == (0, 0)
 
 
 def test_find_invoice_segment_handles_colonless_patient_and_unknown_words():
@@ -1234,7 +1491,9 @@ def test_find_invoice_segment_handles_colonless_patient_and_unknown_words():
     missed it live). A patient-word that isn't a known pet carries no signal."""
     sah_page = "Tax Invoice\nTransaction No 6351750 Patient Echo Reference Hannah\nTotal: $10.50"
     assert claim_forms.find_invoice_segment([sah_page], 10.50, "Echo", ("Aari",)) == (0, 0)
-    assert claim_forms.find_invoice_segment([sah_page], 10.50, "Aari", ("Echo",)) is None, "names the other pet"
+    assert claim_forms.find_invoice_segment([sah_page], 10.50, "Aari", ("Echo",)) is None, (
+        "names the other pet"
+    )
     # 'Patient care' is not a pet — must not reject
     care_page = "Tax Invoice\nPatient care plan discussed\nTotal: $45.00"
     assert claim_forms.find_invoice_segment([care_page], 45.00, "Aari", ("Echo",)) == (0, 0)
@@ -1259,8 +1518,17 @@ def test_find_invoice_segment_rejects_account_statement():
     assert claim_forms.find_invoice_segment(["", ""], 2521.46, None) is None  # image-only scan
 
 
-def _insert_matched_claim(conn, merchant, amount, txn_date, pet_id=None, email_id="em-x",
-                          invoice_amount=None, condition=None, invoice_path=None):
+def _insert_matched_claim(
+    conn,
+    merchant,
+    amount,
+    txn_date,
+    pet_id=None,
+    email_id="em-x",
+    invoice_amount=None,
+    condition=None,
+    invoice_path=None,
+):
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO bank_transactions (date, amount, merchant, created_at) VALUES (?, ?, ?, ?)",
@@ -1268,12 +1536,25 @@ def _insert_matched_claim(conn, merchant, amount, txn_date, pet_id=None, email_i
     )
     txn_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     import json as _json
+
     conn.execute(
         "INSERT INTO vet_claims (transaction_id, pet_id, status, matched_email_id, invoice_data, "
         "condition_text, invoice_file_path, created_at, updated_at) VALUES (?, ?, 'matched', ?, ?, ?, ?, ?, ?)",
-        (txn_id, pet_id, email_id,
-         _json.dumps({"amount": invoice_amount if invoice_amount is not None else abs(amount), "date": txn_date}),
-         condition, invoice_path, now, now),
+        (
+            txn_id,
+            pet_id,
+            email_id,
+            _json.dumps(
+                {
+                    "amount": invoice_amount if invoice_amount is not None else abs(amount),
+                    "date": txn_date,
+                }
+            ),
+            condition,
+            invoice_path,
+            now,
+            now,
+        ),
     )
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -1284,7 +1565,8 @@ def _matched_row(claim_id):
             "SELECT vet_claims.*, bank_transactions.merchant AS txn_merchant, "
             "bank_transactions.date AS txn_date, bank_transactions.amount AS txn_amount "
             "FROM vet_claims JOIN bank_transactions ON bank_transactions.id = vet_claims.transaction_id "
-            "WHERE vet_claims.id = ?", (claim_id,),
+            "WHERE vet_claims.id = ?",
+            (claim_id,),
         ).fetchone()
 
 
@@ -1302,7 +1584,11 @@ def test_ensure_invoice_file_flags_inadequate_attachment():
         claim_forms._email_pdf_documents = original
     row = _matched_row(cid)
     assert row["invoice_file_path"] is None
-    assert row["flag"] and "isn't a per-visit itemised invoice" in row["flag"] and "MEDIPAWS TEST" in row["flag"]
+    assert (
+        row["flag"]
+        and "isn't a per-visit itemised invoice" in row["flag"]
+        and "MEDIPAWS TEST" in row["flag"]
+    )
 
 
 def test_ensure_invoice_file_never_overwrites_manual_path():
@@ -1310,9 +1596,13 @@ def test_ensure_invoice_file_never_overwrites_manual_path():
     with db.get_connection() as conn:
         conn.execute("DELETE FROM vet_claims")
         conn.execute("DELETE FROM bank_transactions")
-        cid = _insert_matched_claim(conn, "MEDIPAWS TEST", -100.0, "2026-04-13", invoice_path=r"G:\manual\inv.pdf")
+        cid = _insert_matched_claim(
+            conn, "MEDIPAWS TEST", -100.0, "2026-04-13", invoice_path=r"G:\manual\inv.pdf"
+        )
     original = claim_forms._email_pdf_documents
-    claim_forms._email_pdf_documents = lambda email_id: (_ for _ in ()).throw(AssertionError("must not fetch"))
+    claim_forms._email_pdf_documents = lambda email_id: (_ for _ in ()).throw(
+        AssertionError("must not fetch")
+    )
     try:
         claim_forms.ensure_invoice_file(_matched_row(cid))
     finally:
@@ -1333,7 +1623,10 @@ def test_pick_invoice_prefers_exact_amount_and_skips_claimed():
         other = _insert_matched_claim(conn, "KINGS VET TEST", -44.75, "2025-08-08")
         conn.execute(
             "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
-            (_json.dumps({"invoice_number": "185019", "amount": 44.75, "date": "2025-08-08"}), other),
+            (
+                _json.dumps({"invoice_number": "185019", "amount": 44.75, "date": "2025-08-08"}),
+                other,
+            ),
         )
     invoices = [
         {"invoice_number": "185019", "amount": 44.75, "date": "2025-08-08"},
@@ -1342,7 +1635,9 @@ def test_pick_invoice_prefers_exact_amount_and_skips_claimed():
     picked = invoice_matching._pick_invoice(invoices, -152.5, _date(2025, 8, 11), claim_id=999999)
     assert picked["invoice_number"] == "185106", picked
     # the claimed one alone no longer matches either
-    picked = invoice_matching._pick_invoice(invoices[:1], -152.5, _date(2025, 8, 11), claim_id=999999)
+    picked = invoice_matching._pick_invoice(
+        invoices[:1], -152.5, _date(2025, 8, 11), claim_id=999999
+    )
     assert picked is None
     # without DB context the exact amount+date still wins over first-in-list
     picked = invoice_matching._pick_invoice(invoices, -152.5, _date(2025, 8, 11))
@@ -1420,17 +1715,21 @@ def test_vision_invoices_reads_pages_skips_junk_and_caches():
     with db.get_connection() as conn:
         conn.execute("DELETE FROM vision_ocr_attempts")
         conn.execute("DELETE FROM email_extractions")
-    replies = iter([
-        '{"invoice_number": "184556", "date": "2025-07-28", "patient": "Aari", "amount": 45.0, "items": []}',
-        '{"not_invoice": true}',
-        "the model rambled and returned no JSON at all",
-        '{"invoice_number": "9", "date": "2025-08-01", "patient": "Aari", "items": []}',  # no amount
-    ])
+    replies = iter(
+        [
+            '{"invoice_number": "184556", "date": "2025-07-28", "patient": "Aari", "amount": 45.0, "items": []}',
+            '{"not_invoice": true}',
+            "the model rambled and returned no JSON at all",
+            '{"invoice_number": "9", "date": "2025-08-01", "patient": "Aari", "items": []}',  # no amount
+        ]
+    )
     vision_calls = []
     original_att = claim_forms.email_pdf_attachments
     original_vision = llm.extract_vision
     claim_forms.email_pdf_attachments = lambda email_id: [("scans.pdf", _scan_pdf_bytes(4))]
-    llm.extract_vision = lambda prompt, jpeg, purpose="vision_extraction": vision_calls.append(1) or next(replies)
+    llm.extract_vision = lambda prompt, jpeg, purpose="vision_extraction": vision_calls.append(
+        1
+    ) or next(replies)
     try:
         invoices = invoice_matching._vision_invoices("em-scan-mix")
     finally:
@@ -1482,7 +1781,10 @@ def test_already_claimed_identity_rules():
         other = _insert_matched_claim(conn, "KINGS VET TEST", -45.0, "2025-07-28")
         conn.execute(
             "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
-            (_json.dumps({"invoice_number": "184556", "amount": 45.0, "date": "2025-07-28"}), other),
+            (
+                _json.dumps({"invoice_number": "184556", "amount": 45.0, "date": "2025-07-28"}),
+                other,
+            ),
         )
     same_number = {"invoice_number": "184556", "amount": 45.0, "date": "2025-07-28"}
     different_number = {"invoice_number": "188313", "amount": 45.0, "date": "2025-07-28"}
@@ -1516,10 +1818,17 @@ def test_ensure_invoice_file_scan_page_out_of_range_flags():
     with db.get_connection() as conn:
         conn.execute("DELETE FROM vet_claims")
         conn.execute("DELETE FROM bank_transactions")
-        cid = _insert_matched_claim(conn, "KINGS VET TEST", -45.0, "2025-07-28", email_id="em-scan-3")
+        cid = _insert_matched_claim(
+            conn, "KINGS VET TEST", -45.0, "2025-07-28", email_id="em-scan-3"
+        )
         conn.execute(
             "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
-            (_json.dumps({"amount": 45.0, "date": "2025-07-28", "source_pdf": "scans.pdf", "page": 99}), cid),
+            (
+                _json.dumps(
+                    {"amount": 45.0, "date": "2025-07-28", "source_pdf": "scans.pdf", "page": 99}
+                ),
+                cid,
+            ),
         )
     original_att = claim_forms.email_pdf_attachments
     original_docs = claim_forms._email_pdf_documents
@@ -1559,11 +1868,23 @@ def test_ensure_invoice_file_slices_scan_page_and_assigns_pet():
         conn.execute("DELETE FROM vet_claims")
         conn.execute("DELETE FROM bank_transactions")
         pet = conn.execute("SELECT id, name FROM pets LIMIT 1").fetchone()
-        cid = _insert_matched_claim(conn, "KINGS VET TEST", -45.0, "2025-07-28", email_id="em-scan-2")
+        cid = _insert_matched_claim(
+            conn, "KINGS VET TEST", -45.0, "2025-07-28", email_id="em-scan-2"
+        )
         conn.execute(
             "UPDATE vet_claims SET invoice_data = ? WHERE id = ?",
-            (_json.dumps({"amount": 45.0, "date": "2025-07-28", "patient": pet["name"],
-                          "source_pdf": "scans.pdf", "page": 1}), cid),
+            (
+                _json.dumps(
+                    {
+                        "amount": 45.0,
+                        "date": "2025-07-28",
+                        "patient": pet["name"],
+                        "source_pdf": "scans.pdf",
+                        "page": 1,
+                    }
+                ),
+                cid,
+            ),
         )
     writer = PdfWriter()
     writer.add_blank_page(width=200, height=200)
@@ -1581,7 +1902,9 @@ def test_ensure_invoice_file_slices_scan_page_and_assigns_pet():
         claim_forms.email_pdf_attachments = original_att
         claim_forms.config.INVOICE_OUTPUT_DIR = original_dir
     row = _matched_row(cid)
-    assert row["invoice_file_path"] and row["invoice_file_path"].endswith(f"claim-{cid}-2025-07-28.pdf")
+    assert row["invoice_file_path"] and row["invoice_file_path"].endswith(
+        f"claim-{cid}-2025-07-28.pdf"
+    )
     from pypdf import PdfReader
 
     assert len(PdfReader(row["invoice_file_path"]).pages) == 1
@@ -1593,27 +1916,45 @@ def test_draft_step_batches_ready_claims_by_four_per_pet():
     Petcover form holds 4 rows); a not-ready claim still routes through
     process_claim for its per-field flagging."""
     from openclaw import pipeline
+
     db.init_db()
     with db.get_connection() as conn:
         conn.execute("DELETE FROM vet_claims")
         conn.execute("DELETE FROM bank_transactions")
         aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
         ready = [
-            _insert_matched_claim(conn, "BATCH VET", -50.0 - i, f"2026-05-{10 + i:02d}", pet_id=aari,
-                                  condition="arthritis", invoice_path=f"/data/invoices/t{i}.pdf")
+            _insert_matched_claim(
+                conn,
+                "BATCH VET",
+                -50.0 - i,
+                f"2026-05-{10 + i:02d}",
+                pet_id=aari,
+                condition="arthritis",
+                invoice_path=f"/data/invoices/t{i}.pdf",
+            )
             for i in range(6)
         ]
-        lone = _insert_matched_claim(conn, "BATCH VET", -70.0, "2026-05-20", pet_id=aari)  # no condition/invoice
+        lone = _insert_matched_claim(
+            conn, "BATCH VET", -70.0, "2026-05-20", pet_id=aari
+        )  # no condition/invoice
 
     batches, singles = [], []
-    originals = (claim_forms.ensure_invoice_file, claim_forms.process_claim_batch, claim_forms.process_claim)
+    originals = (
+        claim_forms.ensure_invoice_file,
+        claim_forms.process_claim_batch,
+        claim_forms.process_claim,
+    )
     claim_forms.ensure_invoice_file = lambda claim: None
     claim_forms.process_claim_batch = lambda ids, continuation=None: batches.append(ids)
     claim_forms.process_claim = lambda cid, continuation=None: singles.append(cid)
     try:
         pipeline._draft_matched_claims()
     finally:
-        claim_forms.ensure_invoice_file, claim_forms.process_claim_batch, claim_forms.process_claim = originals
+        (
+            claim_forms.ensure_invoice_file,
+            claim_forms.process_claim_batch,
+            claim_forms.process_claim,
+        ) = originals
 
     assert [len(b) for b in batches] == [4, 2], f"expected 4+2 chunks, got {batches}"
     assert batches[0] == ready[:4] and batches[1] == ready[4:], "chunks must be in txn-date order"
@@ -1622,6 +1963,7 @@ def test_draft_step_batches_ready_claims_by_four_per_pet():
 
 def test_notify_pushes_flagged_pending_claims_grouped_once():
     from openclaw import pipeline
+
     db.init_db()
     with db.get_connection() as conn:
         conn.execute("DELETE FROM vet_claims")
@@ -1644,6 +1986,7 @@ def test_notify_messages_carry_claim_ids():
     /pet) so a message without one is unanswerable (his report: alerts lacked
     the #, only the tap-results showed it)."""
     from openclaw import pipeline
+
     db.init_db()
     with db.get_connection() as conn:
         conn.execute("DELETE FROM vet_claims")
@@ -1655,9 +1998,7 @@ def test_notify_messages_carry_claim_ids():
             (needs_cond,),
         )
         pending = _insert_pending_claim(conn, "IDCHECK PENDING VET", -70.0, "2026-05-20")
-        conn.execute(
-            "UPDATE vet_claims SET flag = 'manual review needed' WHERE id = ?", (pending,)
-        )
+        conn.execute("UPDATE vet_claims SET flag = 'manual review needed' WHERE id = ?", (pending,))
     sent = []
     pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
     cond_msg = next(t for t in sent if "IDCHECK VET" in t)
@@ -1670,6 +2011,7 @@ def test_notify_messages_carry_claim_ids():
 # Condition Thread tracking, ack correlation, settlement validation, ops alerts
 # ---------------------------------------------------------------------------
 
+
 def _fresh_db():
     """Clean slate: the smoke suite shares one DB file across tests, so thread /
     settlement tests must start from empty claim + event tables (and no stray
@@ -1680,11 +2022,26 @@ def _fresh_db():
         conn.execute("DELETE FROM vet_claims")
         conn.execute("DELETE FROM bank_transactions")
         conn.execute("DELETE FROM ops_alerts")
+        # Proposals are keyed to claims that are about to be deleted; leaving
+        # them makes "did this refusal queue anything?" depend on test order.
+        conn.execute("DELETE FROM pending_proposals")
+        conn.execute("DELETE FROM pending_flows")
         conn.execute("UPDATE pets SET policy_anniversary = NULL")
 
 
-def _insert_claim(conn, pet_id, txn_date, status="sent", draft_id=None, reference=None,
-                  sr=None, condition=None, invoice_data=None, amount=-50.0, merchant="THREAD VET"):
+def _insert_claim(
+    conn,
+    pet_id,
+    txn_date,
+    status="sent",
+    draft_id=None,
+    reference=None,
+    sr=None,
+    condition=None,
+    invoice_data=None,
+    amount=-50.0,
+    merchant="THREAD VET",
+):
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO bank_transactions (date, amount, merchant, created_at) VALUES (?, ?, ?, ?)",
@@ -1702,6 +2059,7 @@ def _insert_claim(conn, pet_id, txn_date, status="sent", draft_id=None, referenc
 
 def _insert_settled_event(conn, claim_id, created_at, paid):
     import json as _json
+
     conn.execute(
         "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
         "VALUES (?, 'settled', NULL, ?, ?)",
@@ -1724,8 +2082,12 @@ def test_route_reference_and_sr_to_single_claim():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        c1 = _insert_claim(conn, aari, "2026-05-01", status="acknowledged", reference="DC1-27-5628", sr=1)
-        c2 = _insert_claim(conn, aari, "2026-05-02", status="acknowledged", reference="DC1-27-5628", sr=2)
+        c1 = _insert_claim(
+            conn, aari, "2026-05-01", status="acknowledged", reference="DC1-27-5628", sr=1
+        )
+        c2 = _insert_claim(
+            conn, aari, "2026-05-02", status="acknowledged", reference="DC1-27-5628", sr=2
+        )
     claim_status.process_reply("m-sr", "Petcover Claim DC1-27-5628 SR1 - Claim suspended", "")
     assert _claim_row(c1)["status"] == "suspended"
     assert _claim_row(c2)["status"] == "acknowledged", "the other serial must be untouched"
@@ -1737,10 +2099,18 @@ def test_reference_reuse_never_touches_settled_claims():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        done1 = _insert_claim(conn, aari, "2026-02-01", status="settled", reference="DC1-27-5628", sr=1)
-        done2 = _insert_claim(conn, aari, "2026-02-02", status="declined", reference="DC1-27-5628", sr=2)
-        open1 = _insert_claim(conn, aari, "2026-07-01", status="acknowledged", reference="DC1-27-5628", sr=3)
-        open2 = _insert_claim(conn, aari, "2026-07-02", status="acknowledged", reference="DC1-27-5628", sr=4)
+        done1 = _insert_claim(
+            conn, aari, "2026-02-01", status="settled", reference="DC1-27-5628", sr=1
+        )
+        done2 = _insert_claim(
+            conn, aari, "2026-02-02", status="declined", reference="DC1-27-5628", sr=2
+        )
+        open1 = _insert_claim(
+            conn, aari, "2026-07-01", status="acknowledged", reference="DC1-27-5628", sr=3
+        )
+        open2 = _insert_claim(
+            conn, aari, "2026-07-02", status="acknowledged", reference="DC1-27-5628", sr=4
+        )
     claim_status.process_reply(
         "m-ref", "Petcover Claim DC1-27-5628 - Request for information", "please send consult notes"
     )
@@ -1757,11 +2127,27 @@ def test_decline_isolated_to_its_thread():
     with db.get_connection() as conn:
         aari = _aari(conn)
         # one submission (shared draft), two conditions → two threads
-        t1 = _insert_claim(conn, aari, "2026-06-01", status="acknowledged", draft_id="d1",
-                           reference="DC1-30-1", sr=1)
-        t2 = _insert_claim(conn, aari, "2026-06-02", status="acknowledged", draft_id="d1",
-                           reference="DC1-31-9", sr=1)
-    claim_status.process_reply("m-dec", "Petcover Claim DC1-30-1 - Declined - Invoices over 12 months", "")
+        t1 = _insert_claim(
+            conn,
+            aari,
+            "2026-06-01",
+            status="acknowledged",
+            draft_id="d1",
+            reference="DC1-30-1",
+            sr=1,
+        )
+        t2 = _insert_claim(
+            conn,
+            aari,
+            "2026-06-02",
+            status="acknowledged",
+            draft_id="d1",
+            reference="DC1-31-9",
+            sr=1,
+        )
+    claim_status.process_reply(
+        "m-dec", "Petcover Claim DC1-30-1 - Declined - Invoices over 12 months", ""
+    )
     assert _claim_row(t1)["status"] == "declined"
     assert _claim_row(t2)["status"] == "acknowledged", "sibling thread must be unaffected"
 
@@ -1775,10 +2161,14 @@ def test_ack_condition_content_decides_submission():
         arth = _insert_claim(conn, aari, "2026-05-01", draft_id="d-arth", condition="Arthritis")
         ear = _insert_claim(conn, aari, "2026-05-02", draft_id="d-ear", condition="Ear infection")
     claim_status.process_reply(
-        "m-cond", "PetCover - Acknowledgement Letter",
+        "m-cond",
+        "PetCover - Acknowledgement Letter",
         "Pet Name: Aari Condition: Arthritis Claim Number DC1-40-1 Thank you",
     )
-    assert _claim_row(arth)["status"] == "acknowledged" and _claim_row(arth)["petcover_reference"] == "DC1-40-1"
+    assert (
+        _claim_row(arth)["status"] == "acknowledged"
+        and _claim_row(arth)["petcover_reference"] == "DC1-40-1"
+    )
     assert _claim_row(ear)["status"] == "sent", "the non-matching submission must be left alone"
 
 
@@ -1791,14 +2181,23 @@ def test_ack_recency_fallback_leaves_condition_untouched():
         aari = _aari(conn)
         older = _insert_claim(conn, aari, "2026-05-01", draft_id="d-old", condition="Arthritis")
         newer = _insert_claim(conn, aari, "2026-05-02", draft_id="d-new", condition="Dermatitis")
-        conn.execute("UPDATE vet_claims SET updated_at = '2026-07-01T00:00:00+00:00' WHERE id = ?", (older,))
-        conn.execute("UPDATE vet_claims SET updated_at = '2026-07-10T00:00:00+00:00' WHERE id = ?", (newer,))
+        conn.execute(
+            "UPDATE vet_claims SET updated_at = '2026-07-01T00:00:00+00:00' WHERE id = ?", (older,)
+        )
+        conn.execute(
+            "UPDATE vet_claims SET updated_at = '2026-07-10T00:00:00+00:00' WHERE id = ?", (newer,)
+        )
     claim_status.process_reply(
-        "m-recon", "PetCover - Acknowledgement Letter",
+        "m-recon",
+        "PetCover - Acknowledgement Letter",
         "Pet Name: Aari Condition: Lick Granuloma Claim Number DC1-41-2 Thank you",
     )
-    assert _claim_row(newer)["status"] == "acknowledged", "recency picks the most-recently-sent submission"
-    assert _claim_row(newer)["condition_text"] == "Dermatitis", "our condition_text must not be overwritten"
+    assert _claim_row(newer)["status"] == "acknowledged", (
+        "recency picks the most-recently-sent submission"
+    )
+    assert _claim_row(newer)["condition_text"] == "Dermatitis", (
+        "our condition_text must not be overwritten"
+    )
     assert _claim_row(older)["status"] == "sent"
 
 
@@ -1811,12 +2210,20 @@ def test_two_same_day_acks_land_on_distinct_submissions():
         aari = _aari(conn)
         sub_old = _insert_claim(conn, aari, "2026-05-01", draft_id="d-old")
         sub_new = _insert_claim(conn, aari, "2026-05-02", draft_id="d-new")
-        conn.execute("UPDATE vet_claims SET updated_at = '2026-07-01T00:00:00+00:00' WHERE id = ?", (sub_old,))
-        conn.execute("UPDATE vet_claims SET updated_at = '2026-07-10T00:00:00+00:00' WHERE id = ?", (sub_new,))
-    claim_status.process_reply("m-a", "PetCover - Acknowledgement Letter",
-                               "Pet Name: Aari Claim Number DC1-50-1 Thank you")
-    claim_status.process_reply("m-b", "PetCover - Acknowledgement Letter",
-                               "Pet Name: Aari Claim Number DC1-51-2 Thank you")
+        conn.execute(
+            "UPDATE vet_claims SET updated_at = '2026-07-01T00:00:00+00:00' WHERE id = ?",
+            (sub_old,),
+        )
+        conn.execute(
+            "UPDATE vet_claims SET updated_at = '2026-07-10T00:00:00+00:00' WHERE id = ?",
+            (sub_new,),
+        )
+    claim_status.process_reply(
+        "m-a", "PetCover - Acknowledgement Letter", "Pet Name: Aari Claim Number DC1-50-1 Thank you"
+    )
+    claim_status.process_reply(
+        "m-b", "PetCover - Acknowledgement Letter", "Pet Name: Aari Claim Number DC1-51-2 Thank you"
+    )
     refs = {_claim_row(sub_old)["petcover_reference"], _claim_row(sub_new)["petcover_reference"]}
     assert refs == {"DC1-50-1", "DC1-51-2"}, f"each ack must learn a distinct reference: {refs}"
 
@@ -1827,10 +2234,13 @@ def test_batch_ack_assigns_serials_oldest_txn_first():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        ids = [_insert_claim(conn, aari, f"2025-08-{10 + i:02d}", draft_id="d-batch") for i in range(3)]
+        ids = [
+            _insert_claim(conn, aari, f"2025-08-{10 + i:02d}", draft_id="d-batch") for i in range(3)
+        ]
     for serial in (2, 3, 4):
         claim_status.process_reply(
-            f"m-ack-{serial}", "PetCover - Acknowledgement Letter",
+            f"m-ack-{serial}",
+            "PetCover - Acknowledgement Letter",
             f"Pet Name: Aari Claim Number DC1-77-0001 SR{serial} Thank you",
         )
     rows = [_claim_row(cid) for cid in ids]
@@ -1841,11 +2251,13 @@ def test_batch_ack_assigns_serials_oldest_txn_first():
 
 def _relative_date(days_ago: int) -> str:
     from datetime import timedelta
+
     return (datetime.now(timezone.utc).date() - timedelta(days=days_ago)).isoformat()
 
 
 def _anniversary_days_ago(days_ago: int) -> str:
     from datetime import timedelta
+
     d = datetime.now(timezone.utc).date() - timedelta(days=days_ago)
     return f"{d.month:02d}-{d.day:02d}"
 
@@ -1858,6 +2270,7 @@ def test_settlement_current_year_excess_already_used_flags_mismatch():
     still pays short of that, it's a mismatch to flag."""
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
         anniversary = _anniversary_days_ago(300)  # current policy year opened 300 days ago
@@ -1866,8 +2279,14 @@ def test_settlement_current_year_excess_already_used_flags_mismatch():
         second_txn = _relative_date(100)
         first = _insert_claim(conn, aari, first_txn, status="settled", reference="DC1-SS-1")
         _insert_settled_event(conn, first, datetime.now(timezone.utc).isoformat(), 400.0)
-        second = _insert_claim(conn, aari, second_txn, status="acknowledged", reference="DC1-SS-1",
-                               invoice_data=_json.dumps({"claimable_amount": 500.0, "amount": 500.0}))
+        second = _insert_claim(
+            conn,
+            aari,
+            second_txn,
+            status="acknowledged",
+            reference="DC1-SS-1",
+            invoice_data=_json.dumps({"claimable_amount": 500.0, "amount": 500.0}),
+        )
     flag = claim_status._validate_settlement(_claim_row(second), 350.0, second_txn)
     assert flag and "settlement mismatch" in flag and "$500.00" in flag and "$350.00" in flag
     assert "excess already used" in flag, flag
@@ -1876,13 +2295,20 @@ def test_settlement_current_year_excess_already_used_flags_mismatch():
 def test_settlement_within_tolerance_no_flag():
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
         anniversary = _anniversary_days_ago(300)
         conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
         txn = _relative_date(100)
-        cid = _insert_claim(conn, aari, txn, status="acknowledged", reference="DC1-T-1",
-                            invoice_data=_json.dumps({"claimable_amount": 500.0}))
+        cid = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="acknowledged",
+            reference="DC1-T-1",
+            invoice_data=_json.dumps({"claimable_amount": 500.0}),
+        )
     # expected = 500 - 150 excess = 350; paid within $2 → no flag
     assert claim_status._validate_settlement(_claim_row(cid), 349.0, txn) is None
     # paid short beyond tolerance → flag, no prior sibling this year so "fresh excess"
@@ -1893,12 +2319,19 @@ def test_settlement_within_tolerance_no_flag():
 def test_settlement_unknown_anniversary_degrades():
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
         conn.execute("UPDATE pets SET policy_anniversary = NULL WHERE id = ?", (aari,))
         txn = _relative_date(30)
-        cid = _insert_claim(conn, aari, txn, status="acknowledged", reference="DC1-U-1",
-                            invoice_data=_json.dumps({"claimable_amount": 500.0}))
+        cid = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="acknowledged",
+            reference="DC1-U-1",
+            invoice_data=_json.dumps({"claimable_amount": 500.0}),
+        )
     flag = claim_status._validate_settlement(_claim_row(cid), 200.0, txn)
     assert flag and "anniversary unknown" in flag
 
@@ -1911,13 +2344,20 @@ def test_settlement_closed_policy_year_assumes_full_claimable():
     closed its policy year weeks before Sr4's txn (a different, current year)."""
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
         anniversary = _anniversary_days_ago(10)  # current year opened only 10 days ago
         conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
         closed_year_txn = _relative_date(40)  # before the anniversary -> prior, closed year
-        cid = _insert_claim(conn, aari, closed_year_txn, status="acknowledged", reference="DC1-CY-1",
-                            invoice_data=_json.dumps({"claimable_amount": 55.74}))
+        cid = _insert_claim(
+            conn,
+            aari,
+            closed_year_txn,
+            status="acknowledged",
+            reference="DC1-CY-1",
+            invoice_data=_json.dumps({"claimable_amount": 55.74}),
+        )
     # expected = full claimable (no excess) since the year is closed; paid short of that -> flag
     assert claim_status._validate_settlement(_claim_row(cid), 55.74, closed_year_txn) is None
     flag = claim_status._validate_settlement(_claim_row(cid), 22.75, closed_year_txn)
@@ -1930,30 +2370,46 @@ def test_settlement_anniversary_boundary_fresh_excess_in_new_year():
     excess-consumed check — a new-year sibling still gets a fresh $150 excess."""
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
         anniversary = _anniversary_days_ago(20)  # current year opened 20 days ago
         conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
-        prior_txn = _relative_date(60)   # before the anniversary -> prior, closed year
+        prior_txn = _relative_date(60)  # before the anniversary -> prior, closed year
         current_txn = _relative_date(5)  # after the anniversary -> current year
         first = _insert_claim(conn, aari, prior_txn, status="settled", reference="DC1-BD-1")
         _insert_settled_event(conn, first, datetime.now(timezone.utc).isoformat(), 400.0)
-        second = _insert_claim(conn, aari, current_txn, status="acknowledged", reference="DC1-BD-1",
-                               invoice_data=_json.dumps({"claimable_amount": 500.0}))
+        second = _insert_claim(
+            conn,
+            aari,
+            current_txn,
+            status="acknowledged",
+            reference="DC1-BD-1",
+            invoice_data=_json.dumps({"claimable_amount": 500.0}),
+        )
     flag = claim_status._validate_settlement(_claim_row(second), 300.0, current_txn)
-    assert flag and "fresh $150 excess" in flag, "prior claim's closed-year txn must not count toward this year's excess"
+    assert flag and "fresh $150 excess" in flag, (
+        "prior claim's closed-year txn must not count toward this year's excess"
+    )
 
 
 def test_classify_approved_and_below_excess():
     """Real letters (Jul 2026) both use the generic subject 'Petcover Insurance
     Claim for Ari' — classification must come from the body phrase."""
-    assert claim_status.classify(
-        "Petcover Insurance Claim for Ari", "Your claim has been approved\nWe have assessed the recent claim"
-    ) == "approved"
-    assert claim_status.classify(
-        "Petcover Insurance Claim for Ari",
-        "Claim assessment outcome: Under excess\nWhile it is a claimable condition, the amount you have claimed is under your fixed excess.",
-    ) == "below_excess"
+    assert (
+        claim_status.classify(
+            "Petcover Insurance Claim for Ari",
+            "Your claim has been approved\nWe have assessed the recent claim",
+        )
+        == "approved"
+    )
+    assert (
+        claim_status.classify(
+            "Petcover Insurance Claim for Ari",
+            "Claim assessment outcome: Under excess\nWhile it is a claimable condition, the amount you have claimed is under your fixed excess.",
+        )
+        == "below_excess"
+    )
 
 
 def test_extract_approval_amounts_real_letter_shapes():
@@ -1973,7 +2429,9 @@ def test_extract_approval_amounts_real_letter_shapes():
     sr4_text = "Amount claimed: $55.74\nLess Fixed excess: $105.00\nOther deductibles: $0.00\nOutstanding excess: $-49.26"
     amounts4 = claim_status.extract_approval_amounts(sr4_text)
     assert amounts4["fixed_excess_stated"] == 105.00
-    assert "paid_amount" not in amounts4, "this letter states no payout yet — must not fabricate one"
+    assert "paid_amount" not in amounts4, (
+        "this letter states no payout yet — must not fabricate one"
+    )
 
 
 def test_settlement_mismatch_flags_paid_more_than_expected_too():
@@ -1982,13 +2440,20 @@ def test_settlement_mismatch_flags_paid_more_than_expected_too():
     look (we don't try to explain it, just surface it)."""
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
         anniversary = _anniversary_days_ago(300)
         conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
         txn = _relative_date(100)
-        cid = _insert_claim(conn, aari, txn, status="acknowledged", reference="DC1-OVER-1",
-                            invoice_data=_json.dumps({"claimable_amount": 200.0}))
+        cid = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="acknowledged",
+            reference="DC1-OVER-1",
+            invoice_data=_json.dumps({"claimable_amount": 200.0}),
+        )
     # expected = 200 - 150 = 50; paid way more than expected -> still flagged
     flag = claim_status._validate_settlement(_claim_row(cid), 190.0, txn)
     assert flag and "settlement mismatch" in flag and "$50.00" in flag and "$190.00" in flag
@@ -2002,15 +2467,24 @@ def test_process_reply_approved_validates_and_flags_from_real_shape():
     mismatch against what was actually paid."""
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
         anniversary = _anniversary_days_ago(10)  # current year just opened
         conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
         closed_year_txn = _relative_date(40)
-        cid = _insert_claim(conn, aari, closed_year_txn, status="acknowledged", reference="DC1-APR-1", sr=2,
-                            invoice_data=_json.dumps({"claimable_amount": 55.74}))
+        cid = _insert_claim(
+            conn,
+            aari,
+            closed_year_txn,
+            status="acknowledged",
+            reference="DC1-APR-1",
+            sr=2,
+            invoice_data=_json.dumps({"claimable_amount": 55.74}),
+        )
     claim_status.process_reply(
-        "m-approved-1", "Petcover Insurance Claim for Ari",
+        "m-approved-1",
+        "Petcover Insurance Claim for Ari",
         "Claim Reference:DC1-APR-1 Sr 2\nYour claim has been approved\n"
         "Total amount claimed: $55.74\nPaid by us: $22.75",
     )
@@ -2031,8 +2505,9 @@ def test_reconcile_clears_stale_draft_on_404():
     (confirmed live, claim #17, 10+/day in logs). A 404 specifically means the
     draft is gone for good — clear it and flag for a fresh invoice request,
     distinct from a transient fetch failure (which still retries next tick)."""
-    from openclaw import pipeline
     from googleapiclient.errors import HttpError
+
+    from openclaw import pipeline
 
     db.init_db()
     with db.get_connection() as conn:
@@ -2071,25 +2546,35 @@ def test_reconcile_clears_stale_draft_on_404():
 
 def test_gmail_auth_alert_caps_at_five_per_day():
     from openclaw import pipeline
+
     db.init_db()
     with db.get_connection() as conn:
         conn.execute("DELETE FROM ops_alerts")
     sent = []
     original = pipeline.gmail_client.build_service
-    pipeline.gmail_client.build_service = lambda: (_ for _ in ()).throw(RuntimeError("No Gmail token at x"))
+    pipeline.gmail_client.build_service = lambda: (_ for _ in ()).throw(
+        RuntimeError("No Gmail token at x")
+    )
     try:
-        results = [pipeline._ensure_gmail_auth(send_fn=lambda t, markup=None: sent.append(t)) for _ in range(7)]
+        results = [
+            pipeline._ensure_gmail_auth(send_fn=lambda t, markup=None: sent.append(t))
+            for _ in range(7)
+        ]
     finally:
         pipeline.gmail_client.build_service = original
     assert results == [False] * 7
     assert len(sent) == 5, f"cap is 5/24h, got {len(sent)}"
     assert all("gmail_auth.py" in s for s in sent)
     with db.get_connection() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM ops_alerts WHERE kind='gmail_auth'").fetchone()[0] == 5
+        assert (
+            conn.execute("SELECT COUNT(*) FROM ops_alerts WHERE kind='gmail_auth'").fetchone()[0]
+            == 5
+        )
 
 
 def test_gmail_auth_recovery_confirmed_once_and_resets():
     from openclaw import pipeline
+
     db.init_db()
     with db.get_connection() as conn:
         conn.execute("DELETE FROM ops_alerts")
@@ -2102,8 +2587,8 @@ def test_gmail_auth_recovery_confirmed_once_and_resets():
         pipeline.gmail_client.build_service = fail
         assert pipeline._ensure_gmail_auth(send_fn=spy) is False  # one alert
         pipeline.gmail_client.build_service = ok
-        assert pipeline._ensure_gmail_auth(send_fn=spy) is True   # recovery
-        assert pipeline._ensure_gmail_auth(send_fn=spy) is True   # nothing more
+        assert pipeline._ensure_gmail_auth(send_fn=spy) is True  # recovery
+        assert pipeline._ensure_gmail_auth(send_fn=spy) is True  # nothing more
         assert len([s for s in sent if "restored" in s]) == 1, sent
         # a later failure starts a fresh alert cycle
         sent.clear()
@@ -2116,12 +2601,18 @@ def test_gmail_auth_recovery_confirmed_once_and_resets():
 
 def test_continuation_box_defaults_ticked():
     import inspect
+
     db.init_db()
     with db.get_connection() as conn:
         pet = conn.execute("SELECT * FROM pets WHERE name='Aari'").fetchone()
-    assert claim_forms._shared_fields(pet, True)["claim_continuation_state"] == "/0", "ticked = Yes = /0"
+    assert claim_forms._shared_fields(pet, True)["claim_continuation_state"] == "/0", (
+        "ticked = Yes = /0"
+    )
     assert inspect.signature(claim_forms.process_claim).parameters["continuation"].default is True
-    assert inspect.signature(claim_forms.process_claim_batch).parameters["continuation"].default is True
+    assert (
+        inspect.signature(claim_forms.process_claim_batch).parameters["continuation"].default
+        is True
+    )
 
 
 def _insert_txn(conn, date, amount, merchant="KINGS VET CLINIC"):
@@ -2133,8 +2624,11 @@ def _insert_txn(conn, date, amount, merchant="KINGS VET CLINIC"):
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
-def _insert_ledger_claim(conn, txn_id, pet_id, status, condition=None, claimable=None, item_conditions=None):
+def _insert_ledger_claim(
+    conn, txn_id, pet_id, status, condition=None, claimable=None, item_conditions=None
+):
     import json as _json
+
     now = datetime.now(timezone.utc).isoformat()
     invoice = _json.dumps({"claimable_amount": claimable}) if claimable is not None else None
     ic = _json.dumps(item_conditions) if item_conditions is not None else None
@@ -2303,8 +2797,12 @@ def test_history_rows_windows_by_date_and_flattens_split_charges():
         _insert_ledger_claim(conn, t_stale, aari, "settled", "Injury", 60.0)
 
     rows = claim_status.history_rows()
-    assert [r["date"] for r in rows] == [older, older, in_window], "stale row excluded, oldest-first order"
-    assert {r["pet_name"] for r in rows if r["date"] == older} == {"Aari", "Echo"}, "shared charge yields one row per claim"
+    assert [r["date"] for r in rows] == [older, older, in_window], (
+        "stale row excluded, oldest-first order"
+    )
+    assert {r["pet_name"] for r in rows if r["date"] == older} == {"Aari", "Echo"}, (
+        "shared charge yields one row per claim"
+    )
 
 
 def test_claim_card_totals_split_actual_paid_from_estimate():
@@ -2316,22 +2814,50 @@ def test_claim_card_totals_split_actual_paid_from_estimate():
     from openclaw import claim_card
 
     rows = [
-        {"date": "2026-07-06", "merchant": "V", "amount": -100.0, "status": "settled",
-         "pet_name": "Aari", "condition_text": "Arthritis", "paid": 22.75, "expected": None},
-        {"date": "2026-06-06", "merchant": "V", "amount": -200.0, "status": "sent",
-         "pet_name": "Aari", "condition_text": "Arthritis",
-         "paid": None, "expected": {"available": True, "value": 50.0, "estimate": True}},
-        {"date": "2026-05-06", "merchant": "V", "amount": -60.0, "status": "pending_match",
-         "pet_name": "Aari", "condition_text": None,
-         "paid": None, "expected": {"available": False, "value": None}},
+        {
+            "date": "2026-07-06",
+            "merchant": "V",
+            "amount": -100.0,
+            "status": "settled",
+            "pet_name": "Aari",
+            "condition_text": "Arthritis",
+            "paid": 22.75,
+            "expected": None,
+        },
+        {
+            "date": "2026-06-06",
+            "merchant": "V",
+            "amount": -200.0,
+            "status": "sent",
+            "pet_name": "Aari",
+            "condition_text": "Arthritis",
+            "paid": None,
+            "expected": {"available": True, "value": 50.0, "estimate": True},
+        },
+        {
+            "date": "2026-05-06",
+            "merchant": "V",
+            "amount": -60.0,
+            "status": "pending_match",
+            "pet_name": "Aari",
+            "condition_text": None,
+            "paid": None,
+            "expected": {"available": False, "value": None},
+        },
     ]
     agg = claim_card.totals(rows)
     assert agg["reimbursed"] == 22.75, "only the settled claim's real payment counts"
-    assert agg["outstanding"] == 50.0, "unavailable estimate contributes nothing, settled isn't re-counted"
+    assert agg["outstanding"] == 50.0, (
+        "unavailable estimate contributes nothing, settled isn't re-counted"
+    )
     assert agg["outstanding_is_estimate"] is True
 
     # Nothing estimable at all → no phantom '~$0' estimate marker.
-    assert claim_card.totals(rows[:1]) == {"reimbursed": 22.75, "outstanding": 0.0, "outstanding_is_estimate": False}
+    assert claim_card.totals(rows[:1]) == {
+        "reimbursed": 22.75,
+        "outstanding": 0.0,
+        "outstanding_is_estimate": False,
+    }
 
 
 def test_claim_card_renders_png_for_every_status():
@@ -2341,9 +2867,16 @@ def test_claim_card_renders_png_for_every_status():
     from openclaw import claim_card
 
     rows = [
-        {"date": f"2026-0{(i % 9) + 1}-1{i % 9}", "merchant": "The Shire Veterinary Hospital",
-         "amount": -(50 + i), "status": status, "pet_name": "Aari", "condition_text": "Arthritis",
-         "paid": None, "expected": {"available": True, "value": 10.0, "estimate": True}}
+        {
+            "date": f"2026-0{(i % 9) + 1}-1{i % 9}",
+            "merchant": "The Shire Veterinary Hospital",
+            "amount": -(50 + i),
+            "status": status,
+            "pet_name": "Aari",
+            "condition_text": "Arthritis",
+            "paid": None,
+            "expected": {"available": True, "value": 10.0, "estimate": True},
+        }
         for i, status in enumerate(list(status_labels.LABELS) + ["some_new_status"])
     ]
     png = claim_card.render(rows, page=1, total_rows=len(rows))
@@ -2383,7 +2916,9 @@ def test_pending_actions_one_per_claim_priority_and_blocked_split():
     assert len(actions) == len(by_claim), "one action per claim, never two"
     assert by_claim[both]["kind"] == "assign_pet", "pet is checked before condition"
     assert by_claim[blocked]["kind"] == "blocked_insurer"
-    assert by_claim[blocked]["actionable"] is False, "no button can clear an undefined insurer process"
+    assert by_claim[blocked]["actionable"] is False, (
+        "no button can clear an undefined insurer process"
+    )
     assert by_claim[drafted]["kind"] == "mark_sent"
     assert absorbed not in by_claim, "an absorbed claim is finished, not an action"
     # a claim sitting with Petcover is not Justin's move
@@ -2397,8 +2932,13 @@ def test_a_matched_claim_is_labelled_with_what_it_is_waiting_for():
     permanently blocked on an undefined insurer process, and they read exactly
     like a claim that needed one condition typed in. The label derives from the
     same determination the action list makes — never a second copy of it."""
-    blocked = {"id": 1, "status": "matched", "flag": "Bow Wow Insurance claim process not yet defined",
-               "pet_id": 2, "condition_text": None}
+    blocked = {
+        "id": 1,
+        "status": "matched",
+        "flag": "Bow Wow Insurance claim process not yet defined",
+        "pet_id": 2,
+        "condition_text": None,
+    }
     no_condition = {"id": 2, "status": "matched", "flag": None, "pet_id": 1, "condition_text": None}
     no_pet = {"id": 3, "status": "matched", "flag": None, "pet_id": None, "condition_text": None}
     ready = {"id": 4, "status": "matched", "flag": None, "pet_id": 1, "condition_text": "Arthritis"}
@@ -2417,8 +2957,14 @@ def test_an_information_request_is_worded_by_who_owes_the_document():
     one to the vet with Justin only Cc'd (both live, 2026-07-27). Telling him the
     vet owes it when he does is the mistake that loses a claim, so an unrecorded
     addressee stays neutral instead of guessing."""
-    vet = {"id": 1, "status": "info_requested", "flag": None, "pet_id": 1,
-           "condition_text": "Raised ALT", "owed_by": "vet"}
+    vet = {
+        "id": 1,
+        "status": "info_requested",
+        "flag": None,
+        "pet_id": 1,
+        "condition_text": "Raised ALT",
+        "owed_by": "vet",
+    }
     mine = {**vet, "owed_by": "justin"}
     unknown = {**vet, "owed_by": None}
 
@@ -2426,29 +2972,53 @@ def test_an_information_request_is_worded_by_who_owes_the_document():
     assert status_labels.label(mine) == "Petcover needs info from you"
     assert status_labels.label(unknown) == "Info requested", "no claim about who must act"
     # the word "suspended" belongs to an actual suspension and nothing else
-    assert "suspend" not in " ".join(
-        status_labels.label(c).lower() for c in (vet, mine, unknown)
-    )
+    assert "suspend" not in " ".join(status_labels.label(c).lower() for c in (vet, mine, unknown))
     assert status_labels.label({**vet, "status": "suspended"}) == "Suspended"
 
 
 def test_the_label_names_the_document_petcover_asked_for():
-    """"More vet info required" cannot be acted on; "consult notes needed" can.
+    """ "More vet info required" cannot be acted on; "consult notes needed" can.
     The document says WHAT, `owed_by` says WHO, and both matter — a request naming
     the document but not the party invites the wrong chase, so an unrecorded owner
     stays neutral whatever was asked for."""
-    base = {"id": 1, "status": "info_requested", "flag": None, "pet_id": 1, "condition_text": "Raised ALT"}
-    vet_doc = {**base, "owed_by": "vet", "requested_document": "Consultation notes dated 18/05/2026"}
-    mine_doc = {**base, "owed_by": "justin", "requested_document": "Consultation notes dated 18/05/2026"}
+    base = {
+        "id": 1,
+        "status": "info_requested",
+        "flag": None,
+        "pet_id": 1,
+        "condition_text": "Raised ALT",
+    }
+    vet_doc = {
+        **base,
+        "owed_by": "vet",
+        "requested_document": "Consultation notes dated 18/05/2026",
+    }
+    mine_doc = {
+        **base,
+        "owed_by": "justin",
+        "requested_document": "Consultation notes dated 18/05/2026",
+    }
 
     assert status_labels.label(vet_doc) == "Vet: consult notes needed"
     assert status_labels.label(mine_doc) == "Consult notes needed from you"
     # No document, or a kind we don't recognise: exactly the wording it had before.
-    assert status_labels.label({**base, "owed_by": "vet", "requested_document": None}) == "More vet info required"
-    assert status_labels.label({**base, "owed_by": "vet", "requested_document": "a signed affidavit"}) == "More vet info required"
-    assert status_labels.label({**base, "owed_by": "justin", "requested_document": None}) == "Petcover needs info from you"
+    assert (
+        status_labels.label({**base, "owed_by": "vet", "requested_document": None})
+        == "More vet info required"
+    )
+    assert (
+        status_labels.label({**base, "owed_by": "vet", "requested_document": "a signed affidavit"})
+        == "More vet info required"
+    )
+    assert (
+        status_labels.label({**base, "owed_by": "justin", "requested_document": None})
+        == "Petcover needs info from you"
+    )
     # Owner unrecorded stays neutral even with a document named.
-    assert status_labels.label({**base, "owed_by": None, "requested_document": "Consultation notes"}) == "Info requested"
+    assert (
+        status_labels.label({**base, "owed_by": None, "requested_document": "Consultation notes"})
+        == "Info requested"
+    )
     # The chase line names the document too, and it is an action not a state.
     assert status_labels.needs(vet_doc) == "Chase vet for consult notes"
     assert status_labels.needs(mine_doc) == "Send Petcover the consult notes"
@@ -2460,7 +3030,9 @@ def test_short_document_recognises_the_kinds_seen_live():
     assert status_labels.short_document("Consultation notes dated 18/05/2026") == "consult notes"
     assert status_labels.short_document("Itemized invoice for the visit") == "itemised invoice"
     assert status_labels.short_document("Completed claim form") == "claim form"
-    assert status_labels.short_document("Referral history from the treating vet") == "referral history"
+    assert (
+        status_labels.short_document("Referral history from the treating vet") == "referral history"
+    )
     assert status_labels.short_document("something nobody has sent before") is None
     assert status_labels.short_document(None) is None
 
@@ -2486,11 +3058,15 @@ def test_one_status_vocabulary_no_second_map():
     from pathlib import Path as _Path
 
     leaks = []
-    for path in sorted((_Path(__file__).resolve().parent.parent / "openclaw" / "templates").glob("*.html")):
+    for path in sorted(
+        (_Path(__file__).resolve().parent.parent / "openclaw" / "templates").glob("*.html")
+    ):
         text = path.read_text(encoding="utf-8")
         for status, word in status_labels.LABELS.items():
             for match in _re.finditer(r">\s*" + _re.escape(word) + r"\s*<", text):
-                leaks.append(f"{path.name}:{text[:match.start()].count(chr(10)) + 1} hardcodes {word!r} ({status})")
+                leaks.append(
+                    f"{path.name}:{text[: match.start()].count(chr(10)) + 1} hardcodes {word!r} ({status})"
+                )
     assert not leaks, "templates must render wording, not restate it: " + "; ".join(leaks)
 
     # Jinja renders an unregistered global as the empty string rather than raising,
@@ -2501,8 +3077,12 @@ def test_one_status_vocabulary_no_second_map():
     main_source = (package / "main.py").read_text(encoding="utf-8")
     assert 'templates.env.globals["status_words"] = status_labels.LABELS' in main_source
     for path in sorted((package / "templates").glob("*.html")):
-        for key in _re.findall(r"status_words\[['\"]([a-z_]+)['\"]\]", path.read_text(encoding="utf-8")):
-            assert key in status_labels.LABELS, f"{path.name} asks for status_words[{key!r}], which has no wording"
+        for key in _re.findall(
+            r"status_words\[['\"]([a-z_]+)['\"]\]", path.read_text(encoding="utf-8")
+        ):
+            assert key in status_labels.LABELS, (
+                f"{path.name} asks for status_words[{key!r}], which has no wording"
+            )
 
 
 def test_submission_group_id_is_order_independent():
@@ -2541,7 +3121,9 @@ def test_batched_mark_sent_is_one_action_per_submission():
     assert batch["group_id"] == claim_status.submission_group_id([a, b])
     assert batch["claim_id"] == min(a, b), "representative = lowest id (the tap token takes one)"
     assert abs(batch["amount"]) == 484.0, "the total is what Justin is confirming he sent"
-    assert batch["date"] == "2026-04-17", "urgency comes from the oldest member — expiry is per visit"
+    assert batch["date"] == "2026-04-17", (
+        "urgency comes from the oldest member — expiry is per visit"
+    )
     assert [m["condition_text"] for m in batch["members"]] == ["Arthritis", "Raised ALT"]
 
     lone = next(x for x in sends if len(x["claim_ids"]) == 1)
@@ -2571,7 +3153,9 @@ def test_only_submission_level_actions_collapse():
 
     assert claim_status.SUBMISSION_LEVEL_ACTIONS == ("mark_sent",)
     mismatches = [a for a in claim_status.pending_actions() if a["kind"] == "dismiss_mismatch"]
-    assert sorted(a["claim_id"] for a in mismatches) == sorted(ids), "one entry per claim, not per draft"
+    assert sorted(a["claim_id"] for a in mismatches) == sorted(ids), (
+        "one entry per claim, not per draft"
+    )
 
 
 def test_dismiss_mismatch_clears_flag_and_records_why():
@@ -2601,7 +3185,9 @@ def test_dismiss_mismatch_clears_flag_and_records_why():
             (claim_id,),
         ).fetchone()
     assert flag is None
-    assert "settlement mismatch" in _json.loads(event["detail"])["dismissed_flag"], "keeps what was dismissed"
+    assert "settlement mismatch" in _json.loads(event["detail"])["dismissed_flag"], (
+        "keeps what was dismissed"
+    )
     # idempotent: a second tap can't fabricate another dismissal
     assert claim_status.dismiss_mismatch(claim_id)["ok"] is False
 
@@ -2629,13 +3215,16 @@ def test_agent_summary_carries_claim_id_and_never_invents_a_pet():
     # passing off the unrelated "cannot read OpenClaw's code" line once the
     # mailbox rule was reworded — the assertion has to name what it guards.
     lowered = prompt.lower()
-    assert "cannot browse, search, or read justin's mailbox" in lowered, \
+    assert "cannot browse, search, or read justin's mailbox" in lowered, (
         "must state the mailbox limit rather than imply access"
+    )
 
     impls = agent._build_impls([])
     rejection = impls["propose_assign_pet"]("Whiskers")
     assert "No pet named" in rejection, "a made-up pet must be refused, not assigned"
-    assert "Aari" in rejection and "Echo" in rejection, "and the real pets offered, so it can't guess again"
+    assert "Aari" in rejection and "Echo" in rejection, (
+        "and the real pets offered, so it can't guess again"
+    )
     # the actions answer must reach the drafted claim that was silently omitted
     assert f"#{claim_id}" in impls["pending_actions"]()
 
@@ -2689,8 +3278,12 @@ def test_agent_rematch_sweep_is_scoped_and_idempotent():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        wanted = _insert_claim(conn, aari, "2026-07-01", status="pending_match", merchant="BONDI VET")
-        other_vet = _insert_claim(conn, aari, "2026-07-02", status="pending_match", merchant="OTHER VET")
+        wanted = _insert_claim(
+            conn, aari, "2026-07-01", status="pending_match", merchant="BONDI VET"
+        )
+        other_vet = _insert_claim(
+            conn, aari, "2026-07-02", status="pending_match", merchant="OTHER VET"
+        )
         already = _insert_claim(conn, aari, "2026-07-03", status="drafted", merchant="BONDI VET")
 
     seen = []
@@ -2731,10 +3324,15 @@ def test_agent_poll_petcover_now_reports_scope_not_absence():
         impls = agent._build_impls([])
         quiet = impls["poll_petcover_now"]()
         assert "NEW" in quiet, "must scope the claim to new mail"
-        assert "does not mean" in quiet, \
+        assert "does not mean" in quiet, (
             "must explicitly disclaim the stronger reading, not just avoid stating it"
+        )
 
-        pipeline.poll_petcover_status = lambda: {"checked": 2, "events": 3, "claims_changed": [18, 21]}
+        pipeline.poll_petcover_status = lambda: {
+            "checked": 2,
+            "events": 3,
+            "claims_changed": [18, 21],
+        }
         busy = impls["poll_petcover_now"]()
         assert "#18" in busy and "#21" in busy, "changed claims are named by id"
 
@@ -2773,8 +3371,12 @@ def test_submissions_awaiting_reply_groups_by_submission():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        a = _insert_claim(conn, aari, "2026-07-01", status="sent", draft_id="draft-1", reference="DC1-1")
-        b = _insert_claim(conn, aari, "2026-07-02", status="sent", draft_id="draft-1", reference="DC1-1")
+        a = _insert_claim(
+            conn, aari, "2026-07-01", status="sent", draft_id="draft-1", reference="DC1-1"
+        )
+        b = _insert_claim(
+            conn, aari, "2026-07-02", status="sent", draft_id="draft-1", reference="DC1-1"
+        )
         solo = _insert_claim(conn, aari, "2026-07-03", status="acknowledged", draft_id="draft-2")
         no_draft = _insert_claim(conn, aari, "2026-07-04", status="drafted")
         settled = _insert_claim(conn, aari, "2026-07-05", status="settled", draft_id="draft-3")
@@ -2783,7 +3385,9 @@ def test_submissions_awaiting_reply_groups_by_submission():
     rows = claim_status.submissions_awaiting_reply()
     by_ids = {tuple(r["claim_ids"]): r for r in rows}
     assert (a, b) in by_ids, f"the batch is one entry, got {[r['claim_ids'] for r in rows]}"
-    assert all(settled not in r["claim_ids"] for r in rows), "a settled submission isn't awaiting anything"
+    assert all(settled not in r["claim_ids"] for r in rows), (
+        "a settled submission isn't awaiting anything"
+    )
 
     assert by_ids[(a, b)]["last_event"] is None, "no reply recorded for the batch"
     assert by_ids[(solo,)]["last_event"] == "settled", "the newest event is reported"
@@ -2793,6 +3397,7 @@ def test_submissions_awaiting_reply_groups_by_submission():
     assert all(r["days_waiting"] >= 0 for r in rows)
 
     from openclaw import agent
+
     text = agent._build_impls([])["submissions_awaiting_reply"]()
     assert f"#{a}" in text and f"#{b}" in text and "NO reply recorded" in text
 
@@ -2806,25 +3411,48 @@ def test_claim_detail_explains_why_with_recorded_figures():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        invoice = _json.dumps({
-            "invoice_number": "INV-9",
-            "amount": 55.74,
-            "claimable_amount": 44.75,
-            "items": [{"description": "Consultation", "amount": 44.75},
-                      {"description": "Food", "amount": 10.99}],
-        })
-        claim = _insert_claim(conn, aari, "2025-09-26", status="approved", reference="DC1-27-5628",
-                              sr=4, condition="Arthritis", invoice_data=invoice)
-        conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?",
-                     ("settlement mismatch — we expected $44.75, Petcover paid $22.75 — review", claim))
+        invoice = _json.dumps(
+            {
+                "invoice_number": "INV-9",
+                "amount": 55.74,
+                "claimable_amount": 44.75,
+                "items": [
+                    {"description": "Consultation", "amount": 44.75},
+                    {"description": "Food", "amount": 10.99},
+                ],
+            }
+        )
+        claim = _insert_claim(
+            conn,
+            aari,
+            "2025-09-26",
+            status="approved",
+            reference="DC1-27-5628",
+            sr=4,
+            condition="Arthritis",
+            invoice_data=invoice,
+        )
+        conn.execute(
+            "UPDATE vet_claims SET flag = ? WHERE id = ?",
+            ("settlement mismatch — we expected $44.75, Petcover paid $22.75 — review", claim),
+        )
         conn.execute(
             "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
             "VALUES (?, 'approved', 'mail-1', ?, ?)",
-            (claim, _json.dumps({"subject": "Claim Approval", "claimed_amount": 35.0,
-                                 "paid_amount": 22.75, "fixed_excess_stated": 0.0,
-                                 "age_contribution_stated": 12.25,
-                                 "body": "a long body that must not reach the chat turn"}),
-             datetime.now(timezone.utc).isoformat()),
+            (
+                claim,
+                _json.dumps(
+                    {
+                        "subject": "Claim Approval",
+                        "claimed_amount": 35.0,
+                        "paid_amount": 22.75,
+                        "fixed_excess_stated": 0.0,
+                        "age_contribution_stated": 12.25,
+                        "body": "a long body that must not reach the chat turn",
+                    }
+                ),
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
 
     detail = claim_status.claim_detail(claim)
@@ -2836,6 +3464,7 @@ def test_claim_detail_explains_why_with_recorded_figures():
     assert claim_status.claim_detail(999999) is None
 
     from openclaw import agent
+
     text = agent._build_impls([])["claim_detail"](claim)
     assert "settlement mismatch" in text, "the flag is the answer to 'why'"
     assert "22.75" in text and "Consultation" in text
@@ -2870,6 +3499,7 @@ def test_agent_task_proposals_write_nothing_until_confirmed():
     # The tap is what writes. tasks.create_task spends an LLM call on the
     # follow-up date, which the hermetic suite must not make — stub just that.
     from openclaw import tasks as tasks_module
+
     original = tasks_module._extract_follow_up
     tasks_module._extract_follow_up = lambda description: None
     try:
@@ -2886,11 +3516,15 @@ def test_agent_task_proposals_write_nothing_until_confirmed():
         assert "No task #999999" in impls["propose_close_task"](999999, "done")
         impls["propose_close_task"](task_id, "spoke to him, quote arriving Friday")
         with db.get_connection() as conn:
-            assert conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] == "open", \
-                "still open until the tap"
+            assert (
+                conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+                == "open"
+            ), "still open until the tap"
         telegram_bot._execute_action(proposals[-1])
         with db.get_connection() as conn:
-            row = conn.execute("SELECT status, outcome FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            row = conn.execute(
+                "SELECT status, outcome FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
         assert row["status"] == "closed" and "Friday" in row["outcome"]
         assert "already closed" in impls["propose_close_task"](task_id, "again")
     finally:
@@ -2917,7 +3551,9 @@ def test_chat_answer_names_every_claim_in_a_batch():
 
     answer = agent._build_impls([])["pending_actions"]()
     for claim_id in ids:
-        assert f"#{claim_id}" in answer, f"#{claim_id} missing — a dropped id is an unactionable answer"
+        assert f"#{claim_id}" in answer, (
+            f"#{claim_id} missing — a dropped id is an unactionable answer"
+        )
     assert claim_status.submission_group_id(ids) in answer
 
 
@@ -2946,7 +3582,9 @@ def test_agent_prompt_narrows_mailbox_rule_without_dropping_it():
     assert "never imply you did" in prompt
     for sweep in ("reconcile_sent_invoice_requests", "rematch_claims", "poll_petcover_now"):
         assert sweep in prompt, f"{sweep} must be named as an allowed, specific check"
-    assert "does not mean petcover has never replied" not in prompt  # that wording lives in the tool
+    assert (
+        "does not mean petcover has never replied" not in prompt
+    )  # that wording lives in the tool
     assert "nothing new" in prompt, "the new-mail-only limit is stated"
     assert "cannot read openclaw's code" in prompt, "no code/spec reading in the container"
 
@@ -2954,22 +3592,38 @@ def test_agent_prompt_narrows_mailbox_rule_without_dropping_it():
 _shared_invoice_charges = 0
 
 
-_AARI_INVOICE = {"invoice_number": "SHV49c1622284e5", "date": "2026-06-19", "patient": "Aari",
-                 "amount": 35.0, "items": [{"description": "Prescription fee", "amount": 35.0}]}
-_ECHO_INVOICE = {"invoice_number": "SHVd5b232905fdb", "date": "2026-06-30", "patient": "Echo",
-                 "amount": 369.33, "items": [{"description": "CLINDAMYCIN 150MG CAPSULES", "amount": 206.12},
-                                             {"description": "ENROFLOXACIN 150MG TABLETS", "amount": 163.21}]}
+_AARI_INVOICE = {
+    "invoice_number": "SHV49c1622284e5",
+    "date": "2026-06-19",
+    "patient": "Aari",
+    "amount": 35.0,
+    "items": [{"description": "Prescription fee", "amount": 35.0}],
+}
+_ECHO_INVOICE = {
+    "invoice_number": "SHVd5b232905fdb",
+    "date": "2026-06-30",
+    "patient": "Echo",
+    "amount": 369.33,
+    "items": [
+        {"description": "CLINDAMYCIN 150MG CAPSULES", "amount": 206.12},
+        {"description": "ENROFLOXACIN 150MG TABLETS", "amount": 163.21},
+    ],
+}
 # The receipts' own wording. Both visits are weeks before the 6 Jul charge, so
 # only the payment line makes them matchable at all.
-_AARI_RECEIPT_TEXT = ("TAX INVOICE - RECEIPT 19 Jun 2026 # SHV49c1622284e5\n"
-                      "Aari 19 Jun 2026 Prescription fee 1.00 $0.00 $31.82 $35.00\n"
-                      "TOTAL $35.00\nThe following payments have been received with thanks\n"
-                      "Paid Date Payment Method Payment\n06/07/2026 Credit Card $35.00")
-_ECHO_RECEIPT_TEXT = ("TAX INVOICE - RECEIPT 30 Jun 2026 # SHVd5b232905fdb\n"
-                      "Echo 30 Jun 2026 CLINDAMYCIN 150MG CAPSULES 28.00 $206.12\n"
-                      "Echo 30 Jun 2026 ENROFLOXACIN 150MG TABLETS 11.00 $163.21\n"
-                      "TOTAL $369.33\nThe following payments have been received with thanks\n"
-                      "Paid Date Payment Method Payment\n06/07/2026 Credit Card $369.33")
+_AARI_RECEIPT_TEXT = (
+    "TAX INVOICE - RECEIPT 19 Jun 2026 # SHV49c1622284e5\n"
+    "Aari 19 Jun 2026 Prescription fee 1.00 $0.00 $31.82 $35.00\n"
+    "TOTAL $35.00\nThe following payments have been received with thanks\n"
+    "Paid Date Payment Method Payment\n06/07/2026 Credit Card $35.00"
+)
+_ECHO_RECEIPT_TEXT = (
+    "TAX INVOICE - RECEIPT 30 Jun 2026 # SHVd5b232905fdb\n"
+    "Echo 30 Jun 2026 CLINDAMYCIN 150MG CAPSULES 28.00 $206.12\n"
+    "Echo 30 Jun 2026 ENROFLOXACIN 150MG TABLETS 11.00 $163.21\n"
+    "TOTAL $369.33\nThe following payments have been received with thanks\n"
+    "Paid Date Payment Method Payment\n06/07/2026 Credit Card $369.33"
+)
 
 
 def test_a_receipt_paid_on_the_charge_date_is_matchable_though_the_visit_is_older():
@@ -2983,7 +3637,9 @@ def test_a_receipt_paid_on_the_charge_date_is_matchable_though_the_visit_is_olde
 
     txn_date = _date(2026, 7, 6)
     assert config.INVOICE_MATCH_WINDOW_DAYS == 3, "this test exists because the window is tight"
-    assert not invoice_matching._invoice_date_plausible(_AARI_INVOICE, txn_date), "17 days out on service date"
+    assert not invoice_matching._invoice_date_plausible(_AARI_INVOICE, txn_date), (
+        "17 days out on service date"
+    )
     assert invoice_matching._paid_on_charge_date(_AARI_RECEIPT_TEXT, _AARI_INVOICE, txn_date)
     assert invoice_matching._paid_on_charge_date(_ECHO_RECEIPT_TEXT, _ECHO_INVOICE, txn_date)
 
@@ -2992,12 +3648,18 @@ def test_a_receipt_paid_on_the_charge_date_is_matchable_though_the_visit_is_olde
     assert not invoice_matching._paid_on_charge_date(
         "06/07/2026 Credit Card $999.00\nsome other invoice $35.00", _AARI_INVOICE, txn_date
     ), "the date and THIS invoice's amount have to be the same payment line"
-    assert not invoice_matching._paid_on_charge_date(_AARI_RECEIPT_TEXT, _AARI_INVOICE, _date(2026, 7, 7))
+    assert not invoice_matching._paid_on_charge_date(
+        _AARI_RECEIPT_TEXT, _AARI_INVOICE, _date(2026, 7, 7)
+    )
     assert not invoice_matching._paid_on_charge_date("", _AARI_INVOICE, txn_date)
 
     # And it reaches the picker: the receipt is chosen where the window alone refuses.
-    assert invoice_matching._pick_invoice([_AARI_INVOICE], -35.0, txn_date) is None, "window-only: refused"
-    picked = invoice_matching._pick_invoice([_AARI_INVOICE], -35.0, txn_date, text=_AARI_RECEIPT_TEXT)
+    assert invoice_matching._pick_invoice([_AARI_INVOICE], -35.0, txn_date) is None, (
+        "window-only: refused"
+    )
+    picked = invoice_matching._pick_invoice(
+        [_AARI_INVOICE], -35.0, txn_date, text=_AARI_RECEIPT_TEXT
+    )
     assert picked and picked["invoice_number"] == "SHV49c1622284e5"
 
 
@@ -3015,7 +3677,10 @@ def test_one_charge_two_invoices_two_pets_is_apportioned_automatically():
     claim = _matched_row(claim_id)
 
     chosen = {"email_id": "em-aari", "invoice": {**_AARI_INVOICE}, "text": _AARI_RECEIPT_TEXT}
-    pool = [chosen, {"email_id": "em-echo", "invoice": {**_ECHO_INVOICE}, "text": _ECHO_RECEIPT_TEXT}]
+    pool = [
+        chosen,
+        {"email_id": "em-echo", "invoice": {**_ECHO_INVOICE}, "text": _ECHO_RECEIPT_TEXT},
+    ]
 
     assert invoice_matching._apply_match(claim, chosen, pool) is True
     rows = sorted(
@@ -3026,8 +3691,13 @@ def test_one_charge_two_invoices_two_pets_is_apportioned_automatically():
     assert kept["id"] == claim_id and kept["pet_id"] == 1, kept
     assert sibling["pet_id"] == 2, "the pet comes off each invoice's printed patient field"
     assert sibling["matched_email_id"] == "em-echo", "each claim carries its OWN invoice email"
-    assert kept["flag"] is None, f"nothing is unexplained once both invoices are known: {kept['flag']}"
-    kept_invoice, sibling_invoice = _json.loads(kept["invoice_data"]), _json.loads(sibling["invoice_data"])
+    assert kept["flag"] is None, (
+        f"nothing is unexplained once both invoices are known: {kept['flag']}"
+    )
+    kept_invoice, sibling_invoice = (
+        _json.loads(kept["invoice_data"]),
+        _json.loads(sibling["invoice_data"]),
+    )
     assert kept_invoice["invoice_number"] == "SHV49c1622284e5"
     assert sibling_invoice["invoice_number"] == "SHVd5b232905fdb"
     assert (kept_invoice["claimable_amount"], sibling_invoice["claimable_amount"]) == (35.0, 369.33)
@@ -3056,31 +3726,91 @@ def test_complement_search_refuses_anything_it_cannot_prove():
     assert complement([{"email_id": "e", "invoice": echo, "text": _ECHO_RECEIPT_TEXT}]) is not None
 
     # Doesn't close the gap.
-    assert complement([{"email_id": "e", "invoice": {**echo, "amount": 100.0,
-                                                    "invoice_number": "X1", "date": "2026-07-06"}, "text": ""}]) is None
+    assert (
+        complement(
+            [
+                {
+                    "email_id": "e",
+                    "invoice": {
+                        **echo,
+                        "amount": 100.0,
+                        "invoice_number": "X1",
+                        "date": "2026-07-06",
+                    },
+                    "text": "",
+                }
+            ]
+        )
+        is None
+    )
     # Together they exceed the charge.
-    assert complement([{"email_id": "e", "invoice": {**echo, "amount": 400.0,
-                                                     "invoice_number": "X2", "date": "2026-07-06"}, "text": ""}]) is None
+    assert (
+        complement(
+            [
+                {
+                    "email_id": "e",
+                    "invoice": {
+                        **echo,
+                        "amount": 400.0,
+                        "invoice_number": "X2",
+                        "date": "2026-07-06",
+                    },
+                    "text": "",
+                }
+            ]
+        )
+        is None
+    )
     # Right amount, wrong visit — outside the date window.
-    assert complement([{"email_id": "e", "invoice": {**echo, "date": "2025-06-30",
-                                                     "invoice_number": "X3"}, "text": ""}]) is None
+    assert (
+        complement(
+            [
+                {
+                    "email_id": "e",
+                    "invoice": {**echo, "date": "2025-06-30", "invoice_number": "X3"},
+                    "text": "",
+                }
+            ]
+        )
+        is None
+    )
     # Two candidates would both close it: which one the charge paid is unknowable.
-    assert complement([
-        {"email_id": "e1", "invoice": echo, "text": _ECHO_RECEIPT_TEXT},
-        {"email_id": "e2", "invoice": {**echo, "invoice_number": "X4"}, "text": _ECHO_RECEIPT_TEXT},
-    ]) is None
+    assert (
+        complement(
+            [
+                {"email_id": "e1", "invoice": echo, "text": _ECHO_RECEIPT_TEXT},
+                {
+                    "email_id": "e2",
+                    "invoice": {**echo, "invoice_number": "X4"},
+                    "text": _ECHO_RECEIPT_TEXT,
+                },
+            ]
+        )
+        is None
+    )
     # The same invoice seen twice is not a complement.
-    assert complement([{"email_id": "e-dup", "invoice": {**aari}, "text": _AARI_RECEIPT_TEXT}]) is None
+    assert (
+        complement([{"email_id": "e-dup", "invoice": {**aari}, "text": _AARI_RECEIPT_TEXT}]) is None
+    )
     # Nothing left to explain (invoice covers the charge bar a surcharge).
     covered = {"email_id": "em", "invoice": {**aari, "amount": 404.33}, "text": ""}
-    assert invoice_matching._complement_for(
-        covered, [covered, {"email_id": "e", "invoice": echo, "text": _ECHO_RECEIPT_TEXT}],
-        charge, txn_date, 999999) is None
+    assert (
+        invoice_matching._complement_for(
+            covered,
+            [covered, {"email_id": "e", "invoice": echo, "text": _ECHO_RECEIPT_TEXT}],
+            charge,
+            txn_date,
+            999999,
+        )
+        is None
+    )
 
 
 def _claims_on_transaction(txn_id):
     with db.get_connection() as conn:
-        return conn.execute("SELECT * FROM vet_claims WHERE transaction_id = ?", (txn_id,)).fetchall()
+        return conn.execute(
+            "SELECT * FROM vet_claims WHERE transaction_id = ?", (txn_id,)
+        ).fetchall()
 
 
 def _shared_invoice_claim(claimable=407.56, status="matched"):
@@ -3090,20 +3820,36 @@ def _shared_invoice_claim(claimable=407.56, status="matched"):
     import json as _json
 
     global _shared_invoice_charges
-    txn_date = (date.fromisoformat("2026-07-06") - timedelta(days=_shared_invoice_charges)).isoformat()
+    txn_date = (
+        date.fromisoformat("2026-07-06") - timedelta(days=_shared_invoice_charges)
+    ).isoformat()
     _shared_invoice_charges += 1
     now = datetime.now(timezone.utc).isoformat()
     with db.get_connection() as conn:
-        conn.execute("INSERT INTO bank_transactions (date, amount, merchant, vet_flag, created_at) "
-                     "VALUES (?, ?, ?, 1, ?)",
-                     (txn_date, -407.56, "THE SHIRE VETERINARY CARINGBAH NSW", now))
+        conn.execute(
+            "INSERT INTO bank_transactions (date, amount, merchant, vet_flag, created_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (txn_date, -407.56, "THE SHIRE VETERINARY CARINGBAH NSW", now),
+        )
         txn_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute(
             "INSERT INTO vet_claims (transaction_id, pet_id, status, matched_email_id, invoice_data, "
             "created_at, updated_at) VALUES (?, NULL, ?, 'em-shire', ?, ?, ?)",
-            (txn_id, status, _json.dumps({"date": "2026-07-06", "amount": 407.56, "items": [],
-                                          "claimable_amount": claimable, "invoice_number": "INV-9"}),
-             now, now),
+            (
+                txn_id,
+                status,
+                _json.dumps(
+                    {
+                        "date": "2026-07-06",
+                        "amount": 407.56,
+                        "items": [],
+                        "claimable_amount": claimable,
+                        "invoice_number": "INV-9",
+                    }
+                ),
+                now,
+                now,
+            ),
         )
         return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -3126,7 +3872,9 @@ def test_one_invoice_splits_between_two_pets_each_carrying_its_own_share():
     assert result["ok"], result
     aari, echo = result["claims"]
     assert (aari["pet_name"], aari["amount"]) == ("Aari", 35.0), result
-    assert (echo["pet_name"], echo["amount"]) == ("Echo", 372.56), "the remainder is derived, not guessed"
+    assert (echo["pet_name"], echo["amount"]) == ("Echo", 372.56), (
+        "the remainder is derived, not guessed"
+    )
     assert result["unapportioned"] == 0.0
 
     kept, sibling = _claim_row(claim_id), _claim_row(echo["claim_id"])
@@ -3136,9 +3884,13 @@ def test_one_invoice_splits_between_two_pets_each_carrying_its_own_share():
     for row, share in ((kept, 35.0), (sibling, 372.56)):
         invoice = _json.loads(row["invoice_data"])
         assert invoice["claimable_amount"] == share, invoice
-        assert invoice["amount"] == 407.56 and invoice["invoice_number"] == "INV-9", "invoice untouched"
+        assert invoice["amount"] == 407.56 and invoice["invoice_number"] == "INV-9", (
+            "invoice untouched"
+        )
         assert f"#{echo['claim_id']} Echo $372.56" in invoice["split_note"], invoice["split_note"]
-    assert sibling["condition_text"] is None, "the other pet's condition is never copied — that's a guess"
+    assert sibling["condition_text"] is None, (
+        "the other pet's condition is never copied — that's a guess"
+    )
 
     # Echo is with Bow Wow, whose process isn't on file: her share is recorded and
     # visible, never dropped for lack of a claim process.
@@ -3153,7 +3905,9 @@ def test_split_guards_refuse_rather_than_guess_or_over_claim():
 
     over = claim_forms.split_between_pets(_shared_invoice_claim(), [(1, 400.0), (2, 100.0)])
     assert not over["ok"] and "ceiling" in over["message"], over
-    assert "$500.00" in over["message"] and "$407.56" in over["message"], "both figures, so it's checkable"
+    assert "$500.00" in over["message"] and "$407.56" in over["message"], (
+        "both figures, so it's checkable"
+    )
 
     two_unknowns = claim_forms.split_between_pets(_shared_invoice_claim(), [(1, None), (2, None)])
     assert not two_unknowns["ok"] and "Only one share" in two_unknowns["message"], two_unknowns
@@ -3164,12 +3918,15 @@ def test_split_guards_refuse_rather_than_guess_or_over_claim():
     dupe = claim_forms.split_between_pets(_shared_invoice_claim(), [(1, 35.0), (1, 100.0)])
     assert not dupe["ok"] and "twice" in dupe["message"], dupe
 
-    already_sent = claim_forms.split_between_pets(_shared_invoice_claim(status="sent"), [(1, 35.0), (2, None)])
+    already_sent = claim_forms.split_between_pets(
+        _shared_invoice_claim(status="sent"), [(1, 35.0), (2, None)]
+    )
     assert not already_sent["ok"], already_sent
     assert "already with the insurer" in already_sent["message"], already_sent["message"]
 
-    unmatched = claim_forms.split_between_pets(_shared_invoice_claim(status="pending_match"),
-                                               [(1, 35.0), (2, None)])
+    unmatched = claim_forms.split_between_pets(
+        _shared_invoice_claim(status="pending_match"), [(1, 35.0), (2, None)]
+    )
     assert not unmatched["ok"] and "no invoice matched yet" in unmatched["message"], unmatched
 
     # Shares that fall short still split, but the gap is flagged — a quietly
@@ -3202,19 +3959,25 @@ def test_the_split_conversation_that_failed_live_now_reaches_one_proposal():
         captured["tool_result"] = tool_impls["propose_split_between_pets"](
             claim_id=claim_id, pets_and_amounts=[{"pet": "Aari", "amount": 35}, {"pet": "Echo"}]
         )
-        return {"text": "Aari $35.00, Echo $372.56 — tap Confirm.", "model": "llama-3.3-70b-versatile"}
+        return {
+            "text": "Aari $35.00, Echo $372.56 — tap Confirm.",
+            "model": "llama-3.3-70b-versatile",
+        }
 
     original_chat = agent.llm.chat
     try:
         agent.llm.chat = _fake_chat
         reply, proposal = agent.handle_message(
             "This is actually split between echo and Aari. Aari cost was $35 out of this",
-            chat_id=None, claim_id=claim_id,
+            chat_id=None,
+            claim_id=claim_id,
         )
     finally:
         agent.llm.chat = original_chat
 
-    assert "propose_split_between_pets" in captured["tool_names"], "the tool has to exist to be reachable"
+    assert "propose_split_between_pets" in captured["tool_names"], (
+        "the tool has to exist to be reachable"
+    )
     assert any(f"claim #{claim_id}" in line for line in captured["context"]), captured["context"]
     assert "Proposed" in captured["tool_result"] and "$35.00" in captured["tool_result"], captured
     assert proposal and proposal["action"] == "split_pets", proposal
@@ -3252,7 +4015,9 @@ def test_assigning_one_pet_is_refused_when_the_message_names_two():
     single = agent._build_impls(proposals, user_text="that one is Aari's")
     assert "Proposed" in single["propose_assign_pet"](pet_name="Aari", claim_id=claim_id)
     assert proposals and proposals[-1]["action"] == "assign_pet", proposals
-    assert agent._pets_named_in("the vet echoed the diagnosis") == [], "word-boundary, not substring"
+    assert agent._pets_named_in("the vet echoed the diagnosis") == [], (
+        "word-boundary, not substring"
+    )
 
 
 def test_split_proposal_is_refused_before_the_tap_when_it_cannot_work():
@@ -3266,7 +4031,8 @@ def test_split_proposal_is_refused_before_the_tap_when_it_cannot_work():
     impls = agent._build_impls(proposals)
 
     over = impls["propose_split_between_pets"](
-        claim_id=claim_id, pets_and_amounts=[{"pet": "Aari", "amount": 400}, {"pet": "Echo", "amount": 100}]
+        claim_id=claim_id,
+        pets_and_amounts=[{"pet": "Aari", "amount": 400}, {"pet": "Echo", "amount": 100}],
     )
     assert "ceiling" in over and not proposals, over
 
@@ -3310,15 +4076,20 @@ def test_malformed_tool_call_retries_then_fails_readably():
                     attempts.append(1)
                     if len(attempts) < 2:
                         raise err
+
                     class _M:
                         content = "recovered"
                         tool_calls = None
+
                     class _R:
                         choices = [type("C", (), {"message": _M()})()]
+
                     return _R()
 
     message = llm._completion(_Client(), "m", [{"role": "user", "content": "hi"}], None, "test")
-    assert message.content == "recovered" and len(attempts) == 2, "one garbled call must not fail the turn"
+    assert message.content == "recovered" and len(attempts) == 2, (
+        "one garbled call must not fail the turn"
+    )
 
     class _AlwaysBad:
         class chat:
@@ -3343,10 +4114,14 @@ def test_transient_non_429_failure_is_retried_but_a_bad_request_is_not():
     cap (switch model instead) or a 400 that is our own request shape."""
     from openclaw import llm
 
-    edge_403 = Exception("Error code: 403 - {'error': {'message': 'Access denied. "
-                         "Please check your network settings.'}}")
-    bad_shape = Exception("Error code: 400 - {'error': {'message': "
-                          "'messages[2].reasoning: reasoning is not supported with this model'}}")
+    edge_403 = Exception(
+        "Error code: 403 - {'error': {'message': 'Access denied. "
+        "Please check your network settings.'}}"
+    )
+    bad_shape = Exception(
+        "Error code: 400 - {'error': {'message': "
+        "'messages[2].reasoning: reasoning is not supported with this model'}}"
+    )
     garbled = Exception("Error code: 400 - {'code': 'tool_use_failed'}")
     assert not llm._is_request_shape_error(edge_403), "403 says nothing about our request"
     assert llm._is_request_shape_error(bad_shape)
@@ -3366,20 +4141,27 @@ def test_transient_non_429_failure_is_retried_but_a_bad_request_is_not():
                         cls.calls.append(1)
                         if len(cls.calls) <= fail_times:
                             raise exc
+
                         class _M:
                             content = "recovered"
                             tool_calls = None
+
                         return type("R", (), {"choices": [type("C", (), {"message": _M()})()]})
+
         return C()
 
     def _llm_call_count():
         with db.get_connection() as conn:
-            return conn.execute("SELECT COUNT(*) FROM llm_calls WHERE purpose = 'retrytest'").fetchone()[0]
+            return conn.execute(
+                "SELECT COUNT(*) FROM llm_calls WHERE purpose = 'retrytest'"
+            ).fetchone()[0]
 
     try:
         before = _llm_call_count()
         client = _client(edge_403, fail_times=1)
-        message = llm._completion(client, "m", [{"role": "user", "content": "hi"}], None, "retrytest")
+        message = llm._completion(
+            client, "m", [{"role": "user", "content": "hi"}], None, "retrytest"
+        )
         assert message.content == "recovered", "a one-off 403 must not kill the turn"
         assert len(client.chat.completions.calls) == 2, client.chat.completions.calls
         assert _llm_call_count() - before == 2, "every attempt logs its own llm_calls row"
@@ -3424,33 +4206,67 @@ def test_daily_budget_exhaustion_falls_through_to_another_model():
                         tried.append(model)
                         if model in fail_for:
                             raise tpd
+
                         class _M:
                             content = f"answered by {model}"
                             tool_calls = None
+
                         return type("R", (), {"choices": [type("C", (), {"message": _M()})()]})
+
         return C()
+
+    # `_completion` reads the chain from config.LLM_PROVIDER, so the provider is
+    # PINNED here. It used to be inherited from whatever .env held, which meant
+    # this test silently stopped exercising a chain at all the day the app moved
+    # off Groq (2026-08-04): `_FALLBACK_MODELS.get("gemini")` was empty, the
+    # "everything spent" case had one link, and the test failed for a reason
+    # unrelated to what it asserts.
+    @contextlib.contextmanager
+    def _pinned(provider):
+        original = config.LLM_PROVIDER
+        config.LLM_PROVIDER = provider
+        try:
+            yield
+        finally:
+            config.LLM_PROVIDER = original
 
     # Primary spent -> second model's own budget answers, and only ONE attempt is
     # spent on the exhausted model (retrying can't free a daily cap).
-    msg = llm._completion(_client({"llama-3.3-70b-versatile"}), "llama-3.3-70b-versatile",
-                          [{"role": "user", "content": "hi"}], None, "test")
+    with _pinned("groq"):
+        msg = llm._completion(
+            _client({"llama-3.3-70b-versatile"}),
+            "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "hi"}],
+            None,
+            "test",
+        )
     assert msg.content == "answered by openai/gpt-oss-120b", tried
-    assert tried == ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"], f"no wasted retries: {tried}"
+    assert tried == ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"], (
+        f"no wasted retries: {tried}"
+    )
     assert llm._last_model_used == "openai/gpt-oss-120b", "the answering model is recorded"
 
     # Everything spent -> visible failure that says what's actually wrong, and
     # doesn't send him hunting an outage. The model set is DERIVED from the
     # configured chain, not hardcoded — hardcoding it broke the moment a fourth
     # link was added, by silently letting the "everything is spent" case succeed.
-    tried.clear()
-    chain = ["llama-3.3-70b-versatile", *llm._FALLBACK_MODELS["groq"]]
-    try:
-        llm._completion(_client(set(chain)), "llama-3.3-70b-versatile",
-                        [{"role": "user", "content": "hi"}], None, "test")
-        raise AssertionError("must fail visibly once every budget is gone")
-    except llm.LLMUnavailableError as exc:
-        assert "daily token budget" in str(exc) and "rolling window" in str(exc)
-        assert tried == chain, f"tries each model exactly once, in order: {tried}"
+    #
+    # Run for EVERY configured provider, not just Groq: a provider with no chain
+    # would otherwise pass this by having nothing to walk. Gemini's own links were
+    # probed live before being added (see llm._FALLBACK_MODELS).
+    for provider, primary in (("groq", "llama-3.3-70b-versatile"), ("gemini", "gemini-2.5-flash")):
+        tried.clear()
+        chain = [primary, *llm._FALLBACK_MODELS[provider]]
+        assert len(chain) > 1, f"{provider} has no fallback chain to walk"
+        try:
+            with _pinned(provider):
+                llm._completion(
+                    _client(set(chain)), primary, [{"role": "user", "content": "hi"}], None, "test"
+                )
+            raise AssertionError(f"{provider}: must fail visibly once every budget is gone")
+        except llm.LLMUnavailableError as exc:
+            assert "daily token budget" in str(exc) and "rolling window" in str(exc)
+            assert tried == chain, f"{provider} tries each model exactly once, in order: {tried}"
 
 
 def test_fallback_model_is_disclosed_in_the_reply():
@@ -3519,7 +4335,9 @@ def test_assistant_turn_drops_output_only_fields():
         content = None
         tool_calls = [_Call()]
 
-    assert llm._assistant_turn(_NoContent())["content"] == "", "None content must not serialize as null"
+    assert llm._assistant_turn(_NoContent())["content"] == "", (
+        "None content must not serialize as null"
+    )
 
 
 def test_petcover_and_vet_mail_tools_are_distinguishable():
@@ -3547,10 +4365,13 @@ def test_tools_schema_stays_small():
     8 tools -> 15; the ceiling makes the next addition deliberate rather than
     something that silently eats the turn's context."""
     import json as _json
+
     from openclaw import agent
 
     encoded = _json.dumps(agent.TOOLS)
-    assert len(encoded) < 9000, f"tool schema is {len(encoded)} bytes — trim descriptions or drop a tool"
+    assert len(encoded) < 9000, (
+        f"tool schema is {len(encoded)} bytes — trim descriptions or drop a tool"
+    )
 
     names = {t["function"]["name"] for t in agent.TOOLS}
     assert names == set(agent._build_impls([])), "every declared tool has an impl and vice versa"
@@ -3607,18 +4428,22 @@ def test_reference_from_a_free_form_subject():
     """No context phrase at all — the shape fallback is the only thing that can
     read this, and the phrases are additionally case-sensitive without it."""
     assert claim_status.extract_reference(_VET_COVER_NOTE_SUBJECT) == "DC1-27-5628"
-    assert claim_status.extract_reference("GABR-0305-Request for consult note -First Request") == "GABR-0305"
+    assert (
+        claim_status.extract_reference("GABR-0305-Request for consult note -First Request")
+        == "GABR-0305"
+    )
     # Live regression: the context phrase captures whatever token follows it, and
     # this subject puts junk there. Shape-first is what keeps it out of the DB.
-    assert claim_status.extract_reference(
-        "Petcover claim for--Aari--DC1-27-5628 Serial Number: 2"
-    ) == "DC1-27-5628"
+    assert (
+        claim_status.extract_reference("Petcover claim for--Aari--DC1-27-5628 Serial Number: 2")
+        == "DC1-27-5628"
+    )
 
 
 def test_every_live_serial_format():
     for text, expected in [
-        ("DC1-27-5628 Sr 3", 3),           # original whitespace form
-        ("Petcover claim for Ari DC1-27-5628 Sr.8", 8),   # dot separator, live 2026-07-27
+        ("DC1-27-5628 Sr 3", 3),  # original whitespace form
+        ("Petcover claim for Ari DC1-27-5628 Sr.8", 8),  # dot separator, live 2026-07-27
         ("Petcover claim for Ari - DC1-27-5628 sr.1", 1),  # lowercase + dot, live 2026-07-27
         ("Petcover claim for--Aari--DC1-27-5628 Serial Number: 2", 2),  # live 2026-07-19
         ("DC1-27-5628 nothing adjacent\nTreatment number: 7", 7),
@@ -3630,28 +4455,38 @@ def test_info_request_letter_is_not_filed_as_a_suspension():
     """It says "will be suspended" about itself. With `suspended` ordered first
     the live DB ended up with zero info_requested events and two suspended ones,
     both of which were actually requests."""
-    assert claim_status.classify("PetCover - Claim Further Information Required", _INFO_REQUEST_LETTER) == "info_requested"
+    assert (
+        claim_status.classify("PetCover - Claim Further Information Required", _INFO_REQUEST_LETTER)
+        == "info_requested"
+    )
 
 
 def test_a_genuine_suspension_is_still_a_suspension():
     """The pair the reorder must not collapse — this is a real subject."""
-    assert claim_status.classify(
-        "Petcover Claim DC1-27-5628 SR1 - Claim suspended", "Your claim has been suspended."
-    ) == "suspended"
+    assert (
+        claim_status.classify(
+            "Petcover Claim DC1-27-5628 SR1 - Claim suspended", "Your claim has been suspended."
+        )
+        == "suspended"
+    )
 
 
 def test_vet_cover_note_is_classified_not_queued():
     """Was `unclassified` live — the one classification that produces no action."""
     assert claim_status.classify(_VET_COVER_NOTE_SUBJECT, _VET_COVER_NOTE_BODY) == "info_requested"
-    assert claim_status.classify(
-        _VET_COVER_NOTE_SUBJECT, "", claim_status.INFO_REQUEST_SENDER
-    ) == "info_requested", "the dedicated channel classifies on the sender alone"
+    assert (
+        claim_status.classify(_VET_COVER_NOTE_SUBJECT, "", claim_status.INFO_REQUEST_SENDER)
+        == "info_requested"
+    ), "the dedicated channel classifies on the sender alone"
 
 
 def test_auto_reply_from_the_required_info_channel_is_still_noise():
-    assert claim_status.classify(
-        "Automatic reply: Aari Goldberg - GOLD093", "", claim_status.INFO_REQUEST_SENDER
-    ) == "ignore"
+    assert (
+        claim_status.classify(
+            "Automatic reply: Aari Goldberg - GOLD093", "", claim_status.INFO_REQUEST_SENDER
+        )
+        == "ignore"
+    )
 
 
 def test_who_owes_the_document_comes_from_the_recipients():
@@ -3665,7 +4500,9 @@ def test_who_owes_the_document_comes_from_the_recipients():
             "INSERT OR REPLACE INTO vet_contacts (merchant, email) VALUES (?, ?)",
             ("Kings Vet KINGSGROVE NSW", "info@kingsvet.com.au"),
         )
-    known = claim_status.resolve_owed_by('"info@kingsvet.com.au" <info@kingsvet.com.au>, jagberg@gmail.com')
+    known = claim_status.resolve_owed_by(
+        '"info@kingsvet.com.au" <info@kingsvet.com.au>, jagberg@gmail.com'
+    )
     assert known["owed_by"] == "vet" and known["clinic"] == "Kings Vet KINGSGROVE NSW"
 
     mine = claim_status.resolve_owed_by("jagberg@gmail.com")
@@ -3673,7 +4510,9 @@ def test_who_owes_the_document_comes_from_the_recipients():
 
     # An address we don't recognize must NOT quietly become Justin's problem —
     # that reassignment is exactly how a request goes unchased.
-    unknown = claim_status.resolve_owed_by('"admin@newvet.com.au" <admin@newvet.com.au>, jagberg@gmail.com')
+    unknown = claim_status.resolve_owed_by(
+        '"admin@newvet.com.au" <admin@newvet.com.au>, jagberg@gmail.com'
+    )
     assert unknown["owed_by"] == "vet" and unknown["clinic"] is None
     assert unknown["clinic_email"] == "admin@newvet.com.au"
 
@@ -3686,15 +4525,20 @@ def test_info_request_event_records_the_vet_and_the_document():
             "INSERT OR REPLACE INTO vet_contacts (merchant, email) VALUES (?, ?)",
             ("Kings Vet KINGSGROVE NSW", "info@kingsvet.com.au"),
         )
-        claim = _insert_claim(conn, aari, "2026-04-02", status="acknowledged",
-                             reference="DC1-26-5992", sr=1)
+        claim = _insert_claim(
+            conn, aari, "2026-04-02", status="acknowledged", reference="DC1-26-5992", sr=1
+        )
     claim_status.process_reply(
-        "m-info", "PetCover - Claim Further Information Required", _INFO_REQUEST_LETTER,
-        "claims.au@petcovergroup.com", '"info@kingsvet.com.au" <info@kingsvet.com.au>, jagberg@gmail.com',
+        "m-info",
+        "PetCover - Claim Further Information Required",
+        _INFO_REQUEST_LETTER,
+        "claims.au@petcovergroup.com",
+        '"info@kingsvet.com.au" <info@kingsvet.com.au>, jagberg@gmail.com',
     )
     with db.get_connection() as conn:
         event = conn.execute(
-            "SELECT event_type, detail FROM claim_status_events WHERE claim_id = ? ORDER BY id DESC", (claim,)
+            "SELECT event_type, detail FROM claim_status_events WHERE claim_id = ? ORDER BY id DESC",
+            (claim,),
         ).fetchone()
     import json as _json
 
@@ -3714,14 +4558,20 @@ def test_the_deadline_is_anchored_on_treatment_not_on_the_bank_charge():
     slack the policy does not give: 17 days for Aari's."""
     import json as _json
 
-    aari_receipt = _json.dumps({"date": "2026-06-19", "amount": 35.0,
-                                "items": [{"description": "Prescription fee", "amount": 35.0,
-                                           "date": "2026-06-19"}]})
+    aari_receipt = _json.dumps(
+        {
+            "date": "2026-06-19",
+            "amount": 35.0,
+            "items": [{"description": "Prescription fee", "amount": 35.0, "date": "2026-06-19"}],
+        }
+    )
     treated, known = claim_status.treatment_date(aari_receipt, "2026-07-06")
     assert (treated, known) == ("2026-06-19", True), "the receipt states the treatment date"
 
     # An invoice billing several visits expires on its OLDEST one.
-    multi = _json.dumps({"date": "2026-06-30", "items": [{"date": "2026-06-18"}, {"date": "2026-06-30"}]})
+    multi = _json.dumps(
+        {"date": "2026-06-30", "items": [{"date": "2026-06-18"}, {"date": "2026-06-30"}]}
+    )
     assert claim_status.treatment_date(multi, "2026-07-06")[0] == "2026-06-18"
 
     # No invoice attached: fall back to the charge, and say it was assumed.
@@ -3740,17 +4590,35 @@ def test_a_date_petcover_names_resolves_to_the_visit_we_hold():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        asked_on = _insert_claim(conn, aari, "2026-04-02", status="info_requested", merchant="Kings Vet",
-                                 invoice_data=_json.dumps({"date": "2026-04-02", "invoice_number": "199464",
-                                                           "amount": 446.5}))
-        holds_visit = _insert_claim(conn, aari, "2026-05-18", status="settled", merchant="Kings Vet",
-                                    invoice_data=_json.dumps({"date": "2026-05-18", "invoice_number": "1000229",
-                                                              "amount": 351.5}))
+        asked_on = _insert_claim(
+            conn,
+            aari,
+            "2026-04-02",
+            status="info_requested",
+            merchant="Kings Vet",
+            invoice_data=_json.dumps(
+                {"date": "2026-04-02", "invoice_number": "199464", "amount": 446.5}
+            ),
+        )
+        holds_visit = _insert_claim(
+            conn,
+            aari,
+            "2026-05-18",
+            status="settled",
+            merchant="Kings Vet",
+            invoice_data=_json.dumps(
+                {"date": "2026-05-18", "invoice_number": "1000229", "amount": 351.5}
+            ),
+        )
 
     hits = invoice_matching.find_visit_by_date("2026-05-18")
-    assert [h["claim_id"] for h in hits] == [holds_visit], "the date names its own visit, not the asking claim"
+    assert [h["claim_id"] for h in hits] == [holds_visit], (
+        "the date names its own visit, not the asking claim"
+    )
     assert hits[0]["invoice_number"] == "1000229" and hits[0]["amount"] == 351.5
-    assert holds_visit != asked_on, "the whole point: the request and the visit are different claims"
+    assert holds_visit != asked_on, (
+        "the whole point: the request and the visit are different claims"
+    )
     # Never a nearest-date guess — an adjacent visit is a different consultation.
     assert invoice_matching.find_visit_by_date("2026-05-19") == []
     assert invoice_matching.find_visit_by_date(None) == []
@@ -3766,13 +4634,27 @@ def test_a_line_item_date_matches_even_when_the_invoice_header_differs():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        claim = _insert_claim(conn, aari, "2026-06-30", merchant="Kings Vet",
-                              invoice_data=_json.dumps({
-                                  "date": "2026-06-30", "invoice_number": "200500", "amount": 300.0,
-                                  "items": [{"description": "Consultation", "amount": 96.5, "date": "2026-06-18"},
-                                            {"description": "Bloods", "amount": 203.5, "date": None}]}))
+        claim = _insert_claim(
+            conn,
+            aari,
+            "2026-06-30",
+            merchant="Kings Vet",
+            invoice_data=_json.dumps(
+                {
+                    "date": "2026-06-30",
+                    "invoice_number": "200500",
+                    "amount": 300.0,
+                    "items": [
+                        {"description": "Consultation", "amount": 96.5, "date": "2026-06-18"},
+                        {"description": "Bloods", "amount": 203.5, "date": None},
+                    ],
+                }
+            ),
+        )
     assert [h["claim_id"] for h in invoice_matching.find_visit_by_date("2026-06-18")] == [claim]
-    assert [h["claim_id"] for h in invoice_matching.find_visit_by_date("2026-06-30")] == [claim], "header date still works"
+    assert [h["claim_id"] for h in invoice_matching.find_visit_by_date("2026-06-30")] == [claim], (
+        "header date still works"
+    )
 
 
 def test_two_visits_sharing_a_date_are_both_reported():
@@ -3786,11 +4668,29 @@ def test_two_visits_sharing_a_date_are_both_reported():
         # Distinct amounts: bank_transactions is unique on (date, amount, merchant),
         # and the real shape is two claims on ONE charge anyway — what matters here
         # is two invoices carrying the same service date.
-        a = _insert_claim(conn, aari, "2026-07-06", merchant="The Shire Vet", amount=-35.0,
-                          invoice_data=_json.dumps({"date": "2026-07-06", "invoice_number": "A1", "amount": 35.0}))
-        b = _insert_claim(conn, aari, "2026-07-06", merchant="The Shire Vet", amount=-369.33,
-                          invoice_data=_json.dumps({"date": "2026-07-06", "invoice_number": "B2", "amount": 369.33}))
-    assert sorted(h["claim_id"] for h in invoice_matching.find_visit_by_date("2026-07-06")) == sorted([a, b])
+        a = _insert_claim(
+            conn,
+            aari,
+            "2026-07-06",
+            merchant="The Shire Vet",
+            amount=-35.0,
+            invoice_data=_json.dumps(
+                {"date": "2026-07-06", "invoice_number": "A1", "amount": 35.0}
+            ),
+        )
+        b = _insert_claim(
+            conn,
+            aari,
+            "2026-07-06",
+            merchant="The Shire Vet",
+            amount=-369.33,
+            invoice_data=_json.dumps(
+                {"date": "2026-07-06", "invoice_number": "B2", "amount": 369.33}
+            ),
+        )
+    assert sorted(
+        h["claim_id"] for h in invoice_matching.find_visit_by_date("2026-07-06")
+    ) == sorted([a, b])
 
 
 def test_requested_document_stops_at_the_letters_boilerplate():
@@ -3798,13 +4698,24 @@ def test_requested_document_stops_at_the_letters_boilerplate():
     after it must yield nothing — an earlier cut of this captured "Please note we
     cannot process the claim…" and would have shown that to Justin as the document
     Petcover wanted."""
-    assert claim_status.extract_requested_document(_INFO_REQUEST_LETTER) == "Consultation notes dated 18/05/2026"
-    assert claim_status.extract_requested_document("we need a copy of\n\nPlease note we cannot process") is None
+    assert (
+        claim_status.extract_requested_document(_INFO_REQUEST_LETTER)
+        == "Consultation notes dated 18/05/2026"
+    )
+    assert (
+        claim_status.extract_requested_document(
+            "we need a copy of\n\nPlease note we cannot process"
+        )
+        is None
+    )
     assert claim_status.extract_requested_document("a letter with no recognized ask at all") is None
     # Two items asked for at once: the earlier first-line-only cut dropped the second.
-    assert claim_status.extract_requested_document(
-        "we need a copy of\nConsultation notes dated 18/05/2026\nItemised invoice\n\nPlease note"
-    ) == "Consultation notes dated 18/05/2026; Itemised invoice"
+    assert (
+        claim_status.extract_requested_document(
+            "we need a copy of\nConsultation notes dated 18/05/2026\nItemised invoice\n\nPlease note"
+        )
+        == "Consultation notes dated 18/05/2026; Itemised invoice"
+    )
 
 
 def test_the_ask_own_filler_is_not_mistaken_for_the_document():
@@ -3818,7 +4729,9 @@ def test_the_ask_own_filler_is_not_mistaken_for_the_document():
         "We have received a claim for treatment provided to Aari Who belongs to Mrs Gabi Goldberg , "
         "please provide the following information in order for us to review the"
     )
-    assert claim_status.extract_requested_document(ends_mid_sentence) is None, "filler is not a document"
+    assert claim_status.extract_requested_document(ends_mid_sentence) is None, (
+        "filler is not a document"
+    )
 
     names_the_item = (
         "received a claim for treatment provided to Ari, who belong to Justin and Gabrielle Goldberg, "
@@ -3834,7 +4747,9 @@ def test_requested_document_date_is_day_first_and_refuses_nonsense():
     """Australian letters: 18/05/2026 is 18 May. A malformed date is not a date —
     returning None keeps the label on the document alone rather than resolving the
     request to a visit that never happened."""
-    assert claim_status.requested_document_date("Consultation notes dated 18/05/2026") == "2026-05-18"
+    assert (
+        claim_status.requested_document_date("Consultation notes dated 18/05/2026") == "2026-05-18"
+    )
     assert claim_status.requested_document_date("Consult notes dated 18 May 2026") == "2026-05-18"
     assert claim_status.requested_document_date("Consult notes dated 3-6-2026") == "2026-06-03"
     assert claim_status.requested_document_date("Consult notes dated 31/02/2026") is None
@@ -3850,8 +4765,11 @@ def test_rereading_the_same_email_records_nothing_new():
     with db.get_connection() as conn:
         aari = _aari(conn)
         claim = _insert_claim(conn, aari, "2026-04-02", status="sent")
-    args = ("m-ack", "PetCover - Acknowledgement Letter",
-            "Pet's name: Ari\nClaim Reference: DC1-26-5992 Sr 1\nCondition: Raised ALT")
+    args = (
+        "m-ack",
+        "PetCover - Acknowledgement Letter",
+        "Pet's name: Ari\nClaim Reference: DC1-26-5992 Sr 1\nCondition: Raised ALT",
+    )
     claim_status.process_reply(*args)
     claim_status.process_reply(*args)  # replay
     with db.get_connection() as conn:
@@ -3875,15 +4793,21 @@ def test_detach_reference_returns_a_claim_to_the_correlation_pool():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        claim = _insert_claim(conn, aari, "2026-06-19", status="suspended", reference="DC1", sr=None)
+        claim = _insert_claim(
+            conn, aari, "2026-06-19", status="suspended", reference="DC1", sr=None
+        )
     assert claim_status.detach_reference(claim)["ok"] is True
     row = _claim_row(claim)
     assert row["petcover_reference"] is None and row["petcover_sr"] is None
     assert claim_status.detach_reference(claim)["ok"] is False, "nothing left to detach"
 
     with db.get_connection() as conn:
-        types = [r["event_type"] for r in conn.execute(
-            "SELECT event_type FROM claim_status_events WHERE claim_id = ?", (claim,))]
+        types = [
+            r["event_type"]
+            for r in conn.execute(
+                "SELECT event_type FROM claim_status_events WHERE claim_id = ?", (claim,)
+            )
+        ]
     assert "reference_detached" in types, "the undo is logged, not a silent wipe"
 
     # Detached, it is a candidate again and the real letter can route to it.
@@ -3912,24 +4836,38 @@ def test_every_declared_transition_is_legal_and_the_terminals_are_dead_ends():
         if from_state is None:
             continue  # the notional creation step; nothing folds through it
         for target in targets:
-            assert target in claim_status.TRANSITIONS, f"{target} is a target with no row of its own"
+            assert target in claim_status.TRANSITIONS, (
+                f"{target} is a target with no row of its own"
+            )
             # Drive it through the real writer: put a claim in `from_state`, fire the
             # event that names `target`, and require the state to actually move.
             event_type = next(e for e, t in claim_status.STATE_EVENTS.items() if t == target)
             with db.get_connection() as conn:
                 # One claim per pair, each on its own transaction: bank_transactions
                 # is UNIQUE on (date, amount, merchant).
-                claim = _insert_claim(conn, aari, "2026-06-01", status=from_state,
-                                      amount=-50.0 - checked, merchant=f"PAIR VET {checked}")
+                claim = _insert_claim(
+                    conn,
+                    aari,
+                    "2026-06-01",
+                    status=from_state,
+                    amount=-50.0 - checked,
+                    merchant=f"PAIR VET {checked}",
+                )
             outcome = claim_status.apply_event(claim, event_type, {})
-            assert outcome["applied"] is True, f"{from_state} -> {target} is declared but was refused"
-            assert _claim_row(claim)["status"] == target, f"{from_state} -> {target} did not write the state"
+            assert outcome["applied"] is True, (
+                f"{from_state} -> {target} is declared but was refused"
+            )
+            assert _claim_row(claim)["status"] == target, (
+                f"{from_state} -> {target} did not write the state"
+            )
             checked += 1
     assert checked == sum(len(t) for s, t in claim_status.TRANSITIONS.items() if s is not None)
     assert checked >= 40, f"only {checked} pairs exercised — the table shrank unnoticed"
     assert claim_status.TRANSITIONS["settled"] == frozenset()
     assert claim_status.TRANSITIONS["declined"] == frozenset()
-    assert claim_status.TRANSITIONS[None] == frozenset({"pending_match"}), "a new claim starts nowhere else"
+    assert claim_status.TRANSITIONS[None] == frozenset({"pending_match"}), (
+        "a new claim starts nowhere else"
+    )
 
 
 def test_the_backwards_moves_of_the_2026_07_27_reread_are_refused():
@@ -3947,7 +4885,9 @@ def test_the_backwards_moves_of_the_2026_07_27_reread_are_refused():
     written before the table existed and the table disagrees with it."""
     assert "acknowledged" not in claim_status.TRANSITIONS["settled"]
     assert "acknowledged" not in claim_status.TRANSITIONS["declined"]
-    assert "acknowledged" in claim_status.TRANSITIONS["below_excess"], "legal — not the table's to refuse"
+    assert "acknowledged" in claim_status.TRANSITIONS["below_excess"], (
+        "legal — not the table's to refuse"
+    )
     assert "below_excess" in claim_status.TRANSITIONS["sent"], "legal — not the table's to refuse"
 
 
@@ -3956,7 +4896,9 @@ def test_the_two_event_classifications_are_complete_and_disjoint():
     an event that is both stateless and state-bearing would be decided by
     dict-lookup order, which is not a decision anyone made."""
     for event_type, target in claim_status.STATE_EVENTS.items():
-        assert target in status_labels.LABELS, f"{event_type} targets '{target}', which has no wording"
+        assert target in status_labels.LABELS, (
+            f"{event_type} targets '{target}', which has no wording"
+        )
         assert target in claim_status.TRANSITIONS, f"{target} is unreachable — no row in the table"
     overlap = set(claim_status.STATE_EVENTS) & claim_status.STATELESS_EVENTS
     assert not overlap, f"declared in both: {overlap}"
@@ -3977,8 +4919,9 @@ def test_a_backfilled_claim_projects_to_the_state_its_backfill_names():
         claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="settled")
     assert claim_status.project_state(claim) == "pending_match", "no history to fold yet"
 
-    outcome = claim_status.apply_event(claim, claim_status.BACKFILL_EVENT,
-                                      {"backfilled": True, "status": "settled"})
+    outcome = claim_status.apply_event(
+        claim, claim_status.BACKFILL_EVENT, {"backfilled": True, "status": "settled"}
+    )
     assert outcome == {"applied": True, "state": "settled", "refused": None}
     assert claim_status.project_state(claim) == "settled"
     assert claim_status.state_projection_disagreements() == []
@@ -3993,10 +4936,14 @@ def test_a_backfill_naming_an_unknown_status_is_refused_not_seeded():
     _fresh_db()
     with db.get_connection() as conn:
         claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="sent")
-    outcome = claim_status.apply_event(claim, claim_status.BACKFILL_EVENT, {"status": "half_settled"})
+    outcome = claim_status.apply_event(
+        claim, claim_status.BACKFILL_EVENT, {"status": "half_settled"}
+    )
     assert outcome["applied"] is False and "half_settled" in outcome["refused"]
     assert _claim_row(claim)["status"] == "sent"
-    assert claim_status.project_state(claim) == "pending_match", "the bad seed is ignored by the fold"
+    assert claim_status.project_state(claim) == "pending_match", (
+        "the bad seed is ignored by the fold"
+    )
 
 
 def test_apply_event_writes_a_legal_state_and_records_it():
@@ -4007,8 +4954,12 @@ def test_apply_event_writes_a_legal_state_and_records_it():
     assert outcome == {"applied": True, "state": "sent", "refused": None}
     assert _claim_row(claim)["status"] == "sent"
     with db.get_connection() as conn:
-        types = [r["event_type"] for r in conn.execute(
-            "SELECT event_type FROM claim_status_events WHERE claim_id = ?", (claim,))]
+        types = [
+            r["event_type"]
+            for r in conn.execute(
+                "SELECT event_type FROM claim_status_events WHERE claim_id = ?", (claim,)
+            )
+        ]
     assert types == ["sent"]
 
 
@@ -4023,10 +4974,16 @@ def test_apply_event_refuses_an_undeclared_transition_and_flags_it():
     assert outcome["state"] == "settled", "reports where the claim actually is"
     row = _claim_row(claim)
     assert row["status"] == "settled", "a refused transition must not move the state"
-    assert "settled" in row["flag"] and "acknowledged" in row["flag"], f"flag names both states: {row['flag']}"
+    assert "settled" in row["flag"] and "acknowledged" in row["flag"], (
+        f"flag names both states: {row['flag']}"
+    )
     with db.get_connection() as conn:
-        types = [r["event_type"] for r in conn.execute(
-            "SELECT event_type FROM claim_status_events WHERE claim_id = ?", (claim,))]
+        types = [
+            r["event_type"]
+            for r in conn.execute(
+                "SELECT event_type FROM claim_status_events WHERE claim_id = ?", (claim,)
+            )
+        ]
     assert types == ["acknowledged"], "the refused event stays as evidence"
 
 
@@ -4065,20 +5022,34 @@ def test_the_whole_lifecycle_is_one_event_per_transition_in_order():
     2026-07-28 repair had to infer from an absence."""
     _fresh_db()
     with db.get_connection() as conn:
-        claim = _insert_claim(conn, _aari(conn), "2026-06-01", status="pending_match",
-                              reference="DC1-27-9001", sr=1)
-    invoice_matching._mark_matched(claim, "email-life-1", {"amount": 120.0, "claimable_amount": 120.0})
+        claim = _insert_claim(
+            conn, _aari(conn), "2026-06-01", status="pending_match", reference="DC1-27-9001", sr=1
+        )
+    invoice_matching._mark_matched(
+        claim, "email-life-1", {"amount": 120.0, "claimable_amount": 120.0}
+    )
     assert _claim_row(claim)["status"] == "matched"
-    claim_status.apply_event(claim, "drafted", {"draft_id": "d-life"})  # claim_forms' own path needs Gmail
+    claim_status.apply_event(
+        claim, "drafted", {"draft_id": "d-life"}
+    )  # claim_forms' own path needs Gmail
     with db.get_connection() as conn:
         conn.execute("UPDATE vet_claims SET draft_id = 'd-life' WHERE id = ?", (claim,))
     assert claim_status.mark_sent(claim)["ok"] is True
-    claim_status.process_reply("email-life-2", "Petcover DC1-27-9001 SR1 acknowledgement letter", "")
-    claim_status.process_reply("email-life-3", "Petcover DC1-27-9001 SR1 - your claim has been approved", "")
+    claim_status.process_reply(
+        "email-life-2", "Petcover DC1-27-9001 SR1 acknowledgement letter", ""
+    )
+    claim_status.process_reply(
+        "email-life-3", "Petcover DC1-27-9001 SR1 - your claim has been approved", ""
+    )
 
     with db.get_connection() as conn:
-        types = [r["event_type"] for r in conn.execute(
-            "SELECT event_type FROM claim_status_events WHERE claim_id = ? ORDER BY created_at, id", (claim,))]
+        types = [
+            r["event_type"]
+            for r in conn.execute(
+                "SELECT event_type FROM claim_status_events WHERE claim_id = ? ORDER BY created_at, id",
+                (claim,),
+            )
+        ]
     assert types == ["matched", "drafted", "sent", "acknowledged", "approved"], types
     assert _claim_row(claim)["status"] == "approved"
     assert claim_status.project_state(claim) == "approved", "the column and the log agree"
@@ -4096,13 +5067,17 @@ def test_no_module_outside_claim_status_writes_the_status_column():
     package = _Path(__file__).resolve().parent.parent / "openclaw"
     # `(?!WHERE)` per character so the SET clause can't run past it: several
     # statements legitimately read `AND status = 'pending_match'` in a WHERE.
-    pattern = _re.compile(r"UPDATE\s+vet_claims\s+SET\s+(?:(?!WHERE)[^\"'])*\bstatus\s*=", _re.IGNORECASE)
+    pattern = _re.compile(
+        r"UPDATE\s+vet_claims\s+SET\s+(?:(?!WHERE)[^\"'])*\bstatus\s*=", _re.IGNORECASE
+    )
     # The guard gets its own guard: a pattern that matches nothing would make this
     # test pass forever. Both halves asserted — it fires on a real violation and
     # does not fire on the WHERE-clause reads that are legitimate.
     assert pattern.search("UPDATE vet_claims SET status = 'sent', updated_at = ? WHERE id = ?")
     assert pattern.search("UPDATE vet_claims SET pet_id = ?, status = 'matched' WHERE id = ?")
-    assert not pattern.search("UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ? AND status = 'x'")
+    assert not pattern.search(
+        "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ? AND status = 'x'"
+    )
     offenders = []
     for path in sorted(package.glob("*.py")):
         if path.name == "claim_status.py":
@@ -4137,7 +5112,9 @@ def test_the_projection_folds_the_real_reply_sequences_we_hold():
         for event_type in ["matched", "drafted", "sent", *replies]:
             claim_status.apply_event(claim, event_type, {})
         assert claim_status.project_state(claim) == expected, f"live claim #{live_id}"
-        assert _claim_row(claim)["status"] == expected, f"live claim #{live_id}: column and fold disagree"
+        assert _claim_row(claim)["status"] == expected, (
+            f"live claim #{live_id}: column and fold disagree"
+        )
 
 
 def test_a_claim_whose_transitions_predate_the_log_projects_to_its_birth_state():
@@ -4183,8 +5160,9 @@ def test_the_projection_survives_an_illegal_event():
                 "INSERT INTO claim_status_events (claim_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
                 (claim, event_type, "{}", datetime.now(timezone.utc).isoformat()),
             )
-    assert "matched" not in claim_status.TRANSITIONS["acknowledged"], \
+    assert "matched" not in claim_status.TRANSITIONS["acknowledged"], (
         "fixture assumes this pair is illegal"
+    )
     # The illegal `matched` is skipped; the two legal events after it still apply.
     # A fold that aborted on the illegal event would stop at `acknowledged`.
     assert claim_status.project_state(claim) == "settled"
@@ -4201,14 +5179,36 @@ def test_a_resolved_visit_says_which_date_actually_matched():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        header = _insert_claim(conn, aari, "2026-05-30", amount=-351.50, merchant="KINGS VET",
-                               invoice_data=_json.dumps({
-                                   "date": "2026-05-30", "amount": 351.50, "invoice_number": "1000229",
-                                   "items": [{"description": "Consult", "amount": 95.0}]}))
-        item = _insert_claim(conn, aari, "2026-05-31", amount=-120.0, merchant="OTHER VET",
-                             invoice_data=_json.dumps({
-                                 "date": "2026-05-31", "amount": 120.0, "invoice_number": "2000111",
-                                 "items": [{"description": "Consult", "amount": 60.0, "date": "2026-05-18"}]}))
+        header = _insert_claim(
+            conn,
+            aari,
+            "2026-05-30",
+            amount=-351.50,
+            merchant="KINGS VET",
+            invoice_data=_json.dumps(
+                {
+                    "date": "2026-05-30",
+                    "amount": 351.50,
+                    "invoice_number": "1000229",
+                    "items": [{"description": "Consult", "amount": 95.0}],
+                }
+            ),
+        )
+        item = _insert_claim(
+            conn,
+            aari,
+            "2026-05-31",
+            amount=-120.0,
+            merchant="OTHER VET",
+            invoice_data=_json.dumps(
+                {
+                    "date": "2026-05-31",
+                    "amount": 120.0,
+                    "invoice_number": "2000111",
+                    "items": [{"description": "Consult", "amount": 60.0, "date": "2026-05-18"}],
+                }
+            ),
+        )
 
     on_header = invoice_matching.find_visit_by_date("2026-05-30")
     assert [h["claim_id"] for h in on_header] == [header]
@@ -4238,9 +5238,12 @@ def test_unmatching_a_submitted_claim_destroys_nothing():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        submitted = _insert_claim(conn, aari, "2026-06-01", status="sent",
-                                  invoice_data=_json.dumps({"amount": 120.0}))
-        conn.execute("UPDATE vet_claims SET matched_email_id = 'email-x' WHERE id = ?", (submitted,))
+        submitted = _insert_claim(
+            conn, aari, "2026-06-01", status="sent", invoice_data=_json.dumps({"amount": 120.0})
+        )
+        conn.execute(
+            "UPDATE vet_claims SET matched_email_id = 'email-x' WHERE id = ?", (submitted,)
+        )
 
     result = invoice_matching.unmatch(submitted)
     assert result["ok"] is False, "a submitted claim's invoice must not be rejectable"
@@ -4252,9 +5255,15 @@ def test_unmatching_a_submitted_claim_destroys_nothing():
     # The ordinary path still works: from `matched`, unmatched -> pending_match
     # is a declared transition, so the wipe and the state change both happen.
     with db.get_connection() as conn:
-        matched = _insert_claim(conn, aari, "2026-06-02", status="matched",
-                                invoice_data=_json.dumps({"amount": 99.0}), amount=-99.0,
-                                merchant="UNMATCH VET")
+        matched = _insert_claim(
+            conn,
+            aari,
+            "2026-06-02",
+            status="matched",
+            invoice_data=_json.dumps({"amount": 99.0}),
+            amount=-99.0,
+            merchant="UNMATCH VET",
+        )
         conn.execute("UPDATE vet_claims SET matched_email_id = 'email-y' WHERE id = ?", (matched,))
     assert invoice_matching.unmatch(matched)["ok"] is True
     row = _claim_row(matched)
@@ -4271,7 +5280,9 @@ def test_health_reports_a_broken_projection_instead_of_500ing():
 
     original = claim_status.state_projection_disagreements
     try:
-        claim_status.state_projection_disagreements = lambda: (_ for _ in ()).throw(ValueError("bad detail"))
+        claim_status.state_projection_disagreements = lambda: (_ for _ in ()).throw(
+            ValueError("bad detail")
+        )
         value = main_module._disagreement_count()
     finally:
         claim_status.state_projection_disagreements = original
@@ -4296,7 +5307,9 @@ def test_the_shadow_comparison_reports_without_repairing_anything():
     reported = pipeline.compare_state_projection()
     assert reported == [{"claim_id": claim, "stored": "settled", "projected": "sent"}]
     after = dict(_claim_row(claim))
-    assert after["status"] == "settled" and after["flag"] == before["flag"], "the comparison wrote something"
+    assert after["status"] == "settled" and after["flag"] == before["flag"], (
+        "the comparison wrote something"
+    )
 
 
 # --- OpenClaw gateway: the internal surface and the outbound seam -------------
@@ -4385,7 +5398,9 @@ def test_two_concurrent_ticks_never_both_run():
         return "done"
 
     outcomes = []
-    first = threading.Thread(target=lambda: outcomes.append(internal_api.run_exclusive("tick", _slow)))
+    first = threading.Thread(
+        target=lambda: outcomes.append(internal_api.run_exclusive("tick", _slow))
+    )
     first.start()
     for _ in range(500):  # wait for the first tick to actually hold the lock
         if entered:
@@ -4393,7 +5408,9 @@ def test_two_concurrent_ticks_never_both_run():
         time.sleep(0.01)
     assert entered, "the first tick never started"
 
-    assert internal_api.run_exclusive("tick", _slow) == (False, None), "a second tick entered the body"
+    assert internal_api.run_exclusive("tick", _slow) == (False, None), (
+        "a second tick entered the body"
+    )
     assert len(entered) == 1, entered
 
     release.set()
@@ -4412,8 +5429,9 @@ def test_different_jobs_do_not_block_each_other():
 
     held = threading.Event()
     release = threading.Event()
-    t = threading.Thread(target=lambda: internal_api.run_exclusive(
-        "tick", lambda: (held.set(), release.wait(5))))
+    t = threading.Thread(
+        target=lambda: internal_api.run_exclusive("tick", lambda: (held.set(), release.wait(5)))
+    )
     t.start()
     try:
         assert held.wait(5), "the tick never took its lock"
@@ -4430,17 +5448,29 @@ def test_nothing_outside_gateway_client_shells_out_to_the_gateway():
 
     This is the guard the module map rates as only *partial* for LoggedBot —
     nothing there stops a second `telegram.Bot` being constructed."""
+    # `config.OPENCLAW_CLI`, not bare `OPENCLAW_CLI` — config.py is where the
+    # setting is DEFINED, and naming a setting is not reaching the gateway.
+    markers = ("import subprocess", "from subprocess", "config.OPENCLAW_CLI")
+
+    def hits(text):
+        return [m for m in markers if m in text]
+
+    # The scan gets its own guard: it reads production text, so a marker list
+    # that had drifted out of date would report a clean sweep forever.
+    assert hits("import subprocess\n"), "the scan misses a real bypass"
+    assert hits("from subprocess import run"), "the scan misses a real bypass"
+    assert hits("subprocess.run(config.OPENCLAW_CLI)"), "the scan misses a real bypass"
+    assert not hits('OPENCLAW_CLI = os.getenv("OPENCLAW_CLI", "openclaw")'), (
+        "config.py's own definition must not count as reaching the gateway"
+    )
+
     src = Path(__file__).resolve().parent.parent / "openclaw"
     offenders = []
     for path in sorted(src.glob("*.py")):
         if path.name == "gateway_client.py":
             continue
-        text = path.read_text(encoding="utf-8")
-        # `config.OPENCLAW_CLI`, not bare `OPENCLAW_CLI` — config.py is where the
-        # setting is DEFINED, and naming a setting is not reaching the gateway.
-        for marker in ("import subprocess", "from subprocess", "config.OPENCLAW_CLI"):
-            if marker in text:
-                offenders.append(f"{path.name}: {marker}")
+        for marker in hits(path.read_text(encoding="utf-8")):
+            offenders.append(f"{path.name}: {marker}")
     assert not offenders, (
         "these reach the gateway outside the logged seam, so their messages "
         f"would never land in telegram_messages: {offenders}"
@@ -4453,7 +5483,7 @@ def test_correlation_id_is_minted_when_the_caller_supplies_none():
     from openclaw import internal_api
 
     assert internal_api._correlation_id("abc123") == "abc123"
-    assert internal_api._correlation_id("  ") .startswith("int-")
+    assert internal_api._correlation_id("  ").startswith("int-")
     assert internal_api._correlation_id(None).startswith("int-")
     assert internal_api._correlation_id(None) != internal_api._correlation_id(None)
 
@@ -4592,14 +5622,23 @@ def test_buttons_are_nested_in_a_blocks_array_never_at_the_top_level():
     _fresh_db()
     seen, run = _capture_argv()
     gateway_client.send_message(
-        "42", "Claim #7", buttons=[{"label": "Mark sent", "command": "/mark 7 sent"}], runner=run)
+        "42", "Claim #7", buttons=[{"label": "Mark sent", "command": "/mark 7 sent"}], runner=run
+    )
 
     import json as _json
 
     payload = _json.loads(seen[0][seen[0].index("--presentation") + 1])
     assert "buttons" not in payload, f"top-level buttons are silently discarded: {payload}"
-    assert payload == {"blocks": [{"type": "buttons", "buttons": [
-        {"label": "Mark sent", "action": {"type": "command", "command": "/mark 7 sent"}}]}]}, payload
+    assert payload == {
+        "blocks": [
+            {
+                "type": "buttons",
+                "buttons": [
+                    {"label": "Mark sent", "action": {"type": "command", "command": "/mark 7 sent"}}
+                ],
+            }
+        ]
+    }, payload
 
 
 def test_a_button_command_over_the_byte_budget_is_refused_not_sent():
@@ -4616,19 +5655,26 @@ def test_a_button_command_over_the_byte_budget_is_refused_not_sent():
     budget = gateway_client.COMMAND_CALLBACK_BUDGET_BYTES
     assert budget == 58, budget
 
+    # A real verb: an undeclared one is refused before the byte check now, and a
+    # fixture that trips the wrong guard measures the wrong thing.
+    pad = budget - len("/mark ")
     seen, run = _capture_argv()
-    gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": "/" + "a" * (budget - 1)}],
-                                runner=run)
+    gateway_client.send_message(
+        "42", "x", buttons=[{"label": "ok", "command": "/mark " + "a" * pad}], runner=run
+    )
     assert len(seen) == 1, "a command exactly at the budget must still send"
 
-    for command in ("/" + "a" * budget, "/mark 7 " + "é" * 30):
+    for command in ("/mark " + "a" * (pad + 1), "/mark 7 " + "é" * 30):
         try:
-            gateway_client.send_message("42", "x", buttons=[{"label": "ok", "command": command}],
-                                        runner=run)
+            gateway_client.send_message(
+                "42", "x", buttons=[{"label": "ok", "command": command}], runner=run
+            )
         except gateway_client.PresentationError as exc:
             assert "byte" in str(exc), str(exc)
         else:
-            raise AssertionError(f"an over-budget command was sent and its button lost: {command!r}")
+            raise AssertionError(
+                f"an over-budget command was sent and its button lost: {command!r}"
+            )
     assert len(seen) == 1, "an over-budget send reached the CLI"
 
 
@@ -4640,8 +5686,11 @@ def test_a_label_less_button_costs_every_button_on_the_message():
 
     _fresh_db()
     seen, run = _capture_argv()
-    for bad in ({"command": "/mark 7 sent"}, {"label": "  ", "command": "/mark 7 sent"},
-                {"label": "Mark", "command": "mark 7 sent"}):
+    for bad in (
+        {"command": "/mark 7 sent"},
+        {"label": "  ", "command": "/mark 7 sent"},
+        {"label": "Mark", "command": "mark 7 sent"},
+    ):
         try:
             gateway_client.send_message("42", "x", buttons=[bad], runner=run)
         except gateway_client.PresentationError:
@@ -4664,9 +5713,12 @@ def test_the_telegram_tee_writes_the_same_row_shape_the_old_transport_did():
     assert internal_api.record_event(body, "corr-2")["status"] == "duplicate"
 
     with db.get_connection() as conn:
-        row = dict(conn.execute(
-            "SELECT kind, summary, payload, app_version, direction, processed_at "
-            "FROM telegram_messages WHERE update_id = 77001").fetchone())
+        row = dict(
+            conn.execute(
+                "SELECT kind, summary, payload, app_version, direction, processed_at "
+                "FROM telegram_messages WHERE update_id = 77001"
+            ).fetchone()
+        )
     assert row["kind"] == "command" and row["summary"] == "/mark 7 sent", row
     assert row["direction"] == "in" and row["app_version"] == config.APP_VERSION, row
     # Written before anything handles it — that unset processed_at IS the replay
@@ -4688,7 +5740,10 @@ def test_the_telegram_tee_refuses_an_event_with_no_update_id():
     restore = _with_secret("s3cret", allow={"127.0.0.1"})
     try:
         assert internal_api._guard(_FakeRequest(), "wrong", "telegram/event", "c") is not None
-        assert internal_api._guard(_FakeRequest(host="10.0.0.9"), "s3cret", "telegram/event", "c") is not None
+        assert (
+            internal_api._guard(_FakeRequest(host="10.0.0.9"), "s3cret", "telegram/event", "c")
+            is not None
+        )
         assert internal_api._guard(_FakeRequest(), "s3cret", "telegram/event", "c") is None
     finally:
         restore()
@@ -4725,19 +5780,55 @@ def test_mcp_inventory_has_no_dangerous_tool():
     line. The inventory is written by hand precisely so it can be asserted."""
     from openclaw import mcp_server
 
-    offenders = []
-    for name in mcp_server.TOOL_NAMES:
-        for bad in mcp_server.FORBIDDEN_TOOL_SUBSTRINGS:
-            if bad in name:
-                offenders.append(f"{name} contains {bad!r}")
-    assert not offenders, offenders
+    def scan(names):
+        return [
+            f"{name} contains {bad!r}"
+            for name in names
+            for bad in mcp_server.FORBIDDEN_TOOL_SUBSTRINGS
+            if bad in name
+        ]
 
-    # No mutation reachable, whatever the inventory says. `_impls` is built from
-    # the chat agent's implementations, which include every propose_* function;
-    # only names listed in TOOLS are selected out of it.
+    # The guard gets its own guard, the same way
+    # test_no_module_outside_claim_status_writes_the_status_column does: this
+    # scan iterates two production lists, so a tripwire that had stopped firing
+    # would pass forever and read exactly like a clean inventory. Both halves.
+    for dangerous in ("read_file", "search_mail", "get_secret", "run_shell", "send_draft"):
+        assert scan([dangerous]), f"the tripwire does not fire on {dangerous!r}"
+    assert not scan(["query_claims", "turn_context"]), "the tripwire fires on a safe name"
+
+    assert not scan(mcp_server.TOOL_NAMES), scan(mcp_server.TOOL_NAMES)
+
+    # Proposals ARE reachable here as of section 3, and that is not a hole: a
+    # propose_* tool queues a row and sends a button, and the write happens on
+    # the tap. What must stay unreachable is the commit. Assert the boundary
+    # where it actually is — no implementation on this surface reaches
+    # `proposals.commit` or `proposals.execute`.
+    from openclaw import agent, proposals
+
+    droppable = [n for n in agent._build_impls([], "") if n.startswith("propose_")]
+    assert droppable, "the agent exposes no propose_* — this test would prove nothing"
     impls = mcp_server._impls()
-    assert set(impls) == set(mcp_server.TOOL_NAMES), (set(impls) ^ set(mcp_server.TOOL_NAMES))
-    assert not [n for n in impls if n.startswith("propose_")], list(impls)
+    assert set(impls) == set(mcp_server.TOOL_NAMES), set(impls) ^ set(mcp_server.TOOL_NAMES)
+
+    committed = []
+    real_commit, real_execute = proposals.commit, proposals.execute
+    proposals.commit = lambda *a, **k: committed.append(("commit", a)) or {
+        "ok": True,
+        "message": "",
+    }
+    proposals.execute = lambda *a, **k: committed.append(("execute", a)) or ""
+    try:
+        # Every tool, called with nothing. Most will complain about missing
+        # arguments; none may reach a write. A TypeError here is the tool
+        # refusing bad input, which is the correct behaviour and not a commit.
+        for name, fn in mcp_server._impls().items():
+            try:
+                fn()
+            except TypeError:
+                pass
+        assert not committed, f"an MCP implementation reached the commit path: {committed}"
+    finally:
+        proposals.commit, proposals.execute = real_commit, real_execute
 
 
 def test_mcp_inventory_is_enumerated_and_within_its_token_budget():
@@ -4751,12 +5842,21 @@ def test_mcp_inventory_is_enumerated_and_within_its_token_budget():
 
     from openclaw import mcp_server
 
-    assert len(mcp_server.TOOLS) <= 12, f"{len(mcp_server.TOOLS)} tools — re-measure the turn before raising this"
+    # Ceilings sit just above the measured truth, not at the theoretical
+    # headroom. They were 12 and 8,000 against 7 tools / 2,405 chars, which let
+    # five tools and 3.3x the schema arrive with the suite green — a budget
+    # nothing can exceed is not a budget.
+    #
+    # Raised 2026-08-02 when section 3 added the five propose_* tools, which is
+    # the mechanism working as designed: 12 tools / 4,660 chars measured, so 13
+    # and 5,200. Still ~1,165 tokens at the usual 4 chars/token, against the
+    # ~8,100 of headroom measured after the 17.8/17.10 cuts. Raise these only
+    # after re-measuring a real turn, never ahead of the need.
+    assert len(mcp_server.TOOLS) <= 13, (
+        f"{len(mcp_server.TOOLS)} tools — re-measure the turn before raising this"
+    )
     schema_chars = len(_json.dumps(mcp_server.TOOLS))
-    # ~8,100 tokens of headroom were measured after the 17.8/17.10 cuts. At the
-    # usual ~4 chars/token this ceiling is roughly a quarter of it, which leaves
-    # room for the answers themselves.
-    assert schema_chars <= 8000, f"tool schemas are {schema_chars} chars; they ship on every turn"
+    assert schema_chars <= 5200, f"tool schemas are {schema_chars} chars; they ship on every turn"
     for tool in mcp_server.TOOLS:
         assert tool["name"] and tool["description"] and "inputSchema" in tool, tool
 
@@ -4766,8 +5866,14 @@ def test_mcp_speaks_enough_of_the_protocol_to_be_probed():
     assertion; this one catches the shape breaking without one."""
     from openclaw import mcp_server
 
-    init = mcp_server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                                "params": {"protocolVersion": "2025-06-18"}})
+    init = mcp_server.dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"},
+        }
+    )
     assert init["result"]["protocolVersion"] == "2025-06-18", init
     assert init["result"]["capabilities"]["tools"] is not None, init
     # The instructions must say what this surface CANNOT do. The absence of a
@@ -4775,12 +5881,45 @@ def test_mcp_speaks_enough_of_the_protocol_to_be_probed():
     assert "READ ONLY" in init["result"]["instructions"], init["result"]["instructions"]
 
     listed = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert [t["name"] for t in listed["result"]["tools"]] == mcp_server.TOOL_NAMES
+    served = [t["name"] for t in listed["result"]["tools"]]
+    # Frozen literal, not TOOL_NAMES: `dispatch` returns TOOLS and TOOL_NAMES is
+    # derived from TOOLS (mcp_server.py:102), so comparing the two asserted
+    # nothing any change could break. The inventory is the
+    # gmail-isolation-boundary surface and a per-turn token cost, so it changes
+    # by deliberate edit here or not at all.
+    assert served == [
+        "turn_context",
+        "query_claims",
+        "pending_actions",
+        "claim_detail",
+        "claim_history",
+        "submissions_awaiting_reply",
+        "list_tasks",
+        "propose_mark_sent",
+        "propose_set_condition",
+        "propose_assign_pet",
+        "propose_mark_resolved",
+        "propose_split_between_pets",
+    ], served
+    # A client reads the schemas off this response, never off TOOLS.
+    assert all(
+        t["inputSchema"]["type"] == "object" and t["description"] for t in listed["result"]["tools"]
+    ), listed["result"]["tools"]
+    # `ping` is part of the probe the gateway runs; it was the one dispatch
+    # method with no assertion.
+    assert mcp_server.dispatch({"jsonrpc": "2.0", "id": 9, "method": "ping"}) == {
+        "jsonrpc": "2.0",
+        "id": 9,
+        "result": {},
+    }
 
     # A notification gets no response at all — returning one is a protocol
     # violation, and the client is entitled to treat it as a broken server.
     assert mcp_server.dispatch({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
-    assert mcp_server.dispatch({"jsonrpc": "2.0", "id": 3, "method": "nonsense"})["error"]["code"] == -32601
+    assert (
+        mcp_server.dispatch({"jsonrpc": "2.0", "id": 3, "method": "nonsense"})["error"]["code"]
+        == -32601
+    )
 
 
 def test_mcp_turn_context_reads_the_pets_live():
@@ -4793,8 +5932,14 @@ def test_mcp_turn_context_reads_the_pets_live():
     from openclaw import mcp_server
 
     _fresh_db()
-    out = mcp_server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                               "params": {"name": "turn_context", "arguments": {}}})
+    out = mcp_server.dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "turn_context", "arguments": {}},
+        }
+    )
     text = out["result"]["content"][0]["text"]
     assert out["result"]["isError"] is False, out
     assert "Aari" in text and "Echo" in text, text
@@ -4802,8 +5947,14 @@ def test_mcp_turn_context_reads_the_pets_live():
 
     with db.get_connection() as conn:
         conn.execute("INSERT INTO pets (name, insurer) VALUES ('Bandit', 'Petcover')")
-    later = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                                 "params": {"name": "turn_context", "arguments": {}}})
+    later = mcp_server.dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "turn_context", "arguments": {}},
+        }
+    )
     assert "Bandit" in later["result"]["content"][0]["text"], "the pet list was cached, not read"
 
 
@@ -4814,12 +5965,24 @@ def test_a_failing_mcp_tool_reports_to_the_model_not_the_transport():
     from openclaw import mcp_server
 
     _fresh_db()
-    missing = mcp_server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                                   "params": {"name": "no_such_tool", "arguments": {}}})
+    missing = mcp_server.dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "no_such_tool", "arguments": {}},
+        }
+    )
     assert missing["result"]["isError"] is True and "error" not in missing, missing
 
-    bad_args = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                                    "params": {"name": "claim_detail", "arguments": {"nope": 1}}})
+    bad_args = mcp_server.dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "claim_detail", "arguments": {"nope": 1}},
+        }
+    )
     assert bad_args["result"]["isError"] is True, bad_args
     assert "claim_detail" in bad_args["result"]["content"][0]["text"], bad_args
 
@@ -4843,7 +6006,9 @@ def test_a_card_is_published_under_the_path_the_gateway_can_actually_read():
     before = (config.MEDIA_OUTBOX_DIR, config.MEDIA_OUTBOX_GATEWAY_DIR)
     try:
         config.MEDIA_OUTBOX_DIR = media_outbox.config.MEDIA_OUTBOX_DIR = str(outbox)
-        config.MEDIA_OUTBOX_GATEWAY_DIR = media_outbox.config.MEDIA_OUTBOX_GATEWAY_DIR = "/home/node/.openclaw/media"
+        config.MEDIA_OUTBOX_GATEWAY_DIR = media_outbox.config.MEDIA_OUTBOX_GATEWAY_DIR = (
+            "/home/node/.openclaw/media"
+        )
 
         seen, run = _capture_argv()
         gateway_client.send_card("42", b"\x89PNG-not-really", caption="Claim #7", runner=run)
@@ -4927,7 +6092,9 @@ def test_the_plugin_report_is_per_boot_and_never_persisted():
     from openclaw import gateway_client, internal_api
 
     internal_api._plugin_report.clear()
-    assert internal_api.plugin_report() == {}, "an absent report must read as 'the plugin has not run'"
+    assert internal_api.plugin_report() == {}, (
+        "an absent report must read as 'the plugin has not run'"
+    )
 
     internal_api._plugin_report.update({"plugin": "claims", "commands": ["mark", "pet"]})
     assert internal_api.plugin_report()["commands"] == ["mark", "pet"]
@@ -4937,10 +6104,1608 @@ def test_the_plugin_report_is_per_boot_and_never_persisted():
     assert internal_api.plugin_report()["commands"] == ["mark", "pet"]
     internal_api._plugin_report.clear()
 
-    # The declared button commands are the preflight's input. If this list and
-    # the card-building code ever diverge, a button ships unasserted.
     assert gateway_client.BUTTON_COMMANDS, "the preflight has nothing to assert"
-    assert all(not c.startswith("/") for c in gateway_client.BUTTON_COMMANDS), gateway_client.BUTTON_COMMANDS
+    assert all(not c.startswith("/") for c in gateway_client.BUTTON_COMMANDS), (
+        gateway_client.BUTTON_COMMANDS
+    )
+
+
+def _propose_via_mcp(name, arguments, runner=None):
+    """Drive one propose_* tool the way the gateway's agent would, with the
+    Confirm card's send captured instead of shelled out."""
+    from openclaw import mcp_server
+
+    seen, capture = _capture_argv()
+    out = mcp_server._call_tool(name, arguments, runner=runner or capture)
+    return out["content"][0]["text"], seen
+
+
+def _claim_count_snapshot():
+    with db.get_connection() as conn:
+        return [
+            tuple(r)
+            for r in conn.execute(
+                "SELECT id, status, pet_id, condition_text FROM vet_claims ORDER BY id"
+            )
+        ]
+
+
+def test_a_proposal_writes_a_pending_row_and_changes_no_claim_data():
+    """3.1 / 3.7 — the whole gate. A propose_* call must leave the claims table
+    byte-identical and put a Confirm button in front of Justin instead.
+
+    3.7's framing is the one that matters: the model saying it did something is
+    not evidence either way, so assert the data, not the sentence."""
+    from openclaw import db as _db
+    from openclaw import proposals
+
+    _fresh_db()
+    with _db.get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+            "VALUES (?, ?, '2026-08-02T00:00:00Z')",
+            (config.TELEGRAM_USERNAME, 4242),
+        )
+        _insert_claim(conn, 1, "2026-06-01", status="drafted", draft_id="d-proposal")
+        claim = conn.execute("SELECT id FROM vet_claims ORDER BY id LIMIT 1").fetchone()
+    assert claim, "fixture has no claim to propose against"
+
+    before = _claim_count_snapshot()
+    text, seen = _propose_via_mcp("propose_mark_sent", {"claim_id": claim["id"]})
+
+    assert _claim_count_snapshot() == before, "a proposal changed claim data"
+    with _db.get_connection() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM pending_proposals")]
+    assert len(rows) == 1, rows
+    assert rows[0]["action"] == "mark_sent" and rows[0]["confirmed_at"] is None, rows[0]
+    assert rows[0]["origin"] == "chat" and str(claim["id"]) in rows[0]["label"], rows[0]
+
+    # A Confirm button went out, carrying the row id and nothing the model wrote.
+    assert len(seen) == 1, seen
+    argv = seen[0]
+    import json as _json
+
+    presentation = _json.loads(argv[argv.index("--presentation") + 1])
+    button = presentation["blocks"][0]["buttons"][0]
+    assert button["action"] == {"type": "command", "command": f"/confirm {rows[0]['id']}"}, button
+    assert len(button["action"]["command"].encode("utf-8")) <= 58, button
+    # The card's text is composed from the code-built label, not from the model.
+    assert argv[argv.index("--message") + 1] == f"Confirm: {rows[0]['label']}", argv
+    assert f"#{rows[0]['id']}" in text and "Nothing has changed yet" in text, text
+
+    # And only the tap commits.
+    assert proposals.commit(rows[0]["id"])["ok"] is True
+    assert _claim_count_snapshot() != before, "the confirmed proposal changed nothing"
+    # Single-use: Telegram redelivers, and a second mark-sent is a second
+    # Petcover submission for one set of invoices.
+    again = proposals.commit(rows[0]["id"])
+    assert again["ok"] is False and "Already confirmed" in again["message"], again
+
+
+def test_the_mcp_surface_refuses_a_single_pet_assignment_when_the_message_names_two():
+    """3.3 — the live 2026-07-27 failure, replayed through the new surface.
+
+    Replaying *"This is actually split between echo and Aari. Aari cost was $35
+    out of this"* against the ASSIGN PET card, the model proposed assigning Aari
+    AND Echo — no API error, the split tool present in the schema. ADR-0025 says
+    this refusal is enforced in the MCP surface, not mirrored there.
+
+    The message text is read from the message log, not from a tool argument: a
+    model that paraphrased it would paraphrase the second pet name away and take
+    the refusal with it."""
+    from openclaw import db as _db
+
+    _fresh_db()
+    live = "This is actually split between echo and Aari. Aari cost was $35 out of this"
+    with _db.get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+            "VALUES (?, ?, '2026-08-02T00:00:00Z')",
+            (config.TELEGRAM_USERNAME, 4242),
+        )
+        conn.execute(
+            "INSERT INTO telegram_messages (update_id, direction, kind, summary, payload, "
+            "app_version, received_at) VALUES (?, 'in', 'text', ?, '{}', 'test', '2026-08-02T00:00:00Z')",
+            (990001, live),
+        )
+        _insert_claim(conn, 1, "2026-06-01", status="pending_match")
+        claim = conn.execute("SELECT id FROM vet_claims ORDER BY id LIMIT 1").fetchone()
+    assert _db.latest_inbound_text() == live, _db.latest_inbound_text()
+
+    before = _claim_count_snapshot()
+    text, seen = _propose_via_mcp(
+        "propose_assign_pet", {"pet_name": "Aari", "claim_id": claim["id"]}
+    )
+
+    assert "SPLIT" in text and "propose_split_between_pets" in text, text
+    assert _claim_count_snapshot() == before, "the refusal still changed claim data"
+    with _db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM pending_proposals").fetchone()["c"] == 0, (
+            "a refusal queued a proposal"
+        )
+    assert not seen, "a refusal sent a Confirm button"
+
+
+def test_the_mcp_surface_refuses_a_split_with_no_amounts_rather_than_writing_zero_rows():
+    """3.4 — a per-pet split with nothing to apportion must be refused, not
+    filled with $0. `propose_split_between_pets` dry-runs the same guards the
+    write uses, so an impossible split is refused in the reply instead of
+    failing after the tap."""
+    from openclaw import db as _db
+
+    _fresh_db()
+    with _db.get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+            "VALUES (?, ?, '2026-08-02T00:00:00Z')",
+            (config.TELEGRAM_USERNAME, 4242),
+        )
+        _insert_claim(conn, 1, "2026-06-01", status="matched")
+        claim = conn.execute("SELECT id FROM vet_claims ORDER BY id LIMIT 1").fetchone()
+
+    before = _claim_count_snapshot()
+    # Two pets, neither carrying an amount: only one share may be left out, and
+    # inventing the other is exactly what must not happen.
+    text, seen = _propose_via_mcp(
+        "propose_split_between_pets",
+        {"claim_id": claim["id"], "pets_and_amounts": [{"pet": "Aari"}, {"pet": "Echo"}]},
+    )
+
+    assert "Never invent" in text or "missing amounts" in text, text
+    assert _claim_count_snapshot() == before, "the refusal changed claim data"
+    with _db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM pending_proposals").fetchone()["c"] == 0, text
+    assert not seen, "a refusal sent a Confirm button"
+
+
+def test_every_mutating_tool_takes_an_explicit_claim_id():
+    """3.5 — with no way to name the claim under discussion, the model
+    fabricated argument values out of the tool schemas' own description strings
+    (live, 2026-07-27). No tool may be targetable only by pet or reference."""
+    from openclaw import mcp_server
+
+    mutating = [t for t in mcp_server.TOOLS if t["name"].startswith("propose_")]
+    assert mutating, "no proposal tools to check"
+    for tool in mutating:
+        assert "claim_id" in tool["inputSchema"]["properties"], tool["name"]
+        assert tool["inputSchema"]["properties"]["claim_id"]["type"] == "integer", tool["name"]
+    # And the claim under discussion is available to the turn without one:
+    # turn_context carries today's date and the pets, and the message log
+    # carries what he actually typed.
+    assert isinstance(db.latest_inbound_text(), str)
+
+
+def test_a_confirm_with_a_junk_id_changes_nothing_and_says_so():
+    """The tap path's own bad input. A 404-shaped answer that reads like success
+    is how a morning of taps changed nothing and left no evidence of why."""
+    from openclaw import internal_api
+
+    _fresh_db()
+    before = _claim_count_snapshot()
+    for junk in ("", "abc", None, "99999"):
+        outcome = internal_api.confirm_proposal(junk)
+        assert outcome["ok"] is False, (junk, outcome)
+        assert "Nothing was changed" in outcome["message"] or "not found" in outcome["message"], (
+            outcome
+        )
+    assert _claim_count_snapshot() == before
+
+
+def test_the_actions_run_is_one_concurrent_burst_and_still_announces_truncation():
+    """Latency and honesty at once, because the cheap fix threatened the rule.
+
+    Every send costs 9–13s end to end (measured live 2026-08-03; ~6.6s of it is
+    local CLI initialisation), so the old shape — summary card first, then N tap
+    cards, then up to two note messages — cost two ordered rounds. What removed
+    the ordering was making nothing depend on it, NOT dropping the summary: the
+    summary is card 0 of the burst, and Telegram may deliver it anywhere in the
+    run (Justin's call 2026-08-03, restoring it).
+
+    The risk in that trade is the held-back count. A cap nobody is told about is
+    a silent truncation, and no latency saving buys that — so it is asserted
+    here rather than left to the rewrite's good intentions.
+    """
+    import concurrent.futures
+    import threading
+    import time as _time
+
+    from openclaw import claim_status, commands
+
+    over = commands.ACTION_CARD_CAP + 2
+    fake = [
+        {
+            "kind": "mark_sent",
+            "claim_id": i,
+            "pet_id": 1,
+            "actionable": True,
+            "title": "mark sent",
+            "merchant": "THE SHIRE VET",
+            "amount": -120.0,
+            "date": "2026-05-01",
+            "age_days": 30,
+            "pet_name": "Aari",
+            "condition_text": "itchy ear",
+            "blocks": "the claim",
+            "flag": None,
+            "claim_ids": [i],
+            "members": None,
+            "group_id": f"S{i}",
+        }
+        for i in range(1, over + 1)
+    ]
+
+    real = claim_status.pending_actions
+    claim_status.pending_actions = lambda: fake
+    try:
+        cards = commands.actions_cards()
+    finally:
+        claim_status.pending_actions = real
+
+    # The summary card plus one message per shown action, and no separate note
+    # messages — the notes ride on the summary's caption.
+    assert len(cards) == commands.ACTION_CARD_CAP + 1, len(cards)
+    assert cards[0].get("png"), "the rendered summary card is missing from the burst"
+    assert not any(c.get("png") for c in cards[1:]), "more than one rendered card is being sent"
+    # The truncation is still stated, on the summary's caption.
+    assert f"+{over - commands.ACTION_CARD_CAP} more" in cards[0]["caption"], cards[0]["caption"]
+    assert "to action" in cards[0]["caption"], cards[0]["caption"]
+    # Every tap card is tappable; the summary carries no buttons.
+    assert all(c["buttons"] for c in cards[1:]), [c["buttons"] for c in cards[1:]]
+    assert not cards[0]["buttons"], cards[0]["buttons"]
+
+    # And nothing about the run is order-dependent, so it can go at once.
+    order, lock = [], threading.Lock()
+
+    def deliver(card):
+        with lock:
+            order.append((card.get("text") or card.get("caption") or "")[:12])
+        _time.sleep(0.12)
+        return None
+
+    began = _time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(cards))) as pool:
+        outcomes = list(pool.map(deliver, cards))
+    elapsed = _time.time() - began
+    assert all(o is None for o in outcomes), outcomes
+    assert elapsed < 0.12 * len(cards) / 2, f"the cards did not overlap: {elapsed:.2f}s"
+
+
+def test_a_tap_result_reaches_justin_even_when_the_edit_fails():
+    """4.6 — a tap whose outcome vanished is indistinguishable from one that
+    never registered, which is the failure ADR-0014 exists for. So the edit
+    falls back to a plain reply, and the degradation is logged rather than
+    quietly becoming the norm."""
+    from openclaw import notify
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+            "VALUES (?, ?, '2026-08-02T00:00:00Z')",
+            (config.TELEGRAM_USERNAME, 4242),
+        )
+
+    replies = []
+    real_send, real_gw = notify.send_text, notify.using_gateway
+    notify.send_text = lambda text, buttons=None: replies.append(text) or True
+    notify.using_gateway = lambda: True
+    try:
+        from openclaw import gateway_client
+
+        real_edit = gateway_client.edit_message
+        gateway_client.edit_message = lambda *a, **k: (_ for _ in ()).throw(
+            gateway_client.GatewaySendError("exit 2: message not found")
+        )
+        try:
+            assert notify.append_result("9", "✅ Claim #7 marked sent") is True
+            assert replies == ["✅ Claim #7 marked sent"], replies
+        finally:
+            gateway_client.edit_message = real_edit
+
+        # No message to edit at all — still says it, rather than dropping it.
+        replies.clear()
+        assert notify.append_result(None, "✅ done") is True
+        assert replies == ["✅ done"], replies
+    finally:
+        notify.send_text, notify.using_gateway = real_send, real_gw
+
+
+def test_a_failed_ack_never_costs_the_handler():
+    """4.7 — the ack exists so a slow answer does not feel dead. Losing it is
+    strictly better than losing the handler, so it returns a bool and never
+    raises, whatever the transport does."""
+    from openclaw import gateway_client, notify
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+            "VALUES (?, ?, '2026-08-02T00:00:00Z')",
+            (config.TELEGRAM_USERNAME, 4242),
+        )
+
+    real_gw, real_react = notify.using_gateway, gateway_client.react
+    notify.using_gateway = lambda: True
+    try:
+        gateway_client.react = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("gateway gone"))
+        assert notify.ack("9") is False, "a broken reaction escaped as an exception"
+        gateway_client.react = lambda *a, **k: True
+        assert notify.ack("9") is True
+        # No message id is not a failure worth reporting — a command tap has none.
+        assert notify.ack(None) is False
+        assert notify.ack("") is False
+    finally:
+        notify.using_gateway, gateway_client.react = real_gw, real_react
+
+
+def test_a_pending_condition_flow_claims_the_next_typed_message_and_then_releases():
+    """4.3 / 12.2 — the whole reason this flow exists. What Justin types is
+    stored verbatim, with no model between his words and `condition_text`, which
+    is the field the hard rules forbid inferring.
+
+    Claims exactly once. A flow that kept claiming would swallow the rest of the
+    conversation; one that never claimed would hand the condition to the agent."""
+    from openclaw import pending_flows
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="matched")
+        cid = conn.execute("SELECT id FROM vet_claims").fetchone()["id"]
+
+    assert pending_flows.claim_text(7001, "hello there") is None, "claimed with no flow pending"
+
+    started = pending_flows.start_condition(7001, cid)
+    assert started["force_reply"] is True and "condition" in started["prompt"], started
+    # Durable: the state is a row, not a dict, because the tap, the claim check
+    # and the reply are three separate requests after the cutover.
+    with db.get_connection() as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) c FROM pending_flows WHERE kind = 'condition'"
+            ).fetchone()["c"]
+            == 1
+        )
+
+    card = pending_flows.claim_text(7001, "kennel cough")
+    assert card is not None and "kennel cough" in card["text"], card
+    with db.get_connection() as conn:
+        stored = conn.execute(
+            "SELECT condition_text FROM vet_claims WHERE id = ?", (cid,)
+        ).fetchone()[0]
+    assert stored == "kennel cough", stored
+
+    assert pending_flows.claim_text(7001, "and another thing") is None, "the flow claimed twice"
+    with db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) c FROM pending_flows").fetchone()["c"] == 0
+
+
+def test_a_split_flow_walks_every_item_and_only_then_applies():
+    """The per-item walk. Nothing is written until the last item is answered —
+    `apply_item_conditions` runs once, not per item, so an abandoned flow leaves
+    the claim untouched rather than half-conditioned."""
+    from openclaw import pending_flows
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="matched")
+        cid = conn.execute("SELECT id FROM vet_claims").fetchone()["id"]
+
+    items = [{"description": "consult", "amount": 80.0}, {"description": "vaccine", "amount": 40.0}]
+    prompt = pending_flows.start_split(7002, cid, 1, items)
+    assert "Item 1/2" in prompt["prompt"] and "consult" in prompt["prompt"], prompt
+    # Buttons are commands, inside budget, and the verb is registered.
+    from openclaw.button_commands import BUTTON_COMMANDS
+
+    for button in prompt["buttons"]:
+        assert button["command"][1:].split(" ")[0] in BUTTON_COMMANDS, button
+        assert len(button["command"].encode("utf-8")) <= 58, button
+
+    nxt = pending_flows.record_item(7002, "itchy ear")
+    assert "Item 2/2" in nxt["prompt"], nxt
+    # Still nothing applied at the halfway point.
+    assert pending_flows.get(7002, pending_flows.SPLIT) is not None
+
+    done = pending_flows.record_item(7002, None)
+    assert "text" in done, done
+    assert pending_flows.get(7002, pending_flows.SPLIT) is None, "the flow outlived its last item"
+
+
+def test_a_typed_item_beats_a_pending_condition_and_the_flow_is_one_decision():
+    """Both flows can be pending at once, as they could when they were two
+    dicts. The typed item wins — it is the more specific state.
+
+    And there is ONE decision function: `claim_text`. The PTB handler and the
+    gateway's `before_dispatch` hook both call it, so the two transports cannot
+    disagree about whether the agent sees a typed condition."""
+    from openclaw import pending_flows, telegram_bot
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="matched")
+        cid = conn.execute("SELECT id FROM vet_claims").fetchone()["id"]
+
+    pending_flows.start_condition(7003, cid)
+    pending_flows.start_split(7003, cid, 1, [{"description": "consult", "amount": 80.0}])
+    pending_flows.await_typed_item(7003)
+
+    card = pending_flows.claim_text(7003, "arthritis")
+    assert card is not None, "the typed item did not claim"
+    # The split consumed it, so the condition flow is still waiting.
+    assert pending_flows.get(7003, pending_flows.CONDITION) is not None
+    assert pending_flows.get(7003, pending_flows.SPLIT) is None, "the one-item split did not finish"
+
+    # No second copy of the decision. The scan is for the state KEY, not for
+    # the module's function names -- calling `pending_flows.await_typed_item` is
+    # the intended use; reaching into `state["await_type"]` is the copy. An
+    # earlier version of this check matched both and would have failed forever.
+    marker = '"await_type"'
+    assert marker in (
+        Path(__file__).resolve().parent.parent / "openclaw" / "pending_flows.py"
+    ).read_text(encoding="utf-8"), "the scan's marker no longer exists"
+    offenders = [
+        p.name
+        for p in (Path(__file__).resolve().parent.parent / "openclaw").glob("*.py")
+        if p.name != "pending_flows.py" and marker in p.read_text(encoding="utf-8")
+    ]
+    assert not offenders, f"these reimplement the pending-flow decision: {offenders}"
+    assert callable(telegram_bot._send_flow_card)
+
+
+def test_the_claim_endpoint_fails_open_and_refuses_a_stranger():
+    """A claim check that errors must let the message through — a lost message
+    is worse than a stray chat turn — and a stranger's message must never be
+    consumed by a flow of Justin's."""
+    from openclaw import internal_api, pending_flows
+
+    _fresh_db()
+    assert internal_api.commands_is_authorized("someone-else") is False
+    assert internal_api.commands_is_authorized(config.TELEGRAM_USERNAME) is True
+
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="matched")
+        cid = conn.execute("SELECT id FROM vet_claims").fetchone()["id"]
+    pending_flows.start_condition(7004, cid)
+
+    real = pending_flows.claim_text
+    pending_flows.claim_text = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db gone"))
+    try:
+        # The route's own body is async; assert the property the route relies on
+        # — that the failure is catchable here rather than escaping upward.
+        try:
+            pending_flows.claim_text(7004, "x")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("the stub did not raise")
+    finally:
+        pending_flows.claim_text = real
+    # And the flow is still pending, so nothing was consumed by the failure.
+    assert pending_flows.get(7004, pending_flows.CONDITION) is not None
+
+
+def test_an_unattended_notification_with_no_registered_chat_says_so_and_sends_nothing():
+    """4.9's second half. Every outbound here is unattended — a pipeline tick on
+    cron, the daily nudge — so the only place a dropped one can surface is the
+    log, and it has to be at ERROR because the fix is a human action (`/start`).
+
+    Returns False rather than raising: a tick must not die because a
+    notification failed, and must never look like it sent one."""
+    from openclaw import notify
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM telegram_registrations")
+
+    sent = []
+    real = notify.using_gateway
+    notify.using_gateway = lambda: sent.append("reached transport") or False
+    try:
+        assert notify.send_text("claim #7 needs a condition") is False
+        assert notify.send_card("cap", b"png") is False
+        assert notify.send_document("cap", b"pdf", "x.pdf") is False
+    finally:
+        notify.using_gateway = real
+    assert sent == [], "an outbound with no target still reached the transport"
+
+
+def test_the_updater_flag_actually_stops_the_updater():
+    """The flag has to gate the *poller*, not just the outbound seam.
+
+    Found the hard way on 2026-08-03: `TELEGRAM_UPDATER_ENABLED` was added and
+    wired only into `notify`, so the cutover deploy handed the token to the
+    gateway while the app kept polling. Telegram answered
+    `Conflict: terminated by other getUpdates request` and the preflight failed
+    the deploy — which is the guard working, but the guard is not the fix.
+
+    A disabled updater must also read as *disabled* rather than *dead*, or
+    `_watchdog_telegram_polling` SIGTERMs the process on a loop."""
+    import asyncio as _asyncio
+
+    from openclaw import config as _config
+    from openclaw import telegram_bot
+
+    before_flag, before_app = _config.TELEGRAM_UPDATER_ENABLED, telegram_bot._application
+    built = []
+    real_build = telegram_bot.build_application
+    telegram_bot.build_application = lambda: built.append(1)
+    try:
+        _config.TELEGRAM_UPDATER_ENABLED = False
+        telegram_bot._application = None
+        _asyncio.run(telegram_bot.start_polling())
+        assert not built, "the updater was built with the flag off — two pollers, one token, 409"
+        # None, not False: the watchdog restarts the process on False.
+        assert telegram_bot.polling_alive() is None, telegram_bot.polling_alive()
+    finally:
+        telegram_bot.build_application = real_build
+        _config.TELEGRAM_UPDATER_ENABLED, telegram_bot._application = before_flag, before_app
+
+
+def test_the_outbound_seam_follows_the_updater_flag():
+    """4.1 — the flag is the app updater's, so the transports are exact
+    opposites. Two pollers on one token is a 409, and the preflight fails the
+    deploy if both poll or neither does."""
+    from openclaw import config as _config
+    from openclaw import notify
+
+    before = _config.TELEGRAM_UPDATER_ENABLED
+    try:
+        _config.TELEGRAM_UPDATER_ENABLED = True
+        assert notify.using_gateway() is False, "the app polls, so the app sends"
+        _config.TELEGRAM_UPDATER_ENABLED = False
+        assert notify.using_gateway() is True, "the gateway polls, so the gateway sends"
+    finally:
+        _config.TELEGRAM_UPDATER_ENABLED = before
+
+
+def test_both_transports_run_the_same_command_logic():
+    """4.1's real requirement. The updater flag stays on for a week after the
+    cutover, so the PTB path and the gateway path run side by side — and a
+    behaviour that differs by transport is one that will differ after the flag
+    is removed, when nobody is looking for it.
+
+    Aliased, not wrapped: assert identity, because a wrapper is where the drift
+    would live."""
+    from openclaw import commands, telegram_bot
+
+    for name in (
+        "handle_mark",
+        "handle_pet",
+        "handle_resolved",
+        "handle_sent",
+        "handle_process",
+        "handle_vetemail",
+        "handle_notvet",
+        "handle_start",
+        "register_chat",
+        "_action_card_text",
+        "prior_conditions",
+    ):
+        assert getattr(telegram_bot, name) is getattr(
+            commands,
+            name.lstrip("_") if name.startswith("_action") or name.startswith("prior") else name,
+            None,
+        ) or getattr(telegram_bot, name) is getattr(commands, name), name
+    assert telegram_bot._is_authorized is commands.is_authorized
+
+
+def test_an_unauthorized_command_is_refused_out_loud():
+    """4.8 — the check stays app-side. The gateway deciding to deliver an event
+    is not the same as this app accepting it, and the username check is the only
+    thing between a stranger's `/mark 7 sent` and a Petcover submission.
+
+    Refused *out loud*: a tap that did nothing and said nothing is
+    indistinguishable from one that never arrived."""
+    from openclaw import commands
+
+    for name in ("mark", "pet", "resolve", "confirm", "actions", "history", "unmatch"):
+        out = commands.dispatch(name, "7 x", "someone-else")
+        assert out == {"text": "Not authorized.", "cards": []}, (name, out)
+    # Case-insensitive: Telegram reports display casing, so an exact compare
+    # wrongly rejects the real user.
+    assert commands.is_authorized(config.TELEGRAM_USERNAME.upper()) is True
+    assert commands.is_authorized(None) is False
+
+
+def test_an_unknown_command_says_so_instead_of_shrugging():
+    """A plugin registering something this app cannot serve is a deploy-time
+    mistake. The pre-gateway equivalent — an unhandled callback prefix — did
+    nothing silently, which read as a tap that never arrived."""
+    from openclaw import commands
+
+    out = commands.dispatch("ping", "", config.TELEGRAM_USERNAME)
+    assert "not a command this app serves" in out["text"], out
+    assert out["cards"] == []
+    for name in ("mark", "pet", "resolve", "unmatch", "invreq", "dismiss"):
+        out = commands.dispatch(name, "", config.TELEGRAM_USERNAME)
+        assert "needs a claim id" in out["text"], (name, out)
+
+
+def test_mark_reserves_two_words_and_treats_the_rest_as_a_condition():
+    """Slice 1's design writes the mark-sent tap as `/mark 7 sent`, while this
+    app's `/mark` sets the condition text. Both are true, so `sent` joins
+    `reviewed` as reserved. The hazard is named rather than hidden: a condition
+    genuinely called "sent" cannot be set by button."""
+    from openclaw import claim_status, commands
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="drafted", draft_id="d-mark")
+        cid = conn.execute("SELECT id FROM vet_claims").fetchone()["id"]
+
+    assert commands.RESERVED_MARK_WORDS == {"sent", "reviewed"}
+    commands.dispatch("mark", f"{cid} kennel cough", config.TELEGRAM_USERNAME)
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT status, condition_text FROM vet_claims WHERE id = ?", (cid,)
+        ).fetchone()
+    assert row["condition_text"] == "kennel cough", dict(row)
+    assert row["status"] == "drafted", dict(row)
+
+    commands.dispatch("mark", f"{cid} sent", config.TELEGRAM_USERNAME)
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT status, condition_text FROM vet_claims WHERE id = ?", (cid,)
+        ).fetchone()
+    # The reserved word marked it sent and did NOT overwrite the condition.
+    assert row["status"] == "sent", dict(row)
+    assert row["condition_text"] == "kennel cough", dict(row)
+    assert claim_status.history_rows() is not None
+
+
+def test_every_card_button_names_a_command_the_plugin_registered():
+    """The hazard slice 1 measured: a `command` button is deterministic only
+    while its command is registered. An unregistered one is not an error — the
+    tap reaches the agent as a chat turn with its own token in the prompt, which
+    is the commit-token-through-a-model path D12 exists to prevent.
+
+    So every button any card can build is checked against the tuple, and against
+    the 58-byte budget that silently deletes an overlong one from the keyboard."""
+    from openclaw import claim_status, commands
+    from openclaw.button_commands import BUTTON_COMMANDS
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="drafted", draft_id="d-cards")
+        _insert_claim(conn, 1, "2026-06-02", status="matched", condition="itchy ear")
+
+    cards = commands.actions_cards() + [c for c in [commands.history_card(1)] if c]
+    # Synthesise one card per action kind too: the live fixture will not produce
+    # all eight, and an unexercised kind is exactly where an unregistered verb
+    # would hide.
+    for kind in commands._ACTION_EMOJI:
+        cards.append(
+            {"buttons": commands._action_buttons({"kind": kind, "claim_id": 7, "pet_id": 1})}
+        )
+
+    checked = 0
+    for card in cards:
+        for button in card.get("buttons") or []:
+            verb = button["command"][1:].split(" ", 1)[0]
+            assert verb in BUTTON_COMMANDS, (verb, button)
+            assert len(button["command"].encode("utf-8")) <= 58, button
+            assert button["label"].strip(), button
+            checked += 1
+    assert checked, "no buttons were checked — the fixture proves nothing"
+
+    # And the guard fires: an unregistered verb is refused at build time.
+    try:
+        commands._command_button("nope", "/ping 7")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("an unregistered command was allowed onto a card")
+    assert claim_status.pending_actions() is not None
+
+
+def test_the_plugin_registers_exactly_the_commands_a_button_may_emit():
+    """19a.4's missing half. `BUTTON_COMMANDS` had only two assertions on it —
+    non-empty, and slash-free — neither of which any rename could break, so the
+    tuple was decorative. It has two readers and both must agree with it:
+
+    * `gateway-plugin/index.js`, which registers the names inside the gateway;
+    * `gateway_client.build_buttons`, which is the only place a button is built.
+
+    The preflight compares the first pair at deploy time. That is the right place
+    for it — it reads the running gateway — but it means a rename went unnoticed
+    until someone deployed. This is the same check without the container.
+
+    A verb nobody registered is not an error at the gateway: the tap reaches the
+    agent as a chat turn and spends tokens (measured live 2026-08-01, three
+    `/ping` taps, three model replies)."""
+    import re as _re
+
+    from openclaw import gateway_client
+    from openclaw.button_commands import BUTTON_COMMANDS
+
+    plugin = (Path(__file__).resolve().parent.parent / "gateway-plugin" / "index.js").read_text(
+        encoding="utf-8"
+    )
+    block = _re.search(r"const COMMANDS = \[(.*?)\];", plugin, _re.S)
+    assert block, "gateway-plugin/index.js no longer declares `const COMMANDS = [...]`"
+    registered = _re.findall(r'name:\s*"([^"]+)"', block.group(1))
+    assert registered, block.group(1)
+    assert registered == list(BUTTON_COMMANDS), (registered, BUTTON_COMMANDS)
+
+    # And the declaration is load-bearing rather than advisory: build_buttons
+    # refuses a verb outside it. `button_commands.py` already said card-building
+    # code must draw from the tuple; nothing made it so until now.
+    _fresh_db()
+    seen, run = _capture_argv()
+    for verb in BUTTON_COMMANDS:
+        gateway_client.send_message(
+            "42", "x", buttons=[{"label": "ok", "command": f"/{verb} 7"}], runner=run
+        )
+    assert len(seen) == len(BUTTON_COMMANDS), "a declared command was refused"
+
+    for undeclared in ("/ping", "/status 7", "/markk 7 sent"):
+        try:
+            gateway_client.send_message(
+                "42", "x", buttons=[{"label": "ok", "command": undeclared}], runner=run
+            )
+        except gateway_client.PresentationError as exc:
+            assert "BUTTON_COMMANDS" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"a button nobody registered was sent: {undeclared!r}")
+    assert len(seen) == len(BUTTON_COMMANDS), "an undeclared command reached the CLI"
+
+
+def test_the_fast_send_path_batches_one_call_keeps_order_and_still_logs_every_card():
+    """4.14. The CLI costs 9–13s a message and ~6.6s of that is its own
+    initialisation with no network contact, so N messages cost N × 9s however
+    they are scheduled. This path is one local HTTP call and N in-process
+    dispatches inside the gateway.
+
+    Three properties are asserted because each replaces something the CLI path
+    gave for free:
+
+    * ONE request for N cards — the whole point;
+    * order preserved, which the concurrent CLI burst could not offer and which
+      is what lets `/actions` put its summary card first again;
+    * every delivered card still lands in `telegram_messages`. The message log is
+      the audit trail and the RL dataset (ADR-0014); a faster path that logs less
+      is a worse path.
+
+    And a partial send must raise, never return quietly: `sent: 1, failures: 1`
+    reading as success is exactly the silent failure the hard rules forbid.
+    """
+    import json as _json
+
+    from openclaw import config, db, gateway_client
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO telegram_registrations (username, chat_id, registered_at) "
+            "VALUES (?, ?, '2026-08-03T00:00:00Z')",
+            (config.TELEGRAM_USERNAME, 77),
+        )
+
+    calls = []
+
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def poster(request, timeout=None):
+        calls.append(_json.loads(request.data))
+        return _Response(
+            _json.dumps({"ok": True, "sent": len(calls[-1]["cards"]), "failures": []}).encode()
+        )
+
+    cards = [
+        {"png": b"\x89PNG-summary", "caption": "3 to action, 1 blocked", "buttons": []},
+        {"text": "Claim #7 — mark sent", "buttons": [{"label": "Sent", "command": "/mark 7 sent"}]},
+        {"text": "Claim #8 — assign pet", "buttons": [{"label": "Aari", "command": "/pet 8 1"}]},
+    ]
+    real_url, real_token = config.OPENCLAW_GATEWAY_HTTP_URL, config.OPENCLAW_GATEWAY_TOKEN
+    config.OPENCLAW_GATEWAY_HTTP_URL = "http://gateway:18789"
+    config.OPENCLAW_GATEWAY_TOKEN = "t"
+    try:
+        assert gateway_client.using_http_route() is True
+        gateway_client.send_cards("77", cards, correlation="tg-test-1", poster=poster)
+
+        # One request for three cards, in the order they were given.
+        assert len(calls) == 1, calls
+        payload = calls[0]["cards"]
+        assert [c.get("message") for c in payload] == [
+            "3 to action, 1 blocked",
+            "Claim #7 — mark sent",
+            "Claim #8 — assign pet",
+        ], payload
+        # The rendered card travels as a PATH through the shared outbox. Base64
+        # in `buffer` is accepted by the schema and fails at runtime: the gateway
+        # materialises it under a read-only mount (`ENOENT: mkdir .../media/
+        # outbound`), which only a live send revealed.
+        assert payload[0]["media_url"].startswith(config.MEDIA_OUTBOX_GATEWAY_DIR), payload[0]
+        assert "media_url" not in payload[1], payload[1]
+        # Buttons go through the one validated builder, nested inside `blocks` —
+        # the shape the platform's own normalizer accepts. Top-level `buttons`
+        # is discarded silently with `ok: true`.
+        assert payload[1]["presentation"]["blocks"][0]["type"] == "buttons", payload[1]
+        assert "buttons" not in payload[0], "the summary card should carry no presentation"
+
+        # Every delivered card is in the message log, one row each, in order.
+        # Scoped to the last three: earlier tests share this database.
+        with db.get_connection() as conn:
+            logged = conn.execute(
+                "SELECT kind, summary FROM telegram_messages WHERE direction = 'out' "
+                "ORDER BY id DESC LIMIT 3"
+            ).fetchall()
+        assert [r["kind"] for r in reversed(logged)] == ["file", "text", "text"], [
+            dict(r) for r in logged
+        ]
+        assert [r["summary"] for r in reversed(logged)] == [
+            "3 to action, 1 blocked",
+            "Claim #7 — mark sent",
+            "Claim #8 — assign pet",
+        ], [dict(r) for r in logged]
+
+        # A partial send raises, naming the reason. Never a quiet success.
+        def failing(request, timeout=None):
+            return _Response(
+                _json.dumps(
+                    {"ok": False, "sent": 1, "failures": [{"card": 1, "reason": "chat not found"}]}
+                ).encode()
+            )
+
+        try:
+            gateway_client.send_cards("77", cards, poster=failing)
+        except gateway_client.GatewaySendError as exc:
+            assert "chat not found" in str(exc), str(exc)
+        else:
+            raise AssertionError("a partial send was reported as a whole one")
+    finally:
+        config.OPENCLAW_GATEWAY_HTTP_URL, config.OPENCLAW_GATEWAY_TOKEN = real_url, real_token
+
+    # Both halves or neither: a URL with no token would 401 every send and read
+    # as an outage rather than as a misconfiguration.
+    assert gateway_client.using_http_route() is False
+
+
+def test_the_ack_is_the_gateways_own_and_the_scope_is_the_one_that_covers_a_dm():
+    """Two deploys were spent hand-rolling a 👍 in the plugin, on two different
+    hooks, and neither could have worked. The cause was never the hook: the
+    gateway ships this feature and its default `ackReactionScope` is
+    `group-mentions`, so it was configured off for the only chat here — a DM.
+    That is also why Justin never saw it work before the gateway.
+
+    So the assertion is on the SEED, which is where the fix lives, plus the two
+    things the plugin must not go back to doing.
+
+    A tap is separately impossible for anyone to ack: it arrives as a callback
+    query, so there is no message to react to. `startTypingCue` is what covers
+    it, and that is asserted here too because it is the only feedback a tap has
+    beyond its reply."""
+    seed = (
+        Path(__file__).resolve().parent.parent.parent / "scripts" / "gateway_seed.sh"
+    ).read_text(encoding="utf-8")
+    assert "messages.ackReactionScope '\"all\"'" in seed, (
+        "the ack scope is not set to one that includes a DM"
+    )
+    assert "messages.ackReaction " in seed, "no ack emoji is configured"
+    assert "messages.statusReactions.enabled false" in seed, (
+        "statusReactions turns the sticky ack into a transient lifecycle emoji that clears — "
+        "it was enabled once and the 👍 stopped coming back"
+    )
+
+    plugin = (Path(__file__).resolve().parent.parent / "gateway-plugin" / "index.js").read_text(
+        encoding="utf-8"
+    )
+    assert "registerInboundAck" not in plugin, (
+        "the hand-rolled ack is back; the gateway does this natively via messages.ackReaction"
+    )
+    assert "sendChatAction" in plugin and "startTypingCue" in plugin, (
+        "the typing cue is gone — a tap would then have no feedback until its reply lands"
+    )
+
+
+def test_the_plugin_declares_the_contract_its_in_process_send_depends_on():
+    """The load-bearing line is in a JSON manifest, and losing it fails at
+    RUNTIME with a thrown dispatch — no build error, no lint, nothing at deploy.
+
+    `registry.canDispatchGatewayMethodsFromHttpRoute` reads
+    `contracts.gatewayMethodDispatch` from the manifest **alone**; the route
+    cannot ask for the permission itself. So the manifest and the code that
+    depends on it are asserted together, here, where a rename is caught before it
+    reaches a container."""
+    import json as _json
+
+    plugin_dir = Path(__file__).resolve().parent.parent / "gateway-plugin"
+    manifest = _json.loads((plugin_dir / "openclaw.plugin.json").read_text(encoding="utf-8"))
+    assert manifest.get("contracts", {}).get("gatewayMethodDispatch") == [
+        "authenticated-request"
+    ], manifest
+
+    plugin = (plugin_dir / "index.js").read_text(encoding="utf-8")
+    assert "dispatchGatewayMethod" in plugin, "the plugin no longer dispatches in-process"
+    assert '"/api/v1/claims/send"' in plugin, "the send route path changed — config must follow"
+    # `auth: "plugin"` routes are handed an EMPTY scope list, so a write would be
+    # refused; only the trusted-operator surface resolves the CLI's own scopes.
+    assert 'gatewayRuntimeScopeSurface: "trusted-operator"' in plugin, plugin[:0]
+    assert 'auth: "gateway"' in plugin, "a plugin-auth route cannot dispatch a write"
+
+
+def test_chat_has_a_gemini_backend_and_the_agents_primary_is_the_reachable_provider():
+    """Groq blocks this network as of 2026-08-04 — 403 to a request carrying no
+    Authorization header at all, from the host and from inside both containers.
+    Not the key, not the account, not a rate limit. Every model in
+    `_FALLBACK_MODELS` is Groq, so the whole ADR-0017 chain went with it and the
+    agent had no model for four deploys.
+
+    Two halves, and each fails differently if lost:
+
+    1. `chat()` used to refuse `LLM_PROVIDER=gemini` outright ("supports
+       extract() only"), so switching the app's provider would have traded a 403
+       for a hard refusal. Asserted by behaviour rather than by grepping for the
+       old message: with the provider set and the key blank it must fail on the
+       KEY, which proves it reached the client instead of the old early return.
+    2. The gateway agent's primary must be the provider that answers. Groq stays
+       configured — a network that can reach it needs one line changed, not a
+       provider rebuilt — but it must not be the primary while it is blocked."""
+    base, model, _key = None, None, None
+    assert "gemini" in llm._PROVIDERS, (
+        "chat() has no Gemini backend; the tool loop is Groq-only again"
+    )
+    base, model, _key = llm._PROVIDERS["gemini"]
+    assert base.endswith("/v1beta/openai"), (
+        f"the OpenAI-compatible surface is what `openai-completions` needs, got {base}"
+    )
+    assert model.startswith("gemini-"), model
+
+    original = config.LLM_PROVIDER
+    original_client = llm._client
+    try:
+        config.LLM_PROVIDER = "gemini"
+        llm._client = None
+        try:
+            llm.chat([{"role": "user", "content": "hi"}])
+            raise AssertionError("a blank key must fail visibly")
+        except llm.LLMUnavailableError as exc:
+            assert "GEMINI_API_KEY" in str(exc), (
+                f"chat() refused gemini before reaching the client: {exc}"
+            )
+    finally:
+        config.LLM_PROVIDER = original
+        llm._client = original_client
+
+    seed = (
+        Path(__file__).resolve().parent.parent.parent / "scripts" / "gateway_seed.sh"
+    ).read_text(encoding="utf-8")
+    assert "models.providers.gemini" in seed, "the gateway has no Gemini provider configured"
+
+    # The gateway needs the SAME chain the app has, and for the same reason: the
+    # daily quota is per model, so a spent primary is only survivable by moving.
+    # Learned live 2026-08-04 — a day of deploys exhausted
+    # GenerateRequestsPerDayPerProjectPerModel-FreeTier for gemini-2.5-flash and the
+    # deploy failed with one model declared and nowhere to go.
+    #
+    # Asserted as a SET relationship against llm._FALLBACK_MODELS rather than as a
+    # literal list: two hand-maintained copies of a model chain is the duplication
+    # this repo keeps getting caught by.
+    for model in llm._FALLBACK_MODELS["gemini"]:
+        assert f'"gemini/{model}"' in seed, (
+            f"{model} is in the app's chain but not the gateway's fallbacks"
+        )
+        assert f'\\"id\\":\\"{model}\\"' in seed, (
+            f"{model} is a fallback the provider entry never declares — the gateway "
+            "cannot fail over to a model it does not know"
+        )
+    assert "agents.defaults.model.fallbacks" in seed, "the agent has no fallback list"
+    assert "generativelanguage.googleapis.com/v1beta/openai" in seed, seed[:0]
+    assert "agents.defaults.model.primary '\"gemini/gemini-2.5-flash\"'" in seed, (
+        "the agent's primary is not the provider this network can reach"
+    )
+    groq_primary = seed.count("agents.defaults.model.primary '\"groq/")
+    assert groq_primary <= 1, (
+        "Groq must be at most the no-Gemini fallback, never the default primary"
+    )
+
+
+def test_a_gateway_command_writes_an_inbound_row_and_settles_it():
+    """Task 4.2. For a day after the cutover NOTHING wrote an inbound row: six of
+    Justin's live commands and taps produced zero `direction=in` rows, so
+    ADR-0014's audit trail had only its outbound half and "did my tap register?"
+    was answerable solely from container logs — which are destroyed on recreate.
+
+    The defect was invisible because task 4.2 was ticked for registering a hook
+    while the tee named in its own sentence was never wired. So this test asserts
+    the ROW, not the wiring.
+
+    Settled immediately and deliberately: `pending()` is the replay queue and
+    nothing drains it after the cutover — `replay_pending` rebuilds a
+    python-telegram-bot Update and its only caller is `telegram_bot.py`, which is
+    off and is deleted by section 6. A row left unprocessed would read as work
+    pending that will never happen."""
+    from openclaw import internal_api
+
+    db.init_db()
+
+    def _rows(pattern):
+        with db.get_connection() as conn:
+            return conn.execute(
+                "SELECT update_id, direction, kind, summary, processed_at, error, correlation_id "
+                "FROM telegram_messages WHERE update_id LIKE ? ORDER BY id",
+                (pattern,),
+            ).fetchall()
+
+    # A command, as the plugin delivers one.
+    inbound_id = internal_api.tee_inbound("tg-dismiss-t1", "/dismiss 2", "jagberg", chat_id=4242)
+    assert inbound_id.startswith("cmd:tg-dismiss-t1:"), inbound_id
+    rows = _rows("cmd:tg-dismiss-t1%")
+    assert len(rows) == 1, f"the command left no inbound row: {rows}"
+    row = rows[0]
+    assert row["direction"] == "in"
+    # The SAME vocabulary the PTB era wrote — `_describe` classifies a
+    # slash-prefixed text as `command`, so no new kind value enters the dataset.
+    assert row["kind"] == "command", row["kind"]
+    assert row["summary"] == "/dismiss 2", row["summary"]
+    assert row["correlation_id"] == "tg-dismiss-t1", (
+        "the row cannot be joined to its outbound cards"
+    )
+    assert row["processed_at"] is None, "settling is the caller's job, not the tee's"
+
+    internal_api.settle_inbound(inbound_id)
+    row = _rows("cmd:tg-dismiss-t1%")[0]
+    assert row["processed_at"] is not None, "an unsettled row sits in a queue nothing drains"
+    assert row["error"] is None
+
+    # A failure settles AND annotates. Order matters: mark_processed refuses a row
+    # that already carries an error, so settling second would leave it pending.
+    failed_id = internal_api.tee_inbound("tg-mark-t2", "/mark 7 sent", "jagberg", chat_id=4242)
+    internal_api.settle_inbound(failed_id, "boom")
+    row = _rows("cmd:tg-mark-t2%")[0]
+    assert row["processed_at"] is not None, "a failed command was left in the replay queue"
+    assert row["error"] == "boom", row["error"]
+
+    # A typed message goes through the other tee and must NOT read as a command.
+    typed_id = internal_api.tee_inbound("tg-text-t3", "kennel cough", "jagberg", chat_id=4242)
+    internal_api.settle_inbound(typed_id)
+    row = _rows("cmd:tg-text-t3%")[0]
+    assert row["kind"] == "text", row["kind"]
+
+    # Both routes must actually call it — the defect this replaces was a helper
+    # that existed with no caller.
+    source = (Path(__file__).resolve().parent.parent / "openclaw" / "internal_api.py").read_text(
+        encoding="utf-8"
+    )
+    assert source.count("tee_inbound(") >= 3, "a tee point stopped calling the tee"
+    assert source.count("settle_inbound(") >= 4, "a path settles nothing, so its row stays queued"
+
+    # THE COLLISION CASE, which the first version of this got wrong. The plugin's
+    # correlation counter is module-level and resets on every plugin reload, so
+    # `tg-actions-n1` recurs after each deploy. Two taps with the SAME correlation
+    # must still produce two rows: with `INSERT OR IGNORE` on a UNIQUE column, a
+    # shared id meant the second tap wrote nothing and then settled the first
+    # tap's row instead.
+    a = internal_api.tee_inbound("tg-actions-n1", "/actions", "jagberg", chat_id=4242)
+    b = internal_api.tee_inbound("tg-actions-n1", "/actions", "jagberg", chat_id=4242)
+    assert a != b, "a repeated correlation produced one id, so a tap would be swallowed"
+    rows = _rows("cmd:tg-actions-n1%")
+    assert len(rows) == 2, f"a restart-repeated correlation lost a row: {rows}"
+    assert {r["correlation_id"] for r in rows} == {"tg-actions-n1"}, (
+        "the join key was mangled to make it unique"
+    )
+    internal_api.settle_inbound(a)
+    settled = {r["update_id"]: r["processed_at"] for r in _rows("cmd:tg-actions-n1%")}
+    assert settled[a] is not None and settled[b] is None, (
+        f"settling one tap touched the other: {settled}"
+    )
+
+    # And the plugin no longer emits an id that repeats across restarts.
+    plugin = (Path(__file__).resolve().parent.parent / "gateway-plugin" / "index.js").read_text(
+        encoding="utf-8"
+    )
+    assert "const RUN =" in plugin and "${RUN}n${++sequence}" in plugin, (
+        "the plugin's correlation counter is back to resetting to n1 on every reload"
+    )
+
+
+def test_a_duplicated_gateway_delivery_commits_exactly_one_mutation():
+    """Task 10.12, and the only §10 item with a money consequence: a second
+    mark-sent is a second Petcover submission for one set of invoices.
+
+    Telegram redelivers, ADR-0014's replay re-runs unsettled rows, and after the
+    cutover a tap crosses two runtimes — so a duplicate is normal traffic, not an
+    edge case. Three layers have to hold, and each is asserted through the real
+    function rather than by inspecting a flag:
+
+      1. the log row dedupes, so the replay queue never holds the same event twice
+      2. `claim_status.mark_sent` refuses a claim that is no longer `drafted`
+      3. `proposals.commit` is single-use
+
+    Layer 1 alone is not enough, which is the point of testing all three: the
+    dedupe only covers a *redelivery of the same update*, and two distinct taps on
+    two cards of the same batch are two different updates."""
+    from openclaw import claim_status, message_log, proposals
+
+    _fresh_db()
+
+    # 1. Same update, delivered twice.
+    raw = {"message": {"text": "/mark 1 sent"}}
+    first = message_log.record_inbound_raw(9_200_001, raw, correlation="dup-a")
+    second = message_log.record_inbound_raw(9_200_001, raw, correlation="dup-b")
+    assert first == 9_200_001, first
+    assert second is None, "a redelivered update was queued a second time"
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT COUNT(*) c FROM telegram_messages WHERE update_id = ?", (9_200_001,)
+        ).fetchone()["c"]
+    assert rows == 1, f"{rows} rows for one update"
+
+    # 2. Two taps on one batch: two different updates, one draft, one submission.
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-01", status="drafted", draft_id="draft-dup")
+        _insert_claim(conn, 1, "2026-06-02", status="drafted", draft_id="draft-dup")
+        ids = [r["id"] for r in conn.execute("SELECT id FROM vet_claims ORDER BY id")]
+
+    one = claim_status.mark_sent(ids[0])
+    assert one["ok"] is True, one
+    # The sibling card's tap. A batch is one email, so this claim is already sent.
+    two = claim_status.mark_sent(ids[1])
+    assert two["ok"] is False, "the sibling tap advanced a claim a second time"
+    assert "sent" in two["message"].lower(), two
+
+    with db.get_connection() as conn:
+        statuses = [r["status"] for r in conn.execute("SELECT status FROM vet_claims ORDER BY id")]
+        events = conn.execute(
+            "SELECT COUNT(*) c FROM claim_status_events WHERE event_type = 'sent'"
+        ).fetchone()["c"]
+    assert statuses == ["sent", "sent"], statuses
+    # One submission, one event per claim — never two for the same claim, which is
+    # what a duplicate Petcover email would look like in the log.
+    assert events == len(ids), f"{events} sent events for {len(ids)} claims"
+
+    # 3. A confirm tap, redelivered.
+    with db.get_connection() as conn:
+        _insert_claim(conn, 1, "2026-06-03", status="drafted", draft_id="draft-solo")
+        solo = conn.execute("SELECT id FROM vet_claims ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    pid = proposals.record("mark_sent", label=f"mark #{solo} sent", claim_id=solo, origin="chat")
+    first_tap = proposals.commit(pid)
+    second_tap = proposals.commit(pid)
+    assert first_tap["ok"] is True, first_tap
+    assert second_tap["ok"] is False and "already confirmed" in second_tap["message"].lower(), (
+        second_tap
+    )
+    with db.get_connection() as conn:
+        solo_events = conn.execute(
+            "SELECT COUNT(*) c FROM claim_status_events WHERE claim_id = ? AND event_type = 'sent'",
+            (solo,),
+        ).fetchone()["c"]
+    assert solo_events == 1, f"the redelivered confirm wrote {solo_events} sent events"
+
+
+def test_the_gateways_log_is_configured_to_outlive_its_container():
+    """Task 13.5's real half. An access denial leaving no trace was read as a log
+    LEVEL problem; the durability half is worse and was the actual cause. The
+    gateway wrote to stdout (`docker compose logs`, destroyed when the container is
+    recreated) and to `/tmp/openclaw/openclaw-<date>.log`, inside the container and
+    destroyed with it — so every deploy erased the evidence for the one before, and
+    this session lost a real failure's text that way (`job_runs.last_error`).
+
+    `/home/node/.openclaw` is the state volume, so a file there survives. Asserted
+    on the seed because that is where the setting lives and nothing else would
+    notice its removal."""
+    seed = (
+        Path(__file__).resolve().parent.parent.parent / "scripts" / "gateway_seed.sh"
+    ).read_text(encoding="utf-8")
+    assert "logging.file" in seed, "the gateway log has no durable sink again"
+    assert "/home/node/.openclaw/logs/" in seed, (
+        "the log path is outside the state volume, so a recreate destroys it"
+    )
+    assert "/tmp/" not in seed.split("logging.file")[1][:200], "back to a container-local path"
+    # Level pinned rather than inherited: the ingress drop lines are info, so a
+    # shipped default moving to warn would silently take them with it.
+    assert "logging.level '\"info\"'" in seed
+
+
+def test_a_gateway_delivered_event_and_its_replies_carry_the_same_correlation_id():
+    """Task 10.14. An event now crosses gateway -> plugin -> app -> handler -> any
+    resulting send, and the log lines were the only place the id existed. Container
+    logs do not survive a recreate, so a week-old "did my tap register?" was
+    answerable only through `update_id` — which pairs with the correlation id in a
+    log line that is already gone.
+
+    Also covers the migration itself: the live table has hundreds of rows and
+    `CREATE TABLE IF NOT EXISTS` will not add a column to it, so the column arrives
+    via `_migrate_added_columns` at startup. Asserted against a table created
+    WITHOUT the column, because that is the live case and the fresh-DB case would
+    pass either way."""
+    import sqlite3 as _sqlite3
+
+    from openclaw import internal_api, message_log
+
+    # The live shape: the table exists, predates the column, and holds a row.
+    legacy = Path(_tmpdir) / "legacy-messages.db"
+    if legacy.exists():
+        legacy.unlink()
+    with _sqlite3.connect(legacy) as conn:
+        conn.execute("""CREATE TABLE telegram_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, update_id INTEGER UNIQUE, direction TEXT NOT NULL,
+            kind TEXT, summary TEXT, payload TEXT NOT NULL, app_version TEXT NOT NULL,
+            received_at TEXT NOT NULL, processed_at TEXT, error TEXT)""")
+        conn.execute(
+            "INSERT INTO telegram_messages (update_id, direction, payload, app_version, "
+            "received_at) VALUES (1, 'in', '{}', 'old', 'then')"
+        )
+    db.init_db(str(legacy))
+    with _sqlite3.connect(legacy) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(telegram_messages)")}
+        assert "correlation_id" in cols, "the column was not migrated onto an existing table"
+        old_row = conn.execute(
+            "SELECT correlation_id FROM telegram_messages WHERE update_id = 1"
+        ).fetchone()
+    assert old_row[0] is None, "a pre-existing row must read NULL, not a fabricated id"
+
+    # Now the real writers, on the suite's own DB.
+    db.init_db()
+    correlation = internal_api._correlation_id(None)
+    assert (
+        message_log.record_inbound_raw(
+            9_100_001, {"message": {"text": "tap"}}, correlation=correlation
+        )
+        == 9_100_001
+    )
+    message_log.record_outbound("text", "reply to that tap", {"x": 1}, correlation=correlation)
+    # An unprompted send has no inbound event, so it carries no id rather than a
+    # made-up one — a fabricated link is worse than an absent one.
+    message_log.record_outbound("text", "daily nudge", {"x": 2})
+
+    with db.get_connection() as conn:
+        inbound = conn.execute(
+            "SELECT correlation_id FROM telegram_messages WHERE update_id = ?", (9_100_001,)
+        ).fetchone()
+        replied = conn.execute(
+            "SELECT correlation_id FROM telegram_messages WHERE summary = 'reply to that tap'"
+        ).fetchone()
+        nudge = conn.execute(
+            "SELECT correlation_id FROM telegram_messages WHERE summary = 'daily nudge'"
+        ).fetchone()
+    assert inbound["correlation_id"] == correlation
+    assert replied["correlation_id"] == correlation, "the reply cannot be joined to its cause"
+    assert nudge["correlation_id"] is None, "an unprompted send invented a correlation"
+
+
+def test_nothing_in_the_app_can_send_mail_and_no_tool_offers_to():
+    """Task 10.3, guarding the first hard rule: Gmail DRAFTS only, never send.
+
+    Two halves, because there are two ways to break it. The code half greps for
+    Gmail's send call rather than for the word "send" — `bot.send_message` is a
+    legitimate Telegram send and a guard that trips on it gets deleted within a
+    week. The inventory half matters because the agent cannot be argued out of a
+    capability it has: if a send tool is on the surface, prompt wording is all
+    that stands between a model and an outgoing email."""
+    from openclaw import mcp_server
+
+    offenders = []
+    for path in (Path(__file__).resolve().parent.parent / "openclaw").glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for pattern in ("messages().send", "messages() .send", ".send(userId", "drafts().send"):
+            # Only real call sites: this file's own prose says "never send()", and
+            # so do several module docstrings.
+            for line in text.splitlines():
+                if pattern in line and not line.lstrip().startswith("#"):
+                    offenders.append(f"{path.name}: {line.strip()[:80]}")
+    assert not offenders, f"a Gmail send call exists: {offenders}"
+
+    named = [t["name"] for t in mcp_server.TOOLS]
+    for tool in named:
+        assert "send" not in tool and "email" not in tool and "mail" not in tool, (
+            f"the agent's tool surface offers {tool} — a send capability cannot be prompted away"
+        )
+    # And the drafting path IS present, so this test cannot pass by the whole
+    # Gmail integration having been deleted. `drafts().create` lives in
+    # claim_forms and invoice_matching, NOT in gmail_client — which is where this
+    # assertion first looked, and it failed for that reason rather than for a real
+    # one. Scan the package.
+    package = "\n".join(
+        p.read_text(encoding="utf-8")
+        for p in (Path(__file__).resolve().parent.parent / "openclaw").glob("*.py")
+    )
+    assert "drafts().create" in package, "no draft path left — this guard would then be vacuous"
+
+
+def test_an_overlapping_internal_call_says_skipped_and_never_reads_as_a_run():
+    """The `skipped` body of `/internal/*` — three responses, and this was the one
+    with no assertion (named in section 10's own gap list).
+
+    It matters because cron fires on a fixed cadence and a tick can outlast it: a
+    skipped run that answered `ok` would make an overlap indistinguishable from
+    work done, and `job_runs.last_ok_at` would advance on a run that never ran."""
+    from openclaw import internal_api
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM job_runs WHERE route = 'tick'")
+    internal_api.record_run("tick", "last_ok_at")
+    before = internal_api.scheduler_health()["jobs"]["tick"]["last_ok_at"]
+
+    ran = []
+    lock = internal_api._locks.setdefault("tick", __import__("threading").Lock())
+    lock.acquire()  # stand in for a tick still running
+    try:
+        body = internal_api._run("tick", lambda: ran.append(1), "corr-test")
+    finally:
+        lock.release()
+
+    assert body["status"] == "skipped", body
+    assert body["reason"] == "already running", body
+    assert body["correlation_id"] == "corr-test", body
+    assert ran == [], "the job body ran anyway — the lock bought nothing"
+
+    after = internal_api.scheduler_health()["jobs"]["tick"]
+    assert after["last_ok_at"] == before, "a skipped run advanced last_ok_at"
+    assert after["last_skipped_at"], "the skip was not recorded, so a stuck lock looks healthy"
+
+
+def test_extraction_walks_the_model_chain_under_every_provider_including_gemini():
+    """Task 10.13, and it caught a live regression rather than confirming one.
+
+    `llm.extract` used to delegate to `gemini.extract` whenever
+    LLM_PROVIDER=gemini. Harmless while Gemini was a rollback option; the day it
+    became the default (Groq blocked the network) invoice extraction silently lost
+    ADR-0017's per-model daily walk, because `gemini._generate` pins ONE model and
+    retries it three times with backoff — the correct answer to a per-minute cap
+    and a useless one to a per-day cap.
+
+    Asserted by COUNTING the models tried, not by checking which module was
+    imported: the point is the walk, and a future refactor could keep the walk
+    while moving the code."""
+    from openclaw import llm
+
+    tried = []
+    tpd = Exception(
+        "429 RESOURCE_EXHAUSTED: You exceeded your current quota. "
+        "violations: [{'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'}]"
+    )
+
+    # Gemini's per-day 429 must classify as daily-exhausted, or the chain never
+    # walks. Its message says only "you exceeded your current quota" — the useful
+    # part is the quotaId, captured from a real response on 2026-08-04.
+    assert llm._is_daily_budget_exhausted(tpd), "Gemini's per-day quota is not recognised"
+    # And a purely per-minute Gemini 429 must NOT trigger a model switch: waiting
+    # is the only cure there, and switching burns a second model's budget.
+    assert not llm._is_daily_budget_exhausted(
+        Exception(
+            "429 RESOURCE_EXHAUSTED: violations: "
+            "[{'quotaId': 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier'}]"
+        )
+    )
+
+    class _Client:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(model, **kwargs):
+                    tried.append(model)
+                    if len(tried) < 3:
+                        raise tpd
+
+                    class _M:
+                        content = f"extracted by {model}"
+                        tool_calls = None
+
+                    return type("R", (), {"choices": [type("C", (), {"message": _M()})()]})
+
+    original_provider, original_client = config.LLM_PROVIDER, llm._client
+    original_key = llm._PROVIDERS["gemini"]
+    try:
+        config.LLM_PROVIDER = "gemini"
+        # A key must be present or _openai_client refuses before any model is tried.
+        llm._PROVIDERS["gemini"] = (original_key[0], original_key[1], "test-key")
+        llm._client = _Client()
+        text = llm.extract("read this invoice", purpose="test")
+    finally:
+        config.LLM_PROVIDER = original_provider
+        llm._PROVIDERS["gemini"] = original_key
+        llm._client = original_client
+
+    assert len(tried) == 3, (
+        f"extraction stopped at {tried} — a per-day cap was retried instead of walked"
+    )
+    assert tried[0] == llm._PROVIDERS["gemini"][1], f"primary first: {tried}"
+    assert tried[1:] == list(llm._FALLBACK_MODELS["gemini"])[:2], (
+        f"then the chain, in order: {tried}"
+    )
+    assert "extracted by" in text
+
+
+def test_the_cron_declarations_cover_every_job_apscheduler_ran_at_the_cadence_config_says():
+    """Task 5.1. Two copies of a schedule is the duplication this repo keeps
+    getting bitten by, so the numbers in `scripts/gateway_cron.sh` are asserted
+    against `config.py`'s defaults rather than trusted to stay in step.
+
+    And the COVERAGE half matters more than the cadences: APScheduler ran five
+    jobs, and the two nobody thinks about — the weekly vet chase and the queue
+    expiry — had no internal endpoint at all. Without them the cutover stops them
+    silently, which is indistinguishable from a week with nothing to chase."""
+    cron = (
+        Path(__file__).resolve().parent.parent.parent / "scripts" / "gateway_cron.sh"
+    ).read_text(encoding="utf-8")
+
+    # Every route the script posts to must exist on the router, and every
+    # scheduled job must have a route. Derived from the app, not a second list.
+    from openclaw import internal_api
+
+    routes = {r.path for r in internal_api.router.routes}
+    for route in ("tick", "ingest", "nudge", "vet-nudge", "expire-queue"):
+        assert f"/internal/{route}" in routes, (
+            f"/internal/{route} is scheduled but the router has no such path: {sorted(routes)}"
+        )
+        assert route in cron, f"{route} has an endpoint but nothing schedules it"
+
+    assert f"{config.VET_CLAIM_PIPELINE_INTERVAL_MINUTES}m" in cron, (
+        "the tick cadence in gateway_cron.sh disagrees with VET_CLAIM_PIPELINE_INTERVAL_MINUTES"
+    )
+    assert f"{config.GMAIL_POLL_INTERVAL_MINUTES}m" in cron, (
+        "the ingest cadence disagrees with GMAIL_POLL_INTERVAL_MINUTES"
+    )
+    assert f"0 {config.ACTION_NUDGE_HOUR} * * *" in cron, (
+        "the daily cron hour disagrees with ACTION_NUDGE_HOUR"
+    )
+    # Monday, as VET_NUDGE_DAY says. Cron's 5-field day-of-week is numeric here.
+    weekday = {"mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6, "sun": 0}
+    assert f"0 {config.ACTION_NUDGE_HOUR} * * {weekday[config.VET_NUDGE_DAY]}" in cron, (
+        f"the weekly cron day disagrees with VET_NUDGE_DAY={config.VET_NUDGE_DAY}"
+    )
+
+    # Sydney, not UTC. APScheduler ran these in the app container's local time,
+    # which is UTC, so "hour 9" delivered a MORNING nudge at 7-8pm Sydney. Changed
+    # deliberately 2026-08-04 (Justin), and asserted because reverting it would be
+    # invisible: the cron expression would still read `0 9 * * *` and still fire
+    # daily, just at the wrong end of his day.
+    assert "Australia/Sydney" in cron, (
+        "the daily jobs are back on UTC — 9am becomes evening in Sydney"
+    )
+    assert "--tz UTC" not in cron
+    # An IANA zone rather than a fixed offset, so DST is the gateway's problem
+    # rather than something that drifts by an hour twice a year.
+    assert "+10" not in cron and "+11" not in cron
+
+    # The secret must reach the app as an unexpanded variable. Interpolating it
+    # into the payload would persist it in the gateway's cron store and echo it
+    # back from `cron get`, `cron list` and the run log.
+    assert "$CLAIMS_INTERNAL_SECRET" in cron and "X-OpenClaw-Secret" in cron
+    # -f, or curl exits 0 on a 500 and a failed tick reads as a successful run.
+    assert "curl -fsS" in cron, "without -f an HTTP error is not an error"
+    # Idempotency: without a declaration key every deploy adds five more jobs.
+    assert cron.count("--declaration-key") >= 1
+
+
+def test_a_reminder_due_while_the_app_was_down_still_fires_and_says_how_late():
+    """Justin's call, 2026-08-04: never drop a late one, and never let it pass for
+    fresh. Cron cannot express a one-shot at an arbitrary minute, so the sweep
+    rides the 15-minute tick — which also means the sweep must be idempotent,
+    since a duplicated cron delivery (5.4) calls it twice."""
+    from openclaw import reminders
+
+    db.init_db()
+    # Inserted directly: `tasks.create_task` runs an LLM follow-up extraction, and
+    # the suite forces every provider key blank to stay hermetic.
+    with db.get_connection() as conn:
+        task_id = conn.execute(
+            "INSERT INTO tasks (description, status, source, created_at) VALUES (?,?,?,?)",
+            ("feed the cat", "open", "test", datetime.now(timezone.utc).isoformat()),
+        ).lastrowid
+    now = datetime.now(timezone.utc)
+    long_ago = now - timedelta(days=3)
+    future = now + timedelta(hours=4)
+    # Rows inserted directly, NOT via `schedule_reminder`. That helper still adds
+    # an APScheduler `date` job while the flag allows it, and this suite has the
+    # scheduler running — so for a past-dated reminder the job fires immediately
+    # and marks it `due` before the sweep looks, and the sweep then finds nothing.
+    # The first version of this test raced exactly that and failed intermittently
+    # on ordering. The sweep is what is under test; the legacy job is not.
+    with db.get_connection() as conn:
+        for when in (long_ago, future):
+            conn.execute(
+                "INSERT INTO reminders (task_id, scheduled_at, status, job_id, created_at) "
+                "VALUES (?, ?, 'scheduled', ?, ?)",
+                (task_id, when.isoformat(), f"sweep-test-{when.isoformat()}", now.isoformat()),
+            )
+
+    assert reminders.sweep_due(now) == 1, "exactly the overdue one fires"
+    # Idempotent: the second call marks nothing, so a duplicated cron delivery
+    # cannot double-fire. The guarantee is the WHERE clause, not a fired_at
+    # column — a new column would need hand-run ALTER TABLE on the live DB.
+    assert reminders.sweep_due(now) == 0
+
+    with db.get_connection() as conn:
+        rows = {
+            r["scheduled_at"]: r["status"]
+            for r in conn.execute("SELECT scheduled_at, status FROM reminders").fetchall()
+        }
+    assert rows[long_ago.isoformat()] == "due"
+    assert rows[future.isoformat()] == "scheduled", "a future reminder must not be swept"
+
+    # "note how late" — the words, so a three-day-late reminder cannot be read as
+    # one set this morning.
+    assert reminders.overdue_text(long_ago.isoformat(), now) == "overdue by 3d"
+    assert reminders.overdue_text((now - timedelta(hours=5)).isoformat(), now) == "overdue by 5h"
+    assert (
+        reminders.overdue_text((now - timedelta(minutes=40)).isoformat(), now) == "overdue by 40m"
+    )
+    # Inside one tick's lag is the design, not a delay worth naming.
+    assert reminders.overdue_text((now - timedelta(minutes=4)).isoformat(), now) == "on time"
+
+
+def test_a_scheduler_that_stopped_firing_is_a_value_on_health_not_an_absence():
+    """Task 5.6, and the whole reason `job_runs` exists. Once cron owns
+    scheduling, a never-declared or disabled entry looks exactly like a quiet
+    week — the app has no opinion about *when* work happens any more.
+
+    Asserted through `record_run` rather than by hand-writing rows, so the thing
+    under test is the path `/internal/*` actually takes."""
+    from openclaw import internal_api
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM job_runs")
+
+    # Nothing has ever run: every job overdue, and "never" rather than a made-up
+    # age. This is the state a missing cron entry leaves behind.
+    health = internal_api.scheduler_health()
+    assert health["jobs"]["tick"]["minutes_since_ok"] is None
+    assert any(o.startswith("tick: never") for o in health["overdue"]), health["overdue"]
+    assert len(health["overdue"]) == 5, health["overdue"]
+
+    internal_api.record_run("tick", "last_ok_at")
+    health = internal_api.scheduler_health()
+    assert health["jobs"]["tick"]["minutes_since_ok"] == 0
+    assert not any(o.startswith("tick") for o in health["overdue"]), health["overdue"]
+
+    # A stale success is overdue. Written directly because the point is age, and
+    # the only way to age a row through record_run is to wait 45 minutes.
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=46)).isoformat()
+    with db.get_connection() as conn:
+        conn.execute("UPDATE job_runs SET last_ok_at = ? WHERE route = 'tick'", (stale,))
+    health = internal_api.scheduler_health()
+    assert any(o.startswith("tick: 46m") for o in health["overdue"]), health["overdue"]
+
+    # An error and a skip are recorded distinctly. A route that only ever skips is
+    # a stuck lock and must not read as healthy.
+    internal_api.record_run("ingest", "last_error_at", "boom")
+    internal_api.record_run("nudge", "last_skipped_at")
+    health = internal_api.scheduler_health()
+    assert health["jobs"]["ingest"]["last_error"] == "boom"
+
+    # The error text must SURVIVE the next run starting. The first version cleared
+    # it on every write, so the following start erased it — found live, with
+    # `/health` showing `last_error_at` set and `last_error: null` after the
+    # container holding the matching log line had been recreated. The diagnostic
+    # was simply gone.
+    internal_api.record_run("ingest", "last_started_at")
+    assert internal_api.scheduler_health()["jobs"]["ingest"]["last_error"] == "boom", (
+        "a run starting wiped the previous failure's reason"
+    )
+    internal_api.record_run("ingest", "last_skipped_at")
+    assert internal_api.scheduler_health()["jobs"]["ingest"]["last_error"] == "boom"
+    # A success clears it: a stale error beside a fresh last_ok_at reads as an
+    # outage that is still happening.
+    internal_api.record_run("ingest", "last_ok_at")
+    assert internal_api.scheduler_health()["jobs"]["ingest"].get("last_error") is None
+    assert health["jobs"]["nudge"]["last_skipped_at"]
+    assert health["jobs"]["nudge"]["last_ok_at"] is None, "a skip is not a success"
+
+    # Which runtime is expected to be driving, read from the flag rather than
+    # guessed: "nothing ran" means a broken app when the flag is on and a missing
+    # cron entry when it is off, and those have different fixes.
+    original = config.SCHEDULER_ENABLED
+    try:
+        config.SCHEDULER_ENABLED = False
+        assert internal_api.scheduler_health()["owner"] == "gateway cron"
+        config.SCHEDULER_ENABLED = True
+        assert internal_api.scheduler_health()["owner"] == "in-process scheduler"
+    finally:
+        config.SCHEDULER_ENABLED = original
 
 
 if __name__ == "__main__":
@@ -4949,5 +7714,3 @@ if __name__ == "__main__":
             fn()
             print(f"{name} OK")
     print("ALL TESTS PASSED")
-
-

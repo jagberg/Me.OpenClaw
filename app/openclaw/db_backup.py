@@ -41,18 +41,24 @@ def _snapshot_db_bytes() -> bytes:
 
 def _get_or_create_subfolder(service, parent_id: str, name: str) -> str:
     query = f"'{parent_id}' in parents and name = '{name}' and mimeType = '{_FOLDER_MIME}' and trashed = false"
-    found = service.files().list(q=query, fields="files(id)", spaces="drive").execute().get("files", [])
+    found = (
+        service.files().list(q=query, fields="files(id)", spaces="drive").execute().get("files", [])
+    )
     if found:
         return found[0]["id"]
-    folder = service.files().create(
-        body={"name": name, "mimeType": _FOLDER_MIME, "parents": [parent_id]}, fields="id"
-    ).execute()
+    folder = (
+        service.files()
+        .create(body={"name": name, "mimeType": _FOLDER_MIME, "parents": [parent_id]}, fields="id")
+        .execute()
+    )
     return folder["id"]
 
 
 def _upload(service, data: bytes, name: str, parent_id: str, mimetype: str) -> None:
     media = MediaInMemoryUpload(data, mimetype=mimetype, resumable=False)
-    service.files().create(body={"name": name, "parents": [parent_id]}, media_body=media, fields="id").execute()
+    service.files().create(
+        body={"name": name, "parents": [parent_id]}, media_body=media, fields="id"
+    ).execute()
 
 
 def _write_local_log(lines: list) -> None:
@@ -82,11 +88,15 @@ def backup_once() -> dict:
         lines.append(f"uploaded {db_name} to Drive folder {config.DRIVE_BACKUP_FOLDER_ID}")
         result["ok"] = True
 
-        log_folder_id = _get_or_create_subfolder(service, config.DRIVE_BACKUP_FOLDER_ID, config.DRIVE_BACKUP_LOG_SUBFOLDER)
+        log_folder_id = _get_or_create_subfolder(
+            service, config.DRIVE_BACKUP_FOLDER_ID, config.DRIVE_BACKUP_LOG_SUBFOLDER
+        )
         lines.append("backup succeeded")
         _write_local_log(lines)
         try:
-            _upload(service, "\n".join(lines).encode("utf-8"), log_name, log_folder_id, "text/plain")
+            _upload(
+                service, "\n".join(lines).encode("utf-8"), log_name, log_folder_id, "text/plain"
+            )
         except Exception as log_exc:
             logger.error("Drive backup: log upload failed (backup itself succeeded): %s", log_exc)
     except Exception as exc:

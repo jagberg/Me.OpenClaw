@@ -59,7 +59,9 @@ def _describe(update: dict) -> tuple[str, str]:
             return "command", f"{prefix}{text}"[:_SUMMARY_LIMIT]
         if text:
             return "text", f"{prefix}{text}"[:_SUMMARY_LIMIT]
-        media = "document" if message.get("document") else "photo" if message.get("photo") else "other"
+        media = (
+            "document" if message.get("document") else "photo" if message.get("photo") else "other"
+        )
         return "non_text", f"<{media}>"
     return "other", ""
 
@@ -80,7 +82,9 @@ def record_inbound(update) -> int | None:
     return record_inbound_raw(update_id, raw, payload=payload)
 
 
-def record_inbound_raw(update_id: int | str, raw: dict, payload: str | None = None) -> int | str | None:
+def record_inbound_raw(
+    update_id: int | str, raw: dict, payload: str | None = None, correlation: str | None = None
+) -> int | str | None:
     """The actual writer. Same row, same dedupe, whichever transport delivered it.
 
     The gateway path calls this directly: after the cutover the app never sees a
@@ -101,23 +105,33 @@ def record_inbound_raw(update_id: int | str, raw: dict, payload: str | None = No
     with db.get_connection() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO telegram_messages "
-            "(update_id, direction, kind, summary, payload, app_version, received_at) "
-            "VALUES (?, 'in', ?, ?, ?, ?, ?)",
-            (update_id, kind, summary, payload, config.APP_VERSION, _now()),
+            "(update_id, direction, kind, summary, payload, app_version, received_at, correlation_id) "
+            "VALUES (?, 'in', ?, ?, ?, ?, ?, ?)",
+            (update_id, kind, summary, payload, config.APP_VERSION, _now(), correlation),
         )
         if cur.rowcount == 0:
             return None
     return update_id
 
 
-def record_outbound(kind: str, summary: str, payload: dict) -> None:
+def record_outbound(kind: str, summary: str, payload: dict, correlation: str | None = None) -> None:
+    """`correlation` ties a reply to the inbound event that caused it, so a tap and
+    the cards it produced share one id. Optional because the unprompted sends --
+    the nudge, a claim notification -- have no inbound event to correlate with, and
+    inventing one would imply a causal link that does not exist."""
     with db.get_connection() as conn:
         conn.execute(
             "INSERT INTO telegram_messages "
-            "(direction, kind, summary, payload, app_version, received_at) "
-            "VALUES ('out', ?, ?, ?, ?, ?)",
-            (kind, (summary or "")[:_SUMMARY_LIMIT], json.dumps(payload, default=str),
-             config.APP_VERSION, _now()),
+            "(direction, kind, summary, payload, app_version, received_at, correlation_id) "
+            "VALUES ('out', ?, ?, ?, ?, ?, ?)",
+            (
+                kind,
+                (summary or "")[:_SUMMARY_LIMIT],
+                json.dumps(payload, default=str),
+                config.APP_VERSION,
+                _now(),
+                correlation,
+            ),
         )
 
 
@@ -149,7 +163,9 @@ def mark_failed(update_id: int | None, error: str) -> None:
 
 def pending() -> list:
     """Inbound updates still owed, newest last, inside the replay window."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=config.MESSAGE_QUEUE_TTL_HOURS)).isoformat()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=config.MESSAGE_QUEUE_TTL_HOURS)
+    ).isoformat()
     with db.get_connection() as conn:
         return conn.execute(
             "SELECT update_id, payload, summary FROM telegram_messages "
@@ -168,8 +184,11 @@ async def replay_pending(application) -> int:
     rows = pending()
     if not rows:
         return 0
-    logger.warning("replaying %d unprocessed Telegram update(s): %s", len(rows),
-                   ", ".join(r["summary"] or "?" for r in rows))
+    logger.warning(
+        "replaying %d unprocessed Telegram update(s): %s",
+        len(rows),
+        ", ".join(r["summary"] or "?" for r in rows),
+    )
     replayed = 0
     for row in rows:
         try:
@@ -190,7 +209,9 @@ async def replay_pending(application) -> int:
 def expire_queue() -> int:
     """Stop replaying updates older than the window. The row stays — it's
     training data; only its queue membership expires."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=config.MESSAGE_QUEUE_TTL_HOURS)).isoformat()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=config.MESSAGE_QUEUE_TTL_HOURS)
+    ).isoformat()
     with db.get_connection() as conn:
         cur = conn.execute(
             "UPDATE telegram_messages SET processed_at = ?, error = COALESCE(error, ?) "

@@ -22,7 +22,7 @@ import json
 import logging
 import subprocess
 
-from . import config, message_log
+from . import config, message_log, trace
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,9 @@ COMMAND_CALLBACK_BUDGET_BYTES = 58
 # `button_commands.py`, which imports nothing, because the deploy-time
 # preflight reads it from a worktree with no virtualenv and importing this
 # module would drag in config (dotenv) and db.
-from .button_commands import BUTTON_COMMANDS  # noqa: F401
+# The E402 suppression below carries that paragraph's weight: the placement is
+# deliberate, so the linter is told rather than the import moved.
+from .button_commands import BUTTON_COMMANDS  # noqa: E402, F401
 
 
 class GatewaySendError(RuntimeError):
@@ -74,6 +76,18 @@ def build_buttons(buttons: list[dict]) -> dict:
             raise PresentationError(f"button has no label: {button!r}")
         if not command.startswith("/"):
             raise PresentationError(f"button command must be a slash command, got {command!r}")
+        verb = command[1:].split(" ", 1)[0]
+        if verb not in BUTTON_COMMANDS:
+            # `button_commands.py` says card-building code must draw from that
+            # tuple; until now nothing made it so. An undeclared verb is not an
+            # error at the gateway — it reaches the agent as a chat turn and
+            # spends tokens (measured live 2026-08-01), and the preflight only
+            # asserts the *declared* names are registered, so a button emitting
+            # anything else ships unasserted.
+            raise PresentationError(
+                f"button command {command!r} is not in BUTTON_COMMANDS {BUTTON_COMMANDS} — "
+                "the plugin registers only those, so this tap would reach the model"
+            )
         size = len(command.encode("utf-8"))
         if size > COMMAND_CALLBACK_BUDGET_BYTES:
             # Bytes, not characters: a non-ASCII pet or condition name costs
@@ -93,38 +107,64 @@ def _argv(action: str, target: str, args: list[str]) -> list[str]:
     is what made correcting the guessed flag names a single edit.
     """
     return [
-        config.OPENCLAW_CLI, "message", action,
-        "--channel", config.OPENCLAW_CHANNEL,
-        "--target", str(target),
+        config.OPENCLAW_CLI,
+        "message",
+        action,
+        "--channel",
+        config.OPENCLAW_CHANNEL,
+        "--target",
+        str(target),
         *args,
         "--json",
     ]
 
 
-def _run(action: str, target: str, args: list[str], *, kind: str, summary: str,
-         payload: dict, correlation: str | None = None, runner=None) -> dict:
+def _run(
+    action: str,
+    target: str,
+    args: list[str],
+    *,
+    kind: str,
+    summary: str,
+    payload: dict,
+    correlation: str | None = None,
+    runner=None,
+) -> dict:
     argv = _argv(action, target, args)
     # Never log argv wholesale — a caption can carry claim detail and the CLI
     # may grow a token flag. Log the action, not the payload.
     logger.info("gateway %s target=%s correlation=%s", action, target, correlation)
     run = runner or subprocess.run
     try:
-        completed = run(argv, capture_output=True, text=True, timeout=config.OPENCLAW_CLI_TIMEOUT_SECONDS)
+        # The one step worth timing above all others: 6.6s of this is the CLI
+        # initialising itself with no network involved, ~2.5s is connect + auth,
+        # and under a second is the gateway's actual work. See `trace`.
+        with trace.step(f"cli.{action}", correlation):
+            completed = run(
+                argv, capture_output=True, text=True, timeout=config.OPENCLAW_CLI_TIMEOUT_SECONDS
+            )
     except FileNotFoundError as exc:
         raise GatewaySendError(f"gateway CLI not found at {config.OPENCLAW_CLI!r}") from exc
     except subprocess.TimeoutExpired as exc:
-        raise GatewaySendError(f"gateway {action} timed out after {config.OPENCLAW_CLI_TIMEOUT_SECONDS}s") from exc
+        raise GatewaySendError(
+            f"gateway {action} timed out after {config.OPENCLAW_CLI_TIMEOUT_SECONDS}s"
+        ) from exc
 
     if completed.returncode != 0:
         # The exit code alone is useless for diagnosis, so stderr goes into the
         # reason. This is the human-readable failure the project's rules require:
         # a send that did not happen must never look like one that did.
         stderr = (completed.stderr or "").strip()[:500]
-        raise GatewaySendError(f"gateway {action} exit {completed.returncode}: {stderr or 'no stderr'}")
+        raise GatewaySendError(
+            f"gateway {action} exit {completed.returncode}: {stderr or 'no stderr'}"
+        )
 
     # Outbound logging stays on this path, so the gateway era keeps the same
     # audit trail and RL dataset the LoggedBot era had.
-    message_log.record_outbound(kind, summary, {**payload, "correlation_id": correlation})
+    with trace.step("log.outbound", correlation, kind=kind):
+        message_log.record_outbound(
+            kind, summary, {**payload, "correlation_id": correlation}, correlation=correlation
+        )
 
     try:
         return json.loads(completed.stdout or "{}")
@@ -135,8 +175,113 @@ def _run(action: str, target: str, args: list[str], *, kind: str, summary: str,
         return {}
 
 
-def send_message(target: str, text: str, buttons: list[dict] | None = None,
-                 correlation: str | None = None, runner=None) -> dict:
+def using_http_route() -> bool:
+    """Whether the fast in-gateway path is configured. Both halves or neither —
+    a URL with no token would 401 every send and read as an outage."""
+    return bool(config.OPENCLAW_GATEWAY_HTTP_URL and config.OPENCLAW_GATEWAY_TOKEN)
+
+
+def send_cards(target: str, cards: list[dict], correlation: str | None = None, poster=None) -> None:
+    """Send N cards in ONE call to the plugin's in-gateway route.
+
+    This is the fast path and the reason it exists is measured, not assumed: the
+    CLI costs 9–13s per message of which ~6.6s is its own initialisation with no
+    network contact at all, so N messages cost N × 9s no matter how they are
+    scheduled. Here one local HTTP call dispatches `message.action` inside the
+    gateway N times, and the only per-card cost is the gateway's own (0.3–1.1s,
+    mostly Telegram's rate pacing).
+
+    **Order is preserved**, which the CLI burst could not offer: the plugin
+    dispatches sequentially, so `/actions` gets its summary card first again.
+
+    Cards are the same dicts the command layer already builds — `text`/`buttons`
+    or `png`/`caption`/`buttons`. Raises `GatewaySendError` if any card failed,
+    naming the first reason, because a partial send must never read as a whole
+    one.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from . import media_outbox
+
+    payload = {"channel": config.OPENCLAW_CHANNEL, "cards": []}
+    for card in cards:
+        entry: dict = {"target": str(target)}
+        if card.get("png") is not None:
+            # A path through the shared outbox, NOT base64. `SendParamsSchema`
+            # does take a base64 `buffer`, and it was the first thing tried —
+            # the gateway materialises it under `<stateDir>/media/outbound`,
+            # which compose mounts READ-ONLY (14.2, deliberately), so every
+            # image failed with `ENOENT: mkdir '/home/node/.openclaw/media/
+            # outbound'`. Publishing to the outbox keeps the narrow mount and
+            # costs 9ms.
+            with trace.step("outbox.publish", correlation, bytes=len(card["png"])):
+                entry["media_url"] = media_outbox.publish(card["png"], ".png", "card")
+            if card.get("caption"):
+                entry["message"] = card["caption"]
+        else:
+            entry["message"] = card.get("text") or ""
+        if card.get("buttons"):
+            # Same builder as the CLI path. A presentation the platform rejects
+            # is discarded silently with `ok: true`, so it is never hand-written.
+            entry["presentation"] = build_buttons(card["buttons"])
+        payload["cards"].append(entry)
+
+    url = config.OPENCLAW_GATEWAY_HTTP_URL.rstrip("/") + "/api/v1/claims/send"
+    request = urllib.request.Request(
+        url,
+        data=_json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {config.OPENCLAW_GATEWAY_TOKEN}",
+        },
+    )
+    logger.info("gateway http send cards=%s correlation=%s", len(cards), correlation)
+    try:
+        with trace.step("http.send_cards", correlation, cards=len(cards)):
+            opener = poster or urllib.request.urlopen
+            with opener(request, timeout=config.OPENCLAW_HTTP_TIMEOUT_SECONDS) as response:
+                answer = _json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        body = (exc.read() or b"").decode(errors="replace")[:500]
+        raise GatewaySendError(f"gateway send route returned {exc.code}: {body}") from exc
+    except Exception as exc:  # noqa: BLE001 — URLError, timeouts, bad JSON
+        raise GatewaySendError(f"gateway send route unreachable: {exc}") from exc
+
+    sent = int(answer.get("sent") or 0)
+    # Log what actually left, per card, so the audit trail and the RL dataset do
+    # not go thinner on the fast path than they were on the CLI one.
+    with trace.step("log.outbound", correlation, kind="cards"):
+        for card in cards[:sent]:
+            kind = "file" if card.get("png") is not None else "text"
+            summary = card.get("caption") if kind == "file" else card.get("text")
+            message_log.record_outbound(
+                kind,
+                summary or "",
+                {
+                    "buttons": card.get("buttons"),
+                    "correlation_id": correlation,
+                    "via": "plugin_route",
+                },
+                correlation=correlation,
+            )
+
+    failures = answer.get("failures") or []
+    if failures or not answer.get("ok"):
+        first = failures[0].get("reason") if failures else "the route reported failure"
+        raise GatewaySendError(
+            f"{len(failures) or len(cards) - sent} of {len(cards)} card(s) did not send: {first}"
+        )
+
+
+def send_message(
+    target: str,
+    text: str,
+    buttons: list[dict] | None = None,
+    correlation: str | None = None,
+    runner=None,
+) -> dict:
     """Plain text, optionally with command buttons.
 
     All renderable content goes in `--message`. It cannot go in a presentation
@@ -148,12 +293,26 @@ def send_message(target: str, text: str, buttons: list[dict] | None = None,
     args = ["--message", text]
     if buttons:
         args += ["--presentation", json.dumps(build_buttons(buttons))]
-    return _run("send", target, args, kind="text", summary=text,
-                payload={"text": text, "buttons": buttons}, correlation=correlation, runner=runner)
+    return _run(
+        "send",
+        target,
+        args,
+        kind="text",
+        summary=text,
+        payload={"text": text, "buttons": buttons},
+        correlation=correlation,
+        runner=runner,
+    )
 
 
-def send_file(target: str, path: str, caption: str = "", buttons: list[dict] | None = None,
-              correlation: str | None = None, runner=None) -> dict:
+def send_file(
+    target: str,
+    path: str,
+    caption: str = "",
+    buttons: list[dict] | None = None,
+    correlation: str | None = None,
+    runner=None,
+) -> dict:
     """Photos (rendered cards) and documents (review PDFs) take the same path.
 
     There is no `--caption` flag. With `--media` set, `--message` *is* the
@@ -166,13 +325,27 @@ def send_file(target: str, path: str, caption: str = "", buttons: list[dict] | N
         args += ["--message", caption]
     if buttons:
         args += ["--presentation", json.dumps(build_buttons(buttons))]
-    return _run("send", target, args, kind="file", summary=caption or path,
-                payload={"file": path, "caption": caption, "buttons": buttons},
-                correlation=correlation, runner=runner)
+    return _run(
+        "send",
+        target,
+        args,
+        kind="file",
+        summary=caption or path,
+        payload={"file": path, "caption": caption, "buttons": buttons},
+        correlation=correlation,
+        runner=runner,
+    )
 
 
-def send_card(target: str, image: bytes, caption: str = "", buttons: list[dict] | None = None,
-              correlation: str | None = None, runner=None, stem: str = "card") -> dict:
+def send_card(
+    target: str,
+    image: bytes,
+    caption: str = "",
+    buttons: list[dict] | None = None,
+    correlation: str | None = None,
+    runner=None,
+    stem: str = "card",
+) -> dict:
     """Send a rendered Pillow card.
 
     Callers keep handing over **bytes**, exactly as they do to
@@ -186,13 +359,16 @@ def send_card(target: str, image: bytes, caption: str = "", buttons: list[dict] 
     """
     from . import media_outbox
 
-    path = media_outbox.publish(image, ".png", stem)
-    return send_file(target, path, caption=caption, buttons=buttons,
-                     correlation=correlation, runner=runner)
+    with trace.step("outbox.publish", correlation, bytes=len(image)):
+        path = media_outbox.publish(image, ".png", stem)
+    return send_file(
+        target, path, caption=caption, buttons=buttons, correlation=correlation, runner=runner
+    )
 
 
-def edit_message(target: str, message_id: str, text: str, correlation: str | None = None,
-                 runner=None) -> dict:
+def edit_message(
+    target: str, message_id: str, text: str, correlation: str | None = None, runner=None
+) -> dict:
     """Append a tap's result.
 
     **This takes text only, and that is a platform limit, not an oversight.**
@@ -210,13 +386,21 @@ def edit_message(target: str, message_id: str, text: str, correlation: str | Non
     move media edits into the in-gateway plugin, which calls the API directly.
     """
     args = ["--message-id", str(message_id), "--message", text]
-    return _run("edit", target, args, kind="edit", summary=text,
-                payload={"message_id": message_id, "text": text},
-                correlation=correlation, runner=runner)
+    return _run(
+        "edit",
+        target,
+        args,
+        kind="edit",
+        summary=text,
+        payload={"message_id": message_id, "text": text},
+        correlation=correlation,
+        runner=runner,
+    )
 
 
-def react(target: str, message_id: str, emoji: str = "👍", correlation: str | None = None,
-          runner=None) -> bool:
+def react(
+    target: str, message_id: str, emoji: str = "👍", correlation: str | None = None, runner=None
+) -> bool:
     """The immediate acknowledgement. A failure here must never break the handler.
 
     Returns whether the reaction landed, so the caller can carry on either way —
@@ -224,9 +408,16 @@ def react(target: str, message_id: str, emoji: str = "👍", correlation: str | 
     strictly better than losing the handler.
     """
     try:
-        _run("react", target, ["--message-id", str(message_id), "--emoji", emoji],
-             kind="react", summary=emoji, payload={"message_id": message_id, "emoji": emoji},
-             correlation=correlation, runner=runner)
+        _run(
+            "react",
+            target,
+            ["--message-id", str(message_id), "--emoji", emoji],
+            kind="react",
+            summary=emoji,
+            payload={"message_id": message_id, "emoji": emoji},
+            correlation=correlation,
+            runner=runner,
+        )
         return True
     except (GatewaySendError, ValueError) as exc:
         logger.warning("gateway react failed correlation=%s: %s", correlation, exc)

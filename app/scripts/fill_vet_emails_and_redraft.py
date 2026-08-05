@@ -49,9 +49,12 @@ def _delete_old_drafts(service):
     resp = service.users().drafts().list(userId="me", maxResults=100).execute()
     deleted = 0
     for d in resp.get("drafts", []):
-        msg = service.users().messages().get(
-            userId="me", id=d["message"]["id"], format="metadata", metadataHeaders=["Subject"]
-        ).execute()
+        msg = (
+            service.users()
+            .messages()
+            .get(userId="me", id=d["message"]["id"], format="metadata", metadataHeaders=["Subject"])
+            .execute()
+        )
         headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
         # Subject may be RFC-2047 encoded (the em-dash makes it non-ASCII), so
         # decode before matching — match the ASCII prefix that has no em-dash.
@@ -63,6 +66,7 @@ def _delete_old_drafts(service):
 
 
 # --- drafting (same shape as draft_yearly_invoice_requests.py) ---
+
 
 def _visits_by_vet():
     with db.get_connection() as conn:
@@ -113,7 +117,8 @@ def _body(visits, pets):
         f"  Total across {len(visits)} visit(s): ${total:,.2f}\n\n"
         f"An itemised breakdown (individual line items per visit) is what the insurer needs "
         f"— a plain total isn't enough. If a visit covered more than one dog, a split by dog "
-        f"would help too.\n\nThanks,\n{config.OWNER_NAME or ''}".rstrip() + "\n"
+        f"would help too.\n\nThanks,\n{config.OWNER_NAME or ''}".rstrip()
+        + "\n"
     )
 
 

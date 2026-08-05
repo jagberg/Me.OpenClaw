@@ -155,6 +155,28 @@ if ($failures.Count -gt 0) {
     throw "partial start"
 }
 
+# --- cron declarations: POST-boot, unlike the seed -----------------------------
+#
+# `cron.add` is a gateway RPC method, so this cannot go in the pre-boot seed --
+# checked, not assumed: `config get cron` holds scheduler settings and no job
+# definitions, and the plugin SDK has no cron surface. Idempotent via
+# --declaration-key, so running it on every deploy re-asserts the same five jobs
+# rather than adding five more.
+#
+# A failure here fails the deploy. A gateway with no cron entries is a gateway
+# where nothing runs, and after the cutover that looks exactly like a quiet week
+# (which is why /health reports `scheduler.overdue` too).
+Write-Host "`n--- cron declarations ---"
+$ErrorActionPreference = "Continue"
+# `exec`, not `run`: the jobs are added through the RUNNING gateway's RPC. And
+# `exec` takes no -v, which is why compose mounts ./scripts at /seed on the
+# gateway service itself rather than this passing a mount in.
+$cronOut = docker compose exec -T gateway sh /seed/gateway_cron.sh 2>&1 | Out-String
+$cronExit = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+Write-Host $cronOut.Trim()
+if ($cronExit -ne 0) { throw "cron declaration failed ($cronExit) -- nothing would be scheduled:`n$($cronOut.Trim())" }
+
 # --- preflight: the config assertions no app-side test can make ---------------
 
 if ($SkipPreflight) {

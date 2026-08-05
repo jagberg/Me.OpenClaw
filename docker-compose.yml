@@ -24,6 +24,33 @@ services:
       # two versions, and telegram_messages.app_version must keep meaning "the
       # Python code that handled this row".
       GATEWAY_VERSION: "${GATEWAY_VERSION:-unknown}"
+      # How the app reaches the gateway to SEND. The CLI is baked into this
+      # image (see app/Dockerfile) and resolves both of these itself --
+      # documented at docs.openclaw.ai/gateway/remote. `ws://`, not `http://`:
+      # the gateway protocol is a WebSocket, and the service name resolves on
+      # the compose network.
+      # The literal address, NOT the `gateway` service name. The CLI refuses
+      # plaintext `ws://` to a non-loopback host and cannot tell that a Docker
+      # DNS name resolves to a private address -- it fails closed with
+      # "SECURITY ERROR: ... uses plaintext ws:// to a non-loopback address".
+      # The pinned subnet (below) is what makes hardcoding this safe.
+      OPENCLAW_GATEWAY_URL: "ws://172.28.0.20:18789"
+      # The same owner-level credential the gateway binds with. This widens the
+      # boundary ADR-0024 drew: the app can now drive the gateway, not just be
+      # driven by it. Accepted deliberately (Justin, 2026-08-03) as the price of
+      # using the product's own client instead of re-deriving its protocol.
+      # It is still NOT the Gmail credential, which remains app-only.
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN:?the app needs the gateway token to send}"
+      # The fast outbound path: the claims plugin's own HTTP route inside the
+      # gateway, which dispatches `message.action` in-process. Same host and port
+      # as the WebSocket URL above -- the gateway serves both on one listener --
+      # and the DNS name is fine here because the ws:// loopback rule that forced
+      # the literal IP is a CLI check, not an HTTP one.
+      #
+      # Blank falls back to the CLI, which still works and still costs ~9s a
+      # message. Measured 2026-08-03: ~6.6s of that is the CLI initialising with
+      # no network contact at all, so nothing about scheduling can recover it.
+      OPENCLAW_GATEWAY_HTTP_URL: "http://172.28.0.20:18789"
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
@@ -41,14 +68,35 @@ services:
       # This is the ONE path between the two containers, and it must never grow
       # into a general mount of app/data.
       - media_outbox:/data/outbox
+      # The gateway CLI's device identity. Shared-secret auth alone is only
+      # enough for a LOOPBACK client; this one connects from the compose subnet,
+      # so the gateway requires a paired device
+      # (docs.openclaw.ai/gateway/security). Pairing is one-time and approved
+      # with `openclaw devices approve <id>` on the gateway -- but the token
+      # lands here, and without a volume every rebuild would silently need
+      # re-pairing and every send would fail until someone noticed.
+      - app_openclaw_identity:/root/.openclaw
 
   gateway:
     image: ghcr.io/openclaw/openclaw:latest
     restart: unless-stopped
     # DELIBERATE ABSENCES, each one load-bearing (7.0a, ADR-0024):
-    #   - no env_file. The gateway gets no Gmail credential, no Google key and
-    #     no DATABASE_PATH. gmail-isolation-boundary enforced by the container
+    #   - no env_file. The gateway gets no Gmail credential and no
+    #     DATABASE_PATH. gmail-isolation-boundary enforced by the container
     #     boundary rather than by configuration, which is its strongest form.
+    #
+    #     NARROWED 2026-08-04, and the narrowing is the point: this used to say
+    #     "no Google key" and now the gateway holds GEMINI_API_KEY, because Groq
+    #     blocks this network (403 to an unauthenticated request; see
+    #     scripts/gateway_seed.sh) and Gemini is the only provider left that the
+    #     agent can reach. That is a real weakening of the sentence, so it was
+    #     checked rather than assumed: a Generative Language API key is a bare
+    #     API key, not the OAuth client + refresh token the Gmail path needs, and
+    #     `gmail.googleapis.com/users/me/profile`, `.../users/me/messages` and
+    #     `drive/v3/files` each returned **401** for it. So the boundary the ADR
+    #     actually protects — the gateway cannot read Justin's mail — still holds
+    #     mechanically. What is gone is the broader claim that no Google-issued
+    #     credential crosses the line.
     #   - no bind mount to app/data. The SQLite file, the OAuth token and the
     #     invoice PDFs are simply not on its filesystem. A read-write open from
     #     the wrong side deleted the WAL sidecars once and took the app down for
@@ -91,6 +139,11 @@ services:
       # this same service and therefore inherits its environment.
       CLAIMS_TELEGRAM_CHAT_ID: "${CLAIMS_TELEGRAM_CHAT_ID:-}"
       GROQ_API_KEY: "${GROQ_API_KEY:-}"
+      # The agent's actual model since 2026-08-04 (Groq is network-blocked).
+      # Interpolated from the repo-root .env, never from app/.env -- that file
+      # holds the Gmail credential paths and the DB path, and compose cannot read
+      # a key out of it without handing over the rest.
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
     ports:
       # Loopback only. The image declares no EXPOSE, so this has to be explicit.
       - "127.0.0.1:18789:18789"
@@ -108,6 +161,17 @@ services:
       # permissions problem (14.4). Read-only: the gateway sends these, it does
       # not write them.
       - media_outbox:/home/node/.openclaw/media:ro
+      # The deploy scripts, read-only, so `deploy.ps1` can run
+      # scripts/gateway_cron.sh through `docker compose exec` -- cron jobs are
+      # added via the RUNNING gateway's RPC (`cron.add`), so unlike the pre-boot
+      # seed this cannot be a one-shot container with its own -v. `exec` accepts
+      # no volume flag, hence a mount declared here.
+      #
+      # Safe to bind where the plugin is not: nothing here is loaded as code by
+      # the gateway, so the world-writable refusal that forces the plugin to be
+      # copied does not apply. Holds no secrets -- the scripts read theirs from
+      # the environment (see gateway_cron.sh on why the cron payload does too).
+      - ./scripts:/seed:ro
       # NOTE: the plugin is COPIED IN by scripts/gateway_configure.ps1, not bind
       # mounted. A Windows bind mount lands as mode 777 and the gateway refuses
       # it -- "blocked plugin candidate: world-writable path" -- which is a
@@ -132,6 +196,11 @@ networks:
         - subnet: 172.28.0.0/24
 
 volumes:
+  # The app's gateway device identity. Small, and losing it costs a re-pair
+  # rather than any data -- but a silent re-pair means every outbound send
+  # fails until someone approves the device, so it is a volume rather than a
+  # container-lifetime directory.
+  app_openclaw_identity:
   # Outside every backup today. 7.0c decides whether it joins db_backup's scope;
   # until then, losing it costs the agent's session history, not claim state.
   gateway_state:

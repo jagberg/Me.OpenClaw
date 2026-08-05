@@ -16,4 +16,17 @@ Card-building code must draw its commands from here, so a new button cannot ship
 unasserted.
 """
 
-BUTTON_COMMANDS = ("mark", "pet", "resolve", "history", "actions")
+BUTTON_COMMANDS = (
+    "mark",
+    "pet",
+    "resolve",
+    "history",
+    "actions",
+    "confirm",
+    "unmatch",
+    "invreq",
+    "dismiss",
+    "merge",
+    "reject",
+    "item",
+)

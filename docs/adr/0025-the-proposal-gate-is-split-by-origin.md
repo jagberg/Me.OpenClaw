@@ -1,6 +1,6 @@
 # ADR 0025: The proposal gate is split by origin, and its text is composed by code
 
-- Status: accepted
+- Status: accepted (gate location superseded by ADR-0027)
 - Date: 2026-08-01
 - Supersedes the gate's location in ADR-0016 (`telegram_bot._execute_action`)
 - Related: ADR-0024 (two runtimes), ADR-0023 (tool inventory)
@@ -86,3 +86,81 @@ deliberate.
 echo and Aari. Aari cost was $35 out of this"* against the ASSIGN PET card on
 2026-07-27 — no API error, the split tool present in the schema — the model
 proposed assigning Aari *and* Echo. The prompt rule lost on live data.
+
+## Amendment (2026-08-02) — the MCP half of the split has no mechanism, and the decision needs re-taking
+
+**The Decision above says a chat-initiated confirm "commits in the MCP surface".
+Nothing in the gateway can deliver that.** Found while starting section 3 of
+`openclaw-telegram-cutover`, by reading the product's shipped code rather than
+its prose — the habit this repo adopted on 2026-08-01 after five wrong
+architectural conclusions in one session.
+
+For an MCP server to gate its own commit behind a human tap, it must ask the
+client a question mid-call. MCP's name for that is **elicitation**. The gateway
+does not offer it:
+
+- `dist/agent-bundle-mcp-runtime-*.js` constructs `new Client({name:
+  "openclaw-bundle-mcp", version: "0.0.0"}, {jsonSchemaValidator, listChanged})`
+  — **no `capabilities` in the options object.**
+- The bundled SDK reads `this._capabilities = options?.capabilities ?? {}`
+  (`@modelcontextprotocol/sdk/dist/esm/client/index.js:107`) and sends exactly
+  that on `initialize` (`:297`). So the client declares `{}`.
+- The same SDK refuses to register a handler for a capability it did not
+  declare: `assertRequestHandlerCapability` throws *"Client does not support
+  elicitation capability"* (`:421-425`).
+- The string `elicit` does not appear anywhere in the gateway's agent MCP
+  runtime (`grep -c` = 0).
+
+The gateway *does* have a rich approval system — `plugin-sdk/approval-runtime.js`
+exports `buildPluginApprovalRequestMessage`, `resolveApprovalApprovers` and the
+timeout constants — which is what the Context above was reading when it recorded
+that "a *plugin* approval takes `title` and `description` as free text". That
+reading was correct and remains correct. The error was carrying it across to the
+MCP surface: **approvals are a plugin capability, and the claims MCP server is
+not a plugin.**
+
+**Not verified live.** This is read off the shipped client, the bundled SDK and
+their absence of any elicitation code — three agreeing points, but not an
+attempted elicitation that came back refused. The live attempt needs a real
+agent turn, and Groq's daily budget was exhausted the same day (`Limit 100000,
+Used 96708`). Worth doing before the cutover; it would only confirm.
+
+### What this does to the decision
+
+Justin chose split-by-origin over a **single Python commit path**, which was the
+recommendation. The option he chose does not exist. The option he declined is
+now the only feasible one, so the outcome is forced — but the reasoning behind
+his choice ("the chat flow stays self-contained") is exactly what is lost, and
+that is his call to accept, not an implementation detail to absorb quietly.
+
+The feasible shape, using only mechanisms slice 1 already proved live:
+
+- A chat proposal returns text plus a **confirm button**, built by
+  `gateway_client.build_buttons` and validated against the platform's own
+  normalizer.
+- The tap is a `command` button → plugin → `/internal` → the same commit
+  function a card tap reaches.
+- The invariant that mattered is untouched: **a commit is still never the return
+  value of a tool the model called.** So is the substantive safeguard — the
+  confirmation text is composed by code from the claim row about to change.
+
+What is genuinely lost is the "two entry points" property, and with it the
+consequence recorded above that *"the gate SHALL be tested on this path
+independently"*. One commit path is easier to hold correct, which was the
+argument for the rejected option in the first place.
+
+Two costs this creates, neither of them blocking:
+
+- A confirm button must carry the proposal's identity inside **58 UTF-8 bytes**,
+  and `confirm` becomes a sixth entry in `BUTTON_COMMANDS` and in the plugin's
+  `COMMANDS` — both now asserted equal by
+  `test_the_plugin_registers_exactly_the_commands_a_button_may_emit`.
+- A proposal must survive between the MCP call and the tap, which are separate
+  requests in separate runtimes. That needs a durable store, not the per-turn
+  `proposals` list `telegram_bot` passes around today.
+
+**Justin decided on 2026-08-02: proceed with one commit path.** Recorded as
+**ADR-0027**, which supersedes this ADR's gate *location* and nothing else.
+Everything above about code-composed confirmation text, harness-enforced
+refusals, and a commit never being a tool return value stands unchanged and is
+carried forward verbatim.

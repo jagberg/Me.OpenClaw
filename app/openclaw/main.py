@@ -53,13 +53,27 @@ async def lifespan(app: FastAPI):
     # Every logged message is stamped with this, so a wrong version silently
     # mislabels the training data — say so rather than shipping "unknown".
     if config.APP_VERSION == "unknown":
-        logger.warning("APP_VERSION is 'unknown' — built without scripts/deploy.ps1; messages will be mistagged.")
+        logger.warning(
+            "APP_VERSION is 'unknown' — built without scripts/deploy.ps1; messages will be mistagged."
+        )
     else:
         logger.info("OpenClaw starting, version %s", config.APP_VERSION)
     db.init_db()
-    scheduler.start()
-    gmail_ingest.start_polling()
-    pipeline.start()
+    # The gateway's cron drives `/internal/*` once this is off (task 5.1). Both
+    # schedulers running would fire the daily nudge twice — `run_exclusive` only
+    # dedupes *concurrent* runs, and two schedulers ten seconds apart are not
+    # concurrent. So this is a swap, not an overlap, and the flag exists to make
+    # it reversible in one env var + restart, the same shape as the Telegram
+    # cutover (4.1). Section 6 deletes both halves.
+    if config.SCHEDULER_ENABLED:
+        scheduler.start()
+        gmail_ingest.start_polling()
+        pipeline.start()
+    else:
+        # Not a warning. This is the intended post-cutover state, and an ERROR
+        # here would train Justin to ignore the log. What IS a failure is nobody
+        # driving the endpoints, and that is `stale_tick_minutes` on /health.
+        logger.info("in-process scheduler disabled — the gateway's cron owns scheduling")
     await telegram_bot.start_polling()
     yield
     await telegram_bot.stop_polling()
@@ -159,6 +173,13 @@ def health():
         # versions, and `telegram_messages.app_version` exists so the dataset is
         # keyed to the code that produced a row — conflating them makes it lie.
         "gateway_version": config.GATEWAY_VERSION or None,
+        # Task 5.6, and the whole reason `job_runs` exists. A cron entry that was
+        # never declared, was disabled, or whose curl silently fails produces the
+        # same empty dashboard as a genuinely quiet week. This says which:
+        # `overdue` lists the jobs whose expected cadence has lapsed, so a dead
+        # scheduler is a value on the URL Justin already checks rather than an
+        # absence he has to notice.
+        "scheduler": internal_api.scheduler_health(),
         **message_log.stats(),
     }
 

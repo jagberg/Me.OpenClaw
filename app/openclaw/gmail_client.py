@@ -65,9 +65,13 @@ def _iter_attachment_parts(payload: dict):
 
 
 def _pdf_attachment_text(service, message_id: str, attachment_id: str) -> str:
-    attachment = service.users().messages().attachments().get(
-        userId="me", messageId=message_id, id=attachment_id
-    ).execute()
+    attachment = (
+        service.users()
+        .messages()
+        .attachments()
+        .get(userId="me", messageId=message_id, id=attachment_id)
+        .execute()
+    )
     data = base64.urlsafe_b64decode(attachment["data"] + "==")
     reader = PdfReader(BytesIO(data))
     return "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -82,7 +86,9 @@ def full_message_text(service, message: dict) -> str:
         if part.get("mimeType") != "application/pdf":
             continue
         try:
-            text += "\n" + _pdf_attachment_text(service, message["id"], part["body"]["attachmentId"])
+            text += "\n" + _pdf_attachment_text(
+                service, message["id"], part["body"]["attachmentId"]
+            )
         except Exception:
             continue  # unreadable attachment — fall back to whatever text we already have
     return text

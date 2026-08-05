@@ -184,11 +184,81 @@ CREATE TABLE IF NOT EXISTS telegram_messages (
     app_version TEXT NOT NULL,
     received_at TEXT NOT NULL,
     processed_at TEXT,
-    error TEXT
+    error TEXT,
+    -- The id `internal_api` mints per gateway event, so a row can be joined to
+    -- the log lines that describe what happened to it. Task 10.14. Before this,
+    -- the join went through `update_id` and only worked while the log line that
+    -- pairs them was still in the container -- which it is not after a recreate.
+    correlation_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_telegram_messages_pending
     ON telegram_messages(direction, processed_at);
+
+-- A mutation the model proposed, waiting for Justin to tap Confirm.
+-- Durable rather than in-process because the proposal and the tap are now two
+-- separate requests in two separate runtimes: the MCP call arrives from the
+-- gateway's agent, the tap arrives later through the plugin. `telegram_bot`'s
+-- in-memory `_pending_actions` dict cannot span that, and a restart in between
+-- would silently turn a proposal into a tap that does nothing.
+-- `confirmed_at` is what makes a tap single-use — a double tap must not commit
+-- twice, and Telegram redelivers.
+CREATE TABLE IF NOT EXISTS pending_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin TEXT NOT NULL,
+    action TEXT NOT NULL,
+    claim_id INTEGER,
+    task_id INTEGER,
+    arg TEXT,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT,
+    result TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_proposals_open
+    ON pending_proposals(confirmed_at, created_at);
+
+-- A flow that owns Justin's next typed message: entering a condition free-hand,
+-- or walking a multi-item invoice one line at a time.
+-- Durable for the same reason pending_proposals is. These were two dicts keyed
+-- by chat id in `telegram_bot`, which was fine while one process owned the tap,
+-- the state and the reply. After the cutover the tap is at the gateway, the
+-- claim decision is an HTTP call, and the reply is a third hop — so a restart
+-- in between would silently hand a typed condition to the chat agent, and
+-- `condition_text` is a field the hard rules forbid inferring.
+-- One row per (chat, kind): a chat can have a condition and a split pending at
+-- once, which is what the in-memory version allowed.
+CREATE TABLE IF NOT EXISTS pending_flows (
+    chat_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    claim_id INTEGER,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, kind)
+);
+
+-- When each scheduled job last ran, and how it ended. Task 5.6.
+--
+-- The failure this exists for: once the gateway's cron owns scheduling, a cron
+-- entry that was never declared, or was disabled, or whose curl silently 404s,
+-- looks EXACTLY like a quiet week. No claims to chase and no cron firing produce
+-- the same empty dashboard, and the in-process scheduler used to make the
+-- difference obvious by being in the same process as the log.
+--
+-- Durable rather than a module dict, because the question is "has anything driven
+-- the tick since the last restart or before it", and a dict answers only the
+-- first half. One row per route, overwritten -- this is a liveness signal, not a
+-- history; `telegram_messages` is where history lives.
+CREATE TABLE IF NOT EXISTS job_runs (
+    route TEXT PRIMARY KEY,
+    last_started_at TEXT,
+    last_ok_at TEXT,
+    last_error_at TEXT,
+    last_error TEXT,
+    last_skipped_at TEXT
+);
 """
 
 # vet_claims columns added after the table's initial release — CREATE TABLE IF
@@ -202,6 +272,16 @@ _VET_CLAIMS_ADDED_COLUMNS = {
     "rejected_email_ids": "TEXT",  # JSON list of invoice emails Justin unmatched — never re-match these
     "item_conditions": "TEXT",  # JSON [{description, amount, condition}] when one invoice spans >1 condition
     "petcover_sr": "INTEGER",  # Petcover's per-document serial within a Condition Thread ("DC1-27-5628 Sr 3")
+}
+
+# Same mechanism, for the message log. `CREATE TABLE IF NOT EXISTS` will not add a
+# column to the live table, and the live table has 269 rows worth keeping -- so
+# this is the ALTER, run at startup, rather than a hand-run one against
+# app/data/openclaw.db. Safe to re-run: _migrate_added_columns reads PRAGMA
+# table_info first, and ADD COLUMN never rewrites existing rows (they read NULL,
+# which is honest -- those events had no correlation id recorded).
+_TELEGRAM_MESSAGES_ADDED_COLUMNS = {
+    "correlation_id": "TEXT",
 }
 
 # Echo's claim_email stays NULL until Justin supplies Bow Wow Insurance's process
@@ -236,6 +316,7 @@ def init_db(path: str | None = None) -> None:
         conn.executescript(SCHEMA)
         _migrate_added_columns(conn, "vet_claims", _VET_CLAIMS_ADDED_COLUMNS)
         _migrate_added_columns(conn, "pets", _PETS_ADDED_COLUMNS)
+        _migrate_added_columns(conn, "telegram_messages", _TELEGRAM_MESSAGES_ADDED_COLUMNS)
         conn.executescript(SEED_PETS)
 
 
@@ -265,6 +346,44 @@ def get_connection(path: str | None = None):
         conn.commit()
     finally:
         conn.close()
+
+
+def registered_chat_id() -> int | None:
+    """The chat Justin registered with /start. THE reader — do not inline it.
+
+    Lived in `telegram_bot`, which the gateway cutover deletes, while being a
+    plain DB read three unrelated callers need. Same move as `list_pet_names`
+    below, for the same reason.
+    """
+    from . import config
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT chat_id FROM telegram_registrations WHERE username = ?",
+            (config.TELEGRAM_USERNAME,),
+        ).fetchone()
+    return row["chat_id"] if row else None
+
+
+def latest_inbound_text() -> str:
+    """The most recent thing Justin typed, as the message log recorded it.
+
+    The MCP surface needs this and cannot see the conversation: the gateway's
+    agent calls a tool, and the tool gets its arguments and nothing else. The
+    two-pets refusal keys on what he actually wrote, so taking it from the
+    model's paraphrase would let the model paraphrase the refusal away — which
+    is the exact failure the refusal exists for (2026-07-27).
+
+    `summary` rather than `payload`: it is already the extracted text, written
+    by the same `_describe` for both transports. Empty string when there is
+    nothing, never None — every caller substring-matches.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT summary FROM telegram_messages WHERE direction = 'in' AND kind IN ('text', 'command') "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return (row["summary"] or "") if row else ""
 
 
 def list_pet_names() -> list[str]:

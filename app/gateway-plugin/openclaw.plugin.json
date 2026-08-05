@@ -4,5 +4,6 @@
   "description": "Registers the claims app's slash commands and forwards them to it. No claims logic here.",
   "version": "0.1.0",
   "activation": { "onStartup": true },
+  "contracts": { "gatewayMethodDispatch": ["authenticated-request"] },
   "configSchema": { "type": "object", "additionalProperties": false, "properties": {} }
 }

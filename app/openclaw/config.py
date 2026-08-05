@@ -44,7 +44,9 @@ GMAIL_CREDENTIALS_PATH = os.environ.get("GMAIL_CREDENTIALS_PATH", "./data/creden
 GMAIL_TOKEN_PATH = os.environ.get("GMAIL_TOKEN_PATH", "./data/token.json")
 GMAIL_POLL_INTERVAL_MINUTES = _int_env("GMAIL_POLL_INTERVAL_MINUTES", 5)
 
-PETCOVER_TEMPLATE_PATH = os.environ.get("PETCOVER_TEMPLATE_PATH", "./data/petcover-claim-template.pdf")
+PETCOVER_TEMPLATE_PATH = os.environ.get(
+    "PETCOVER_TEMPLATE_PATH", "./data/petcover-claim-template.pdf"
+)
 # Status polling ignores Petcover emails older than this (Gmail after: format).
 # Guards against first-run backfill: without it the first poll would ingest
 # years of historical replies about long-settled claims and could mis-correlate
@@ -81,6 +83,36 @@ OWNER_BANK_ACCOUNT_NUMBER = os.environ.get("OWNER_BANK_ACCOUNT_NUMBER", "")
 # copied chat ID — the bot self-registers its chat ID via /start, see telegram_bot.py).
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USERNAME = os.environ.get("TELEGRAM_USERNAME", "jagberg")
+# Which runtime polls Telegram. Default on = this app, which is the pre-cutover
+# state. Turning it off hands the channel to the gateway, and that IS the
+# cutover -- two pollers on one token is a 409 Conflict, so the two are exact
+# opposites and `scripts/gateway_preflight.py` fails the deploy if both poll or
+# neither does. Kept as a flag rather than a deletion for one week of real use
+# after cutover (task 4.1): rollback is this env var and a restart, ~30s.
+TELEGRAM_UPDATER_ENABLED = os.environ.get("TELEGRAM_UPDATER_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+# Which runtime schedules work. Default on = APScheduler in this process, the
+# pre-cutover state. Off hands the five cadences to the gateway's cron, which
+# drives `/internal/*` (task 5.1). Same shape and same reason as the flag above:
+# a week of real use before section 6 deletes the loser, rollback in one env var.
+#
+# Deliberately a SWAP, not an overlap. `internal_api.run_exclusive` dedupes
+# concurrent runs of a route, which is not the same as idempotence -- two
+# schedulers firing the daily nudge ten seconds apart are not concurrent, and
+# Justin would get two messages. The gateway's own convention agrees: cron jobs are
+# declarative (`--declaration-key`) and it has no notion of a second scheduler,
+# so per-job `cron disable` is its rollback and this flag is ours.
+SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 # The OpenClaw gateway's side of the house. The gateway owns the bot token and
 # the agent loop; this app owns the claims domain and calls out to it. Two
@@ -97,7 +129,9 @@ INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET", "")
 # auth. Default is loopback only. A gateway running in its own compose service
 # is NOT loopback, so that deployment has to widen this deliberately.
 INTERNAL_API_ALLOW_HOSTS = {
-    h.strip() for h in os.environ.get("INTERNAL_API_ALLOW_HOSTS", "127.0.0.1,::1").split(",") if h.strip()
+    h.strip()
+    for h in os.environ.get("INTERNAL_API_ALLOW_HOSTS", "127.0.0.1,::1").split(",")
+    if h.strip()
 }
 # How outbound Telegram messages leave once the gateway owns the token. Every
 # send goes through gateway_client so there is one logged seam — the same reason
@@ -109,6 +143,25 @@ OPENCLAW_CLI_TIMEOUT_SECONDS = _int_env("OPENCLAW_CLI_TIMEOUT_SECONDS", 30)
 # second channel is a design decision (the authorization check is Telegram
 # username-based and has no equivalent elsewhere), not an env change.
 OPENCLAW_CHANNEL = os.environ.get("OPENCLAW_CHANNEL", "telegram")
+# The fast outbound path: the plugin's own HTTP route inside the gateway, which
+# dispatches `message.action` in-process. Blank falls back to the CLI.
+#
+# Why it exists, measured 2026-08-03: `openclaw message send` costs 9-13s, of
+# which ~6.6s is the CLI initialising itself with no network contact at all
+# (`--dry-run` costs the same and the gateway logs no RPC), ~2.5s is connect +
+# auth, and under a second is the gateway's own work. One process per message
+# means none of that amortises. Over this route a send is one local HTTP call
+# plus the same sub-second gateway work.
+#
+# `OPENCLAW_GATEWAY_URL` is a `ws://` URL for the CLI; this is the same host and
+# port over HTTP, because the gateway serves both on one listener.
+OPENCLAW_GATEWAY_HTTP_URL = os.environ.get("OPENCLAW_GATEWAY_HTTP_URL", "")
+# Bearer token for that route. The gateway authenticates it as a shared secret
+# and hands the route the CLI's own default operator scopes, which is what makes
+# a write (`message.action`) permitted — verified against the shipped
+# `resolvePluginRouteRuntimeOperatorScopes`, not inferred.
+OPENCLAW_GATEWAY_TOKEN = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
+OPENCLAW_HTTP_TIMEOUT_SECONDS = _int_env("OPENCLAW_HTTP_TIMEOUT_SECONDS", 60)
 # The gateway's own version, stamped by scripts/deploy.ps1 and surfaced on
 # /health. It must never be written into `telegram_messages.app_version`: that
 # column exists so the message log is a dataset keyed to the code that produced
@@ -123,13 +176,13 @@ GATEWAY_VERSION = os.environ.get("GATEWAY_VERSION", "")
 # These are the ONLY bytes that cross the container boundary. Widening either to
 # reach `app/data` would undo the isolation the whole design rests on.
 MEDIA_OUTBOX_DIR = os.environ.get("MEDIA_OUTBOX_DIR", "/data/outbox")
-MEDIA_OUTBOX_GATEWAY_DIR = os.environ.get(
-    "MEDIA_OUTBOX_GATEWAY_DIR", "/home/node/.openclaw/media"
-)
+MEDIA_OUTBOX_GATEWAY_DIR = os.environ.get("MEDIA_OUTBOX_GATEWAY_DIR", "/home/node/.openclaw/media")
 
 # Twice-daily Google Drive DB backup (drive_backup.py). Folder ID is from
 # https://drive.google.com/drive/folders/1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2
-DRIVE_BACKUP_FOLDER_ID = os.environ.get("DRIVE_BACKUP_FOLDER_ID", "1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2")
+DRIVE_BACKUP_FOLDER_ID = os.environ.get(
+    "DRIVE_BACKUP_FOLDER_ID", "1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2"
+)
 DRIVE_BACKUP_PREFIX = os.environ.get("DRIVE_BACKUP_PREFIX", "OpenClawBettyVet")
 DRIVE_BACKUP_LOG_SUBFOLDER = os.environ.get("DRIVE_BACKUP_LOG_SUBFOLDER", "logs")
 # Durable local record: written even if Drive itself is unreachable, so a

@@ -44,7 +44,7 @@ Telegram + dashboard ── every state change, question and blocker lands as a
                         message with the claim #id and one-tap buttons
 ```
 
-The whole pipeline runs on an APScheduler tick (default 15 min) inside one FastAPI process (ADR-0006). A failure on one claim flags that claim and moves on — a tick is never lost to one bad email (visible failures are a hard rule).
+The whole pipeline runs on a 15-minute tick inside one FastAPI process (ADR-0006). The tick is driven by the **gateway's cron** since 2026-08-04 (`POST /internal/tick`); APScheduler is still in the code behind `SCHEDULER_ENABLED` for one week's rollback, and off in the deployed config. A failure on one claim flags that claim and moves on — a tick is never lost to one bad email (visible failures are a hard rule).
 
 The lifecycle above is a **declared state machine**, not a column anyone may write. Every legal move is in one transition table, and `claim_status.apply_event` is the only thing that writes a claim's state: it records the event first, then applies it if the table allows the move — and if it doesn't, the state stays put and the claim is flagged naming both states, with the event kept as evidence. So a claim's history is a fact on record rather than something to reconstruct: re-reading an old acknowledgement can no longer walk a settled claim backwards, which it did to two claims in July 2026 (two others moved the same day by being routed to the wrong claim, which is a separate guard). Each tick folds every claim's events and compares the result against the stored status; `/health` publishes the disagreement count, and it should read zero. Reverting a state change, and the timeline view that would show it, are not built yet.
 
@@ -74,10 +74,10 @@ For each unmatched vet charge, `invoice_matching`:
 | Service | What for | What's sent | Auth |
 |---|---|---|---|
 | **Gmail API** (Google) | Search/read mail + attachments; create/update **drafts**; never `send()` | Search queries (merchant names, dates), message/attachment reads; drafts containing filled claim PDFs | OAuth token in `app/data/token.json` (testing-app 7-day expiry; re-auth: `python scripts/gmail_auth.py`) |
-| **Groq** (default LLM, free tier) | Invoice text extraction; Telegram free-chat agent | Email/PDF text of candidate invoice emails; chat prompts | `GROQ_API_KEY` |
-| ↳ four Groq models are called, not one | `llama-3.3-70b-versatile` is the primary. Its free budget is **100k tokens/day, per model**, so on daily exhaustion the chain falls through to `openai/gpt-oss-120b` → `openai/gpt-oss-20b` → `llama-3.1-8b-instant`, each with its own budget, and the reply says which one answered (ADR-0017) | Same as above | Same key |
-| **Gemini** (Google, `gemini-2.5-flash`, free tier) | **Vision OCR** of scanned invoice PDFs (always, regardless of provider); full text-LLM rollback if `LLM_PROVIDER=gemini` | Downscaled JPEG of scan pages | `GEMINI_API_KEY` |
-| **OpenAI** (optional, `gpt-4o-mini`) | Paid fallback provider — only if `LLM_PROVIDER=openai` | Same as Groq | `OPENAI_API_KEY` |
+| **Gemini** (Google, free tier) — **the default LLM since 2026-08-04** | Invoice text extraction; vision OCR of scanned invoice PDFs (always, regardless of provider); the gateway agent's chat turns (`gemini/gemini-2.5-flash`) | Email/PDF text of candidate invoice emails; downscaled JPEGs of scan pages; chat prompts | `GEMINI_API_KEY` |
+| ↳ four Gemini models are called, not one | `gemini-2.5-flash` is the primary; on daily exhaustion the chain falls through to `gemini-3.6-flash` → `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`, each with its own budget, and the reply says which one answered (ADR-0017). Text extraction goes through Gemini's own SDK; the chat tool loop goes through Google's OpenAI-compatible surface at `/v1beta/openai` | Same as above | Same key |
+| **Groq** (configured, currently unreachable) | Was the default LLM. This network is **blocked by Groq**: a request with no auth header at all gets `403 "Access denied. Please check your network settings."` Left configured so a network that can reach it costs one line — ADR-0009's 2026-08-04 amendment | Same as Gemini's text calls | `GROQ_API_KEY` |
+| **OpenAI** (optional, `gpt-4o-mini`) | Paid fallback provider — only if `LLM_PROVIDER=openai` | Same as Gemini's text calls | `OPENAI_API_KEY` |
 | **Telegram Bot API** | Notifications, questions with tap-buttons, document (PDF) review messages, 👍 receipt acks, free-chat queries | Claim summaries (amounts, dates, vet names, pet names), invoice PDFs for review | `TELEGRAM_BOT_TOKEN`; single authorized username |
 | **Google Drive** (via `db_backup`) | SQLite DB backup | The database file | Same Google OAuth |
 | **OpenClaw gateway** *(deployed 2026-08-02; not yet polling — see "In flight" below)* | Will own Telegram transport, the chat agent loop, model routing and cron | Same claim summaries the Bot API already carries; **no Gmail credential and no database access, deliberately** | Runs locally in Docker; holds no `TELEGRAM_BOT_TOKEN` until the cutover |
@@ -96,7 +96,7 @@ Every LLM call is rate-limited and logged to the `llm_calls` table (provider, pu
 ```
 cd app
 python -m venv .venv && .venv/Scripts/pip install -r requirements.txt
-cp .env.example .env        # fill in: Groq + Gemini keys, owner/policy details, bank payout details, Telegram token
+cp .env.example .env        # fill in: Gemini key (required), Groq key (optional), owner/policy details, bank payout details, Telegram token
 python scripts/gmail_auth.py   # one-time OAuth consent (opens a browser)
 .venv/Scripts/uvicorn openclaw.main:app --port 8000
 ```
@@ -125,8 +125,12 @@ secret-guarded), `mcp_server.py` (the claims read surface at `/mcp`), `media_out
 `app/gateway-workspace/` (the agent's prompt files, injected every turn). `gateway_client.py` is
 merged and has no caller until the cutover.
 
-**Unchanged:** Telegram polling, the chat agent, the scheduler, and everything the sections above
-describe. See [docs/gateway-deploy.md](docs/gateway-deploy.md) — especially the list of what the
+**Cut over:** Telegram polling and the chat agent (the gateway holds the token; the app's updater
+is off), and scheduling — five cron entries in the gateway drive `/internal/tick`, `/internal/ingest`,
+`/internal/nudge`, `/internal/vet-nudge` and `/internal/expire-queue`. The calendar jobs run at 09:00 **Australia/Sydney** — under APScheduler they ran in the container's UTC, so a morning nudge arrived that evening. Reminders are the one job cron
+cannot express (a one-shot at an arbitrary minute), so they sweep on the tick.
+
+**Unchanged:** everything the sections above describe. See [docs/gateway-deploy.md](docs/gateway-deploy.md) — especially the list of what the
 deploy preflight *cannot* assert.
 
 Read ADR-0024 (why the domain is not ported), ADR-0025 (where the proposal gate lives) and ADR-0023 (why the agent's tool allowlist is load-bearing for both security and cost) before touching any of it.

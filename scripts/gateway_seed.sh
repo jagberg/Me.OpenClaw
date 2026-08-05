@@ -101,15 +101,113 @@ else
   echo "WARN: CLAIMS_TELEGRAM_CHAT_ID unset - access policy not configured; the preflight will fail on it"
 fi
 
-# Groq as a custom OpenAI-compatible provider. OpenClaw bundles 38 providers and
-# none of them is Groq, which is the one this project standardised on. `models`
-# must be an ARRAY of objects with `id`; an object keyed by model id is rejected.
+# Groq as a custom OpenAI-compatible provider. OpenClaw's bundled catalogue
+# (`models list --all`) has 20 providers and none is Google; it DOES carry a
+# `groq` id, which this block overrides with the account's own model list.
+# `models` must be an ARRAY of objects with `id`; an object keyed by model id is
+# rejected.
+#
+# Configured, but NOT the primary any more. As of 2026-08-04 Groq refuses this
+# network: `api.groq.com` answers 403 `Access denied. Please check your network
+# settings.` to a request carrying **no Authorization header**, and identically
+# from inside both containers. Not the key, not the account, not a rate limit,
+# and not fixable from here. It stays configured so that a network which can
+# reach Groq gets it back by editing one line rather than rebuilding a provider.
 if [ -n "$GROQ_API_KEY" ]; then
   oc config set models.providers.groq "{\"baseUrl\":\"https://api.groq.com/openai/v1\",\"api\":\"openai-completions\",\"apiKey\":\"$GROQ_API_KEY\",\"models\":[{\"id\":\"llama-3.3-70b-versatile\",\"name\":\"Llama 3.3 70B\",\"input\":[\"text\"],\"contextWindow\":131072}]}"
-  oc config set agents.defaults.model.primary '"groq/llama-3.3-70b-versatile"'
-else
-  echo "WARN: GROQ_API_KEY unset - the agent has no model; the preflight will fail on it"
 fi
+
+# Gemini, the provider this network CAN reach, and therefore the primary.
+# Google publishes an OpenAI-compatible surface at `/v1beta/openai`, so it is
+# the same `openai-completions` shape as Groq rather than a new integration.
+# Probed before being written, per the repo rule about validating against the
+# product rather than reasoning about it: `POST /chat/completions` with a
+# `claims__pending`-shaped tool returned `finish_reason: tool_calls` and the
+# right tool name (2026-08-04).
+#
+# `max_tokens` matters here in a way it did not for Llama: 2.5-flash spends
+# tokens on internal reasoning first, so a 16-token cap returned
+# `finish_reason: length` with EMPTY content and a 200. A silent-looking empty
+# reply is the failure mode to expect if a caller caps output tightly.
+if [ -n "$GEMINI_API_KEY" ]; then
+  # FOUR models, not one, and the reason is a live failure rather than caution.
+  # 2026-08-04: a day of deploys and probes exhausted
+  # `GenerateRequestsPerDayPerProjectPerModel-FreeTier` for gemini-2.5-flash, and
+  # the deploy failed on `model serves a turn` with the gateway reporting only
+  # "API rate limit reached". With one model declared there was nowhere to go --
+  # the gateway cannot fail over to a model its provider entry never mentions.
+  #
+  # This is ADR-0017's walk, rebuilt on the gateway side. `llm.py` has had it for
+  # the app since July and it is why invoice extraction kept working through the
+  # same exhaustion. Same chain, same order, and every link was probed against a
+  # `claims__*`-shaped tool before being written down (see llm._FALLBACK_MODELS).
+  oc config set models.providers.gemini "{\"baseUrl\":\"https://generativelanguage.googleapis.com/v1beta/openai\",\"api\":\"openai-completions\",\"apiKey\":\"$GEMINI_API_KEY\",\"models\":[{\"id\":\"gemini-2.5-flash\",\"name\":\"Gemini 2.5 Flash\",\"input\":[\"text\"],\"contextWindow\":1048576},{\"id\":\"gemini-3.6-flash\",\"name\":\"Gemini 3.6 Flash\",\"input\":[\"text\"],\"contextWindow\":1048576},{\"id\":\"gemini-3.5-flash-lite\",\"name\":\"Gemini 3.5 Flash Lite\",\"input\":[\"text\"],\"contextWindow\":1048576},{\"id\":\"gemini-3.1-flash-lite\",\"name\":\"Gemini 3.1 Flash Lite\",\"input\":[\"text\"],\"contextWindow\":1048576}]}"
+  oc config set agents.defaults.model.primary '"gemini/gemini-2.5-flash"'
+  # The daily quota is PER MODEL, so moving models is the only cure for a spent
+  # day -- waiting cannot help until the reset. The gateway classifies every quota
+  # error into one `rate_limit` bucket and treats it as transient (ADR-0009's
+  # accepted gap), so it will still waste retries on the exhausted model before
+  # moving; a chain turns that from "the agent is dead until tomorrow" into "the
+  # agent answers on a weaker model and says so".
+  oc config set agents.defaults.model.fallbacks '["gemini/gemini-3.6-flash","gemini/gemini-3.5-flash-lite","gemini/gemini-3.1-flash-lite"]'
+elif [ -n "$GROQ_API_KEY" ]; then
+  oc config set agents.defaults.model.primary '"groq/llama-3.3-70b-versatile"'
+  echo "WARN: GEMINI_API_KEY unset - falling back to Groq, which is network-blocked here; the preflight will fail on it"
+else
+  echo "WARN: no model provider key - the agent has no model; the preflight will fail on it"
+fi
+
+# Acknowledgement reactions, which the gateway does natively and this project
+# spent two deploys hand-rolling in the plugin instead.
+#
+# THE ACTUAL REASON THE THUMBS-UP NEVER APPEARED: the shipped default is
+# `ackReactionScope: "group-mentions"`, and Justin's chat is a DM. So it was
+# configured off for the only chat that exists here -- which is also why he never
+# saw it work in the pre-gateway version. No hook was ever going to fix that.
+#
+# "all" rather than "direct" so a group ever added gets it too. The emoji is a
+# JSON \u escape, not a literal: this file is read on a cp1252 console and a raw
+# emoji in the seed's echoed output is mojibake at best.
+oc config set messages.ackReactionScope '"all"'
+oc config set messages.ackReaction '"\ud83d\udc4d"'
+# Lifecycle reactions on the trigger message: queued -> thinking -> done/error.
+# Telegram requires this explicitly true; unset is not enough (Discord is the
+# only channel that infers it from ack reactions being active).
+#
+# statusReactions stays OFF, and turning it on was a mistake worth recording.
+# It replaces the sticky ack with a LIFECYCLE emoji on the same message: queued
+# -> thinking -> done, cleared at the end. `ackReactionPromise` becomes
+# `statusReactionController.setQueued()` rather than a plain reaction
+# (telegram-ingress-spool ~5566), so the 👍 stops being an acknowledgement that
+# stays and becomes a progress indicator that vanishes -- which is exactly what
+# Justin saw: slow to appear on a typed message, and gone again after /actions.
+# It also carried a 700ms `timing.debounceMs` before the first emoji.
+#
+# A command has no agent lifecycle to display, so there is nothing for the
+# controller to show anyway. Off means line 5566's other branch runs: one
+# reaction, added once, left alone (`removeAckAfterReply` is false).
+oc config set messages.statusReactions.enabled false
+
+# --- logging that outlives the container ------------------------------------
+# Task 13.5 / 9.x. The gateway's own log had two sinks and neither survived a
+# deploy: stdout (`docker compose logs`, gone when the container is recreated)
+# and `/tmp/openclaw/openclaw-<date>.log`, which is inside the container and
+# also gone. So "an access denial leaves no trace" was partly a retention
+# problem, not only a level problem -- and every deploy destroyed the evidence
+# for the previous one.
+#
+# `/home/node/.openclaw` is the state VOLUME, so a file there persists across
+# recreates with no new mount. Level pinned to info explicitly rather than left
+# to the shipped default: the ingress drop lines are info
+# (`dropping dm (not allowlisted)`, `skipping group message reason=not-allowed`),
+# so a default that ever moves to warn would silently take them with it.
+#
+# NOT set: `logging.redactSensitive`. It takes "off" or "tools" -- not the
+# boolean it reads like -- and the validator rejected `true` outright. Choosing
+# between those two without knowing which the default is would be guessing at a
+# control that decides whether tool payloads reach the log.
+oc config set logging.level '"info"'
+oc config set logging.file '"/home/node/.openclaw/logs/gateway.log"'
 
 # The claims read surface. Service name, not host.docker.internal: the latter
 # resolves through the host and NATs the source address to loopback.

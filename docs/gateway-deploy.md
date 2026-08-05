@@ -96,6 +96,15 @@ preflight asserts the *absence* of any Google or Gemini credential on the
 gateway, which is stronger and simpler. The agent runs on Groq, so there is no
 legitimate reason for one to be there.
 
+> **Narrowed 2026-08-04.** The premise above no longer holds: Groq refuses this
+> network (403 to an unauthenticated request — ADR-0009's amendment), and the
+> agent runs on Gemini. `GEMINI_API_KEY` is therefore exempt, by **exact name**,
+> and every other `GMAIL*`/`GOOGLE*`/`GEMINI*` name still fails the check. It was
+> exempted after checking rather than reasoning: that key returned **401** on
+> `gmail.googleapis.com/users/me/profile`, on `.../users/me/messages` and on
+> `drive/v3/files`, so it cannot read mail or files. What the preflight no longer
+> proves is the broader "no Google-issued credential at all".
+
 **Runtime media roots are read from config, not from the running process.** If
 the two ever diverge the check reads the intention rather than the fact.
 

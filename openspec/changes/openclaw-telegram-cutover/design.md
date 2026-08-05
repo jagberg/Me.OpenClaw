@@ -99,6 +99,13 @@ is a decision for him, not a fallback to pick silently.
 
 ## Open Questions
 
+- 3.0 — **ANSWERED, and it invalidates a decision.** ADR-0025 put the chat-initiated
+  confirm "in the MCP surface". The gateway's MCP client declares no `elicitation`
+  capability, so an MCP server there cannot ask for a confirmation mid-call and
+  cannot gate its own commit. Approvals are a plugin capability and this server is
+  not a plugin. Evidence in ADR-0025's 2026-08-02 amendment; the forced consequence
+  is one commit path via `/internal`, which is the option Justin declined. **Awaiting
+  him** — the outcome is forced but the trade-off he was choosing on is not.
 - 0.10 — can a plugin conditionally claim inbound text? Gates 12.2.
 - 12.4 — does the gateway deliver **edited** messages to the agent? If not, a typed
   correction vanishes: the exact 2026-07-27 failure, whose fix now sits outside the

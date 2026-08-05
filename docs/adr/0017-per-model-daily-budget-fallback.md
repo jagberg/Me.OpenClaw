@@ -99,3 +99,45 @@ classification, treated as transient and re-probed during cooldown — correct f
 a per-minute limit, useless for a per-day one. So this ADR's walk stays in
 `llm.py` for extraction and vision, which are the calls that exhaust a day. See
 the addendum to ADR-0009 for what the chat path gives up.
+
+---
+
+## Amendment (2026-08-04) — the gateway side now has the walk too, and it was needed the same day
+
+ADR-0009's 2026-08-01 amendment recorded this as an accepted gap: the gateway
+classifies every quota failure as `rate_limit`, treats it as transient, and
+re-probes the same model, so *"chat therefore spends three futile retries per
+exhausted-day turn before moving on. Mitigated by configuring a multi-model chain
+so `next=none` becomes `next=<model B>`; not eliminated."*
+
+The mitigation was never actually configured. It is now, and the trigger was a
+failing deploy rather than a review: a day of probes and deploys spent
+`GenerateRequestsPerDayPerProjectPerModel-FreeTier` for `gemini-2.5-flash`, and
+`scripts/gateway_preflight.py` failed `model serves a turn` with the gateway
+reporting only `FailoverError: API rate limit reached`. With one model in the
+provider entry there was nowhere to go — **the gateway cannot fail over to a model
+its provider entry never declares**, so a `fallbacks` list alone would not have
+been enough.
+
+`scripts/gateway_seed.sh` now declares all four models on the provider and sets
+`agents.defaults.model.fallbacks` to the three probed links in capability order.
+The next deploy passed with `model serves a turn — gemini-3.6-flash answered`,
+which is this ADR's behaviour, on the gateway, verified by an exhaustion nobody
+staged.
+
+**Two independent chains, deliberately.** `llm._FALLBACK_MODELS` serves
+`extract()` and `extract_vision()`; the gateway's config serves chat turns. They
+are not shared and cannot be: one is Python config, the other is the product's.
+`test_chat_has_a_gemini_backend_and_the_agents_primary_is_the_reachable_provider`
+asserts the gateway's list against `llm._FALLBACK_MODELS` so the two cannot drift
+apart silently, and additionally that each fallback is declared on the provider —
+the failure mode above.
+
+**What is still true and still unfixed.** The gateway will keep wasting its
+transient-retry budget on the exhausted model before moving, because its single
+`rate_limit` classification cannot see the difference between per-minute and
+per-day. Only the provider's own quota detail can: a per-day 429 carries a
+`quotaId` containing `PerDay`. The app distinguishes them
+(`llm._is_daily_budget_exhausted`, extended the same day to read Gemini's
+spelling); the gateway does not, and that is a product limit rather than a
+configuration one.

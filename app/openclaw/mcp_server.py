@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse, Response
 
-from . import config, db
+from . import config, db, proposals
 
 logger = logging.getLogger(__name__)
 
@@ -79,24 +79,111 @@ _MERCHANT = {"type": "string", "description": "vet/merchant name (partial ok)"}
 # that can only appear by being written here is a tool that can be counted, and
 # the count is what 19a.3 asserts.
 TOOLS = [
-    _tool("turn_context", "Today's date and the only pets that exist, read live from the database. "
-          "Call before answering anything involving a pet name or a relative date.", {}),
-    _tool("query_claims", "List claims filtered by status, pet, vet and/or transaction-date range.",
-          {"status": {"type": "string", "description": "e.g. pending_match, matched, drafted, sent, "
-                      "acknowledged, info_requested, suspended, approved, settled, declined"},
-           "pet": _PET, "merchant": _MERCHANT, "since": _SINCE, "until": _UNTIL}),
-    _tool("pending_actions", "THE list of everything waiting on Justin, with claim ids, amounts and age. "
-          "Use for any 'what do I need to do / what's outstanding' question.",
-          {"since": _SINCE, "until": _UNTIL}),
-    _tool("claim_detail", "One claim in full by id: invoice items, claimable, flag, and every reply "
-          "with its dollar figures. Use for 'why is claim #N like this'.",
-          {"claim_id": {"type": "integer"}}, required=["claim_id"]),
-    _tool("claim_history", "A claim's Petcover reply/status-event history, found by pet and/or reference.",
-          {"pet": _PET, "reference": _REF}),
-    _tool("submissions_awaiting_reply",
-          "Claims sent to PETCOVER and whether a reply came back, one entry per submission.", {}),
-    _tool("list_tasks", "Justin's non-claim tasks (household admin, follow-ups).",
-          {"status": {"type": "string", "description": "open or closed"}}),
+    _tool(
+        "turn_context",
+        "Today's date and the only pets that exist, read live from the database. "
+        "Call before answering anything involving a pet name or a relative date.",
+        {},
+    ),
+    _tool(
+        "query_claims",
+        "List claims filtered by status, pet, vet and/or transaction-date range.",
+        {
+            "status": {
+                "type": "string",
+                "description": "e.g. pending_match, matched, drafted, sent, "
+                "acknowledged, info_requested, suspended, approved, settled, declined",
+            },
+            "pet": _PET,
+            "merchant": _MERCHANT,
+            "since": _SINCE,
+            "until": _UNTIL,
+        },
+    ),
+    _tool(
+        "pending_actions",
+        "THE list of everything waiting on Justin, with claim ids, amounts and age. "
+        "Use for any 'what do I need to do / what's outstanding' question.",
+        {"since": _SINCE, "until": _UNTIL},
+    ),
+    _tool(
+        "claim_detail",
+        "One claim in full by id: invoice items, claimable, flag, and every reply "
+        "with its dollar figures. Use for 'why is claim #N like this'.",
+        {"claim_id": {"type": "integer"}},
+        required=["claim_id"],
+    ),
+    _tool(
+        "claim_history",
+        "A claim's Petcover reply/status-event history, found by pet and/or reference.",
+        {"pet": _PET, "reference": _REF},
+    ),
+    _tool(
+        "submissions_awaiting_reply",
+        "Claims sent to PETCOVER and whether a reply came back, one entry per submission.",
+        {},
+    ),
+    _tool(
+        "list_tasks",
+        "Justin's non-claim tasks (household admin, follow-ups).",
+        {"status": {"type": "string", "description": "open or closed"}},
+    ),
+    # --- proposals: these change nothing. Each records a pending row and sends
+    # Justin a Confirm button; the write happens on the tap, in `proposals.commit`,
+    # which nothing in this file can reach. Every one takes an explicit claim id
+    # because without a way to name the claim under discussion the model
+    # fabricated argument values out of these very description strings
+    # (live, 2026-07-27).
+    _tool(
+        "propose_mark_sent",
+        "PROPOSE marking a drafted claim as sent to Petcover. Changes nothing "
+        "until Justin taps Confirm.",
+        {"claim_id": {"type": "integer"}, "pet": _PET, "reference": _REF},
+    ),
+    _tool(
+        "propose_set_condition",
+        "PROPOSE recording the condition being claimed. Never invent the "
+        "text — if he has not said it, ask. Changes nothing until he taps Confirm.",
+        {
+            "condition_text": {"type": "string"},
+            "claim_id": {"type": "integer"},
+            "pet": _PET,
+            "reference": _REF,
+        },
+        required=["condition_text"],
+    ),
+    _tool(
+        "propose_assign_pet",
+        "PROPOSE assigning one pet to a claim. If his message names two pets "
+        "this is a SPLIT, not an assignment. Changes nothing until he taps Confirm.",
+        {
+            "pet_name": {"type": "string"},
+            "claim_id": {"type": "integer"},
+            "reference": _REF,
+            "merchant": _MERCHANT,
+        },
+        required=["pet_name"],
+    ),
+    _tool(
+        "propose_mark_resolved",
+        "PROPOSE confirming an outstanding action is dealt with. Changes "
+        "nothing until Justin taps Confirm.",
+        {"claim_id": {"type": "integer"}, "pet": _PET, "reference": _REF},
+    ),
+    _tool(
+        "propose_split_between_pets",
+        "PROPOSE splitting one invoice across pets, each with its own "
+        "share in dollars. Never invent a share. Changes nothing until Justin taps Confirm.",
+        {
+            "claim_id": {"type": "integer"},
+            "pets_and_amounts": {
+                "type": "array",
+                "description": "[{pet, amount}] — one entry per pet",
+                "items": {"type": "object"},
+            },
+        },
+        required=["claim_id", "pets_and_amounts"],
+    ),
 ]
 
 TOOL_NAMES = [t["name"] for t in TOOLS]
@@ -105,9 +192,30 @@ TOOL_NAMES = [t["name"] for t in TOOLS]
 # inventory is written by hand, so anything matching these got here on purpose
 # and the point is that the suite says so out loud before a deploy does.
 FORBIDDEN_TOOL_SUBSTRINGS = (
-    "file", "read_", "write", "shell", "exec", "bash", "browser", "fetch", "http",
-    "mail", "gmail", "inbox", "search_mail", "secret", "token", "credential", "env",
-    "password", "key", "send", "draft", "delete", "sql", "query_db",
+    "file",
+    "read_",
+    "write",
+    "shell",
+    "exec",
+    "bash",
+    "browser",
+    "fetch",
+    "http",
+    "mail",
+    "gmail",
+    "inbox",
+    "search_mail",
+    "secret",
+    "token",
+    "credential",
+    "env",
+    "password",
+    "key",
+    "send",
+    "draft",
+    "delete",
+    "sql",
+    "query_db",
 )
 
 
@@ -121,12 +229,14 @@ def turn_context() -> str:
     """
     pets = db.list_pet_names()
     today = datetime.now(timezone.utc).date().isoformat()
-    return (f"Today is {today}. The ONLY pets that exist: {', '.join(pets) if pets else '(none on file)'}. "
-            "Resolve relative dates against today and state the range you used.")
+    return (
+        f"Today is {today}. The ONLY pets that exist: {', '.join(pets) if pets else '(none on file)'}. "
+        "Resolve relative dates against today and state the range you used."
+    )
 
 
-def _impls() -> dict:
-    """Reuse the chat agent's read implementations rather than restating them.
+def _impls(queue: list | None = None) -> dict:
+    """Reuse the chat agent's implementations rather than restating them.
 
     They are the same answers the current bot gives, derived from the same
     queries — `pending_actions` in particular shares its derivation with the
@@ -134,13 +244,19 @@ def _impls() -> dict:
     copy here would be a second answer to the same question, which is the shape
     this codebase has been bitten by five times.
 
-    `_build_impls` takes a proposals list because the mutating tools append to
-    it. Passing one that is thrown away is not a loophole: no `propose_*` name
-    is in TOOLS, so nothing here can reach them.
+    The same reuse carries the *refusals*. `propose_assign_pet` refuses a
+    message naming two pets on file, and `propose_split_between_pets` dry-runs
+    the real ceiling/status/duplicate guards before queueing anything — both
+    live in `_build_impls`, so this surface enforces them rather than mirroring
+    them (ADR-0025).
+
+    `_build_impls` appends proposals to `queue` and reads `user_text` for the
+    two-pets refusal. The text comes from the message log, not from the model:
+    a paraphrase could drop the second pet name and take the refusal with it.
     """
     from . import agent
 
-    impls = agent._build_impls([], "")
+    impls = agent._build_impls(queue if queue is not None else [], db.latest_inbound_text())
     selected = {name: impls[name] for name in TOOL_NAMES if name in impls}
     selected["turn_context"] = turn_context
     return selected
@@ -154,8 +270,62 @@ def _result(rid, payload: dict) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "result": payload}
 
 
-def _call_tool(name: str, arguments: dict) -> dict:
-    impls = _impls()
+def _queue_and_ask(queued: list, runner=None) -> list[str]:
+    """Persist what a `propose_*` call queued, and put a Confirm button in front
+    of Justin. Returns one note per proposal, for the model to read back.
+
+    This is the whole gate on the chat path. The tool call itself wrote nothing;
+    the button carries only a row id, and the tap goes through the plugin to
+    `/internal/confirm` — so a commit is never the return value of a tool the
+    model called, and the model never gets to say what the button says.
+
+    The card's text is composed here from the proposal's own code-built label,
+    never from the model's description of its intent. A model that resolved the
+    wrong claim would describe the wrong claim convincingly, and the approval
+    would be a rubber stamp with better typography (ADR-0025).
+    """
+    from . import gateway_client
+
+    notes = []
+    target = db.registered_chat_id()
+    for proposal in queued:
+        pid = proposals.record(
+            proposal["action"],
+            label=proposal["label"],
+            claim_id=proposal.get("claim_id"),
+            task_id=proposal.get("task_id"),
+            arg=proposal.get("arg"),
+            origin="chat",
+        )
+        if target is None:
+            # Visible, never a proposal that silently has no way to be confirmed.
+            logger.error("proposal #%s has no chat to confirm in — Justin must /start the bot", pid)
+            notes.append(
+                f"Recorded proposal #{pid} but there is no registered chat to send the "
+                "Confirm button to. Tell Justin the tap cannot be delivered."
+            )
+            continue
+        try:
+            gateway_client.send_message(
+                str(target),
+                f"Confirm: {proposal['label']}",
+                buttons=[{"label": "Confirm", "command": f"/confirm {pid}"}],
+                runner=runner,
+            )
+        except Exception as exc:  # noqa: BLE001 — a lost button must not read as a queued action
+            logger.error("could not deliver the Confirm button for proposal #%s: %s", pid, exc)
+            notes.append(
+                f"Recorded proposal #{pid} but the Confirm button did not send ({exc}). "
+                "Tell Justin it is not done and the button did not arrive."
+            )
+            continue
+        notes.append(f"Sent Justin a Confirm button for proposal #{pid}. Nothing has changed yet.")
+    return notes
+
+
+def _call_tool(name: str, arguments: dict, runner=None) -> dict:
+    queued: list = []
+    impls = _impls(queued)
     fn = impls.get(name)
     if fn is None:
         # isError, not a JSON-RPC error: the spec routes tool failures back to
@@ -165,11 +335,17 @@ def _call_tool(name: str, arguments: dict) -> dict:
     try:
         text = fn(**(arguments or {}))
     except TypeError as exc:
-        return {"content": [{"type": "text", "text": f"Bad arguments for {name}: {exc}"}], "isError": True}
+        return {
+            "content": [{"type": "text", "text": f"Bad arguments for {name}: {exc}"}],
+            "isError": True,
+        }
     except Exception as exc:  # noqa: BLE001 — visible failure, never a silent empty answer
         logger.error("mcp tool %s failed: %s", name, exc, exc_info=True)
         return {"content": [{"type": "text", "text": f"{name} failed: {exc}"}], "isError": True}
-    return {"content": [{"type": "text", "text": str(text)}], "isError": False}
+    # A refusal queues nothing, so this loop is also what makes a refusal a
+    # genuine no-op rather than a queued action with a discouraging message.
+    text = "\n".join([str(text), *_queue_and_ask(queued, runner=runner)]) if queued else str(text)
+    return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
 def dispatch(message: dict):
@@ -183,12 +359,15 @@ def dispatch(message: dict):
     params = message.get("params") or {}
 
     if method == "initialize":
-        return _result(rid, {
-            "protocolVersion": params.get("protocolVersion") or PROTOCOL_VERSION,
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": SERVER_NAME, "version": config.APP_VERSION},
-            "instructions": INSTRUCTIONS,
-        })
+        return _result(
+            rid,
+            {
+                "protocolVersion": params.get("protocolVersion") or PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": config.APP_VERSION},
+                "instructions": INSTRUCTIONS,
+            },
+        )
     if method == "ping":
         return _result(rid, {})
     if method == "tools/list":
