@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: A serial is assigned from evidence the letter carries, or not at all
 
