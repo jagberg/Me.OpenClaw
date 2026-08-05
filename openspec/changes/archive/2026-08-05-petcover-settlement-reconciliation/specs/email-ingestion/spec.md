@@ -2,14 +2,14 @@
 
 ### Requirement: Petcover's claims mail is never consumed by task capture
 
+The system SHALL exclude every sender in `PETCOVER_STATUS_SENDERS` from task capture, and SHALL
+leave those messages **unmarked** in `processed_emails` so the claims poller still finds them.
+Marking without tasking is not sufficient: the mark is the lockout.
+
 `processed_emails` is a single dedupe gate shared by two pollers that scan overlapping mail:
 `gmail_ingest.poll_once` (inbox → candidate tasks) marks every message it sees, and
 `pipeline.poll_petcover_status` skips any message already marked. Whichever poller runs first
 therefore wins, permanently — the loser never sees the message at all.
-
-The system SHALL exclude every sender in `PETCOVER_STATUS_SENDERS` from task capture, and SHALL
-leave those messages **unmarked** in `processed_emails` so the claims poller still finds them.
-Marking without tasking is not sufficient: the mark is the lockout.
 
 Verified live 2026-08-04. Five `Claim Approval` letters between 28/07 and 03/08 lost the race, carry
 a `processed_emails.task_id` and produced **no claim status event of any kind**, while the five
