@@ -1,3 +1,4 @@
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -46,6 +47,9 @@ templates.env.globals["status_needs"] = status_labels.needs
 # claim row yet still has to say "No invoice", and saying it literally is how the
 # three hand-synced maps started (ADR-0021).
 templates.env.globals["status_words"] = status_labels.LABELS
+# Event details are stored as JSON text; the review queue renders the figures a
+# dismissed assessment difference was made of.
+templates.env.filters["from_json"] = lambda raw: json.loads(raw or "{}")
 
 
 @asynccontextmanager

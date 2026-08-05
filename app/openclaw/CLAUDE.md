@@ -70,6 +70,9 @@ Root rules live in the repo-root `CLAUDE.md` (hard rules, domain rules, working 
 - A treatment date is **not** a charge date, and the deadline hangs off the treatment (Petcover: "within one year of your pet receiving treatment"). `claim_status.treatment_date()` takes the EARLIEST date the invoice states — its own or any line item's — since an invoice billing several visits expires on its oldest; with no invoice it falls back to the charge date and the message says `assumed = charge date`. Live proof of the gap: The Shire Vet treated Aari 19 Jun and Echo 30 Jun 2026, both charged 06/07/2026 — anchoring on the charge over-granted 17d and 6d. Nothing bounds that gap. **`_policy_year_key` still uses the charge date for excess/cap** — same question, different money, deliberately not aligned (BACKLOG).
 - An `info_requested` label depends on `owed_by` from the event detail: vet → "More vet info required", Justin → "Petcover needs info from you", unrecorded → neutral "Info requested". Never default it — Petcover asks the vet as often as Justin and he's only Cc'd, so naming the wrong party is how the chase never happens.
 - `email_extractions` caches successful extraction FOREVER; invalidate the row if you change what extraction must return.
+- **`processed_emails` is shared by both pollers and a mark is a permanent lockout.** `gmail_ingest.poll_once` marks every inbox message; `pipeline.poll_petcover_status` skips anything marked. Petcover's senders are excluded from task capture *and left unmarked* — skipping without marking is the whole fix, and `config.PETCOVER_STATUS_SENDERS` is where both sides read the list. Five approval letters (~$2.6k) were lost to this before 2026-08-04, and `claims.au@` is caught by neither `_is_noise` branch, so nothing else was going to stop them.
+- **No `text/plain` part used to mean the body became Gmail's 198-char `snippet`.** `gmail_client._message_text` walks nested parts and falls back to HTML rendered to text (cells → ` | `, rows → newlines) before the snippet. Petcover's claim-status table — the only document stating a treatment date per serial, and the thing that proved our serial map wrong on all 10 — is HTML-only and read as a greeting for six days.
+- **A serial's claim assignment is a guess, and it is recorded as one.** `_claim_for_sr` picks the oldest un-serialized claim; `process_reply` writes `sr_assigned_by` on the event when that path is taken. Measured 0-for-10 against Petcover's own table, so `_check_what_petcover_assessed` names the claim whose invoice the stated figure actually matches rather than sending Justin to ask Petcover. It still never re-routes: that moves money.
 - Vision attempts are refunded on `LLMUnavailableError` (provider outage ≠ unreadable scan).
 - Invoice identity across claims: `invoice_number` first, else amount+date (`_already_claimed`).
 - **`claim_status.apply_event` is the ONLY writer of `vet_claims.status`.** It appends the event, then applies the state if `TRANSITIONS` declares the move; an undeclared move leaves the state alone and flags the claim naming both states and the event id. Callers keep their own field writes (`invoice_data`, `draft_id`, `claim_file_path`) and hand over the state — always *after* their own `flag = ?` write, or that write wipes the refusal it caused. `test_no_module_outside_claim_status_writes_the_status_column` fails if a module writes the column directly. Nine statements across three modules used to; six of them appended nothing, which is how the 2026-07-27 re-read moved four claims backwards and the 2026-07-28 repair had to infer a claim's prior state from an absence.
@@ -80,12 +83,12 @@ Root rules live in the repo-root `CLAUDE.md` (hard rules, domain rules, working 
 
 ## The move this codebase keeps making: one writer, one declared table, one mechanical guard
 
-Five times now, the same shape has fixed the same class of bug: **a rule enforced by
+Six times now, the same shape has fixed the same class of bug: **a rule enforced by
 convention across N callers gets collapsed into a single writer that owns a declared
 table, plus a test that fails if a caller bypasses it.** Reach for this when you find
 yourself writing "remember to also update X" — that sentence is the smell.
 
-Not a pattern catalogue. These five are the instances; the guard column is the honest
+Not a pattern catalogue. These six are the instances; the guard column is the honest
 state of each, because a convention with no check is what every one of these incidents
 was before it became an incident.
 
@@ -96,6 +99,7 @@ was before it became an incident.
 | Telegram sends | plain `telegram.Bot` per caller | `LoggedBot` | **partial** — `test_core.py:776` asserts the app's bot IS a `LoggedBot`; nothing stops a second construction | a failed update reached `mark_processed` looking successful and left the replay queue (ADR-0014) |
 | LLM provider access | per-caller SDK calls | `llm.py` seam (`chat`/`extract`/`extract_vision`) | **none** — convention only | ADR-0009; a 403 took extraction and chat down together because all four fallback models are one provider |
 | Host access to the live DB | 4 plain `sqlite3.connect` sites | *not collapsed* | **none** — `docs/failure-modes.md` standing gap #1 | 51-minute total outage 2026-07-25; the rule was then broken 4 more times in one session by people who had just read it |
+| Reading a claim's claimable subtotal | 5 sites spelling `claimable_amount` with a fallback to `amount` | `claim_status.claimable_subtotal` → `(value, recorded)` | **yes** — `test_no_module_substitutes_the_invoice_total_for_a_claimable_subtotal` (three matchers, each self-checked against a known-violating string) | a dismissed settlement flag told Justin "we expected $430.74" from $580.74 − $150.00, where $580.74 was an invoice total never submitted as claimable. **The guard found 2 of the 5 sites; reading the code twice had found 3** — `dashboard_lists` fell through to *Petcover's own* figure inside the row whose job is to compare against it, and `claim_forms.apportion_between_pets` split the invoice total between pets |
 
 Two related moves with 3+ instances each, both forced by this repo's constraints
 rather than chosen:

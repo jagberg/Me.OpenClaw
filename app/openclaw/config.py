@@ -218,3 +218,25 @@ VET_NUDGE_DAY = os.environ.get("VET_NUDGE_DAY", "mon")
 # within one year of the pet RECEIVING TREATMENT, so the deadline is anchored on
 # the transaction date, not on when the request arrived.
 INFO_REQUEST_DEADLINE_DAYS = int(os.environ.get("INFO_REQUEST_DEADLINE_DAYS", "365"))
+
+# Petcover's claims-relevant senders. Both pollers need this list: the claims
+# service to FIND these letters, and gmail_ingest to LEAVE THEM ALONE — they
+# share `processed_emails` as their dedupe gate, so whichever ran first won and
+# the other skipped the message permanently. Live cost, found 2026-08-04: five
+# approval letters between 28/07 and 03/08 (including $2,521.46 claimed /
+# $1,638.95 paid) became assistant tasks and never reached a single claim.
+# marketing.au@ deliberately excluded — not claims-relevant.
+PETCOVER_STATUS_SENDERS = [
+    "claims.au@petcovergroup.com",
+    "requiredinfo.au@petcovergroup.com",
+    "accounts.au@petcovergroup.com",
+]
+
+# The share of a claim Petcover actually pays. Their letters print the other 65%
+# complement as an "Age Contribution: $12.25 [35%]" line, constant across all ten
+# live approval letters, and Justin confirmed it as the policy's own term rather
+# than something read off the letters: "Petcover only paying 65% of a claim".
+# ponytail: one rate for the one Petcover-insured pet. A second insurer, or a
+# rate that changes at a policy anniversary, needs a per-pet column — which on
+# this live DB means a hand-run ALTER TABLE, so it waits until there is one.
+PETCOVER_BENEFIT_RATE = float(os.environ.get("PETCOVER_BENEFIT_RATE", "0.65"))

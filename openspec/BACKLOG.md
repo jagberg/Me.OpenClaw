@@ -428,3 +428,47 @@ never once asserts *the app can actually send a message*. A check that pushed a
 real message through `gateway_client` at deploy time would have caught this
 before a human tapped anything. That is the gap worth closing regardless of
 which option wins.
+
+## From petcover-settlement-reconciliation (2026-08-04)
+
+- ~~Should the dashboard's expected-reimbursement estimate net the 35% age
+  contribution?~~ **Decided 2026-08-04 by Justin: yes.** 65% is the policy's own
+  benefit rate, not a percentage inferred from the letters, so the
+  "no fabricated deduction" rule it seemed to contradict never applied. The
+  ledger now nets `config.PETCOVER_BENEFIT_RATE` after the excess and before the
+  cap. Echo (no Petcover figures on file) is untouched. See the change's
+  `dashboard-visit-ledger` delta and design.md Decision 3's reversal note.
+  Remaining open piece: whether the rate should ever be per-pet — that needs a
+  column, which on the live DB means a hand-run `ALTER TABLE`, so it waits for a
+  second insured pet.
+- **The closed-policy-year disagreement, open since 2026-07-25**: the dashboard
+  drains the $150 excess for closed years and settlement validation does not.
+  Worth settling in the same conversation as the age contribution — two open
+  disagreements about the same numbers is one too many.
+- **Five `approved` events lack `age_contribution_stated`** (ids 18, 21, 22, 54,
+  55) because the extraction pattern shipped after they were written. Today's
+  code reads it from those same five emails, but `_already_recorded` blocks a
+  re-read from backfilling and that is correct (ADR-0020): re-reading mail is not
+  a repair tool. The gap is permanent in the log and Check A skips those events
+  rather than checking them against a term they never captured.
+- **Recover the five lost approval letters.** `poll_petcover_status(reread=True,
+  since=2026-07-24)`. A live write, so Justin's call, and it must run *after* the
+  settlement fix deploys or the recovered letters are flagged by the formula that
+  fix replaces. `process_reply` skips already-logged (email, claim, event)
+  triples, so it records only what is new and cannot resurrect claim #2's
+  dismissal. Sequenced after the serial-map correction below — see that entry.
+- **Confirm the estimate after deploy.** Claim #8's card read
+  `Expected payment: $296.50` before the 65% rate landed and should read
+  `$192.72` after. Read-only check; the whole point of the change is that this
+  figure now matches what Petcover pays.
+- **Correct the live serial→claim map.** Petcover's status table of 2026-07-29
+  (`19fab5f3b534416c`) states a treatment date per serial, and against it every
+  serial we hold is on the wrong claim (0 for 10), while every letter's stated
+  amount matches its true claim's invoice to the cent (7 for 7). The true map is
+  written out in the change's post-mortem. Not applied: it rewrites
+  money-affecting links on nine claims and is Justin's call. **Sequencing note:**
+  the recovery re-read of the five lost approval letters routes by the same
+  0-for-10 heuristic, so doing it first attaches real settlements to wrong claims
+  — correct the map first, or accept that the new links need fixing too.
+  Supersedes the earlier "not correctable from data we hold", which was written
+  before that table was read.

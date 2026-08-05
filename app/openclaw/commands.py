@@ -236,6 +236,22 @@ _ACTION_EMOJI = {
 }
 
 
+def _money_or_not_recorded(value, recorded: bool) -> str:
+    """A recorded $0.00 is an answer; an absent key is not. Never print one as
+    the other, and never substitute the invoice total or the bank charge —
+    substituting the total is what produced claim #2's wrong $430.74."""
+    if not recorded or value is None:
+        return "Not recorded"
+    return f"${value:,.2f}"
+
+
+def _expected_text(expected: dict | None) -> str:
+    if not expected or not expected.get("available"):
+        note = (expected or {}).get("note")
+        return f"Not recorded ({note})" if note else "Not recorded"
+    return f"${expected['value']:,.2f}"
+
+
 def _action_card_text(action: dict) -> str:
     """One action as a short HTML card. Always carries the claim #id — Justin
     acts by id (/mark, /pet), and an alert without one is unusable.
@@ -269,7 +285,13 @@ def _action_card_text(action: dict) -> str:
         lines.append(
             f"{_esc(who) + ' · ' if who else ''}{action['date']} ({action['age_days']}d ago)"
         )
-    lines.append(f"Blocks: {_esc(action['blocks'])}")
+        # The bank charge above is a ceiling, not the claim (ADR-0007), and the
+        # card that started this said neither of these numbers. "Not recorded"
+        # is a real answer and prints as one — $0.00 would be a different claim.
+        claim_amount = _money_or_not_recorded(action["claimable"], action["claimable_recorded"])
+        lines.append(f"Claim amount: {claim_amount}")
+        lines.append(f"Expected payment: {_expected_text(action['expected'])}")
+    lines.append(f"{_esc(action['waiting'])} · {_esc(action['blocks'])}")
     if action["kind"] == "assign_pet":
         # The buttons can only say ONE pet. An invoice covering two needs a share
         # each, which is a reply, not a tap — and he has to know that's allowed.

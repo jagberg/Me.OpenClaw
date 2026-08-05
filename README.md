@@ -35,7 +35,9 @@ Justin sends the draft (manually, always)
         ▼
 claim_status ── poll Petcover replies: learn their claim reference from the
         │       acknowledgement, log every event append-only, parse settlement
-        │       amounts out of the PDF attachment. An information request also
+        │       amounts out of the PDF attachment, and run TWO independent
+        │       settlement checks (their arithmetic; what they assessed).
+        │       An information request also
         │       records WHO owes the document (To:/Cc: vs vet_contacts) and WHAT
         │       it is ("Consultation notes dated 18/05/2026"), and resolves that
         │       date to the visit we already hold — usually a different claim's.
@@ -45,6 +47,25 @@ Telegram + dashboard ── every state change, question and blocker lands as a
 ```
 
 The whole pipeline runs on a 15-minute tick inside one FastAPI process (ADR-0006). The tick is driven by the **gateway's cron** since 2026-08-04 (`POST /internal/tick`); APScheduler is still in the code behind `SCHEDULER_ENABLED` for one week's rollback, and off in the deployed config. A failure on one claim flags that claim and moves on — a tick is never lost to one bad email (visible failures are a hard rule).
+
+**Settlement checking asks two separate questions**, because they have different answers and
+different audiences. An approval letter states its own full breakdown — amount claimed, fixed excess,
+non-claimable amount, age contribution (a rate and a dollar figure), percentage excess, amount paid —
+so *Check A* re-adds those figures and confirms they reach the amount Petcover says they paid. That is
+arithmetic on numbers they printed, not a model of their policy: nothing is inferred, and a letter
+stating no rate is skipped rather than assumed. *Check B* compares the amount they say they assessed
+against the claimable subtotal we actually submitted, and asks about a difference rather than
+asserting one — every stated amount matches some real invoice of ours, the amounts cross Condition
+Thread boundaries, and the letters carry no invoice number, so re-routing a settlement is Justin's
+call after Petcover answers. Across all ten live approval letters (2026-08-04) Check A passes to the
+cent and Check B has questions about five of them. The claim amount used is always the recorded
+claimable subtotal, never the invoice total and never the bank charge: one accessor reads it, a guard
+test fails if any caller re-adds the old fallback, and where it was never recorded the surfaces say
+`Not recorded` instead of a plausible substitute.
+
+Petcover's own mail is also excluded from the assistant's task capture. Both pollers share
+`processed_emails` as their "seen it" gate, so whichever ran first won — which is how five approval
+letters became to-do items and reached no claim at all.
 
 The lifecycle above is a **declared state machine**, not a column anyone may write. Every legal move is in one transition table, and `claim_status.apply_event` is the only thing that writes a claim's state: it records the event first, then applies it if the table allows the move — and if it doesn't, the state stays put and the claim is flagged naming both states, with the event kept as evidence. So a claim's history is a fact on record rather than something to reconstruct: re-reading an old acknowledgement can no longer walk a settled claim backwards, which it did to two claims in July 2026 (two others moved the same day by being routed to the wrong claim, which is a separate guard). Each tick folds every claim's events and compares the result against the stored status; `/health` publishes the disagreement count, and it should read zero. Reverting a state change, and the timeline view that would show it, are not built yet.
 
