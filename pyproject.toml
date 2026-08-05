@@ -1,0 +1,17 @@
+[tool.ruff]
+# Lint and format only what we wrote. The venv is inside `app/`, so it must be
+# excluded explicitly or ruff walks 11k site-packages files.
+line-length = 100
+target-version = "py313"
+extend-exclude = [".venv", "app/.venv"]
+
+[tool.ruff.lint]
+# ruff's default (E4/E7/E9 + F) plus import sorting and whitespace. Deliberately
+# NOT E501: 691 lines exceed 100 chars and nearly all of them are prose comments
+# or docstrings, which the formatter does not rewrap. Selecting E501 would report
+# hundreds of findings that no tool can fix, and a linter nobody can get to zero
+# is a linter nobody runs.
+select = ["E4", "E7", "E9", "F", "I", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["openclaw"]

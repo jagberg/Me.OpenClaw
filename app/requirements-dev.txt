@@ -1,0 +1,4 @@
+# Dev-only tooling. Deliberately NOT in requirements.txt: the Dockerfile installs
+# that one, and a linter has no business in the running container.
+#   ./.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+ruff==0.14.14
