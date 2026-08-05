@@ -7214,6 +7214,93 @@ def test_a_gateway_command_writes_an_inbound_row_and_settles_it():
         f"settling one tap touched the other: {settled}"
     )
 
+
+def test_the_gateway_row_and_the_ptb_row_differ_in_nothing_a_query_reads():
+    """Task 9.4. The previous test asserts a row exists; this one asserts it is the
+    SAME row the old transport wrote, column by column, because ADR-0014's dataset
+    is only worth having if a query spanning the cutover means one thing.
+
+    Compared against a real python-telegram-bot payload rather than against my
+    idea of one: `record_inbound` serialises `update.to_dict()`, so the fixture is
+    that dict's shape.
+    """
+    import json as _json
+
+    from openclaw import internal_api, message_log
+
+    db.init_db()
+
+    def _row(update_id):
+        with db.get_connection() as conn:
+            return conn.execute(
+                "SELECT * FROM telegram_messages WHERE update_id = ?", (str(update_id),)
+            ).fetchone()
+
+    # The PTB shape, as `update.to_dict()` produced it before the cutover.
+    ptb_raw = {
+        "update_id": 90001,
+        "message": {
+            "message_id": 55,
+            "date": 1754300000,
+            "text": "/dismiss 2",
+            "from": {"id": 7, "username": "jagberg", "is_bot": False},
+            "chat": {"id": 4242, "type": "private"},
+        },
+    }
+    message_log.record_inbound_raw(90001, ptb_raw)
+    gateway_id = internal_api.tee_inbound("tg-dismiss-p1", "/dismiss 2", "jagberg", chat_id=4242)
+
+    old, new = _row(90001), _row(gateway_id)
+
+    # Every column a query reads must agree. `update_id` and `payload` are the two
+    # that legitimately differ, and both differences are recorded in task 4.2.
+    for column in ("direction", "kind", "summary", "app_version"):
+        assert old[column] == new[column], (
+            f"{column} changed meaning across the cutover: {old[column]!r} -> {new[column]!r}"
+        )
+    assert new["app_version"] == config.APP_VERSION, (
+        "a row that cannot say which build wrote it mistags the dataset"
+    )
+    for column in ("direction", "kind", "summary", "app_version", "received_at"):
+        assert new[column] is not None, f"{column} is NULL on the gateway path"
+
+    # The payload is thinner, not empty: it must still be parseable and still carry
+    # the three facts anything downstream reads off it.
+    payload = _json.loads(new["payload"])
+    assert payload["message"]["text"] == "/dismiss 2"
+    assert payload["message"]["from"]["username"] == "jagberg"
+    assert payload["message"]["chat"]["id"] == 4242
+
+    # processed_at ordering: NULL until settled, then never before received_at. A
+    # row settled "before" it arrived would make replay ordering meaningless.
+    assert new["processed_at"] is None
+    internal_api.settle_inbound(gateway_id)
+    new = _row(gateway_id)
+    assert new["processed_at"] >= new["received_at"], (
+        f"settled before it arrived: {new['received_at']} -> {new['processed_at']}"
+    )
+
+    # The 2026-07-27 bug: an edit arrives with `message` absent, and logged as kind
+    # `other` with an empty summary — the one message that mattered was the one the
+    # log could not show. `_describe` is shared by both transports, so this guards
+    # the classifier for whichever one delivers the edit.
+    kind, summary = message_log._describe(
+        {"edited_message": {"text": "Aari cost was $35 out of this", "chat": {"id": 4242}}}
+    )
+    assert kind == "text", kind
+    assert summary == "edit: Aari cost was $35 out of this", summary
+
+    # ...but nothing on the gateway path can produce that row, and this asserts the
+    # gap rather than letting the classifier test imply coverage it does not have.
+    # The tee builds one shape, `{"message": ...}`, so `tap`, `edit:` and every
+    # `callback_query` row are unreachable — which is why a tapped button now logs
+    # as `kind=command` where it once logged `kind=tap` with its callback data.
+    # Delete this assertion when a raw-event tee exists; until then it is the
+    # honest boundary of 9.4.
+    assert "callback_query" not in payload and "edited_message" not in payload, (
+        "a raw-event tee now exists — 9.4's edit and tap parity is testable end to end"
+    )
+
     # And the plugin no longer emits an id that repeats across restarts.
     plugin = (Path(__file__).resolve().parent.parent / "gateway-plugin" / "index.js").read_text(
         encoding="utf-8"
