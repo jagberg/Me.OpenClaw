@@ -8157,6 +8157,110 @@ def test_a_guessed_serial_is_recorded_as_a_guess():
         ]
     assert any("heuristic" in (d.get("sr_assigned_by") or "") for d in rows), rows
 
+
+def test_a_serial_letter_attaches_by_the_amount_it_states():
+    """Petcover's letter says what it assessed, and exactly one claim is worth
+    that. The ordering heuristic this replaces was measured wrong on every
+    serial we hold (their status table, 2026-08-04)."""
+    _fresh_db()
+    import json as _json
+
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        # Two claims in one submission. The OLDER one is not the one the letter
+        # is about — which is exactly the case the heuristic got wrong.
+        old = _insert_claim(conn, aari, _relative_date(200), status="sent", draft_id="d1",
+                            condition="Arthritis", amount=-45.0,
+                            invoice_data=_json.dumps({"claimable_amount": 45.00}))
+        new = _insert_claim(conn, aari, _relative_date(30), status="sent", draft_id="d1",
+                            condition="Arthritis", amount=-446.50,
+                            invoice_data=_json.dumps({"claimable_amount": 446.50}))
+
+    claim_status.process_reply(
+        "mail-amount-routed",
+        "PetCover Letter - Claim Approval",
+        "Ari\nClaim Reference:DC1-27-5628\nTreatment number: 5\nCondition: Illness (Arthritis)\n"
+        "Total amount claimed: $446.50\nFixed excess $0.00\nAge Contribution: $156.28 [35%]\n"
+        "Paid by us: $290.23\n",
+    )
+
+    with db.get_connection() as conn:
+        rows = {r["id"]: r for r in conn.execute("SELECT id, petcover_sr FROM vet_claims")}
+    assert rows[new]["petcover_sr"] == 5, "the letter's own amount did not decide it"
+    assert rows[old]["petcover_sr"] is None, "the oldest claim took a serial that isn't its own"
+
+
+def test_a_letter_whose_amount_matches_no_claim_is_left_for_manual_link():
+    """The live failure of 2026-08-05: an under-excess letter for a $55.74
+    arthritis claim was attached to a $2,521.46 ALT workup and moved it to
+    `below_excess`. No claim is worth $55.74, so nothing should be chosen."""
+    _fresh_db()
+    import json as _json
+
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        big = _insert_claim(conn, aari, _relative_date(100), status="sent", condition="Raised ALT",
+                            amount=-1970.40,
+                            invoice_data=_json.dumps({"claimable_amount": 2521.46}))
+
+    claim_status.process_reply(
+        "mail-under-excess",
+        "Petcover Insurance Claim for Ari",
+        "Ari\nClaim Reference:DC1-27-5628 Sr 4\nCondition:Arthritis\n"
+        "Claim assessment outcome: Under excess\n"
+        "Amount claimed:$55.74Less Fixed excess:$105.00Other deductibles:$0.00\n"
+        "Outstanding excess:$-49.26\n",
+    )
+
+    with db.get_connection() as conn:
+        claim = conn.execute("SELECT status, petcover_sr FROM vet_claims WHERE id = ?", (big,)).fetchone()
+        unlinked = conn.execute(
+            "SELECT detail FROM claim_status_events WHERE claim_id IS NULL ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert claim["petcover_sr"] is None, "a $55.74 letter took the serial of a $2,521.46 claim"
+    assert claim["status"] == "sent", "an unrelated letter moved the claim's state"
+    detail = _json.loads(unlinked["detail"])
+    assert "needs manual link" in detail["flag"], detail
+    assert "$55.74" in detail["flag"], "the flag must name the figure that matched nothing"
+    assert f"#{big}" in detail["flag"], "the flag must name what it considered"
+
+
+def test_the_under_excess_letter_gives_up_its_amount():
+    """It writes `Amount claimed:` without the `Total`, so the approval pattern
+    missed it entirely — which is why that letter had no figure to route by."""
+    figures = claim_status.extract_approval_amounts(
+        "Amount claimed:$55.74Less Fixed excess:$105.00Outstanding excess:$-49.26"
+    )
+    assert figures["claimed_amount"] == 55.74
+    assert figures["fixed_excess_stated"] == 105.00
+    assert claim_status.stated_claim_amount("Total amount claimed: $446.50") == 446.50
+    assert claim_status.stated_claim_amount("Amount Claimed $132.50\nTotal Payable: $86.13") == 132.50
+    assert claim_status.stated_claim_amount("no figures here") is None
+
+
+def test_an_acknowledgement_still_routes_and_still_says_it_guessed():
+    """An ack states no amount, so the ordering heuristic is all there is. It
+    survives — but the event records that the link was inferred."""
+    _fresh_db()
+    import json as _json
+
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        _insert_claim(conn, aari, _relative_date(60), status="sent", condition="Arthritis",
+                      amount=-132.50, invoice_data=_json.dumps({"claimable_amount": 132.50}))
+
+    claim_status.process_reply(
+        "mail-ack-no-amount",
+        "PetCover - Acknowledgement Letter",
+        "Ari\nClaim Reference: DC1-27-5628 Sr 7\nCondition: Arthritis\nYour claim has been received",
+    )
+    with db.get_connection() as conn:
+        rows = [
+            _json.loads(r["detail"] or "{}")
+            for r in conn.execute("SELECT detail FROM claim_status_events ORDER BY id")
+        ]
+    assert any(d.get("sr_assigned_by", "").startswith("heuristic") for d in rows), rows
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
