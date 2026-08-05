@@ -7215,6 +7215,51 @@ def test_a_gateway_command_writes_an_inbound_row_and_settles_it():
     )
 
 
+def test_a_tick_reports_what_it_did_not_merely_that_it_fired():
+    """Task 9.6. `cron runs` says a job fired. After the cutover that is the ONLY
+    thing cron can say, so a 40-second tick that advanced nothing reads exactly
+    like one that advanced four claims — and the two need opposite responses.
+
+    Measured by counting before and after rather than by each step reporting its
+    own work: a step that forgets to report is indistinguishable from a step that
+    did nothing, which is the failure being measured.
+    """
+    from openclaw import internal_api
+
+    db.init_db()
+
+    def _busy():
+        with db.get_connection() as conn:
+            conn.execute("INSERT INTO ops_alerts (kind, sent_at) VALUES ('t', '2026-08-06')")
+        return "did a thing"
+
+    out = internal_api._run("tick", _busy, "corr-busy")
+    assert out["status"] == "ok", out
+    assert out["changed"] == {"ops_alerts": 1}, (
+        f"a tick that wrote a row reported no effect: {out.get('changed')!r}"
+    )
+    assert isinstance(out["duration_ms"], int), out
+    assert out["result"] == "did a thing", "the step's own return value was dropped"
+
+    # The quiet tick. `{}` is the answer, and it must be an answer rather than an
+    # absent field — "nothing changed" is the state worth alerting on later, and a
+    # missing key cannot be alerted on at all.
+    quiet = internal_api._run("tick", lambda: None, "corr-quiet")
+    assert quiet["changed"] == {}, quiet["changed"]
+    assert "duration_ms" in quiet
+
+    # A delta reports the direction of movement, not just that something moved:
+    # a claim leaving `matched` for `drafted` is two entries, -1 and +1, which is
+    # what makes "advanced" legible in a log line.
+    before = {"claims:matched": 2, "claims:drafted": 0, "tasks": 5}
+    after = {"claims:matched": 1, "claims:drafted": 1, "tasks": 5}
+    assert internal_api._effect_delta(before, after) == {"claims:drafted": 1, "claims:matched": -1}
+
+    # A failed snapshot must not invent movement. Returning {} on error means the
+    # line reads "changed={}" — honest — rather than every count looking new.
+    assert internal_api._effect_delta({}, after) == {}
+
+
 def test_the_gateway_row_and_the_ptb_row_differ_in_nothing_a_query_reads():
     """Task 9.4. The previous test asserts a row exists; this one asserts it is the
     SAME row the old transport wrote, column by column, because ADR-0014's dataset

@@ -14,6 +14,7 @@ guarantee. A rejected request is logged loudly: a rejection that looked like
 import concurrent.futures
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -211,17 +212,78 @@ def settle_inbound(inbound_id: str, error: str | None = None) -> None:
         logger.warning("could not settle inbound %s: %s", inbound_id, exc)
 
 
+# What a tick is allowed to change. Counted before and after rather than
+# reported by each step, deliberately: a step that forgets to report looks
+# identical to a step that did nothing, and that is exactly the failure this
+# measures. `llm_calls` is here because a tick that spent tokens and advanced
+# nothing is the interesting case, not a quiet one.
+_EFFECT_COUNTS = {
+    "claims_flagged": "SELECT COUNT(*) FROM vet_claims WHERE flag IS NOT NULL",
+    "status_events": "SELECT COUNT(*) FROM claim_status_events",
+    "messages_out": "SELECT COUNT(*) FROM telegram_messages WHERE direction = 'out'",
+    "tasks": "SELECT COUNT(*) FROM tasks",
+    "reminders_scheduled": "SELECT COUNT(*) FROM reminders WHERE status = 'scheduled'",
+    "llm_calls": "SELECT COUNT(*) FROM llm_calls",
+    "ops_alerts": "SELECT COUNT(*) FROM ops_alerts",
+}
+
+
+def _effect_snapshot() -> dict:
+    """Counts a tick could move, plus the claim status histogram.
+
+    Task 9.6: `cron runs` says a job fired, not what it did — and after the
+    cutover that is the only thing cron can say. A tick that ran for 40 seconds
+    and advanced nothing reads exactly like one that advanced four claims.
+    """
+    snap = {}
+    try:
+        with db.get_connection() as conn:
+            for name, sql in _EFFECT_COUNTS.items():
+                snap[name] = conn.execute(sql).fetchone()[0]
+            for row in conn.execute("SELECT status, COUNT(*) c FROM vet_claims GROUP BY status"):
+                snap[f"claims:{row['status']}"] = row["c"]
+    except Exception as exc:  # noqa: BLE001 — a measurement must never fail the tick
+        logger.warning("could not snapshot tick effects: %s", exc)
+        return {}
+    return snap
+
+
+def _effect_delta(before: dict, after: dict) -> dict:
+    """Only what moved. An empty dict is the honest answer for a quiet tick, and
+    it is the value worth alerting on later — not a missing line."""
+    if not before or not after:
+        return {}
+    keys = set(before) | set(after)
+    return {
+        k: after.get(k, 0) - before.get(k, 0)
+        for k in sorted(keys)
+        if after.get(k, 0) != before.get(k, 0)
+    }
+
+
 def _run(route: str, fn, correlation: str):
     logger.info("internal %s starting correlation=%s", route, correlation)
     record_run(route, "last_started_at")
+    before = _effect_snapshot()
+    started = time.monotonic()
     try:
         ran, outcome = run_exclusive(route, fn)
     except Exception as exc:
         # Never swallow. The caller is a cron entry with no human watching it,
         # so the only place this can surface is the log.
         level = logging.WARNING if pipeline._is_transient(exc) else logging.ERROR
+        # Duration on the failure path too: a tick that died after 40s and one
+        # that died on the first line need different diagnoses, and a partial
+        # tick's effects are exactly what the next reader needs to see.
         logger.log(
-            level, "internal %s failed correlation=%s: %s", route, correlation, exc, exc_info=True
+            level,
+            "internal %s failed correlation=%s duration_ms=%s changed=%s: %s",
+            route,
+            correlation,
+            int((time.monotonic() - started) * 1000),
+            _effect_delta(before, _effect_snapshot()),
+            exc,
+            exc_info=True,
         )
         record_run(route, "last_error_at", str(exc))
         return JSONResponse(
@@ -241,9 +303,28 @@ def _run(route: str, fn, correlation: str):
             "correlation_id": correlation,
             "reason": "already running",
         }
-    logger.info("internal %s done correlation=%s result=%s", route, correlation, outcome)
+    changed = _effect_delta(before, _effect_snapshot())
+    duration_ms = int((time.monotonic() - started) * 1000)
+    # `changed={}` is a real answer, not a missing field: it says the tick ran and
+    # moved nothing. Logged on one line with the duration so "slow and idle" and
+    # "slow and busy" are distinguishable without reading the whole tick's log.
+    logger.info(
+        "internal %s done correlation=%s duration_ms=%s changed=%s result=%s",
+        route,
+        correlation,
+        duration_ms,
+        changed,
+        outcome,
+    )
     record_run(route, "last_ok_at")
-    return {"status": "ok", "route": route, "correlation_id": correlation, "result": outcome}
+    return {
+        "status": "ok",
+        "route": route,
+        "correlation_id": correlation,
+        "duration_ms": duration_ms,
+        "changed": changed,
+        "result": outcome,
+    }
 
 
 def _endpoint(route: str, fn):
