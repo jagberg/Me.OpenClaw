@@ -8261,6 +8261,105 @@ def test_an_acknowledgement_still_routes_and_still_says_it_guessed():
         ]
     assert any(d.get("sr_assigned_by", "").startswith("heuristic") for d in rows), rows
 
+
+def _settled_claim_for_replay():
+    """A settled claim, as one looks by the time a replay re-reads its old mail."""
+    import json as _json
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        cid = _insert_claim(conn, aari, _relative_date(100), status="settled",
+                            reference="DC1-27-5628", sr=5, condition="Arthritis", amount=-446.50,
+                            invoice_data=_json.dumps({"claimable_amount": 446.50}))
+    return cid
+
+
+def test_a_replayed_refusal_is_recorded_but_does_not_flag_the_claim():
+    """A replay re-applies mail the log already has, so a refused transition is
+    expected on every claim whose state has moved on. Recording it is the audit
+    trail; writing it to `flag` is what buried six claims on 2026-08-05."""
+    cid = _settled_claim_for_replay()
+    outcome = claim_status.apply_event(cid, "acknowledged", {"subject": "ack"}, "mail-replayed",
+                                       replaying=True)
+
+    assert outcome["refused"], "the transition must still be refused"
+    assert outcome["state"] == "settled", "a replay must not move the state"
+    row = _claim_row(cid)
+    assert row["flag"] is None, f"a replayed refusal reached the flag: {row['flag']}"
+    with db.get_connection() as conn:
+        events = conn.execute(
+            "SELECT event_type, raw_email_id FROM claim_status_events WHERE claim_id = ?", (cid,)
+        ).fetchall()
+    assert any(e["event_type"] == "acknowledged" and e["raw_email_id"] == "mail-replayed"
+               for e in events), "the event itself must still be recorded"
+
+
+def test_an_ordinary_refusal_still_flags_the_claim():
+    """The guard against fixing the noise by making refusals quiet everywhere.
+    Outside a replay, a refused transition means a letter arrived out of order —
+    genuinely surprising, and the flag is how it becomes visible."""
+    cid = _settled_claim_for_replay()
+    outcome = claim_status.apply_event(cid, "acknowledged", {"subject": "ack"}, "mail-live")
+
+    assert outcome["refused"]
+    flag = _claim_row(cid)["flag"]
+    assert flag and "refused settled -> acknowledged" in flag, flag
+
+
+def test_a_replay_finding_reaches_the_flag_instead_of_losing_to_a_refusal():
+    """Claim #2's shape. Its `claimable subtotal not recorded` finding lost to a
+    refusal that a replay had already decided not to write, so it reached no
+    surface at all."""
+    import json as _json
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?",
+                     (_anniversary_days_ago(300), aari))
+        # settled already, and no claimable subtotal recorded — so a re-read of
+        # its approval letter both refuses the transition AND produces a finding.
+        cid = _insert_claim(conn, aari, _relative_date(100), status="settled",
+                            reference="DC1-26-5992", sr=2, condition="Arthritis", amount=-585.39,
+                            invoice_data=_json.dumps({"amount": 580.74}))
+
+    body = (
+        "Ari\nClaim Reference:DC1-26-5992\nTreatment number: 2\n"
+        "Your claim has been approved\n"
+        "Total amount claimed: $35.00\nFixed excess $0.00\nNon‐claimable amount $0.00\n"
+        "Age Contribution: $12.25 [35%]\nPercentage Excess: $0.00 [0%]\nPaid by us: $22.75\n"
+    )
+    claim_status.process_reply("mail-replay-finding", "PetCover Letter - Claim Approval", body,
+                               replaying=True)
+
+    flag = _claim_row(cid)["flag"]
+    assert flag, "the replay produced a finding and it reached no surface"
+    assert flag.startswith("claimable subtotal not recorded"), flag
+    assert "refused" not in flag, "the refusal took the column back"
+
+    # Same letter, not a replay: the refusal is news and keeps the column.
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?",
+                     (_anniversary_days_ago(300), aari))
+        live = _insert_claim(conn, aari, _relative_date(100), status="settled",
+                             reference="DC1-26-5992", sr=2, condition="Arthritis", amount=-585.39,
+                             invoice_data=_json.dumps({"amount": 580.74}))
+    claim_status.process_reply("mail-live-finding", "PetCover Letter - Claim Approval", body)
+    assert "refused" in (_claim_row(live)["flag"] or ""), _claim_row(live)["flag"]
+
+
+def test_a_replay_never_silences_a_defect():
+    """Only a refused *transition* is expected during a replay. An undeclared
+    event type is a bug in the state machine whoever is reading the mail."""
+    cid = _settled_claim_for_replay()
+    outcome = claim_status.apply_event(cid, "not_a_real_event_type", {}, "mail-x", replaying=True)
+    assert outcome["refused"]
+    flag = _claim_row(cid)["flag"]
+    assert flag and "unknown event type" in flag, flag
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -821,7 +821,7 @@ def poll_petcover_status(reread: bool = False, since: str | None = None) -> dict
         # cannot answer that).
         recipients = ", ".join(filter(None, (headers.get("To", ""), headers.get("Cc", ""))))
         claim_status.process_reply(
-            message["id"], subject, body, headers.get("From", ""), recipients
+            message["id"], subject, body, headers.get("From", ""), recipients, replaying=reread
         )
         if not reread:
             gmail_ingest._mark_processed(message["id"], None)

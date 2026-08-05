@@ -764,7 +764,11 @@ def transition_allowed(current: str | None, event_type: str) -> bool:
 
 
 def apply_event(
-    claim_id: int, event_type: str, detail: dict | None = None, email_id: str | None = None
+    claim_id: int,
+    event_type: str,
+    detail: dict | None = None,
+    email_id: str | None = None,
+    replaying: bool = False,
 ) -> dict:
     """The only writer of `vet_claims.status`.
 
@@ -778,7 +782,16 @@ def apply_event(
 
     Returns `{"applied", "state", "refused"}`, where `state` is the claim's state
     afterwards either way, so a caller can report what actually happened rather
-    than what it asked for."""
+    than what it asked for.
+
+    `replaying=True` means the caller is deliberately re-applying mail the log has
+    already seen. A refused *transition* is then the expected outcome for every
+    claim whose state has moved on since, so it is recorded and returned but NOT
+    written to the claim's flag — on 2026-08-05 a recovery replay left
+    `refused settled -> acknowledged` on six claims and, on one of them, displaced
+    the finding the replay existed to produce. It suppresses nothing else: an
+    unknown event type or an unknown backfill status is a defect whether or not
+    anyone is replaying, and stays flagged."""
     with db.get_connection() as conn:
         row = conn.execute("SELECT status FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
     if row is None:
@@ -817,7 +830,11 @@ def apply_event(
             f"refused {current} -> {target} from event #{event_id} ('{event_type}') "
             "— not a declared transition; state left alone"
         )
-        _flag_claim(claim_id, refusal)
+        # Recorded either way — the event above is the audit trail. The flag is
+        # the surface Justin reads, and during a replay this refusal is expected
+        # rather than news.
+        if not replaying:
+            _flag_claim(claim_id, refusal)
         return {"applied": False, "state": current, "refused": refusal}
 
     with db.get_connection() as conn:
@@ -939,7 +956,12 @@ def state_projection_disagreements() -> list[dict]:
 
 
 def process_reply(
-    email_id: str, subject: str, body: str, sender: str | None = None, recipients: str | None = None
+    email_id: str,
+    subject: str,
+    body: str,
+    sender: str | None = None,
+    recipients: str | None = None,
+    replaying: bool = False,
 ) -> None:
     """Classifies one Petcover reply and routes it to the claim(s) it concerns.
     Routing precedence: (reference, Sr) → the one cited claim; reference-only →
@@ -1069,14 +1091,20 @@ def process_reply(
         # here is the learning this reply enabled (reference, Sr) and the
         # settlement check. "unclassified" moving no state used to be an `if` in
         # this UPDATE and is now a property of the event type.
-        outcome = apply_event(claim["id"], event_type, detail, email_id)
+        outcome = apply_event(claim["id"], event_type, detail, email_id, replaying=replaying)
         with db.get_connection() as conn:
             updates = ["updated_at = ?"]
             params = [now]
             # A refusal already flagged this claim, and it is the more serious of
             # the two: the state did not move at all. Don't overwrite it with a
             # settlement note — that number is still in the event's detail.
-            if settlement_flag and not outcome["refused"]:
+            # A refusal outranks a settlement note — the state did not move at
+            # all. But during a replay the refusal was never written, so nothing
+            # is being overwritten and the finding is the only news there is:
+            # claim #2's "claimable subtotal not recorded" lost to an unwritten
+            # refusal on 2026-08-05 and reached no surface.
+            refusal_holds_the_flag = bool(outcome["refused"]) and not replaying
+            if settlement_flag and not refusal_holds_the_flag:
                 updates.append("flag = ?")
                 params.append(settlement_flag)
             elif (

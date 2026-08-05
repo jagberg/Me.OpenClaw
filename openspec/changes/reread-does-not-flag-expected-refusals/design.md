@@ -36,9 +36,17 @@ refusal; the event and its detail are the audit trail (ADR-0008), and this chang
 
 ## Decisions
 
-### Decision 1 — thread the replay flag through `process_reply`, don't infer it
+### Decision 1 — thread the replay flag through to `apply_event`, don't infer it
 
-`process_reply` gains an explicit `replaying: bool = False`, passed by `poll_petcover_status` from the
+**Corrected during implementation, 2026-08-06.** This section originally said the suppression belonged
+in `process_reply`. It does not: `apply_event` is what writes the refusal, via `_flag_claim`, before
+`process_reply` ever sees the outcome. So `replaying` is threaded one step further —
+`poll_petcover_status(reread=…)` → `process_reply(replaying=…)` → `apply_event(replaying=…)` — and the
+suppression sits at the single site that writes the flag. The original reasoning stands; only the
+location was wrong, and it was wrong because the design was written from the caller's shape rather
+than from the writer's.
+
+Both functions gain an explicit `replaying: bool = False`, passed by `poll_petcover_status` from the
 `reread` argument it already has. The alternative — inferring "this must be a replay" from the event
 already existing, or from a module-level flag set by the poller — was rejected on both counts:
 inference gets it wrong for a genuinely late-arriving letter (which looks identical), and a module
@@ -50,7 +58,9 @@ nothing becomes quiet by accident.
 ### Decision 2 — suppress the flag write, never the event
 
 The refusal event is written exactly as it is today, including its detail. Only the
-`flag = ?` write in `process_reply`'s update is skipped when `replaying` is true. So the log answers
+`_flag_claim` call in `apply_event`'s refused-transition branch is skipped when `replaying` is true,
+and only for that branch: an unknown event type or an unknown backfill status is a defect whoever is
+reading the mail, and stays flagged. So the log answers
 "what happened during that replay" in full, and the dashboard answers "what needs Justin" without
 being flooded by it.
 
