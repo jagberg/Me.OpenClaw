@@ -2287,9 +2287,7 @@ def test_settlement_current_year_excess_already_used_flags_mismatch():
             reference="DC1-SS-1",
             invoice_data=_json.dumps({"claimable_amount": 500.0, "amount": 500.0}),
         )
-    flag = claim_status._validate_settlement(
-        _claim_row(second), {"paid_amount": 350.0}, second_txn
-    )
+    flag = claim_status._validate_settlement(_claim_row(second), {"paid_amount": 350.0}, second_txn)
     assert flag and "settlement mismatch" in flag and "$500.00" in flag and "$350.00" in flag
     assert "excess already used" in flag, flag
 
@@ -2361,8 +2359,13 @@ def test_settlement_closed_policy_year_assumes_full_claimable():
             invoice_data=_json.dumps({"claimable_amount": 55.74}),
         )
     # expected = full claimable (no excess) since the year is closed; paid short of that -> flag
-    assert claim_status._validate_settlement(_claim_row(cid), {"paid_amount": 55.74}, closed_year_txn) is None
-    flag = claim_status._validate_settlement(_claim_row(cid), {"paid_amount": 22.75}, closed_year_txn)
+    assert (
+        claim_status._validate_settlement(_claim_row(cid), {"paid_amount": 55.74}, closed_year_txn)
+        is None
+    )
+    flag = claim_status._validate_settlement(
+        _claim_row(cid), {"paid_amount": 22.75}, closed_year_txn
+    )
     assert flag and "expected $55.74" in flag
 
 
@@ -7719,7 +7722,6 @@ def test_a_scheduler_that_stopped_firing_is_a_value_on_health_not_an_absence():
         config.SCHEDULER_ENABLED = original
 
 
-
 # --- petcover-settlement-reconciliation ------------------------------------
 #
 # The ten live approval letters, read read-only from Gmail on 2026-08-04 and
@@ -7777,7 +7779,9 @@ def test_the_approval_letter_gives_up_every_figure_it_states():
     assert got["percentage_excess_stated"] == 0.00
     assert got["paid_amount"] == 289.73
     # A term the letter omits stays absent — never stored as a guessed zero.
-    without = claim_status.extract_approval_amounts("Total amount claimed: $35.00\nPaid by us: $22.75")
+    without = claim_status.extract_approval_amounts(
+        "Total amount claimed: $35.00\nPaid by us: $22.75"
+    )
     assert "non_claimable_stated" not in without
     assert "age_contribution_percent" not in without
 
@@ -7790,7 +7794,9 @@ def test_settlement_arithmetic_matches_petcovers_own_figures():
     on Tr 8 where they paid $289.73."""
     for letter in LIVE_APPROVAL_LETTERS:
         detail = _letter_detail(letter)
-        assert claim_status._check_petcovers_arithmetic(detail, detail["paid_amount"]) is None, letter[0]
+        assert claim_status._check_petcovers_arithmetic(detail, detail["paid_amount"]) is None, (
+            letter[0]
+        )
 
     tr8 = _letter_detail(LIVE_APPROVAL_LETTERS[-1])
     naive = (tr8["claimed_amount"] - tr8["fixed_excess_stated"]) * (1 - 0.35)
@@ -7799,8 +7805,11 @@ def test_settlement_arithmetic_matches_petcovers_own_figures():
     # A letter whose own figures genuinely don't add up is flagged, naming all
     # four of Petcover's numbers.
     broken = {
-        "claimed_amount": 200.00, "fixed_excess_stated": 0.00, "non_claimable_stated": 0.00,
-        "age_contribution_percent": 0.35, "paid_amount": 150.00,
+        "claimed_amount": 200.00,
+        "fixed_excess_stated": 0.00,
+        "non_claimable_stated": 0.00,
+        "age_contribution_percent": 0.35,
+        "paid_amount": 150.00,
     }
     flag = claim_status._check_petcovers_arithmetic(broken, 150.00)
     assert flag and flag.startswith("settlement mismatch")
@@ -7809,9 +7818,12 @@ def test_settlement_arithmetic_matches_petcovers_own_figures():
 
     # No stated percentage — an event written before the pattern shipped — is
     # skipped, not checked against a term it never captured.
-    assert claim_status._check_petcovers_arithmetic(
-        {"claimed_amount": 351.50, "fixed_excess_stated": 150.00, "paid_amount": 130.97}, 130.97
-    ) is None
+    assert (
+        claim_status._check_petcovers_arithmetic(
+            {"claimed_amount": 351.50, "fixed_excess_stated": 150.00, "paid_amount": 130.97}, 130.97
+        )
+        is None
+    )
 
 
 def test_assessment_difference_is_a_separate_flag_from_arithmetic():
@@ -7820,15 +7832,30 @@ def test_assessment_difference_is_a_separate_flag_from_arithmetic():
     kind, and no word about a $150 excess we did not infer."""
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
-        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (_anniversary_days_ago(300), aari))
+        conn.execute(
+            "UPDATE pets SET policy_anniversary = ? WHERE id = ?",
+            (_anniversary_days_ago(300), aari),
+        )
         txn = _relative_date(100)
-        cid = _insert_claim(conn, aari, txn, status="acknowledged", reference="DC1-26-5992", sr=1,
-                            invoice_data=_json.dumps({"amount": 446.50, "claimable_amount": 446.50}))
+        cid = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="acknowledged",
+            reference="DC1-26-5992",
+            sr=1,
+            invoice_data=_json.dumps({"amount": 446.50, "claimable_amount": 446.50}),
+        )
     detail = {
-        "claimed_amount": 351.50, "fixed_excess_stated": 150.00, "non_claimable_stated": 0.00,
-        "age_contribution_stated": 70.53, "age_contribution_percent": 0.35, "paid_amount": 130.97,
+        "claimed_amount": 351.50,
+        "fixed_excess_stated": 150.00,
+        "non_claimable_stated": 0.00,
+        "age_contribution_stated": 70.53,
+        "age_contribution_percent": 0.35,
+        "paid_amount": 130.97,
     }
     flag = claim_status._validate_settlement(_claim_row(cid), detail, txn)
     assert flag and flag.startswith("assessment difference"), flag
@@ -7841,9 +7868,16 @@ def test_assessment_difference_is_a_separate_flag_from_arithmetic():
     # Same letter against a claim we submitted at Petcover's own figure: nothing
     # to ask about, so no flag at all.
     with db.get_connection() as conn:
-        agreed = _insert_claim(conn, _aari(conn), txn, status="acknowledged", reference="DC1-26-5992", sr=9,
-                               amount=-351.50,
-                               invoice_data=_json.dumps({"claimable_amount": 351.50}))
+        agreed = _insert_claim(
+            conn,
+            _aari(conn),
+            txn,
+            status="acknowledged",
+            reference="DC1-26-5992",
+            sr=9,
+            amount=-351.50,
+            invoice_data=_json.dumps({"claimable_amount": 351.50}),
+        )
     assert claim_status._validate_settlement(_claim_row(agreed), detail, txn) is None
 
 
@@ -7854,12 +7888,23 @@ def test_no_expectation_is_computed_without_a_recorded_claimable_subtotal():
     so the letter isn't lost behind a silent None."""
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
-        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (_anniversary_days_ago(300), aari))
+        conn.execute(
+            "UPDATE pets SET policy_anniversary = ? WHERE id = ?",
+            (_anniversary_days_ago(300), aari),
+        )
         txn = _relative_date(100)
-        cid = _insert_claim(conn, aari, txn, status="acknowledged", reference="DC1-26-5992", sr=2,
-                            invoice_data=_json.dumps({"amount": 580.74}))
+        cid = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="acknowledged",
+            reference="DC1-26-5992",
+            sr=2,
+            invoice_data=_json.dumps({"amount": 580.74}),
+        )
     detail = _letter_detail(LIVE_APPROVAL_LETTERS[4])
     flag = claim_status._validate_settlement(_claim_row(cid), detail, txn)
     assert flag and flag.startswith("claimable subtotal not recorded"), flag
@@ -7869,9 +7914,15 @@ def test_no_expectation_is_computed_without_a_recorded_claimable_subtotal():
 
 def test_the_accessor_tells_a_recorded_zero_from_an_absent_key():
     import json as _json
-    assert claim_status.claimable_subtotal(_json.dumps({"claimable_amount": 446.50})) == (446.50, True)
+
+    assert claim_status.claimable_subtotal(_json.dumps({"claimable_amount": 446.50})) == (
+        446.50,
+        True,
+    )
     # Live claim #20: a real $0.00, not a missing key.
-    assert claim_status.claimable_subtotal(_json.dumps({"amount": 152.50, "claimable_amount": 0.0})) == (0.0, True)
+    assert claim_status.claimable_subtotal(
+        _json.dumps({"amount": 152.50, "claimable_amount": 0.0})
+    ) == (0.0, True)
     # Live claim #2: an invoice total is not a stand-in.
     assert claim_status.claimable_subtotal(_json.dumps({"amount": 580.74})) == (None, False)
     assert claim_status.claimable_subtotal(None) == (None, False)
@@ -7900,7 +7951,10 @@ def test_no_module_substitutes_the_invoice_total_for_a_claimable_subtotal():
         'claimable = invoice.get("claimable_amount")\n    if claimable is None:\n        claimable = invoice.get("amount")'
     )
     assert or_chain.search('claimed = invoice.get("claimable_amount") or invoice.get("amount")')
-    assert not any(p.search('value, recorded = claim_status.claimable_subtotal(row["invoice_data"])') for p in patterns)
+    assert not any(
+        p.search('value, recorded = claim_status.claimable_subtotal(row["invoice_data"])')
+        for p in patterns
+    )
 
     offenders = []
     for path in sorted((_Path(__file__).resolve().parent.parent / "openclaw").glob("*.py")):
@@ -7908,8 +7962,10 @@ def test_no_module_substitutes_the_invoice_total_for_a_claimable_subtotal():
         for pattern in patterns:
             match = pattern.search(text)
             if match:
-                offenders.append(f"{path.name}:{text[:match.start()].count(chr(10)) + 1}")
-    assert not offenders, f"these substitute the invoice total for a claimable subtotal: {offenders}"
+                offenders.append(f"{path.name}:{text[: match.start()].count(chr(10)) + 1}")
+    assert not offenders, (
+        f"these substitute the invoice total for a claimable subtotal: {offenders}"
+    )
 
 
 def test_every_action_kind_declares_a_waiting_party():
@@ -7934,10 +7990,20 @@ def test_every_action_kind_declares_a_waiting_party():
     finally:
         del claim_status._ACTION_META["invented_kind"]
 
-    assert claim_status.waiting_party("dismiss_mismatch", "arithmetic") == claim_status.NOBODY_WAITING
-    assert claim_status.waiting_party("dismiss_mismatch", "assessment") == claim_status.YOU_WAITING_ON_PETCOVER
-    assert claim_status.waiting_party("confirm_resolved", "justin") == claim_status.PETCOVER_WAITING_ON_YOU
-    assert claim_status.waiting_party("confirm_resolved", "vet") == claim_status.YOU_WAITING_ON_THE_VET
+    assert (
+        claim_status.waiting_party("dismiss_mismatch", "arithmetic") == claim_status.NOBODY_WAITING
+    )
+    assert (
+        claim_status.waiting_party("dismiss_mismatch", "assessment")
+        == claim_status.YOU_WAITING_ON_PETCOVER
+    )
+    assert (
+        claim_status.waiting_party("confirm_resolved", "justin")
+        == claim_status.PETCOVER_WAITING_ON_YOU
+    )
+    assert (
+        claim_status.waiting_party("confirm_resolved", "vet") == claim_status.YOU_WAITING_ON_THE_VET
+    )
 
 
 def test_action_card_never_shows_the_invoice_total_as_the_claim_amount():
@@ -7947,31 +8013,53 @@ def test_action_card_never_shows_the_invoice_total_as_the_claim_amount():
 
     card = commands._action_card_text(
         {
-            "kind": "dismiss_mismatch", "title": "Review settlement",
+            "kind": "dismiss_mismatch",
+            "title": "Review settlement",
             "blocks": "a paid-vs-expected difference is unreviewed",
             "waiting": claim_status.NOBODY_WAITING,
-            "claim_id": 2, "merchant": "THE SHIRE VETERINARY CARINGBAH", "amount": -585.39,
-            "pet_name": "Aari", "condition_text": "Arthritis", "date": "2026-06-19", "age_days": 46,
-            "claimable": None, "claimable_recorded": False,
-            "expected": {"available": False, "value": None,
-                         "note": "invoice on file, but no claimable subtotal recorded"},
+            "claim_id": 2,
+            "merchant": "THE SHIRE VETERINARY CARINGBAH",
+            "amount": -585.39,
+            "pet_name": "Aari",
+            "condition_text": "Arthritis",
+            "date": "2026-06-19",
+            "age_days": 46,
+            "claimable": None,
+            "claimable_recorded": False,
+            "expected": {
+                "available": False,
+                "value": None,
+                "note": "invoice on file, but no claimable subtotal recorded",
+            },
             "members": None,
         }
     )
     assert "Claim amount: Not recorded" in card
     assert "580.74" not in card
     assert "Claim amount: $0.00" not in card
-    assert "Expected payment: Not recorded (invoice on file, but no claimable subtotal recorded)" in card
+    assert (
+        "Expected payment: Not recorded (invoice on file, but no claimable subtotal recorded)"
+        in card
+    )
     assert "#2" in card
     assert claim_status.NOBODY_WAITING in card
     assert "Petcover is waiting on you" not in card
 
     # A recorded $0.00 is a figure, and prints as one.
     zero = {
-        "kind": "dismiss_mismatch", "title": "Review settlement", "blocks": "b",
-        "waiting": claim_status.YOU_WAITING_ON_PETCOVER, "claim_id": 20, "merchant": "VET",
-        "amount": -152.50, "pet_name": "Echo", "condition_text": None, "date": "2026-07-01",
-        "age_days": 10, "claimable": 0.0, "claimable_recorded": True,
+        "kind": "dismiss_mismatch",
+        "title": "Review settlement",
+        "blocks": "b",
+        "waiting": claim_status.YOU_WAITING_ON_PETCOVER,
+        "claim_id": 20,
+        "merchant": "VET",
+        "amount": -152.50,
+        "pet_name": "Echo",
+        "condition_text": None,
+        "date": "2026-07-01",
+        "age_days": 10,
+        "claimable": 0.0,
+        "claimable_recorded": True,
         "expected": {"available": False, "value": None, "note": "no policy excess/cap on file"},
         "members": None,
     }
@@ -7987,17 +8075,34 @@ def test_dismissing_an_assessment_difference_keeps_it_reviewable():
     claim #2's whole finding became prose in `dismissed_flag`, on no surface."""
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
         txn = _relative_date(100)
-        assessed = _insert_claim(conn, aari, txn, status="settled", reference="DC1-26-5992", sr=1,
-                                 invoice_data=_json.dumps({"claimable_amount": 446.50}))
-        arithmetic = _insert_claim(conn, aari, txn, status="settled", reference="DC1-26-5993", sr=1,
-                                   amount=-500.0,
-                                   invoice_data=_json.dumps({"claimable_amount": 500.0}))
+        assessed = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="settled",
+            reference="DC1-26-5992",
+            sr=1,
+            invoice_data=_json.dumps({"claimable_amount": 446.50}),
+        )
+        arithmetic = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="settled",
+            reference="DC1-26-5993",
+            sr=1,
+            amount=-500.0,
+            invoice_data=_json.dumps({"claimable_amount": 500.0}),
+        )
         flags = {
-            assessed: (f"assessment difference — claim #{assessed} (DC1-26-5992 Sr 1): we submitted "
-                       "$446.50, Petcover states they assessed $351.50."),
+            assessed: (
+                f"assessment difference — claim #{assessed} (DC1-26-5992 Sr 1): we submitted "
+                "$446.50, Petcover states they assessed $351.50."
+            ),
             arithmetic: "settlement mismatch — Petcover's own figures don't add up: review",
         }
         for cid, flag in flags.items():
@@ -8005,10 +8110,19 @@ def test_dismissing_an_assessment_difference_keeps_it_reviewable():
             conn.execute(
                 "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
                 "VALUES (?, 'approved', ?, ?, ?)",
-                (cid, f"mail{cid}", _json.dumps({
-                    "claimed_amount": 351.50, "paid_amount": 130.97,
-                    "fixed_excess_stated": 150.00, "non_claimable_stated": 0.00,
-                }), datetime.now(timezone.utc).isoformat()),
+                (
+                    cid,
+                    f"mail{cid}",
+                    _json.dumps(
+                        {
+                            "claimed_amount": 351.50,
+                            "paid_amount": 130.97,
+                            "fixed_excess_stated": 150.00,
+                            "non_claimable_stated": 0.00,
+                        }
+                    ),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
             )
 
     assert claim_status.dismiss_mismatch(assessed)["ok"]
@@ -8054,7 +8168,9 @@ def test_petcover_letters_are_never_taken_by_the_task_ingest():
     # branch, which is exactly why five letters became tasks.
     assert not gmail_ingest._is_noise({"From": "claims.au@petcovergroup.com"})
     assert not gmail_ingest._belongs_to_the_claims_service({"From": "reception@theshirevet.com.au"})
-    assert not gmail_ingest._belongs_to_the_claims_service({"From": "marketing.au@petcovergroup.com"})
+    assert not gmail_ingest._belongs_to_the_claims_service(
+        {"From": "marketing.au@petcovergroup.com"}
+    )
 
 
 def test_an_html_only_email_yields_its_table_not_a_snippet():
@@ -8079,12 +8195,20 @@ def test_an_html_only_email_yields_its_table_not_a_snippet():
         "payload": {
             "mimeType": "multipart/related",
             "parts": [
-                {"mimeType": "multipart/alternative", "parts": [
-                    {"mimeType": "text/html", "body": {
-                        "data": _b64.urlsafe_b64encode(body.encode()).decode()}},
-                ]},
-                {"mimeType": "image/png", "filename": "image001.png",
-                 "body": {"attachmentId": "abc"}},
+                {
+                    "mimeType": "multipart/alternative",
+                    "parts": [
+                        {
+                            "mimeType": "text/html",
+                            "body": {"data": _b64.urlsafe_b64encode(body.encode()).decode()},
+                        },
+                    ],
+                },
+                {
+                    "mimeType": "image/png",
+                    "filename": "image001.png",
+                    "body": {"attachmentId": "abc"},
+                },
             ],
         },
     }
@@ -8095,7 +8219,11 @@ def test_an_html_only_email_yields_its_table_not_a_snippet():
     # text/plain still wins when there is one — the HTML path is a fallback, not
     # a replacement.
     message["payload"]["parts"][0]["parts"].insert(
-        0, {"mimeType": "text/plain", "body": {"data": _b64.urlsafe_b64encode(b"plain wins").decode()}}
+        0,
+        {
+            "mimeType": "text/plain",
+            "body": {"data": _b64.urlsafe_b64encode(b"plain wins").decode()},
+        },
     )
     assert gmail_client._message_text(message) == "plain wins"
 
@@ -8107,19 +8235,38 @@ def test_an_assessment_difference_names_whose_invoice_the_figure_actually_is():
     Petcover which invoice this assessed" sends him to the wrong party."""
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
-        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (_anniversary_days_ago(300), aari))
+        conn.execute(
+            "UPDATE pets SET policy_anniversary = ? WHERE id = ?",
+            (_anniversary_days_ago(300), aari),
+        )
         txn = _relative_date(100)
-        mine = _insert_claim(conn, aari, txn, status="acknowledged", reference="DC1-26-5992", sr=1,
-                             amount=-446.50,
-                             invoice_data=_json.dumps({"claimable_amount": 446.50}))
-        theirs = _insert_claim(conn, aari, _relative_date(140), status="acknowledged",
-                               amount=-351.50,
-                               invoice_data=_json.dumps({"claimable_amount": 351.50}))
+        mine = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="acknowledged",
+            reference="DC1-26-5992",
+            sr=1,
+            amount=-446.50,
+            invoice_data=_json.dumps({"claimable_amount": 446.50}),
+        )
+        theirs = _insert_claim(
+            conn,
+            aari,
+            _relative_date(140),
+            status="acknowledged",
+            amount=-351.50,
+            invoice_data=_json.dumps({"claimable_amount": 351.50}),
+        )
     detail = {
-        "claimed_amount": 351.50, "fixed_excess_stated": 150.00, "non_claimable_stated": 0.00,
-        "age_contribution_percent": 0.35, "paid_amount": 130.97,
+        "claimed_amount": 351.50,
+        "fixed_excess_stated": 150.00,
+        "non_claimable_stated": 0.00,
+        "age_contribution_percent": 0.35,
+        "paid_amount": 130.97,
     }
     flag = claim_status._validate_settlement(_claim_row(mine), detail, txn)
     assert flag and flag.startswith("assessment difference"), flag
@@ -8140,10 +8287,18 @@ def test_a_guessed_serial_is_recorded_as_a_guess():
     serial we hold. The log could not tell a guessed link from a cited one."""
     _fresh_db()
     import json as _json
+
     with db.get_connection() as conn:
         aari = _aari(conn)
-        _insert_claim(conn, aari, _relative_date(60), status="sent", condition="Arthritis",
-                      amount=-132.50, invoice_data=_json.dumps({"claimable_amount": 132.50}))
+        _insert_claim(
+            conn,
+            aari,
+            _relative_date(60),
+            status="sent",
+            condition="Arthritis",
+            amount=-132.50,
+            invoice_data=_json.dumps({"claimable_amount": 132.50}),
+        )
 
     claim_status.process_reply(
         "mail-guessed-sr",
@@ -8169,12 +8324,26 @@ def test_a_serial_letter_attaches_by_the_amount_it_states():
         aari = _aari(conn)
         # Two claims in one submission. The OLDER one is not the one the letter
         # is about — which is exactly the case the heuristic got wrong.
-        old = _insert_claim(conn, aari, _relative_date(200), status="sent", draft_id="d1",
-                            condition="Arthritis", amount=-45.0,
-                            invoice_data=_json.dumps({"claimable_amount": 45.00}))
-        new = _insert_claim(conn, aari, _relative_date(30), status="sent", draft_id="d1",
-                            condition="Arthritis", amount=-446.50,
-                            invoice_data=_json.dumps({"claimable_amount": 446.50}))
+        old = _insert_claim(
+            conn,
+            aari,
+            _relative_date(200),
+            status="sent",
+            draft_id="d1",
+            condition="Arthritis",
+            amount=-45.0,
+            invoice_data=_json.dumps({"claimable_amount": 45.00}),
+        )
+        new = _insert_claim(
+            conn,
+            aari,
+            _relative_date(30),
+            status="sent",
+            draft_id="d1",
+            condition="Arthritis",
+            amount=-446.50,
+            invoice_data=_json.dumps({"claimable_amount": 446.50}),
+        )
 
     claim_status.process_reply(
         "mail-amount-routed",
@@ -8199,9 +8368,15 @@ def test_a_letter_whose_amount_matches_no_claim_is_left_for_manual_link():
 
     with db.get_connection() as conn:
         aari = _aari(conn)
-        big = _insert_claim(conn, aari, _relative_date(100), status="sent", condition="Raised ALT",
-                            amount=-1970.40,
-                            invoice_data=_json.dumps({"claimable_amount": 2521.46}))
+        big = _insert_claim(
+            conn,
+            aari,
+            _relative_date(100),
+            status="sent",
+            condition="Raised ALT",
+            amount=-1970.40,
+            invoice_data=_json.dumps({"claimable_amount": 2521.46}),
+        )
 
     claim_status.process_reply(
         "mail-under-excess",
@@ -8213,7 +8388,9 @@ def test_a_letter_whose_amount_matches_no_claim_is_left_for_manual_link():
     )
 
     with db.get_connection() as conn:
-        claim = conn.execute("SELECT status, petcover_sr FROM vet_claims WHERE id = ?", (big,)).fetchone()
+        claim = conn.execute(
+            "SELECT status, petcover_sr FROM vet_claims WHERE id = ?", (big,)
+        ).fetchone()
         unlinked = conn.execute(
             "SELECT detail FROM claim_status_events WHERE claim_id IS NULL ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -8234,7 +8411,9 @@ def test_the_under_excess_letter_gives_up_its_amount():
     assert figures["claimed_amount"] == 55.74
     assert figures["fixed_excess_stated"] == 105.00
     assert claim_status.stated_claim_amount("Total amount claimed: $446.50") == 446.50
-    assert claim_status.stated_claim_amount("Amount Claimed $132.50\nTotal Payable: $86.13") == 132.50
+    assert (
+        claim_status.stated_claim_amount("Amount Claimed $132.50\nTotal Payable: $86.13") == 132.50
+    )
     assert claim_status.stated_claim_amount("no figures here") is None
 
 
@@ -8246,8 +8425,15 @@ def test_an_acknowledgement_still_routes_and_still_says_it_guessed():
 
     with db.get_connection() as conn:
         aari = _aari(conn)
-        _insert_claim(conn, aari, _relative_date(60), status="sent", condition="Arthritis",
-                      amount=-132.50, invoice_data=_json.dumps({"claimable_amount": 132.50}))
+        _insert_claim(
+            conn,
+            aari,
+            _relative_date(60),
+            status="sent",
+            condition="Arthritis",
+            amount=-132.50,
+            invoice_data=_json.dumps({"claimable_amount": 132.50}),
+        )
 
     claim_status.process_reply(
         "mail-ack-no-amount",
@@ -8269,9 +8455,17 @@ def _settled_claim_for_replay():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        cid = _insert_claim(conn, aari, _relative_date(100), status="settled",
-                            reference="DC1-27-5628", sr=5, condition="Arthritis", amount=-446.50,
-                            invoice_data=_json.dumps({"claimable_amount": 446.50}))
+        cid = _insert_claim(
+            conn,
+            aari,
+            _relative_date(100),
+            status="settled",
+            reference="DC1-27-5628",
+            sr=5,
+            condition="Arthritis",
+            amount=-446.50,
+            invoice_data=_json.dumps({"claimable_amount": 446.50}),
+        )
     return cid
 
 
@@ -8280,8 +8474,9 @@ def test_a_replayed_refusal_is_recorded_but_does_not_flag_the_claim():
     expected on every claim whose state has moved on. Recording it is the audit
     trail; writing it to `flag` is what buried six claims on 2026-08-05."""
     cid = _settled_claim_for_replay()
-    outcome = claim_status.apply_event(cid, "acknowledged", {"subject": "ack"}, "mail-replayed",
-                                       replaying=True)
+    outcome = claim_status.apply_event(
+        cid, "acknowledged", {"subject": "ack"}, "mail-replayed", replaying=True
+    )
 
     assert outcome["refused"], "the transition must still be refused"
     assert outcome["state"] == "settled", "a replay must not move the state"
@@ -8291,8 +8486,9 @@ def test_a_replayed_refusal_is_recorded_but_does_not_flag_the_claim():
         events = conn.execute(
             "SELECT event_type, raw_email_id FROM claim_status_events WHERE claim_id = ?", (cid,)
         ).fetchall()
-    assert any(e["event_type"] == "acknowledged" and e["raw_email_id"] == "mail-replayed"
-               for e in events), "the event itself must still be recorded"
+    assert any(
+        e["event_type"] == "acknowledged" and e["raw_email_id"] == "mail-replayed" for e in events
+    ), "the event itself must still be recorded"
 
 
 def test_an_ordinary_refusal_still_flags_the_claim():
@@ -8316,13 +8512,23 @@ def test_a_replay_finding_reaches_the_flag_instead_of_losing_to_a_refusal():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?",
-                     (_anniversary_days_ago(300), aari))
+        conn.execute(
+            "UPDATE pets SET policy_anniversary = ? WHERE id = ?",
+            (_anniversary_days_ago(300), aari),
+        )
         # settled already, and no claimable subtotal recorded — so a re-read of
         # its approval letter both refuses the transition AND produces a finding.
-        cid = _insert_claim(conn, aari, _relative_date(100), status="settled",
-                            reference="DC1-26-5992", sr=2, condition="Arthritis", amount=-585.39,
-                            invoice_data=_json.dumps({"amount": 580.74}))
+        cid = _insert_claim(
+            conn,
+            aari,
+            _relative_date(100),
+            status="settled",
+            reference="DC1-26-5992",
+            sr=2,
+            condition="Arthritis",
+            amount=-585.39,
+            invoice_data=_json.dumps({"amount": 580.74}),
+        )
 
     body = (
         "Ari\nClaim Reference:DC1-26-5992\nTreatment number: 2\n"
@@ -8330,8 +8536,9 @@ def test_a_replay_finding_reaches_the_flag_instead_of_losing_to_a_refusal():
         "Total amount claimed: $35.00\nFixed excess $0.00\nNon‐claimable amount $0.00\n"
         "Age Contribution: $12.25 [35%]\nPercentage Excess: $0.00 [0%]\nPaid by us: $22.75\n"
     )
-    claim_status.process_reply("mail-replay-finding", "PetCover Letter - Claim Approval", body,
-                               replaying=True)
+    claim_status.process_reply(
+        "mail-replay-finding", "PetCover Letter - Claim Approval", body, replaying=True
+    )
 
     flag = _claim_row(cid)["flag"]
     assert flag, "the replay produced a finding and it reached no surface"
@@ -8342,11 +8549,21 @@ def test_a_replay_finding_reaches_the_flag_instead_of_losing_to_a_refusal():
     _fresh_db()
     with db.get_connection() as conn:
         aari = _aari(conn)
-        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?",
-                     (_anniversary_days_ago(300), aari))
-        live = _insert_claim(conn, aari, _relative_date(100), status="settled",
-                             reference="DC1-26-5992", sr=2, condition="Arthritis", amount=-585.39,
-                             invoice_data=_json.dumps({"amount": 580.74}))
+        conn.execute(
+            "UPDATE pets SET policy_anniversary = ? WHERE id = ?",
+            (_anniversary_days_ago(300), aari),
+        )
+        live = _insert_claim(
+            conn,
+            aari,
+            _relative_date(100),
+            status="settled",
+            reference="DC1-26-5992",
+            sr=2,
+            condition="Arthritis",
+            amount=-585.39,
+            invoice_data=_json.dumps({"amount": 580.74}),
+        )
     claim_status.process_reply("mail-live-finding", "PetCover Letter - Claim Approval", body)
     assert "refused" in (_claim_row(live)["flag"] or ""), _claim_row(live)["flag"]
 
@@ -8359,6 +8576,103 @@ def test_a_replay_never_silences_a_defect():
     assert outcome["refused"]
     flag = _claim_row(cid)["flag"]
     assert flag and "unknown event type" in flag, flag
+
+
+def test_a_petcover_letter_matching_no_claim_becomes_a_visible_action():
+    """Six unmatched letters accumulated between 2026-07-21 and 2026-08-05 without
+    appearing on the dashboard, in /actions, or in any nudge — one of them an
+    approval stating $135.00 claimed and $87.75 PAID against no claim we hold.
+    `process_reply` recorded them with claim_id NULL and returned; nothing read
+    those rows. Money already assessed, invisible."""
+    import json as _json
+
+    from openclaw import commands
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, created_at, detail) "
+            "VALUES (NULL, 'approved', 'mail-1', '2026-08-03T00:21:50+00:00', ?)",
+            (
+                _json.dumps(
+                    {
+                        "subject": "PetCover Letter - Claim Approval",
+                        "claimed_amount": 135.0,
+                        "paid_amount": 87.75,
+                        "reference": "DC1-26-5992",
+                        "sr": 4,
+                        "flag": "needs manual link - no claim matched",
+                    }
+                ),
+            ),
+        )
+
+    letters = claim_status.unlinked_letters(date(2026, 8, 6))
+    assert len(letters) == 1, letters
+    letter = letters[0]
+    assert letter["kind"] == "unlinked_letter"
+    assert letter["claim_id"] is None, "an unlinked letter must not claim a claim"
+    assert letter["paid_amount"] == 87.75
+    assert letter["age_days"] == 3, letter["age_days"]
+    # NOBODY_WAITING, not "Petcover is waiting on you": they have already assessed
+    # and paid. Naming the wrong party is how a chase never happens.
+    assert letter["waiting"] == claim_status.NOBODY_WAITING, letter["waiting"]
+    # No tap resolves it -- there is no /link verb, and an unregistered verb
+    # reaches the agent as a chat turn.
+    assert letter["actionable"] is False
+    assert commands._action_buttons(letter) == [], "a button whose verb is unregistered"
+
+    # It reaches the action list, which is what /actions and the nudge read.
+    assert any(a["kind"] == "unlinked_letter" for a in claim_status.pending_actions())
+
+    # The card names the letter and the amounts, and carries the event id in
+    # place of the claim id it cannot have.
+    text = commands._action_card_text(letter)
+    assert "DC1-26-5992 Sr 4" in text, text
+    assert "$135.00 claimed" in text and "$87.75 PAID" in text, text
+    assert "event #" in text, text
+    assert "Claim #None" not in text, text
+
+
+def test_linking_an_event_retires_its_no_claim_matched_flag():
+    """Live 2026-08-05: event #93 held `claim_id = 12` AND `needs manual link - no
+    claim matched`, because link_event set the column and left the detail alone.
+    A row that contradicts itself makes any count of unlinked letters by flag text
+    over-count. The reason is kept under `linked_flag` rather than deleted —
+    same convention as `mismatch_dismissed`."""
+    import json as _json
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT INTO vet_claims (id, transaction_id, status, created_at, updated_at) "
+            "VALUES (12, 1, 'settled', '2026-08-01', '2026-08-01')"
+        )
+        cur = conn.execute(
+            "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, created_at, detail) "
+            "VALUES (NULL, 'settled', 'mail-2', '2026-08-05T13:46:17+00:00', ?)",
+            (_json.dumps({"subject": "EFT Template", "flag": "needs manual link - no claim"}),),
+        )
+        event_id = cur.lastrowid
+
+    assert claim_status.link_event(event_id, 12) is True
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT claim_id, detail FROM claim_status_events WHERE id = ?", (event_id,)
+        ).fetchone()
+    detail = _json.loads(row["detail"])
+    assert row["claim_id"] == 12
+    assert "flag" not in detail, "the row still says no claim matched while holding one"
+    assert detail["linked_flag"] == "needs manual link - no claim", detail
+    assert detail["linked_to_claim"] == 12
+    assert detail["subject"] == "EFT Template", "linking destroyed the letter's own record"
+
+    # And it drops out of the unlinked list, which is the point.
+    assert claim_status.unlinked_letters(date(2026, 8, 6)) == []
+
+    # A second link is refused, so the flag cannot be retired twice.
+    assert claim_status.link_event(event_id, 12) is False
+
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

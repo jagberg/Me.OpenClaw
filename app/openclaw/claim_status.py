@@ -1044,11 +1044,23 @@ def process_reply(
 
     if not claims:
         if not _already_recorded(None, event_type, email_id):
+            # Record WHICH letter this was, not just that one failed to match.
+            # Both are already parsed above and cost nothing to keep. Without
+            # them an unlinked row says only "PetCover - Acknowledgement Letter",
+            # and identifying it means opening Gmail — which is what the six rows
+            # sitting unlinked since 2026-07-21 each required. `unlinked_letters`
+            # renders these; the older rows have no reference and show the event
+            # type alone.
             _record_event(
                 None,
                 event_type,
                 email_id,
-                {**detail, "flag": unmatched_reason},
+                {
+                    **detail,
+                    **({"reference": reference} if reference else {}),
+                    **({"sr": sr} if sr is not None else {}),
+                    "flag": unmatched_reason,
+                },
             )
         return
 
@@ -1132,8 +1144,8 @@ def _policy_year_start(anniversary_mmdd: str, on: date) -> date:
 # the prefix is what tells the card, the dismissal and the waiting party which
 # finding they are looking at.
 SETTLEMENT_FLAG_PREFIXES = (
-    "settlement mismatch",             # Check A — Petcover's own arithmetic
-    "assessment difference",           # Check B — they assessed something else
+    "settlement mismatch",  # Check A — Petcover's own arithmetic
+    "assessment difference",  # Check B — they assessed something else
     "claimable subtotal not recorded",  # we cannot check B at all
 )
 
@@ -1284,7 +1296,10 @@ def _validate_settlement(claim, detail: dict, txn_date_iso: str) -> str | None:
         return None
     claimable, subtotal_recorded = claimable_subtotal(claim["invoice_data"])
 
-    if detail.get("claimed_amount") is not None and detail.get("age_contribution_percent") is not None:
+    if (
+        detail.get("claimed_amount") is not None
+        and detail.get("age_contribution_percent") is not None
+    ):
         # The letter states its own breakdown, so it — not our excess model —
         # decides the expectation. The excess/cap path below never runs here.
         arithmetic = _check_petcovers_arithmetic(detail, paid_amount)
@@ -1393,10 +1408,38 @@ def link_event(event_id: int, claim_id: int) -> bool:
         claim = conn.execute("SELECT 1 FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
         if event is None or event["claim_id"] is not None or claim is None:
             return False
+        # Retire the "no claim matched" flag as part of the link, using the same
+        # `*_flag` convention `mismatch_dismissed` and the refusal-clearing events
+        # already use: the reason is kept, renamed to say it is resolved.
+        #
+        # Found live 2026-08-05: event #93 carried `needs manual link - no claim
+        # matched` while holding `claim_id = 12`, because linking set the column
+        # and left the detail alone. A row that contradicts itself makes any count
+        # of unlinked letters by flag text over-count, and `unlinked_letters`
+        # would have listed a letter that has a claim.
+        detail = _linked_detail(event["detail"], claim_id)
         conn.execute(
-            "UPDATE claim_status_events SET claim_id = ? WHERE id = ?", (claim_id, event_id)
+            "UPDATE claim_status_events SET claim_id = ?, detail = ? WHERE id = ?",
+            (claim_id, detail, event_id),
         )
     return True
+
+
+def _linked_detail(raw: str | None, claim_id: int) -> str:
+    """`flag` -> `linked_flag`, plus which claim took it. Unparseable detail is
+    returned untouched rather than replaced — losing a letter's own record to
+    tidy a flag would be the worse trade."""
+    try:
+        detail = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return raw
+    if not isinstance(detail, dict):
+        return raw
+    flag = detail.pop("flag", None)
+    if flag is not None:
+        detail["linked_flag"] = flag
+    detail["linked_to_claim"] = claim_id
+    return json.dumps(detail)
 
 
 def mark_sent(claim_id: int) -> dict:
@@ -1797,6 +1840,9 @@ ACTION_PRIORITY = (
     "assign_pet",
     "set_condition",
     "dismiss_mismatch",
+    # Last: it is review work, not a blocked claim. It is also the only kind that
+    # is NOT about a claim — see `unlinked_letters`.
+    "unlinked_letter",
     "blocked_insurer",
 )
 
@@ -1836,8 +1882,16 @@ WAITING_PARTIES = (
 # disagree (ADR-0021, status_labels.py). Where one kind covers two situations the
 # third element is a dict and `waiting_party` resolves it; there is no default.
 _ACTION_META = {
-    "split_proposal": ("Confirm invoice split", "one invoice paid over several charges", NOBODY_WAITING),
-    "unmatch": ("Check invoice match", "a possible wrong/extra invoice is attached", NOBODY_WAITING),
+    "split_proposal": (
+        "Confirm invoice split",
+        "one invoice paid over several charges",
+        NOBODY_WAITING,
+    ),
+    "unmatch": (
+        "Check invoice match",
+        "a possible wrong/extra invoice is attached",
+        NOBODY_WAITING,
+    ),
     # Petcover asked for something. Who holds it decides who is blocked — the
     # answer is already on the claim as `owed_by`, so it is read, not assumed.
     "confirm_resolved": (
@@ -1846,7 +1900,11 @@ _ACTION_META = {
         {"justin": PETCOVER_WAITING_ON_YOU, "vet": YOU_WAITING_ON_THE_VET},
     ),
     "mark_sent": ("Send Gmail draft", "Petcover reply tracking hasn't started", NOBODY_WAITING),
-    "invoice_request_sent": ("Invoice request sent?", "no invoice means no claim", YOU_WAITING_ON_THE_VET),
+    "invoice_request_sent": (
+        "Invoice request sent?",
+        "no invoice means no claim",
+        YOU_WAITING_ON_THE_VET,
+    ),
     "set_condition": ("Set condition", "the claim can't be drafted", NOBODY_WAITING),
     "assign_pet": ("Assign pet", "the claim can't be filled", NOBODY_WAITING),
     # Justin's own words on the old card: "It also said Petcover is waiting on me
@@ -1858,7 +1916,22 @@ _ACTION_META = {
         "a paid-vs-expected difference is unreviewed",
         {"arithmetic": NOBODY_WAITING, "assessment": YOU_WAITING_ON_PETCOVER},
     ),
-    "blocked_insurer": ("Define claim process", "every claim for this pet is stuck", NOBODY_WAITING),
+    "blocked_insurer": (
+        "Define claim process",
+        "every claim for this pet is stuck",
+        NOBODY_WAITING,
+    ),
+    # A Petcover letter that matched no claim. NOBODY_WAITING because nothing is
+    # blocked on it — Petcover has already assessed and often already paid; it is
+    # our record that is missing, and only Justin can say which claim it belongs
+    # to. Live example: DC1-26-5992 Sr 4, $135.00 claimed and $87.75 paid on
+    # 2026-08-03, against no claim in the database and no bank charge of that
+    # amount anywhere in the CSV.
+    "unlinked_letter": (
+        "Link Petcover letter",
+        "a letter Petcover already assessed has no claim",
+        NOBODY_WAITING,
+    ),
 }
 
 
@@ -1881,6 +1954,7 @@ def _waiting_key(kind: str, claim: dict) -> str | None:
     if kind == "confirm_resolved":
         return "vet" if claim.get("owed_by") == "vet" else "justin"
     return None
+
 
 _INSURER_UNDEFINED = "claim process not yet defined"
 
@@ -2000,8 +2074,93 @@ def pending_actions() -> list[dict]:
                 }
             )
     actions = _collapse_submissions(actions)
+    actions.extend(unlinked_letters(today))
     actions.sort(key=lambda a: (a["date"], ACTION_PRIORITY.index(a["kind"])))
     return actions
+
+
+def unlinked_letters(today: date | None = None) -> list[dict]:
+    """Petcover letters that matched no claim, as actions.
+
+    These are the one kind that is NOT about a claim, and the reason they need a
+    home: `process_reply` records an unmatched letter with `claim_id` NULL and a
+    `flag` explaining why, then returns. Nothing read those rows. Six had
+    accumulated between 2026-07-21 and 2026-08-05 without appearing on the
+    dashboard, in `/actions`, or in any nudge — including an approval stating
+    $135.00 claimed and $87.75 **paid**, against no claim we hold. Money already
+    assessed, invisible. That is the silent failure the hard rules forbid.
+
+    One entry per event rather than per claim: an unmatched row has no claim to
+    group by, and the reference and serial were not stored on the older ones, so
+    there is nothing reliable to fold them on. Newer rows carry them (see
+    `process_reply`), which is what makes the card able to name the letter.
+
+    `actionable` is False for the same reason `blocked_insurer` is: there is no
+    tap that resolves it. Linking happens on the dashboard, which already owns
+    `link_event`. A button would need a `/link` verb registered by the plugin,
+    and an unregistered verb reaches the agent as a chat turn.
+    """
+    today = today or datetime.now(timezone.utc).date()
+    title, blocks, _ = _ACTION_META["unlinked_letter"]
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, event_type, raw_email_id, created_at, detail "
+            "FROM claim_status_events WHERE claim_id IS NULL ORDER BY created_at, id"
+        ).fetchall()
+
+    out = []
+    for row in rows:
+        try:
+            detail = json.loads(row["detail"] or "{}")
+        except (TypeError, ValueError):
+            detail = {}
+        claimed = detail.get("claimed_amount")
+        paid = detail.get("paid_amount")
+        reference = detail.get("reference")
+        sr = detail.get("sr")
+        letter = " ".join(
+            part
+            for part in (reference, None if sr is None else f"Sr {sr}", row["event_type"])
+            if part
+        )
+        seen = row["created_at"][:10]
+        out.append(
+            {
+                "kind": "unlinked_letter",
+                "title": title,
+                "blocks": blocks,
+                "waiting": waiting_party("unlinked_letter"),
+                # No claim, so no claim money. Left as None rather than 0.0: a
+                # zero here would render as "$0.00 claimable" and read as a
+                # finding rather than an absence.
+                "claimable": None,
+                "claimable_recorded": False,
+                "expected": None,
+                "claim_id": None,
+                "claim_ids": [],
+                "group_id": None,
+                "draft_id": None,
+                "pet_name": detail.get("pet_name"),
+                "pet_id": None,
+                "merchant": letter or "Petcover letter",
+                # The letter's own numbers, which are the only amounts it has.
+                "amount": claimed or 0.0,
+                "paid_amount": paid,
+                "claimed_amount": claimed,
+                "event_id": row["id"],
+                "email_id": row["raw_email_id"],
+                "date": seen,
+                "status": row["event_type"],
+                "condition_text": detail.get("condition"),
+                "flag": detail.get("flag"),
+                "owed_by": None,
+                "requested_document": None,
+                "detail": detail.get("flag") or "",
+                "age_days": (today - date.fromisoformat(seen)).days,
+                "actionable": False,
+            }
+        )
+    return out
 
 
 def _collapse_submissions(actions: list[dict]) -> list[dict]:

@@ -41,9 +41,7 @@ def _belongs_to_the_claims_service(headers: dict) -> bool:
     local-part isn't in `_AUTOMATED_SENDER` and the letters carry no
     List-Unsubscribe), so nothing else was going to stop them becoming tasks.
     """
-    return _sender_address(headers).lower() in {
-        s.lower() for s in config.PETCOVER_STATUS_SENDERS
-    }
+    return _sender_address(headers).lower() in {s.lower() for s in config.PETCOVER_STATUS_SENDERS}
 
 
 def _already_processed(message_id: str) -> bool:
