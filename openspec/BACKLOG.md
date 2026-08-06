@@ -471,8 +471,28 @@ The arithmetic closes exactly: **$289.73 + $87.75 = $377.48**, which is $580.74 
 A `vet_claims` row holds **one** `petcover_reference` and one `petcover_sr`, so this cannot be recorded. Consequences to expect, not to fix by accident:
 
 - **Claim #2 under-reports what Petcover paid by $87.75.** Any reconciliation reading it sees $289.73 against a $580.74 invoice and infers a shortfall that does not exist.
-- **Event 91 (the `DC1-26-5992` Sr 4 approval) stays unlinked forever.** Linking it to #2 was considered and rejected: `_latest_settlement_detail` takes the most recent event carrying figures, so #2 would then report its settlement as **$87.75**, which is worse than reporting $289.73.
+- **Event 91 (the `DC1-26-5992` Sr 4 approval) stays unlinked.** Linking it to #2 was considered and rejected: `_latest_settlement_detail` takes the most recent event carrying figures, so #2 would then report its settlement as **$87.75**, which is worse than reporting $289.73.
 - Deciding this properly means either a claim owning several (reference, sr) pairs, or a split-claim row per thread. Both are schema changes on a live DB.
+
+**Correction, 2026-08-06 — unlinked no longer means invisible.** This entry
+originally read "stays unlinked **forever**" and drew the conclusion that the
+$87.75 is therefore lost from view. The first half stands; the conclusion was
+wrong, and `723c516` ("a Petcover letter with no claim is now visible") fixed it
+the same day. `claim_status.unlinked_letters()` reads every
+`claim_status_events` row with `claim_id IS NULL` and `pending_actions` appends
+them, so event 91 now appears in `/actions` and on the dashboard as an
+`unlinked_letter` card carrying its own event id. Six such rows existed live —
+10, 30, 31, 88, **91**, 92 — accumulated since 2026-07-21 and read by nothing.
+
+**Why the original reasoning is still the right reasoning.** Surfacing a letter
+and attributing its money to a claim are different acts, and only the second was
+rejected here. Nothing above changes: **claim #2 still under-reports what
+Petcover paid by $87.75**, and the schema decision is still the only real fix.
+
+Caveat that survives the fix: event 91 predates `process_reply` storing
+`reference`/`sr` on unmatched rows, so both are NULL on it (verified live
+2026-08-06) and its card cannot name the letter — it reads as an `approved`
+event with amounts and no thread. Only rows written after `723c516` carry them.
 
 ### Four claims have no recoverable claimable subtotal
 *Found 2026-08-06. Capability: `claimable-subtotal-provenance`.*
