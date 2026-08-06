@@ -157,6 +157,26 @@ else
   echo "WARN: no model provider key - the agent has no model; the preflight will fail on it"
 fi
 
+# --- the heartbeat, off ---------------------------------------------------------
+# `0m` disables it (docs/gateway/heartbeat.md, "Defaults"); there is no `enabled`
+# flag. Off rather than lengthened, because a heartbeat here has nothing to do:
+# every scheduled thing this deployment runs is a gateway cron job hitting the
+# app's internal endpoints, and none of those needs a model. HEARTBEAT.md says
+# exactly that and the reply was always the literal `HEARTBEAT_OK`.
+#
+# The cost was not theoretical. A full agent turn every 30 minutes -- 48 a day --
+# spent the whole Gemini free-tier daily quota, and the four-model fallback chain
+# above is per-model insurance against exactly one model being exhausted, not
+# against a schedule that exhausts them in order. Once spent, a TYPED message
+# answers "API rate limit reached" while taps keep working, because taps are the
+# plugin's deterministic path and never reach a model. So the heartbeat's only
+# measurable effect was to break the one surface that needs the model.
+#
+# `0m` also drops HEARTBEAT.md from normal bootstrap context, which is why the
+# file stays in the workspace rather than being deleted: it costs nothing now and
+# it is the thing to edit if a real poll ever exists.
+oc config set agents.defaults.heartbeat.every '"0m"'
+
 # Acknowledgement reactions, which the gateway does natively and this project
 # spent two deploys hand-rolling in the plugin instead.
 #
