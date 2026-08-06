@@ -233,6 +233,7 @@ _ACTION_EMOJI = {
     "assign_pet": "🐾",
     "set_condition": "⚠️",
     "dismiss_mismatch": "🔍",
+    "unlinked_letter": "🔗",
 }
 
 
@@ -262,6 +263,21 @@ def _action_card_text(action: dict) -> str:
     email Justin is confirming he sent."""
     members = action.get("members")
     head = f"{_ACTION_EMOJI.get(action['kind'], '•')} {_esc(action['title'].upper())}"
+    if action["kind"] == "unlinked_letter":
+        # The one card with no claim id, because there is no claim — that is the
+        # whole finding. It carries the EVENT id instead, which is what the
+        # dashboard's link form takes, so the card still names something Justin
+        # can act on. Amounts are the letter's own; a letter with none (an
+        # acknowledgement) simply omits the line rather than printing $0.00.
+        lines = [head, f"{_esc(action['merchant'])} · event #{action['event_id']}"]
+        if action.get("claimed_amount") is not None:
+            paid = action.get("paid_amount")
+            money = f"${action['claimed_amount']:,.2f} claimed"
+            if paid is not None:
+                money += f" · ${paid:,.2f} PAID"
+            lines.append(money)
+        lines.append(f"seen {action['date']} ({action['age_days']}d ago) · link on the dashboard")
+        return "\n".join(lines)
     if members:
         lines = [
             head,
