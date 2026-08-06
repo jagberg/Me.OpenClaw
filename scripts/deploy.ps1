@@ -102,36 +102,63 @@ $buildExit = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 if ($buildExit -ne 0) { throw "docker compose failed with exit code $buildExit" }
 
-Start-Sleep -Seconds 15
-
 # --- health, per runtime, and a partial start is a failure --------------------
+#
+# POLL to a deadline; do NOT sleep once and probe once. A fixed 15s wait raced
+# the gateway's own startup and reported `DEPLOY FAILED -- UNREACHABLE` on
+# deploys that were fine, which cost more than the check is worth in two ways.
+# It trained the reader to disbelieve the one message whose entire job is to
+# catch a real partial start. And because the failure path THROWS, it also
+# skipped the cron declarations below -- so a deploy that genuinely needed
+# re-seeding would have skipped it silently while blaming something else.
+#
+# Retrying does not weaken the check: a runtime that is really down still fails,
+# just at the deadline instead of at 15 seconds.
+function Wait-ForProbe {
+    param([scriptblock]$Probe, [int]$TimeoutSeconds = 90)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        try { return & $Probe }
+        catch {
+            if ((Get-Date) -ge $deadline) { throw }
+            Start-Sleep -Seconds 5
+        }
+    }
+}
 
 $failures = @()
 
 Write-Host "`n--- app /health ---"
 try {
-    $appHealth = Invoke-RestMethod -Uri "http://localhost:8000/health" -TimeoutSec 20
+    $appHealth = Wait-ForProbe { Invoke-RestMethod -Uri "http://localhost:8000/health" -TimeoutSec 20 }
     $appHealth | ConvertTo-Json -Depth 4
 } catch {
-    $failures += "app: /health unreachable ($($_.Exception.Message))"
+    $failures += "app: /health unreachable after 90s ($($_.Exception.Message))"
     Write-Host "UNREACHABLE"
 }
 
 Write-Host "`n--- gateway health ---"
 try {
-    $ErrorActionPreference = "Continue"
-    $raw = docker compose exec -T gateway node openclaw.mjs health --json
-    $healthExit = $LASTEXITCODE
-    $ErrorActionPreference = "Stop"
-    if ($healthExit -ne 0) { throw "health exited $healthExit" }
-    $gwHealth = $raw | ConvertFrom-Json
+    # `ok` is inside the retry, not asserted after it. A gateway three seconds
+    # into booting answers `ok: false` rather than refusing the connection, so
+    # asserting it once is the same race as probing once -- it just fails with a
+    # different sentence.
+    $gwHealth = Wait-ForProbe {
+        $ErrorActionPreference = "Continue"
+        $raw = docker compose exec -T gateway node openclaw.mjs health --json
+        $healthExit = $LASTEXITCODE
+        $ErrorActionPreference = "Stop"
+        if ($healthExit -ne 0) { throw "health exited $healthExit" }
+        $h = $raw | ConvertFrom-Json
+        if (-not $h.ok) { throw "health reports not ok" }
+        $h
+    }
     # `ok` alone is not enough. The Telegram channel can be configured, enabled
     # and not running, which is the dead-updater failure ADR-0015 was written
     # for -- it just moved runtimes.
     $tg = $gwHealth.channels.telegram
     Write-Host "  ok=$($gwHealth.ok)  plugins=$($gwHealth.plugins.loaded -join ',')"
     Write-Host "  telegram: running=$($tg.running) connected=$($tg.connected) lastError=$($tg.lastError)"
-    if (-not $gwHealth.ok) { $failures += "gateway: health reports not ok" }
     if ($gwHealth.plugins.errors.Count -gt 0) { $failures += "gateway: plugin errors $($gwHealth.plugins.errors -join ',')" }
     # NOT a failure here. Before the cutover the gateway deliberately holds no
     # token and runs no channel, so asserting "running" would fail every slice-1
@@ -145,7 +172,7 @@ try {
         $failures += "gateway: telegram lastError = $($tg.lastError)"
     }
 } catch {
-    $failures += "gateway: health unreachable ($($_.Exception.Message))"
+    $failures += "gateway: health unreachable or not ok after 90s ($($_.Exception.Message))"
     Write-Host "UNREACHABLE"
 }
 
