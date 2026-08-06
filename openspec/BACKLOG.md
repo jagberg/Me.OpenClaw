@@ -461,6 +461,35 @@ which option wins.
   `Expected payment: $296.50` before the 65% rate landed and should read
   `$192.72` after. Read-only check; the whole point of the change is that this
   figure now matches what Petcover pays.
+### One invoice, two Condition Threads — the model cannot represent it
+*Found 2026-08-06 while closing out `serial-assignment-by-evidence`. Capability: `condition-thread-tracking`.*
+
+Claim #2's $580.74 invoice was assessed by Petcover as **two** claims: $445.74 under `DC1-27-5628` Sr 8 (arthritis, paid $289.73, with $135.00 marked non-claimable) and the remaining **$135.00** under `DC1-26-5992` Sr 4 (the ALT thread, paid $87.75). The Blood Profile line moved threads.
+
+The arithmetic closes exactly: **$289.73 + $87.75 = $377.48**, which is $580.74 × 0.65 and is precisely the figure their 29/07 status table projected for Sr 8 *before* the split. So nothing was refused — the whole invoice was allowed, across two threads.
+
+A `vet_claims` row holds **one** `petcover_reference` and one `petcover_sr`, so this cannot be recorded. Consequences to expect, not to fix by accident:
+
+- **Claim #2 under-reports what Petcover paid by $87.75.** Any reconciliation reading it sees $289.73 against a $580.74 invoice and infers a shortfall that does not exist.
+- **Event 91 (the `DC1-26-5992` Sr 4 approval) stays unlinked forever.** Linking it to #2 was considered and rejected: `_latest_settlement_detail` takes the most recent event carrying figures, so #2 would then report its settlement as **$87.75**, which is worse than reporting $289.73.
+- Deciding this properly means either a claim owning several (reference, sr) pairs, or a split-claim row per thread. Both are schema changes on a live DB.
+
+### Four claims have no recoverable claimable subtotal
+*Found 2026-08-06. Capability: `claimable-subtotal-provenance`.*
+
+Claims **#16, #18, #19, #21** have an invoice total and **zero line items** stored, so the subtotal cannot be recomputed from anything we hold — `invoice_matching.claimable_amount` needs items. Fixing them means re-extracting the source invoice, which spends LLM/vision budget and rewrites data on three settled claims and one below-excess claim for display purposes only.
+
+Claim #2 *was* fixable and is done: it had its four line items, and the app's own rule returns $580.74 with nothing non-claimable.
+
+### The serial→treatment-date map needs a fresh ask, not a feed
+*Found 2026-08-06. Capability: `condition-thread-tracking`.*
+
+Petcover's 2026-07-29 table is the only artefact that states a treatment date per serial, and it is a **one-off Justin requested** — nothing delivers it on a schedule. It covers serials up to that date only.
+
+Consequence: where two claims share an amount, the letter alone cannot place the serial and routing correctly refuses (live: the two $35.00 claims and the two $45.00 claims). Resolving a future ambiguity means asking Petcover again. The historical ambiguity is already resolved — the map was corrected by hand on 2026-08-05 against that table.
+
+Worth knowing: **the charge date equalled Petcover's stated treatment date on all nine claims they state one for.** So `treatment_date()`'s "assumed = charge date" fallback, which drives the 12-month submission deadline, is confirmed against real data rather than merely plausible.
+
 - **Correct the live serial→claim map.** Petcover's status table of 2026-07-29
   (`19fab5f3b534416c`) states a treatment date per serial, and against it every
   serial we hold is on the wrong claim (0 for 10), while every letter's stated
