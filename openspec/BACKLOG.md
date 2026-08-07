@@ -153,6 +153,21 @@ Gemini credentials already exist and are already used for vision OCR (ADR-0010),
 
 Not resolved here: **why** Groq is blocking this egress. That is a network/account question for Justin (VPN, ISP address reputation, or a region block), and no code change fixes it.
 
+**Resolved 2026-08-07 — there is no egress block today, and the probe was the problem.** Measured with the clients the code actually uses, not with `urllib`:
+
+| client | container | result |
+|---|---|---|
+| `openai` SDK (httpx 0.28.1), default UA | app | **200**, real completion from `llama-3.3-70b-versatile` |
+| Node `fetch`, default UA | gateway | **200**, real completion |
+| `urllib`, default UA | app | **403 `error code: 1010`** |
+| `urllib`, UA `curl/8.0` or `Mozilla/5.0` | app | **401 Invalid API Key** — i.e. it reached Groq |
+
+`1010` is a Cloudflare User-Agent ban. Every "Groq is blocked" probe on record was `urllib`-shaped, so it measured a UA filter that neither runtime is subject to. The one-line check this entry flagged as "cheap to check first, ten minutes, unrelated to the provider choice" was the whole answer.
+
+Two things this does **not** claim. It does not prove 2026-08-04's block was the same artefact — the body recorded then (`Access denied. Please check your network settings.`) is a different string from `1010`, so a real block that has since lifted is equally consistent. And it changes no config: `LLM_PROVIDER` is still `gemini` and the gateway agent is still `gemini/gemini-2.5-flash`, because moving a primary provider is a behaviour change and Justin's call.
+
+**What it unblocks.** The cross-provider fallback this entry asks for is now buildable and no longer needs a new account: Gemini's free-tier daily exhaustion — the thing that spent the quota on 2026-08-06 and made typed chat answer "API rate limit reached" — has somewhere to fall through to. ADR-0017's chain being four links of one provider is still the defect; it now has a second provider to reach for. Still worth an ADR, since it changes what "fallback" means in 0017.
+
 ### Which date anchors a claim — the deadline says treatment, the excess math still says the charge
 *Open since 2026-07-29. Capabilities: `settlement-validation`, `dashboard-visit-ledger`. Follows the ADR-0020 correction of the same date.*
 
@@ -428,6 +443,18 @@ never once asserts *the app can actually send a message*. A check that pushed a
 real message through `gateway_client` at deploy time would have caught this
 before a human tapped anything. That is the gap worth closing regardless of
 which option wins.
+
+**Closed — verified 2026-08-07.** `gateway_preflight.check_app_can_send` exists
+and is wired into `main()`. It is also a better check than this entry asked for:
+it does **not** push a real message (that would train Justin to ignore the
+preflight), and it does not use `message send --dry-run` (which answers
+`handledBy: "core"` without contacting the gateway, so it passes against a wrong
+URL, a wrong token or an unpaired device — all three of the failures this deploy
+actually hit). It sends **write-scoped** to target `0`, so the connect, the
+pairing and the write scope are all exercised and Telegram refuses the dummy
+target. The function's own docstring names the three weaker probes that were
+tried live and passed while a real send failed. Left here rather than deleted so
+the reasoning stays reachable; the gap itself is gone.
 
 ## From petcover-settlement-reconciliation (2026-08-04)
 
