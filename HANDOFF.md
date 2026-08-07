@@ -1,4 +1,35 @@
-# Handoff — 2026-08-06
+# Handoff — 2026-08-06, worked 2026-08-07/08
+
+**Status of this file: most of it is closed. What remains is Monday-gated or
+Justin's.** Closed items are struck through in place rather than deleted, so the
+reasoning that produced them stays readable. Still open: section 6 (deliberately
+held to Mon 2026-08-10 so Justin can test first), section 9's seven items, six
+unarchived openspec changes, and the four decisions at the bottom.
+
+Closed on 2026-08-07/08, each verified rather than assumed:
+
+- **Fault 1, the heartbeat** — disabled with `every: "0m"` in
+  `scripts/gateway_seed.sh` and hot-applied live (`[heartbeat] disabled`, no
+  restart). Cadence was wall-clock :14/:44, 48 turns/day, and it was spending the
+  whole Gemini daily free tier.
+- **Fault 2, unreviewed CLI flags** — re-verified against 2026.7.1. All eight
+  flags `gateway_client.py` uses exist, and the app container's baked-in CLI is
+  also 2026.7.1, not older. (`-m, --message` and `-t, --target` print
+  short-form-first, which a naive `--flag` grep misses — that misread cost one
+  false alarm.)
+- **The `deploy.ps1` defect** — replaced the fixed 15s sleep with polling to a
+  90s deadline, and moved the `ok` assertion inside the retry.
+- **Repository hygiene 1–3** — master and `origin/master` agree; the main
+  checkout is reattached to master; every merged worktree is pruned.
+  `worktree list` is now exactly three: main, this session's, and `deploy`.
+  Three *empty* directories survive (`-settlement`, `-integration`,
+  `-understandAny`) — git deregistered them but could not `rmdir` them,
+  `Permission denied`, because something holds a directory handle. Harmless.
+- **Not in this file but found while working it:** Groq is reachable and always
+  was for the clients the code uses — see **ADR-0028**. Every "Groq is blocked"
+  probe on record was `urllib`-shaped and measured a Cloudflare User-Agent ban.
+
+
 
 Written at the end of a long session, for a fresh session with no memory of it.
 Everything below was verified live on 2026-08-06, not recalled. Read root
@@ -32,11 +63,14 @@ persisted in the `gateway_state` volume, so they survive a container recreate).
 |---|---|
 | compose + deploy script | `C:\Code\Me.OpenClaw-telegram-claimquery` (branch `deploy`) |
 | **the live DB** | `C:\Code\Me.OpenClaw\app\data\openclaw.db` — bound into both containers |
-| master | checked out in `C:\Code\Me.OpenClaw-settlement`, **not** the main checkout |
+| master | **the main checkout, `C:\Code\Me.OpenClaw`** — corrected 2026-08-07. Until then it lived in `C:\Code\Me.OpenClaw-settlement` while the main checkout sat detached; that worktree is gone and master is back where the live data dir is |
 
 **Trap 1 — the wrong `app/data`.** Compose binds the *main checkout's* data dir.
 Every other worktree has its own `app/data/openclaw.db`, and they are stale
-copies. Reading one silently returns plausible-but-old rows. I did this on
+copies. (Two such copies were deleted with their worktrees on 2026-08-07 — the
+`-integration` one was 2.3 MB and its WAL sidecar had been touched that very
+morning, so the trap was live, not theoretical. The trap itself is not retired:
+any new worktree recreates it.) Reading one silently returns plausible-but-old rows. I did this on
 2026-08-06 and concluded "no messages since 31 July" from a DB that had stopped
 being written weeks earlier. Always name the path in full:
 `sqlite3.connect("file:C:/Code/Me.OpenClaw/app/data/openclaw.db?mode=ro", uri=True)`.
@@ -54,7 +88,9 @@ cron dead because a `last_ok` ten hours old was in fact fourteen minutes old.
 From `C:\Code\Me.OpenClaw-telegram-claimquery`:
 `git switch -C deploy origin/master` then `./scripts/deploy.ps1`.
 
-**Known defect: the script reports `DEPLOY FAILED` on a good deploy.** Its
+**~~Known defect: the script reports `DEPLOY FAILED` on a good deploy.~~ Fixed
+2026-08-07 (`3b475fa`) — `Wait-ForProbe` polls both runtimes to a 90s deadline
+and the `ok` assertion moved inside the retry. The original reasoning, kept:** Its
 gateway health probe races Docker's `start_period`, so a healthy start reads as
 `UNREACHABLE`. Two consequences: the script cannot be trusted to catch a *real*
 partial start, which is the only reason it exists; and because it throws, its
@@ -62,9 +98,9 @@ post-boot cron-seeding step never runs. Harmless while declarations persist in
 the volume, but a deploy that genuinely needed re-seeding would skip it in
 silence. Fixing this is worth doing before the next deploy.
 
-## Live faults, open
+## Live faults — 1 and 2 CLOSED 2026-08-07, kept for their reasoning
 
-1. **The gateway heartbeat is burning the Gemini free-tier quota.** The gateway
+1. ~~**The gateway heartbeat is burning the Gemini free-tier quota.**~~ **Closed.** The gateway
    logs `[heartbeat] started` at boot and runs an agent turn every 30 minutes;
    every one has ended `failoverReason: rate_limit`, `gemini-2.5-flash`, `429`
    since at least 2026-08-05 16:13 UTC. Four fallback models are configured and
@@ -72,9 +108,13 @@ silence. Fixing this is worth doing before the next deploy.
    undeclared models" trap — the daily quota is genuinely spent. **Effect: taps
    work, typed chat replies "API rate limit reached".** Lengthening or disabling
    the heartbeat is the first thing to try.
-2. **The gateway is 2026.7.1; every CLI flag in `gateway_client.py` was verified
+2. ~~**The gateway is 2026.7.1; every CLI flag in `gateway_client.py` was verified
    against 2026.6.34.** Unreviewed since the bump. Re-verify against
-   `openclaw message <sub> --help` before trusting a send path.
+   `openclaw message <sub> --help` before trusting a send path.~~ **Closed
+   2026-08-07 — re-verified, all eight flags present on 2026.7.1, and the app
+   container's own CLI is 2026.7.1 too.** Existence is not semantics, but the
+   review this asked for is done. `check_app_can_send` in the preflight is what
+   exercises the path for real.
 3. **`vet-nudge: never`** on `/health`. Correct, not a fault — it is weekly on
    Mondays and was declared on a Tuesday. First real firing is 2026-08-10, which
    is also the first proof that cadence works.
@@ -118,7 +158,7 @@ silence. Fixing this is worth doing before the next deploy.
   {name: ...}}` pinning the existing ones. The SQLite DB is unaffected: `/data`
   is a bind, not a volume.
 
-## Repository hygiene, before the next session
+## Repository hygiene — 1, 2 and 3 DONE 2026-08-07; 4 is behavioural and stands
 
 1. **Push local `master`.** It is one commit ahead of `origin/master`
    (`e9e552d`, from a parallel session). Local and remote disagreeing is the

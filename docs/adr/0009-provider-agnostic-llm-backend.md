@@ -84,6 +84,16 @@ chat path only, recorded rather than left to be discovered.
 
 ## Amendment (2026-08-04) — Groq is unreachable from this network; Gemini is the default
 
+> **The finding of fact below is superseded by [ADR-0028](0028-groqs-403-was-a-user-agent-ban.md) (2026-08-08).**
+> Measured with the clients the code actually uses, both runtimes reach Groq: the
+> `openai` SDK returns 200 from the app container and Node `fetch` returns 200 from
+> the gateway container. The 403 reproduces only for `python-urllib`'s default
+> User-Agent (`error code: 1010`, a Cloudflare UA ban), which is what every probe
+> on record used. **The Decision below — Gemini as the default, Groq left
+> configured — is unaffected and still stands.** Whether 2026-08-04's block was
+> this same artefact is undetermined: the body recorded here is a different string
+> from `1010`. Original text kept verbatim.
+
 Not an outage, not a quota, not the key. `api.groq.com/openai/v1/models`
 answers:
 
