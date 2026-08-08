@@ -85,9 +85,10 @@ def _with_stubbed_claim_fill(fn):
     process_claim can run without a real template file or Gmail credentials."""
     original_fill = claim_forms.fill_petcover_form
     original_draft = claim_forms.create_claim_draft
-    claim_forms.fill_petcover_form = lambda data, output_path: Path(output_path).parent.mkdir(
-        parents=True, exist_ok=True
-    ) or Path(output_path).write_text("stub")
+    claim_forms.fill_petcover_form = lambda data, output_path: (
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        or Path(output_path).write_text("stub")
+    )
     claim_forms.create_claim_draft = lambda **kwargs: "draft-stub-id"
     try:
         fn()

@@ -490,9 +490,8 @@ def test_extraction_cached_per_email_no_second_llm_call():
     db.init_db()
     calls = []
     original_extract = llm.extract
-    llm.extract = (
-        lambda *a, **k: calls.append(1)
-        or '{"invoices": [{"date": "2026-01-20", "amount": 10.50, "items": []}]}'
+    llm.extract = lambda *a, **k: (
+        calls.append(1) or '{"invoices": [{"date": "2026-01-20", "amount": 10.50, "items": []}]}'
     )
     try:
         first = invoice_matching._invoices_for_email("cache-test-1", "some invoice text")
@@ -1727,9 +1726,9 @@ def test_vision_invoices_reads_pages_skips_junk_and_caches():
     original_att = claim_forms.email_pdf_attachments
     original_vision = llm.extract_vision
     claim_forms.email_pdf_attachments = lambda email_id: [("scans.pdf", _scan_pdf_bytes(4))]
-    llm.extract_vision = lambda prompt, jpeg, purpose="vision_extraction": vision_calls.append(
-        1
-    ) or next(replies)
+    llm.extract_vision = lambda prompt, jpeg, purpose="vision_extraction": (
+        vision_calls.append(1) or next(replies)
+    )
     try:
         invoices = invoice_matching._vision_invoices("em-scan-mix")
     finally:
@@ -5822,10 +5821,13 @@ def test_mcp_inventory_has_no_dangerous_tool():
 
     committed = []
     real_commit, real_execute = proposals.commit, proposals.execute
-    proposals.commit = lambda *a, **k: committed.append(("commit", a)) or {
-        "ok": True,
-        "message": "",
-    }
+    proposals.commit = lambda *a, **k: (
+        committed.append(("commit", a))
+        or {
+            "ok": True,
+            "message": "",
+        }
+    )
     proposals.execute = lambda *a, **k: committed.append(("execute", a)) or ""
     try:
         # Every tool, called with nothing. Most will complain about missing
@@ -8804,6 +8806,82 @@ def test_linking_an_event_retires_its_no_claim_matched_flag():
 
     # A second link is refused, so the flag cannot be retired twice.
     assert claim_status.link_event(event_id, 12) is False
+
+
+def test_action_kind_is_asserted_for_the_four_kinds_nothing_covered():
+    """`clarify-claim-status-vocabulary` task 1.2 claimed a before/after assertion
+    for every action kind and was ticked without one. Measured 2026-07-28: 4 of 9
+    kinds were asserted anywhere, and the four missing ones included `unmatch` and
+    `confirm_resolved` — the two the extraction into `_action_kind_from_row`
+    actually moved. Both suites passed throughout, which is the point: a mechanical
+    refactor that nothing asserts is a refactor nobody can show is mechanical."""
+    base = {"id": 1, "status": "matched", "flag": None, "pet_id": 1, "condition_text": "Arthritis"}
+
+    # An open split proposal outranks whatever the row says.
+    assert claim_status._action_kind({**base, "id": 5}, {5}, set()) == "split_proposal"
+
+    # An unresolved event, from the other set argument.
+    assert claim_status._action_kind({**base, "id": 6}, set(), {6}) == "confirm_resolved"
+
+    # `unmatch` is decided by the row alone.
+    additional = {**base, "id": 7, "flag": "possible additional invoice for this visit"}
+    assert claim_status._action_kind(additional, set(), set()) == "unmatch"
+
+    # THE PRECEDENCE THE EXTRACTION HAD TO PRESERVE, and the reason these two
+    # kinds are the ones worth asserting. `unmatch` lives in the row-only half
+    # but outranks `confirm_resolved`, which is decided from a set — so the set
+    # check in `_action_kind` carries an explicit "not additional-invoice" guard.
+    # Drop that guard and this claim silently becomes `confirm_resolved`: a claim
+    # needing its wrong invoice detached would instead be offered "mark resolved".
+    assert claim_status._action_kind(additional, set(), {7}) == "unmatch"
+
+    # …and a split proposal still outranks both.
+    assert claim_status._action_kind(additional, {7}, {7}) == "split_proposal"
+
+    # `invoice_request_sent` keys off the flag, never off invoice_request_sent_at
+    # + draft_id — draft_id is overloaded and that pair matches almost every claim.
+    assert (
+        claim_status._action_kind(
+            {**base, "id": 8, "flag": "invoice_request_drafted"}, set(), set()
+        )
+        == "invoice_request_sent"
+    )
+
+
+def test_a_claim_draft_subject_names_its_claims():
+    """Two drafts titled `Vet claim — Aari` coexisted live on 2026-07-25 — #7+#6
+    batched, and #12 — and the older one was read as deleted. It existed the whole
+    time. The wrong conclusion produced a "redo claim #7" request that no tool
+    could serve, and two duplicate tasks nobody closed."""
+    assert claim_forms._draft_subject("Aari", [7, 6]) == "Vet claim — Aari (#7, #6)"
+    assert claim_forms._draft_subject("Aari", [12]) == "Vet claim — Aari (#12)"
+    # Two submissions for one pet are now distinguishable, which is the whole point.
+    assert claim_forms._draft_subject("Aari", [7, 6]) != claim_forms._draft_subject("Aari", [12])
+    # The `Vet claim` prefix survives, so pipeline.DRAFT_SEARCH_LINK still matches.
+    assert claim_forms._draft_subject("Echo", [3]).startswith("Vet claim")
+
+
+def test_the_phantom_db_raises_instead_of_answering():
+    """ADR-0018 guards a read-write open of the LIVE db, which fails loudly. This
+    is the quieter one: `app/.env` sets the *container* path `/data/openclaw.db`
+    and `config` loads `.env` from cwd, so a host-side call resolves it to
+    `C:\\data\\openclaw.db` — a real file holding 1 vet_claim, 1 bank_transaction
+    and 2 telegram_messages when measured 2026-08-08, against a live corpus of
+    22+ claims and 307 messages. The query succeeds and the rows are wrong."""
+    if os.name != "nt":
+        return  # the resolution only misfires on Windows; inside the container it is correct
+
+    try:
+        db._refuse_phantom("/data/openclaw.db")
+    except RuntimeError as exc:
+        assert "phantom" in str(exc), "the message must name what it refused"
+        assert "mode=ro" in str(exc) or "query_db" in str(exc), "and name the way out"
+    else:
+        raise AssertionError("a POSIX-absolute path on Windows must be refused")
+
+    # Not over-broad: a real Windows path is the normal case and must still open.
+    db._refuse_phantom(r"C:\Code\Me.OpenClaw\app\data\openclaw.db")
+    db._refuse_phantom("./data/openclaw.db")
 
 
 if __name__ == "__main__":

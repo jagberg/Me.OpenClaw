@@ -1,0 +1,29 @@
+{
+  "$comment": [
+    "Project-scoped, and checked in on purpose: the rule is about THIS repo's live",
+    "SQLite DB, so it should travel with the repo and not be inherited by every",
+    "other project on the machine.",
+    "",
+    "ADR-0018 required host-side access to the live DB to be read-only and left the",
+    "enforcement unbuilt, 'worth building if this recurs'. It recurred -- four",
+    "read-write opens in one session on 2026-07-27, with the rule in CLAUDE.md and",
+    "the ADR read later that same session. Convention is not the control; this is.",
+    "",
+    "See scripts/guard_live_db.py for what it matches and, more importantly, what",
+    "it deliberately does not: docker exec always passes, because in-container is",
+    "where a real write belongs."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/guard_live_db.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

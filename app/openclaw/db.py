@@ -320,9 +320,41 @@ def init_db(path: str | None = None) -> None:
         conn.executescript(SEED_PETS)
 
 
+def _refuse_phantom(path: str) -> None:
+    """Raise rather than open `C:\\data\\openclaw.db`, the phantom DB.
+
+    `app/.env` sets `DATABASE_PATH=/data/openclaw.db` — the *container* path —
+    and `config` loads `.env` from cwd, so calling this module from the Windows
+    host resolves that to `C:\\data\\openclaw.db`. That file exists (created
+    2026-07-22) and holds a handful of stale rows: 1 `vet_claims`, 1
+    `bank_transactions`, 2 `telegram_messages` when measured 2026-08-08, against
+    a live corpus of 22+ claims and 307 messages.
+
+    **This is worse than the failure ADR-0018 guards against.** A read-write open
+    of the *live* DB breaks loudly — the container loses its WAL sidecars. This
+    breaks quietly: the query succeeds, returns rows, and the rows are wrong. It
+    surfaced only because `find_visit_by_date` returned `[]` for a date the live
+    DB certainly holds; had the phantom contained a plausible row instead of
+    none, the wrong answer would have been reported as fact.
+
+    A POSIX-absolute path on Windows is always a container path leaking to the
+    host, so that one condition is the whole test. It cannot fire inside the
+    container, where `os.name` is `posix`.
+    """
+    if os.name == "nt" and path.startswith("/"):
+        raise RuntimeError(
+            f"Refusing to open {path!r} from the Windows host: it resolves to "
+            f"C:{path.replace('/', os.sep)}, the stale phantom DB, and would return "
+            "plausible-but-wrong rows rather than an error. Either copy the live DB "
+            "read-only and point DATABASE_PATH at the copy, or run this inside the "
+            "app container. To read the live DB, use scripts/query_db.py. See ADR-0018."
+        )
+
+
 @contextmanager
 def get_connection(path: str | None = None):
     path = path or config.DATABASE_PATH
+    _refuse_phantom(path)
     conn = sqlite3.connect(path)
     # The host and the container both open this bind-mounted file. In the default
     # rollback journal a writer blocks readers outright, which is how a host-side

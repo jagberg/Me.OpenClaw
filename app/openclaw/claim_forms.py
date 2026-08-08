@@ -153,6 +153,26 @@ def discard_claim_draft(message_id: str) -> None:
     raise ClaimFillError(f"no Gmail draft found for message {message_id}")
 
 
+def _draft_subject(pet_name: str, claim_ids) -> str:
+    """`Vet claim — Aari (#7, #6)`, one definition for both draft paths.
+
+    Every submission for the same pet used to read `Vet claim — {pet}`, so two
+    drafts for one pet were indistinguishable in Gmail. On 2026-07-25 two titled
+    `Vet claim — Aari` coexisted — #7+#6 batched, and #12 — and Justin concluded
+    #7's draft had been deleted. It had not; it was `r-7259758204005672288` with
+    the correct recipient and three attachments. The wrong conclusion then
+    produced a "redo claim #7" request that nothing could serve.
+
+    Checked before changing it: this does NOT affect reply correlation.
+    `claim_status.classify` and `extract_reference` run against *Petcover's*
+    reply subject, which is their own wording, never against the subject we send.
+    `pipeline.DRAFT_SEARCH_LINK` filters drafts on the `Vet claim` prefix alone,
+    which this preserves.
+    """
+    ids = ", ".join(f"#{i}" for i in claim_ids)
+    return f"Vet claim — {pet_name} ({ids})"
+
+
 def _flag(claim_id: int, message: str) -> None:
     with db.get_connection() as conn:
         conn.execute(
@@ -532,7 +552,7 @@ def process_claim_batch(claim_ids: list[int], continuation: bool | None = True) 
     try:
         draft_message_id = create_claim_draft(
             to=pet["claim_email"],
-            subject=f"Vet claim — {pet['name']}",
+            subject=_draft_subject(pet["name"], claim_ids),
             body="Please find attached the completed claim form and invoices.",
             attachment_paths=attachment_paths,
         )
@@ -940,7 +960,7 @@ def process_claim(claim_id: int, continuation: bool | None = True) -> None:
     try:
         draft_message_id = create_claim_draft(
             to=pet["claim_email"],
-            subject=f"Vet claim — {pet['name']}",
+            subject=_draft_subject(pet["name"], [claim_id]),
             body="Please find attached the completed claim form and invoice details.",
             attachment_paths=attachment_paths,
         )
