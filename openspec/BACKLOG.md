@@ -15,6 +15,26 @@ Bow Wow's template format, submission method (email vs portal) and required fiel
 
 ## Decisions needed
 
+### Should there be a `/link` verb for unlinked Petcover letters?
+*Moved out of `HANDOFF.md` 2026-08-08 when that file was deleted; open since 2026-08-06. Capability: `telegram-bot`, `condition-thread-tracking`.*
+
+Unlinked letters are visible — `unlinked_letters()` surfaces them as `/actions` cards — but they are **not tappable**: the cards carry `actionable: False`, so linking one to a claim is a dashboard-only act.
+
+The reason it was not just added: a command button is deterministic *only while its command is registered*, and an unregistered verb is not an error — it reaches the agent as an ordinary chat turn and spends tokens. So adding the button and adding the verb are one change, not two, and the 58-byte command-button budget applies.
+
+Six such rows exist live (10, 30, 31, 88, 91, 92). Note 91 is the one whose linking to claim #2 is **rejected** on separate grounds — see "One invoice, two Condition Threads" — so a `/link` verb must not imply that every unlinked letter should be linked.
+
+### Should the compose project name be corrected?
+*Moved out of `HANDOFF.md` 2026-08-08. Open since 2026-08-06. Cosmetic, with a non-cosmetic failure mode.*
+
+The project name is `meopenclaw-telegram-claimquery`, taken from a stale feature-branch directory name — so every container and volume is prefixed with a branch that no longer means anything.
+
+**Renaming naively orphans three volumes**, and `gateway_state` (31 MB: pairing identity, agent sessions, plugin registry, cron state) is **not regenerable**. Losing it reads to the user as "the gateway forgot everything" — a re-pair, lost sessions, and cron declarations to re-seed.
+
+Safe route, if it is done at all: `name:` in compose **plus** explicit `volumes: {<vol>: {name: <existing>}}` pinning each existing volume. The SQLite DB is unaffected either way — `/data` is a bind, not a volume.
+
+Worth being honest that the benefit is tidiness only. The cost of getting it wrong is a visible outage.
+
 ### Do closed policy years drain the excess on the dashboard?
 *Found 2026-07-25 during the baseline sync. Capability: `dashboard-visit-ledger` vs `settlement-validation`.*
 
@@ -249,7 +269,13 @@ the fix is to create the capability or drop the sentence.
 Worth doing before the next archive either way — a baseline that references
 missing capabilities gets less trustworthy each time it is read and believed.
 
-## Doctor reports two CRITICALs that do not block startup (found 2026-08-01)
+## ~~Doctor reports two CRITICALs that do not block startup~~ CLOSED 2026-08-08 (found 2026-08-01)
+
+**Re-run on 2026.7.1: zero CRITICALs.** The session-store one is gone — self-healing, as this entry suspected. The skills half persists but has *changed shape*: it is now a count (`Eligible: 13 / Missing requirements: 32`), not a CRITICAL.
+
+**Keep the warning below — it is stronger evidence now than when written.** A condition that silently changed severity across one version bump is exactly why `doctor` must not be promoted from repair tool to health gate. `config validate` remains the authoritative pre-boot check.
+
+Original entry follows.
 
 Slice 1's task 13.6, moved here at archive on 2026-08-02 rather than into
 `openclaw-telegram-cutover`, because it is true of the gateway as it runs today
@@ -390,7 +416,15 @@ which is the one purpose where a quality failure costs money rather than time.
 Revisit when: slice 2 is archived, or a Cerebras key becomes obtainable, or a
 vision-capable free tier appears whose terms do not permit human review.
 
-### The app cannot reach the gateway to send anything (found live 2026-08-03)
+### ~~The app cannot reach the gateway to send anything~~ CLOSED 2026-08-08 (found live 2026-08-03)
+
+**Both proposed options shipped, and the entry is kept for the reasoning.** Verified 2026-08-08:
+
+- **Option 2 won as the live path.** `gateway_client.py:231` posts to `OPENCLAW_GATEWAY_HTTP_URL + /api/v1/claims/send`, the plugin's own in-process route inside the gateway — so the token stays in one place and no protocol is re-derived.
+- **Option 1 shipped as the fallback.** `app/Dockerfile` multi-stage-copies the `openclaw` CLI out of the gateway image, with a comment naming this failure. Both containers' CLIs are 2026.7.1.
+- The preflight gap is closed too — see the note at the end of this entry.
+
+Original reasoning below, unchanged.
 
 **The cutover was rolled back on this.** First real `/actions` after the cutover
 returned, correctly and visibly:
