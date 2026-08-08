@@ -24,8 +24,12 @@ Per the repo rule: record what was *actually verified live*, not what was coded.
 
 ## 3. Read-only verifications (no decision needed)
 
-- [ ] 3.1 Claim #8's card should read `Expected payment: $192.72`, not `$296.50` — the whole point of the 65% benefit rate, never checked since it shipped. Read-only against the live DB, full path, `mode=ro`
-- [ ] 3.2 Claim #21: we extracted $44.75, Petcover's letter states $35.00 claimed / $22.75 paid. Determine which is wrong. Note the prior: amounts matched 7 for 7 elsewhere, so our extraction is the likelier suspect
+- [~] 3.1 Claim #8's card should read `Expected payment: $192.72`, not `$296.50` — the whole point of the 65% benefit rate, never checked since it shipped. Read-only against the live DB, full path, `mode=ro`
+  - **Inputs confirmed live 2026-08-08** (`query_db.py`): claim #8 is `settled`, Sr 5, `DC1-27-5628`, bank charge **446.50**. The arithmetic closes exactly — `446.50 − 150.00 = 296.50`, and `296.50 × 0.65 = 192.725 → $192.72`. So the figure and its derivation are confirmed.
+  - **Still open:** this proves the *formula* and its inputs, not that the card *renders* it. That needs the ledger code run against a read-only copy of the live DB (host-side app code resolves to the phantom — see `db._refuse_phantom`). Left `[~]` rather than ticked, because "the maths works" is not "the dashboard shows it".
+- [~] 3.2 Claim #21: we extracted $44.75, Petcover's letter states $35.00 claimed / $22.75 paid. Determine which is wrong. Note the prior: amounts matched 7 for 7 elsewhere, so our extraction is the likelier suspect
+  - **Live 2026-08-08:** claim #21 is `settled`, Sr **1**, `DC1-26-5978`, bank charge **44.75**. Petcover's own figures are internally consistent at the policy rate — `35.00 × 0.65 = 22.75` exactly — so their letter is not arithmetically wrong; the disagreement is only over the **claimable base**, $44.75 vs $35.00, a gap of $9.75 that looks like one non-claimable line.
+  - **Do not conclude from this yet.** Serials are scoped to their reference, so this Sr 1 is a different serial from the Sr 1 the handoff places on claim #6 — no contradiction there. But the serial map is 0-for-10 wrong overall, so #21's own `(reference, sr)` is itself suspect. Deciding whether our extraction or the assignment is at fault requires the invoice line items, and **section 5 should land first** — a remap could move this letter to a different claim and dissolve the discrepancy entirely.
 - [ ] 3.3 Claim #17: vision-OCR attempted once in six days with two attempts remaining and the source email still found by the live query. Trace `match_claim`'s vision branch live rather than guessing — maxResults truncation is already ruled out
 - [ ] 3.4 Record each finding in `openspec/BACKLOG.md` against its entry, including any that turn out to be non-issues
 

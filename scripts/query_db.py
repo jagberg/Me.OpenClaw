@@ -83,7 +83,14 @@ def main() -> int:
             print("read-only: SELECT / WITH / PRAGMA / EXPLAIN only (ADR-0018)", file=sys.stderr)
             return 2
 
-        rows = conn.execute(args.sql).fetchall()
+        # A mistyped column is the common case, not an exceptional one, and a
+        # traceback here reads as "the helper is broken" — which is how a helper
+        # stops being used and the one-liner it replaced comes back.
+        try:
+            rows = conn.execute(args.sql).fetchall()
+        except sqlite3.Error as exc:
+            print(f"{exc}\n(hint: python scripts/query_db.py --tables)", file=sys.stderr)
+            return 1
         if not rows:
             print("(no rows)")
             return 0
