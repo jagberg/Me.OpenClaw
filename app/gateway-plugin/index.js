@@ -268,63 +268,58 @@ function registerPendingFlowClaim(api) {
   );
 }
 
-/**
- * Message ids of inbound documents this plugin has claimed, so the
- * `before_dispatch` guard below can suppress the SAME message from also
- * reaching the agent.
- *
- * A plain `Set` works because `message_received` fires synchronously up to
- * its first `await` (`fireAndForgetHook` does not await the promise it
- * kicks off, but the handler body still runs immediately when called), and
- * that happens strictly before `before_dispatch` runs for the same inbound
- * message -- both are steps in one dispatch pass. Swept on read (task 8's
- * TTL is generous; a message id is never looked up twice) rather than on a
- * timer, matching `media_outbox._sweep`'s reasoning.
+/** Matches the gateway's own placeholder body text for a saved, captionless
+ * document (`formatSavedMediaPlaceholder`, telegram-ingress-spool.js) --
+ * `<media:document>`, or `<media:document> (N attachments)` for more than
+ * one. Read from the gateway's shipped source, not guessed: it carries no
+ * filename or path, which is why the handler below locates the staged file
+ * itself rather than parsing one out of this string.
  */
-const claimedDocumentMessageIds = new Map();
-const DOCUMENT_CLAIM_TTL_MS = 5 * 60 * 1000;
-
-function claimDocumentMessage(id) {
-  if (id == null) return;
-  claimedDocumentMessageIds.set(id, Date.now());
-}
-
-function tookDocumentMessage(id) {
-  if (id == null) return false;
-  const seenAt = claimedDocumentMessageIds.get(id);
-  if (seenAt === undefined) return false;
-  claimedDocumentMessageIds.delete(id);
-  return Date.now() - seenAt < DOCUMENT_CLAIM_TTL_MS;
-}
+const SAVED_DOCUMENT_PLACEHOLDER_RE = /^<media:document>/;
 
 /**
  * Forward an inbound Telegram document (the NetBank CSV upload, task 6) to
- * the app, and reply with whatever the app says.
+ * the app, and reply with whatever it says -- all inside `before_dispatch`,
+ * not `message_received` (task 1.1-1.4's spike, redone against the real
+ * gateway rather than its source alone).
  *
- * WHY `message_received` AND NOT `inbound_claim`. Read out of the gateway's
- * own shipped dispatch code (`dispatch-B9if0XZc.js`), not assumed:
- * `inbound_claim` only runs when the conversation already has a
- * `pluginOwnedBinding` -- a conversation-binding mechanism this plugin never
- * sets up -- so it would simply never fire for a plain document upload.
- * `message_received` fires unconditionally (`fireAndForgetHook`, no
- * `pluginOwnedBinding` precondition) and its event DOES carry
- * `metadata.mediaPath` (`toPluginMessageReceivedEvent`); `before_dispatch`,
- * the hook this plugin already uses live, carries neither media metadata NOR
- * a document-only message reliably -- confirmed by reading
- * `runBeforeDispatch`'s two argument objects, which have no media field at
- * all.
+ * WHY NOT `message_received`, DESPITE CARRYING `metadata.mediaPath`. Tried
+ * first, and measured live: the gateway's own `registerHook` plumbing calls
+ * a plugin's internal wrapper as `handler(event, ctx)` -- two positional
+ * arguments -- but that wrapper reads `evt.context` off its SOLE parameter,
+ * so `ctx` (the object actually carrying `conversationId` etc.) is silently
+ * dropped and `evt.context` is `undefined`. The wrapper's own
+ * `Object.hasOwn(context, "pluginConfig")` then throws before our handler is
+ * ever called, caught by the gateway's own hook-error handler with no
+ * visible trace on our side. Confirmed live: a real document staged
+ * correctly (media/inbound had the file) and still reached the agent as a
+ * chat turn, with zero app-side log activity for the forward that should
+ * have happened. `before_dispatch` does not hit this: its existing handler
+ * (`claims-pending-flow`, above) has read `event.context.text` successfully
+ * in production for months, so its wiring merges the two arguments
+ * correctly where `message_received`'s does not -- a gateway inconsistency,
+ * not a plugin bug, and not fixable from here.
  *
- * WHY A SEPARATE `before_dispatch` GUARD IS STILL NEEDED. `message_received`
- * is fire-and-forget and cannot itself stop the message reaching the agent.
- * Measured live before this guard existed: a captionless CSV upload staged
- * correctly and STILL spent a real model turn, because the gateway's own
- * placeholder text (`<media:document>` or similar) is non-empty, so nothing
- * short-circuits dispatch. `registerDocumentDispatchGuard` below claims the
- * same message id and returns `{ handled: true }` before the agent is asked.
+ * WHY LOCATE THE FILE RATHER THAN READ A PATH OFF THE EVENT. `before_dispatch`
+ * carries no media field at all (confirmed by reading `runBeforeDispatch`'s
+ * two argument objects in `dispatch-B9if0XZc.js`), and the placeholder text
+ * it DOES carry names no file. But the Telegram ingress step stages the
+ * file into `media/inbound/` and constructs that same placeholder text in
+ * one synchronous pass before `before_dispatch` ever runs, and this is a
+ * single-user bot with no concurrent uploads -- so "the newest file in
+ * media/inbound" is the file, not a guess. `mediaPath` metadata would be
+ * more precise if a hook actually delivered it; none does.
+ *
+ * DOUBLES AS THE FALLTHROUGH GUARD (task 6.3): returning `{ handled: true }`
+ * from `before_dispatch` is what stops the agent seeing the message at all
+ * -- there is no separate suppression step needed once the file is handled
+ * inside the hook that can actually say so.
  *
  * FAILS VISIBLY, NOT SILENTLY. Every branch that does not forward the file
  * replies with why -- never a bare "ok" and never nothing, per the hard
- * rule against silent no-ops.
+ * rule against silent no-ops. Registered SEPARATELY from
+ * `claims-pending-flow` (own hook name) so a throw in one cannot take out
+ * the other -- `runClaimingHooksList` tries the next handler on error.
  */
 function registerDocumentUpload(api) {
   if (typeof api.registerHook !== "function") {
@@ -332,23 +327,33 @@ function registerDocumentUpload(api) {
     return;
   }
   api.registerHook(
-    "message_received",
+    "before_dispatch",
     async (event) => {
-      const metadata = event?.metadata ?? {};
-      const mediaPath = metadata.mediaPath ?? metadata.mediaPaths?.[0];
-      if (!mediaPath) return;
-      const messageId = event?.messageId ?? event?.context?.messageId ?? null;
-      // Claimed BEFORE the first await, so the before_dispatch guard (which
-      // runs later in this same dispatch pass) is guaranteed to see it.
-      claimDocumentMessage(messageId);
-      const correlation = correlationId("csv-upload", { messageId });
-      const username =
-        metadata.senderUsername ?? event?.context?.senderUsername ?? event?.senderUsername ?? null;
+      const context = event?.context ?? {};
+      const text = context.text ?? context.message?.text ?? event?.content ?? "";
+      if (!SAVED_DOCUMENT_PLACEHOLDER_RE.test(text)) return {};
+
+      const correlation = correlationId("csv-upload", context);
+      const username = context.senderUsername ?? context.userName ?? context.username ?? null;
       try {
         const fs = await import("node:fs/promises");
         const path = await import("node:path");
+        const inboundDir = "/home/node/.openclaw/media/inbound";
+        const entries = await fs.readdir(inboundDir);
+        if (entries.length === 0) {
+          throw new Error(`the placeholder said a document was saved, but ${inboundDir} is empty`);
+        }
+        const stats = await Promise.all(
+          entries.map(async (name) => {
+            const full = path.join(inboundDir, name);
+            return { full, mtimeMs: (await fs.stat(full)).mtimeMs };
+          }),
+        );
+        stats.sort((a, b) => b.mtimeMs - a.mtimeMs);
+        const mediaPath = stats[0].full;
+
         const bytes = await fs.readFile(mediaPath);
-        const { status, text } = await callApp(
+        const { status, text: replyBody } = await callApp(
           "transactions/csv",
           {
             filename: path.basename(mediaPath),
@@ -360,46 +365,16 @@ function registerDocumentUpload(api) {
         );
         const replyText =
           status >= 400
-            ? `Upload failed (${status}). ${text}`.slice(0, 3500)
-            : text.slice(0, 3500);
-        const failure = await dispatchCard({ target: CHAT_ID, message: replyText }, "telegram", api.logger);
-        if (failure) api.logger?.error?.(`claims: could not send the CSV upload reply: ${failure}`);
+            ? `Upload failed (${status}). ${replyBody}`.slice(0, 3500)
+            : replyBody.slice(0, 3500);
+        return { handled: true, text: replyText, reply: { text: replyText } };
       } catch (err) {
         api.logger?.error?.(`claims: CSV upload forwarding failed: ${String(err)}`);
-        const failure = await dispatchCard(
-          { target: CHAT_ID, message: `Upload failed -- could not read or forward the file: ${String(err)}`.slice(0, 3500) },
-          "telegram",
-          api.logger,
-        );
-        if (failure) api.logger?.error?.(`claims: could not even send the CSV upload failure reply: ${failure}`);
+        const failText = `Upload failed -- could not read or forward the file: ${String(err)}`.slice(0, 3500);
+        return { handled: true, text: failText, reply: { text: failText } };
       }
     },
     { name: "claims-csv-upload", description: "Forward an inbound document to the app's CSV import route" },
-  );
-}
-
-/**
- * Suppress the agent turn for a document `registerDocumentUpload` already
- * claimed (task 6.3). Registered as its own `before_dispatch` handler --
- * `claims-pending-flow` above still runs first and still returns `{}` for a
- * document (its own text is non-empty but not a pending flow's answer), so
- * this one is what actually stops the fallthrough.
- *
- * No reply text here: `message_received`'s own async work sends the real
- * reply once the app has answered, which is usually not yet by the time
- * `before_dispatch` runs for the same message.
- */
-function registerDocumentDispatchGuard(api) {
-  if (typeof api.registerHook !== "function") return;
-  api.registerHook(
-    "before_dispatch",
-    async (event) => {
-      const context = event?.context ?? {};
-      const messageId = context.messageId ?? event?.messageId ?? null;
-      if (!tookDocumentMessage(messageId)) return {};
-      return { handled: true };
-    },
-    { name: "claims-csv-upload-guard", description: "Stop a claimed document upload from also reaching the agent" },
   );
 }
 
@@ -681,7 +656,6 @@ export default definePluginEntry({
     registerPendingFlowClaim(api);
     registerSendRoute(api);
     registerDocumentUpload(api);
-    registerDocumentDispatchGuard(api);
 
     void claimCommandMenu(api.logger);
     void reportRegistration(registered, api.logger);
