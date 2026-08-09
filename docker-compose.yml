@@ -155,12 +155,16 @@ services:
       # and the Telegram ingress spool. Named rather than bound, so nothing on
       # the host filesystem is reachable by accident.
       - gateway_state:/home/node/.openclaw
-      # The read side of the outbox, mounted at <stateDir>/media because the
-      # media allowlist is a fixed set of roots and ignores mounts it does not
-      # know about. Anywhere else fails with a path error that reads like a
-      # permissions problem (14.4). Read-only: the gateway sends these, it does
-      # not write them.
-      - media_outbox:/home/node/.openclaw/media:ro
+      # The read side of the outbox, mounted one level under <stateDir>/media
+      # (not at <stateDir>/media itself) so the mount shadows only the outbox
+      # subdirectory. The media allowlist's root is the whole <stateDir>/media
+      # tree (containment check, not an exact-path check), so a file under
+      # media/outbox/ is still inside the allowed root -- moving the mount here
+      # does not need a wider allowlist. Read-only: the gateway sends these, it
+      # does not write them. `media/inbound`, a sibling directory, is therefore
+      # part of the writable gateway_state volume, which is what an inbound
+      # Telegram document needs to stage into (csv-upload-via-telegram, 2026-08).
+      - media_outbox:/home/node/.openclaw/media/outbox:ro
       # The deploy scripts, read-only, so `deploy.ps1` can run
       # scripts/gateway_cron.sh through `docker compose exec` -- cron jobs are
       # added via the RUNNING gateway's RPC (`cron.add`), so unlike the pre-boot

@@ -176,7 +176,7 @@ GATEWAY_VERSION = os.environ.get("GATEWAY_VERSION", "")
 # These are the ONLY bytes that cross the container boundary. Widening either to
 # reach `app/data` would undo the isolation the whole design rests on.
 MEDIA_OUTBOX_DIR = os.environ.get("MEDIA_OUTBOX_DIR", "/data/outbox")
-MEDIA_OUTBOX_GATEWAY_DIR = os.environ.get("MEDIA_OUTBOX_GATEWAY_DIR", "/home/node/.openclaw/media")
+MEDIA_OUTBOX_GATEWAY_DIR = os.environ.get("MEDIA_OUTBOX_GATEWAY_DIR", "/home/node/.openclaw/media/outbox")
 
 # Twice-daily Google Drive DB backup (drive_backup.py). Folder ID is from
 # https://drive.google.com/drive/folders/1UAxtye0zKxRlZTIWya-GxMqQJK6RE0y2

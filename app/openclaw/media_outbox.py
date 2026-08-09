@@ -5,17 +5,26 @@ them live against native markdown tables and chose them (11.3). Today they are
 sent as **bytes** straight through python-telegram-bot. The gateway CLI takes a
 **path**, and it will not send from just any path: `assertLocalMediaAllowed`
 refuses anything outside a fixed set of roots, and `/tmp` is not among them
-(14.1, 14.4). Sending the identical file from `<stateDir>/media` succeeds.
+(14.1, 14.4). Sending the identical file from `<stateDir>/media/outbox` succeeds.
 
 So a file has to exist somewhere both containers can see, and that somewhere has
 to be inside one of the gateway's own roots. Hence one shared volume, mounted
-`/data/outbox` in the app and `<stateDir>/media` read-only in the gateway.
+`/data/outbox` in the app and `<stateDir>/media/outbox` read-only in the gateway.
 
 **Two path spaces for one file, and that is the thing to hold onto.** The app
 writes `/data/outbox/card-<id>.png`; the gateway must be told
-`/home/node/.openclaw/media/card-<id>.png`. Handing the gateway the app's path
-produces `Local media path is not under an allowed directory`, which reads like
-a permissions problem and is actually a namespace one.
+`/home/node/.openclaw/media/outbox/card-<id>.png`. Handing the gateway the app's
+path produces `Local media path is not under an allowed directory`, which reads
+like a permissions problem and is actually a namespace one.
+
+The mount point moved one level down, from `<stateDir>/media` to
+`<stateDir>/media/outbox`, during `csv-upload-via-telegram` (2026-08). Read-only
+at the OLD mount point shadowed the whole `media` tree, including
+`media/inbound` — the directory the gateway itself downloads an inbound
+Telegram document into. Nesting the outbox one level deeper leaves
+`media/inbound` on the writable `gateway_state` volume, and the allowlist still
+accepts it: the check is containment under `<stateDir>/media`, not an exact
+path, so a file under `media/outbox/` is still inside the allowed root.
 
 **Why not widen the allowlist instead.** `media.localRoots` accepts the string
 `"any"`, which disables the check outright. It is one word and it is the whole
