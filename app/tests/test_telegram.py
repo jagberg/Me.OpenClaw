@@ -2,6 +2,8 @@
 no telegram Update objects (pure handler functions only). Run with:
 python tests/test_telegram.py"""
 
+import asyncio
+import base64
 import json
 import os
 import sys
@@ -19,7 +21,9 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 from openclaw import (  # noqa: E402
     claim_forms,
     claim_status,
+    config,
     db,
+    internal_api,
     invoice_matching,
     pipeline,
     telegram_bot,
@@ -27,6 +31,18 @@ from openclaw import (  # noqa: E402
 
 AUTHORIZED_USER = "jagberg"
 UNAUTHORIZED_USER = "someone_else"
+
+
+class _FakeCsvRequest:
+    """Enough of a `Request` for `internal_api.transactions_csv`: `.client.host`
+    and an async `.json()`."""
+
+    def __init__(self, body, host="127.0.0.1"):
+        self._body = body
+        self.client = type("c", (), {"host": host})()
+
+    async def json(self):
+        return self._body
 
 
 def _seed_matched_claim(
@@ -706,6 +722,83 @@ def test_apply_item_conditions_groups_and_fills_rows():
             conn.execute("SELECT status FROM vet_claims WHERE id = ?", (cid,)).fetchone()[0]
             == "drafted"
         )
+
+
+def _csv_body(csv_text, username=AUTHORIZED_USER, filename="test.csv", chat_id=4242):
+    return {
+        "filename": filename,
+        "content_b64": base64.b64encode(csv_text.encode("utf-8")).decode("ascii"),
+        "username": username,
+        "chat_id": chat_id,
+    }
+
+
+def test_transactions_csv_authorized_upload_is_teed_settled_and_imports():
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM bank_transactions")
+    before_secret, before_hosts = config.INTERNAL_API_SECRET, config.INTERNAL_API_ALLOW_HOSTS
+    config.INTERNAL_API_SECRET = "s3cret"
+    orig_run_once = pipeline.run_once
+    pipeline.run_once = lambda: None
+    try:
+        body = _csv_body('06/07/2026,"-12.00","TEST MERCHANT            SYDNEY      AUS",""\n')
+        request = _FakeCsvRequest(body)
+        response = asyncio.run(internal_api.transactions_csv(request, "s3cret", "corr-csv-1"))
+    finally:
+        config.INTERNAL_API_SECRET, config.INTERNAL_API_ALLOW_HOSTS = before_secret, before_hosts
+        pipeline.run_once = orig_run_once
+    assert response["status"] == "ok", response
+    assert "Imported 1 new transaction" in response["result"]
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT correlation_id, direction, processed_at FROM telegram_messages WHERE correlation_id = ?",
+            ("corr-csv-1",),
+        ).fetchone()
+    assert row is not None, "the upload must be teed as an inbound row"
+    assert row["direction"] == "in"
+    assert row["processed_at"] is not None, "the row must be settled, not left pending"
+
+
+def test_transactions_csv_unauthorized_sender_is_refused_logged_and_answered():
+    before_secret = config.INTERNAL_API_SECRET
+    config.INTERNAL_API_SECRET = "s3cret"
+    try:
+        body = _csv_body('06/07/2026,"-1.00","X SYDNEY AUS",""\n', username=UNAUTHORIZED_USER)
+        request = _FakeCsvRequest(body)
+        response = asyncio.run(internal_api.transactions_csv(request, "s3cret", "corr-csv-2"))
+    finally:
+        config.INTERNAL_API_SECRET = before_secret
+    assert response["status"] == "ok"
+    assert "not authorized" in response["result"].lower()
+
+
+def test_transactions_csv_malformed_body_is_a_400_not_a_500():
+    before_secret = config.INTERNAL_API_SECRET
+    config.INTERNAL_API_SECRET = "s3cret"
+
+    class _BrokenJsonRequest(_FakeCsvRequest):
+        async def json(self):
+            raise ValueError("not json")
+
+    try:
+        response = asyncio.run(
+            internal_api.transactions_csv(_BrokenJsonRequest({}), "s3cret", "corr-csv-3")
+        )
+    finally:
+        config.INTERNAL_API_SECRET = before_secret
+    assert response.status_code == 400
+
+
+def test_transactions_csv_bad_secret_is_rejected_before_touching_the_db():
+    before_secret = config.INTERNAL_API_SECRET
+    config.INTERNAL_API_SECRET = "s3cret"
+    try:
+        request = _FakeCsvRequest(_csv_body('06/07/2026,"-1.00","X SYDNEY AUS",""\n'))
+        response = asyncio.run(internal_api.transactions_csv(request, "wrong-secret", "corr-csv-4"))
+    finally:
+        config.INTERNAL_API_SECRET = before_secret
+    assert response.status_code == 403
 
 
 if __name__ == "__main__":

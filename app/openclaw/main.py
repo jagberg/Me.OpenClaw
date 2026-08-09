@@ -94,7 +94,7 @@ app.include_router(mcp_server.router)
 
 
 @app.get("/")
-def dashboard(request: Request, upload_error: str | None = None):
+def dashboard(request: Request, upload_error: str | None = None, upload_result: str | None = None):
     with db.get_connection() as conn:
         open_tasks = conn.execute(
             "SELECT * FROM tasks WHERE status = 'open' ORDER BY created_at DESC"
@@ -118,6 +118,8 @@ def dashboard(request: Request, upload_error: str | None = None):
             "pets": pets,
             "ledger": claim_status.visit_ledger(),
             "upload_error": upload_error,
+            "upload_result": upload_result,
+            "transactions_watermark": netbank_csv.latest_transaction_date(),
             **claim_status.dashboard_lists(),
         },
     )
@@ -209,16 +211,17 @@ def outcome(task_id: int, outcome: str = Form(...)):
 
 @app.post("/transactions/upload")
 async def upload_transactions(file: UploadFile = File(...)):
+    """Calls the SAME entrypoint the Telegram upload does (task 5.1). This is
+    also what closes the pre-existing defect on this path: before, this
+    handler called `pipeline.run_once()` directly, outside `run_exclusive`,
+    so a dashboard upload landing during a cron tick ran two pipelines
+    concurrently — and the pipeline drafts Gmail submissions, so that was two
+    insurer submissions for one set of invoices. `ingest_upload` runs the scan
+    under the tick's own lock; both channels are one entrypoint or they are not.
+    """
     content = (await file.read()).decode("utf-8", errors="replace")
-    try:
-        rows = netbank_csv.parse(content)
-    except netbank_csv.CsvParseError as exc:
-        logger.error("NetBank CSV parse failure: %s", exc)
-        return RedirectResponse(f"/?upload_error={quote(str(exc))}", status_code=303)
-
-    netbank_csv.import_rows(rows)
-    pipeline.run_once()
-    return RedirectResponse("/", status_code=303)
+    result = netbank_csv.ingest_upload(content)
+    return RedirectResponse(f"/?upload_result={quote(result)}", status_code=303)
 
 
 @app.post("/claims/{claim_id}/pet")

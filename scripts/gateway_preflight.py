@@ -574,6 +574,34 @@ def check_media_roots(cfg: dict) -> Result:
     return result.ok(f"localRoots={roots!r}" if roots else "default roots")
 
 
+def check_inbound_document_path(gw: Gateway) -> Result:
+    """csv-upload-via-telegram task 7.1 — `check_button_commands`' principle:
+    a silently broken path must not look like a week with no uploads.
+
+    Weaker than the real thing, and the gap is stated rather than papered
+    over, exactly as `check_button_commands` states its own: there is no way
+    to fake a real Telegram document send from a deploy script, so this
+    checks the ONE structural prerequisite that has actually broken here.
+    `media/inbound` sits under a mount that was read-only until
+    csv-upload-via-telegram, and Docker recreates its parent as root:root
+    every time the outbox mount's own directory is auto-vivified (task 1.6) —
+    so both the mount mode and the ownership are checked, not just one.
+    """
+    result = Result("inbound document path writable")
+    code, out, err = gw.shell(
+        "mkdir -p /home/node/.openclaw/media/inbound "
+        "&& touch /home/node/.openclaw/media/inbound/.preflight-write-test "
+        "&& rm /home/node/.openclaw/media/inbound/.preflight-write-test "
+        "&& echo WRITABLE"
+    )
+    if code != 0 or "WRITABLE" not in out:
+        return result.fail(
+            f"media/inbound is not writable by the gateway's own user -- an inbound "
+            f"Telegram document will stage silently and never reach the app: {(err or out).strip()[:200]}"
+        )
+    return result.ok()
+
+
 def check_menu_scopes(gw: Gateway) -> Result:
     """13.1c — the app owns Telegram's per-chat scope only while it stays free.
 
@@ -727,6 +755,7 @@ def main() -> int:
         )
     )
     results.append(check_media_roots(gw.config("media")))
+    results.append(check_inbound_document_path(gw))
     results.append(check_app_can_send(args.app_container))
     results.append(check_isolation(gw))
     results.append(check_menu_scopes(gw))

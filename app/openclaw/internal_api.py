@@ -815,6 +815,77 @@ async def telegram_claim(
     }
 
 
+@router.post("/transactions/csv")
+async def transactions_csv(
+    request: Request,
+    x_openclaw_secret: str | None = Header(default=None),
+    x_correlation_id: str | None = Header(default=None),
+):
+    """The Telegram half of `csv-upload-via-telegram` (task 4): a document the
+    plugin's `message_received` hook staged and read arrives here as base64.
+
+    Thin wrapper only, per this module's own rule — decode, authorize, tee,
+    call `netbank_csv.ingest_upload` (task 3.3, the SAME entrypoint the
+    dashboard's `/transactions/upload` calls), settle, return the reply text.
+    No CSV parsing and no claims logic here; that would be a second copy of
+    what the dashboard path already does, and this project has been bitten by
+    second copies of a rule enough times to have a name for the pattern.
+    """
+    from . import netbank_csv
+
+    correlation = _correlation_id(x_correlation_id)
+    rejected = _guard(request, x_openclaw_secret, "transactions/csv", correlation)
+    if rejected is not None:
+        return rejected
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    username = body.get("username")
+    if not commands_is_authorized(username):
+        # Refused, logged and answered -- never silently dropped (task 4.2).
+        logger.warning(
+            "transactions/csv refused for unauthorized sender %r correlation=%s",
+            username,
+            correlation,
+        )
+        return {
+            "status": "ok",
+            "route": "transactions/csv",
+            "correlation_id": correlation,
+            "result": "Not authorized to upload transactions.",
+        }
+
+    filename = body.get("filename") or "upload.csv"
+    content_b64 = body.get("content_b64") or ""
+    chat_id = body.get("chat_id") or db.registered_chat_id()
+    inbound_id = tee_inbound(correlation, f"[csv upload] {filename}", username, chat_id=chat_id)
+    try:
+        import base64
+
+        csv_text = base64.b64decode(content_b64).decode("utf-8", errors="replace")
+        result_text = netbank_csv.ingest_upload(csv_text)
+    except Exception as exc:  # noqa: BLE001 — an upload that failed must say so
+        settle_inbound(inbound_id, str(exc))
+        logger.error("transactions/csv failed correlation=%s: %s", correlation, exc, exc_info=True)
+        return {
+            "status": "error",
+            "route": "transactions/csv",
+            "correlation_id": correlation,
+            "result": f"Upload failed: {exc}",
+        }
+
+    settle_inbound(inbound_id)
+    logger.info("transactions/csv ok filename=%s correlation=%s", filename, correlation)
+    return {
+        "status": "ok",
+        "route": "transactions/csv",
+        "correlation_id": correlation,
+        "result": result_text,
+    }
+
+
 def commands_is_authorized(username: str | None) -> bool:
     from . import commands
 

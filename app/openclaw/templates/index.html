@@ -162,6 +162,10 @@
         <button type="submit">Upload NetBank CSV</button>
       </form>
       {% if upload_error %}<span class="flagnote">Upload failed: {{ upload_error }}</span>{% endif %}
+      {% if upload_result %}<span class="sub">{{ upload_result }}</span>{% endif %}
+    </div>
+    <div class="sub">
+      {% if transactions_watermark %}Latest transaction held: {{ transactions_watermark }}.{% else %}No transactions held.{% endif %}
     </div>
   </section>
 

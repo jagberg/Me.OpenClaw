@@ -109,10 +109,13 @@ def test_netbank_csv_parses_and_dedups_on_reupload():
     assert rows[0]["merchant"] == "EXAMPLE MERCHANT PTY LT SYDNEY AUS"
     assert rows[1]["amount"] == -85.00
 
-    inserted_first = netbank_csv.import_rows(rows)
-    inserted_second = netbank_csv.import_rows(rows)  # overlapping re-upload, the normal case
-    assert inserted_first == 2
+    read_first, inserted_first, skipped_first = netbank_csv.import_rows(rows)
+    read_second, inserted_second, skipped_second = netbank_csv.import_rows(
+        rows
+    )  # overlapping re-upload, the normal case
+    assert (read_first, inserted_first, skipped_first) == (2, 2, 0)
     assert inserted_second == 0, "re-upload of the same rows must not duplicate"
+    assert (read_second, skipped_second) == (2, 2)
 
 
 def test_netbank_csv_bad_layout_raises_visibly():
@@ -122,6 +125,128 @@ def test_netbank_csv_bad_layout_raises_visibly():
     except netbank_csv.CsvParseError:
         raised = True
     assert raised, "unrecognized CSV layout must surface a visible failure, not silently skip"
+
+
+def test_netbank_csv_bad_row_names_the_offending_row_and_inserts_nothing():
+    """CsvParseError must name the row (task 3.5) and parse() must raise before
+    any row is returned -- nothing partial is ever inserted."""
+    db.init_db()
+    csv_text = (
+        '09/07/2026,"-19.64","GOOD ROW ONE             SYDNEY      AUS",""\n'
+        '09/07/2026,"-1.00","BAD","ROW","EXTRA"\n'
+    )
+    try:
+        netbank_csv.parse(csv_text)
+        raised = False
+    except netbank_csv.CsvParseError as exc:
+        raised = True
+        assert "row 2" in str(exc), str(exc)
+    assert raised
+    with db.get_connection() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM bank_transactions WHERE merchant LIKE 'GOOD ROW%'"
+        ).fetchone()[0]
+    assert count == 0, "a parse failure on row 2 must not have inserted row 1"
+
+
+def test_watermark_derivation():
+    """The watermark is `MAX(date)`, empty-table-safe, and an overlapping
+    re-upload must not appear to move it backwards or duplicate it forward."""
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM bank_transactions")
+    assert netbank_csv.latest_transaction_date() is None
+
+    netbank_csv.import_rows(
+        netbank_csv.parse('01/07/2026,"-10.00","MERCHANT A               SYDNEY      AUS",""\n')
+    )
+    assert netbank_csv.latest_transaction_date() == "2026-07-01"
+
+    # A later upload that overlaps an earlier date must not move the watermark
+    # backwards, and re-parsing an already-held date must not duplicate it.
+    netbank_csv.import_rows(
+        netbank_csv.parse(
+            '01/07/2026,"-10.00","MERCHANT A               SYDNEY      AUS",""\n'
+            '05/07/2026,"-20.00","MERCHANT B               SYDNEY      AUS",""\n'
+        )
+    )
+    assert netbank_csv.latest_transaction_date() == "2026-07-05"
+
+
+def test_no_stored_watermark_exists():
+    """Nothing outside `bank_transactions` may answer "latest transaction
+    date" (design.md Decision 3: derived, never stored) -- a second answer to
+    the same question eventually disagrees with the first."""
+    with db.get_connection() as conn:
+        columns = {
+            row[1]
+            for table in ("bank_transactions",)
+            for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        all_tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    assert "watermark" not in " ".join(all_tables).lower()
+    assert not any("watermark" in c.lower() for c in columns)
+
+
+def test_ingest_upload_reports_counts_claims_and_watermark():
+    from openclaw import pipeline
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM bank_transactions")
+    orig_run_once = pipeline.run_once
+    pipeline.run_once = lambda: None  # isolate from Gmail/LLM entirely
+    try:
+        result = netbank_csv.ingest_upload(
+            '02/07/2026,"-30.00","MERCHANT C               SYDNEY      AUS",""\n'
+        )
+    finally:
+        pipeline.run_once = orig_run_once
+    assert "Imported 1 new transaction" in result
+    assert "1 read" in result
+    assert "0 claim(s) found" in result
+    assert "2026-07-02" in result
+
+
+def test_ingest_upload_reports_a_skipped_scan_as_skipped_not_success():
+    """`ran=False` (a tick already in flight) must be stated as such, never as
+    a completed scan (design.md Decision 4)."""
+    import threading
+
+    from openclaw import internal_api
+
+    lock = internal_api._locks.setdefault("tick", threading.Lock())
+    lock.acquire()
+    try:
+        result = netbank_csv.ingest_upload(
+            '03/07/2026,"-40.00","MERCHANT D               SYDNEY      AUS",""\n'
+        )
+    finally:
+        lock.release()
+    assert "already running" in result
+    assert "Imported 1 new transaction" in result
+
+
+def test_ingest_upload_reports_a_raised_scan_as_partial_not_plain_success():
+    from openclaw import pipeline
+
+    orig_run_once = pipeline.run_once
+
+    def _boom():
+        raise RuntimeError("scan exploded")
+
+    pipeline.run_once = _boom
+    try:
+        result = netbank_csv.ingest_upload(
+            '04/07/2026,"-50.00","MERCHANT E               SYDNEY      AUS",""\n'
+        )
+    finally:
+        pipeline.run_once = orig_run_once
+    assert "scan failed" in result
+    assert "scan exploded" in result
+    assert "Imported 1 new transaction" in result
 
 
 def test_classify_obvious_vet_merchant_skips_gemini():
