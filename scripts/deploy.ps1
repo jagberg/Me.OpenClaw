@@ -102,6 +102,14 @@ $buildExit = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 if ($buildExit -ne 0) { throw "docker compose failed with exit code $buildExit" }
 
+# Docker auto-creates the mount-point directory for the nested
+# media/outbox bind (docker-compose.yml) as root:root, but the gateway
+# process runs as uid 1000 (node) and cannot write media/inbound under a
+# root-owned parent -- confirmed live, csv-upload-via-telegram task 1.6.
+# Idempotent: a no-op once the directory is already node-owned, and safe
+# to run every deploy rather than only on a fresh volume.
+docker compose exec -T -u root gateway chown node:node /home/node/.openclaw/media 2>&1 | Out-Null
+
 # --- health, per runtime, and a partial start is a failure --------------------
 #
 # POLL to a deadline; do NOT sleep once and probe once. A fixed 15s wait raced
