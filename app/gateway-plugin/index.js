@@ -398,40 +398,32 @@ function registerDocumentUpload(api) {
 }
 
 /**
- * `/upload-tx` sent with a CSV attached, as an explicit alternative to the
- * caption-less path above -- Justin's own ask, so he can say what he means
- * rather than relying on "any document" detection. A real registered
- * command, which is the ONE dispatch path already proven reliable in this
- * plugin (every other slash command uses it); avoids the open question of
- * whether a captioned "/upload-tx" would even reach `before_dispatch` before
- * command-routing does something else with it.
+ * `/upload-tx` as a PROMPT, not an attachment carrier. Telegram's own
+ * clients do not offer a way to attach a caption while composing a slash
+ * command (measured live -- Justin could not produce that combination), so
+ * a command handler can never see the file at all; the two have to be two
+ * separate messages.
+ *
+ * So this asks for the file rather than trying to receive it: reply telling
+ * Justin to send the CSV next, no caption. The caption-less path
+ * (`registerDocumentUpload`, above) picks it up unconditionally the moment
+ * it arrives -- nothing here needs to arm, remember or expire a pending
+ * state, because that path was never waiting for `/upload-tx` to unlock it.
+ * This command exists only because "attach a file" with no visible prompt
+ * is not obviously the way in.
  */
 function registerUploadTxCommand(api) {
   if (typeof api.registerCommand !== "function") {
-    api.logger?.error?.("claims: api.registerCommand is unavailable -- /upload-tx cannot be registered");
+    api.logger?.error?.("claims: api.registerCommand is unavailable -- /upload-tx cannot prompt for the file");
     return;
   }
   api.registerCommand({
     name: "upload-tx",
-    description: "Import a NetBank CSV attached to this message",
-    acceptsArgs: true,
-    handler: async (ctx) => {
-      const correlation = correlationId("upload-tx", ctx);
-      const username = ctx.senderUsername ?? ctx.userName ?? ctx.username ?? null;
-      try {
-        // 30s: long enough for the attachment to finish staging alongside
-        // the command text, short enough that a bare "/upload-tx" typed
-        // later never reprocesses an old file.
-        const staged = await findNewestStagedFile(30_000);
-        if (!staged) {
-          return { text: "No file attached -- send /upload-tx with the CSV as an attachment." };
-        }
-        const text = await forwardStagedCsv(staged.path, { username, correlation });
-        return { text };
-      } catch (err) {
-        return { text: `/upload-tx could not read or forward the file: ${String(err)}`.slice(0, 3500) };
-      }
-    },
+    description: "Import a NetBank CSV",
+    acceptsArgs: false,
+    handler: async () => ({
+      text: "Send the NetBank CSV now as a document attachment, with no caption -- it imports automatically.",
+    }),
   });
 }
 
