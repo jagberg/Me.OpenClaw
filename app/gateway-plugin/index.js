@@ -376,6 +376,14 @@ function registerDocumentUpload(api) {
     async (event) => {
       const context = event?.context ?? {};
       const text = context.text ?? context.message?.text ?? event?.content ?? "";
+      // TEMPORARY (csv-upload-via-telegram spike, remove once the real shape
+      // is confirmed): the agent still ran on the last two real sends despite
+      // this hook being deployed, so log every invocation rather than only
+      // the ones that match -- proves whether the hook runs at all and what
+      // shape it actually receives.
+      api.logger?.info?.(
+        `claims: csv-upload before_dispatch saw text=${JSON.stringify(text)} event=${JSON.stringify(event).slice(0, 800)}`,
+      );
       if (!SAVED_DOCUMENT_PLACEHOLDER_RE.test(text)) return {};
 
       const correlation = correlationId("csv-upload", context);
