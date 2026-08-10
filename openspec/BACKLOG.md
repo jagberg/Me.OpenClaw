@@ -582,3 +582,16 @@ Worth knowing: **the charge date equalled Petcover's stated treatment date on al
   — correct the map first, or accept that the new links need fixing too.
   Supersedes the earlier "not correctable from data we hold", which was written
   before that table was read.
+
+## From csv-upload-via-telegram (archived 2026-08-10)
+
+- **`templates/index.html:299` crashes on some dashboard ledger rows.** `d.claimable_subtotal`
+  is missing on some claims in `claim_status.dashboard_lists()`'s output — a data-shape gap,
+  not touched by csv-upload-via-telegram. Found live while verifying that change's dashboard
+  parity (task 8.4), after fixing an unrelated `TemplateResponse` signature bug that was
+  masking it. Reproduce: `GET /` against the live DB.
+- **`claims-pending-flow`'s condition-entry flow is unverified since the gateway cutover.**
+  ADR-0029 found `before_dispatch` hooks silently never invoke a plugin's handler in gateway
+  2026.7.1; this flow uses the identical mechanism and has not been independently re-checked
+  against a real typed condition since. If it's also broken, condition text is falling through
+  to the chat agent — the exact outcome the hard rules forbid.
