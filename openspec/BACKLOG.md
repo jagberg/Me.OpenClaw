@@ -585,11 +585,23 @@ Worth knowing: **the charge date equalled Petcover's stated treatment date on al
 
 ## From csv-upload-via-telegram (archived 2026-08-10)
 
-- **`templates/index.html:299` crashes on some dashboard ledger rows.** `d.claimable_subtotal`
-  is missing on some claims in `claim_status.dashboard_lists()`'s output — a data-shape gap,
-  not touched by csv-upload-via-telegram. Found live while verifying that change's dashboard
-  parity (task 8.4), after fixing an unrelated `TemplateResponse` signature bug that was
-  masking it. Reproduce: `GET /` against the live DB.
+- ~~`templates/index.html:299` crashes on some dashboard ledger rows.~~ **Fixed
+  2026-08-10.** The line above misdiagnosed the crash site: it isn't
+  `visit_ledger()`'s ledger rows — that function always populates a
+  `claimable` key. The real feed is `dashboard_lists()`'s `unclassified` list
+  in the email-review-queue block: settlement-comparison events
+  (`mismatch_dismissed`/`settled`/`approved`) always write `claimable_subtotal`/
+  `claimed_amount`/`paid_amount` into `detail`, but a plain `unclassified`
+  Petcover reply that got manually linked to a claim (or correlated but never
+  classified) never had those keys — a real absence, not a bug. The template
+  used dict-attribute access (`d.claimable_subtotal`), which raises
+  `jinja2.exceptions.UndefinedError` the instant the key is missing, before
+  the existing `is not none` fallback ever runs. Fixed at the template
+  (`app/openclaw/templates/index.html:294-306`, switched to `d.get(...)`) —
+  not in `claim_status.py` — because fabricating a `claimable_subtotal` for
+  an event type that never had one would guess a value the hard rules forbid.
+  Regression test: `test_dashboard_renders_a_claim_linked_unclassified_event_without_settlement_figures`
+  in `app/tests/test_core.py`.
 - **`claims-pending-flow`'s condition-entry flow is unverified since the gateway cutover.**
   ADR-0029 found `before_dispatch` hooks silently never invoke a plugin's handler in gateway
   2026.7.1; this flow uses the identical mechanism and has not been independently re-checked
