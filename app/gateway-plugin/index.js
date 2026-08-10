@@ -321,6 +321,51 @@ const SAVED_DOCUMENT_PLACEHOLDER_RE = /^<media:document>/;
  * `claims-pending-flow` (own hook name) so a throw in one cannot take out
  * the other -- `runClaimingHooksList` tries the next handler on error.
  */
+const INBOUND_MEDIA_DIR = "/home/node/.openclaw/media/inbound";
+
+/**
+ * The newest staged file in `media/inbound`, or `null`. Shared by both
+ * upload paths below -- caption-less (`before_dispatch`) and `/upload-tx`
+ * (a real command) -- because neither hook nor command carries a media path
+ * (task 1.1-1.4's spike; see `registerDocumentUpload`'s docstring), and this
+ * is single-user with no concurrent uploads, so "the newest file" is THE
+ * file, not a guess.
+ *
+ * `maxAgeMs` matters for `/upload-tx` specifically: typed with no
+ * attachment, it must not silently reprocess whatever was staged from an
+ * earlier, unrelated upload minutes or hours ago.
+ */
+async function findNewestStagedFile(maxAgeMs) {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const entries = await fs.readdir(INBOUND_MEDIA_DIR).catch(() => []);
+  if (entries.length === 0) return null;
+  const stats = await Promise.all(
+    entries.map(async (name) => {
+      const full = path.join(INBOUND_MEDIA_DIR, name);
+      return { full, mtimeMs: (await fs.stat(full)).mtimeMs };
+    }),
+  );
+  stats.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const newest = stats[0];
+  if (maxAgeMs != null && Date.now() - newest.mtimeMs > maxAgeMs) return null;
+  return { path: newest.full, basename: path.basename(newest.full) };
+}
+
+/** Reads and forwards a staged file to the app's CSV import route; returns
+ * the reply text either way -- never a bare "ok" and never nothing. */
+async function forwardStagedCsv(mediaPath, { username, correlation }) {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const bytes = await fs.readFile(mediaPath);
+  const { status, text } = await callApp(
+    "transactions/csv",
+    { filename: path.basename(mediaPath), content_b64: bytes.toString("base64"), username, chat_id: CHAT_ID },
+    correlation,
+  );
+  return status >= 400 ? `Upload failed (${status}). ${text}`.slice(0, 3500) : text.slice(0, 3500);
+}
+
 function registerDocumentUpload(api) {
   if (typeof api.registerHook !== "function") {
     api.logger?.error?.("claims: api.registerHook is unavailable -- an inbound CSV upload will reach the model as chat");
@@ -336,37 +381,11 @@ function registerDocumentUpload(api) {
       const correlation = correlationId("csv-upload", context);
       const username = context.senderUsername ?? context.userName ?? context.username ?? null;
       try {
-        const fs = await import("node:fs/promises");
-        const path = await import("node:path");
-        const inboundDir = "/home/node/.openclaw/media/inbound";
-        const entries = await fs.readdir(inboundDir);
-        if (entries.length === 0) {
-          throw new Error(`the placeholder said a document was saved, but ${inboundDir} is empty`);
+        const staged = await findNewestStagedFile(null);
+        if (!staged) {
+          throw new Error(`the placeholder said a document was saved, but ${INBOUND_MEDIA_DIR} is empty`);
         }
-        const stats = await Promise.all(
-          entries.map(async (name) => {
-            const full = path.join(inboundDir, name);
-            return { full, mtimeMs: (await fs.stat(full)).mtimeMs };
-          }),
-        );
-        stats.sort((a, b) => b.mtimeMs - a.mtimeMs);
-        const mediaPath = stats[0].full;
-
-        const bytes = await fs.readFile(mediaPath);
-        const { status, text: replyBody } = await callApp(
-          "transactions/csv",
-          {
-            filename: path.basename(mediaPath),
-            content_b64: bytes.toString("base64"),
-            username,
-            chat_id: CHAT_ID,
-          },
-          correlation,
-        );
-        const replyText =
-          status >= 400
-            ? `Upload failed (${status}). ${replyBody}`.slice(0, 3500)
-            : replyBody.slice(0, 3500);
+        const replyText = await forwardStagedCsv(staged.path, { username, correlation });
         return { handled: true, text: replyText, reply: { text: replyText } };
       } catch (err) {
         api.logger?.error?.(`claims: CSV upload forwarding failed: ${String(err)}`);
@@ -376,6 +395,44 @@ function registerDocumentUpload(api) {
     },
     { name: "claims-csv-upload", description: "Forward an inbound document to the app's CSV import route" },
   );
+}
+
+/**
+ * `/upload-tx` sent with a CSV attached, as an explicit alternative to the
+ * caption-less path above -- Justin's own ask, so he can say what he means
+ * rather than relying on "any document" detection. A real registered
+ * command, which is the ONE dispatch path already proven reliable in this
+ * plugin (every other slash command uses it); avoids the open question of
+ * whether a captioned "/upload-tx" would even reach `before_dispatch` before
+ * command-routing does something else with it.
+ */
+function registerUploadTxCommand(api) {
+  if (typeof api.registerCommand !== "function") {
+    api.logger?.error?.("claims: api.registerCommand is unavailable -- /upload-tx cannot be registered");
+    return;
+  }
+  api.registerCommand({
+    name: "upload-tx",
+    description: "Import a NetBank CSV attached to this message",
+    acceptsArgs: true,
+    handler: async (ctx) => {
+      const correlation = correlationId("upload-tx", ctx);
+      const username = ctx.senderUsername ?? ctx.userName ?? ctx.username ?? null;
+      try {
+        // 30s: long enough for the attachment to finish staging alongside
+        // the command text, short enough that a bare "/upload-tx" typed
+        // later never reprocesses an old file.
+        const staged = await findNewestStagedFile(30_000);
+        if (!staged) {
+          return { text: "No file attached -- send /upload-tx with the CSV as an attachment." };
+        }
+        const text = await forwardStagedCsv(staged.path, { username, correlation });
+        return { text };
+      } catch (err) {
+        return { text: `/upload-tx could not read or forward the file: ${String(err)}`.slice(0, 3500) };
+      }
+    },
+  });
 }
 
 /**
@@ -656,6 +713,7 @@ export default definePluginEntry({
     registerPendingFlowClaim(api);
     registerSendRoute(api);
     registerDocumentUpload(api);
+    registerUploadTxCommand(api);
 
     void claimCommandMenu(api.logger);
     void reportRegistration(registered, api.logger);
