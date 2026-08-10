@@ -528,6 +528,53 @@ def test_unclassified_reply_never_overwrites_status():
     assert status == "acknowledged", "unclassified is a review-queue entry, not a lifecycle stage"
 
 
+def test_dashboard_renders_a_claim_linked_unclassified_event_without_settlement_figures():
+    """Real 500, found live: `templates/index.html`'s review-queue row does
+    `d.claimable_subtotal` (etc.) on `e.detail|from_json`, but only
+    settlement-comparison events (`mismatch_dismissed`, `settled`, `approved`)
+    ever write those keys. An `unclassified` event that carries a known
+    reference — exactly `test_unclassified_reply_never_overwrites_status`
+    above — reaches the template with `claim_id` set and none of the three
+    keys, and `d.claimable_subtotal` raises `UndefinedError` on a plain dict
+    missing the key, crashing the whole dashboard. The absence is real (this
+    event was never a settlement letter), so the fix reads via `.get()` and
+    keeps the existing 'not recorded' / 'not stated' fallback text — not a
+    Python-side change to what `unclassified` events record."""
+    from openclaw import main as main_module
+
+    db.init_db()
+    with db.get_connection() as conn:
+        aari = conn.execute("SELECT id FROM pets WHERE name='Aari'").fetchone()[0]
+        claim_id = _insert_sent_claim(conn, aari, "2026-03-02", "draft-uncls-render")
+        conn.execute(
+            "UPDATE vet_claims SET status = 'acknowledged', petcover_reference = 'DC1-88-0002' WHERE id = ?",
+            (claim_id,),
+        )
+    claim_status.process_reply(
+        "msg-uncls-render-1",
+        "Petcover Claim DC1-88-0002 SR3",
+        "A new template we have never seen before.",
+    )
+
+    lists = claim_status.dashboard_lists()
+    assert claim_id in [e["claim_id"] for e in lists["unclassified"]], (
+        "fixture must reproduce the exact linked-unclassified review-queue row"
+    )
+
+    html = main_module.templates.env.get_template("index.html").render(
+        tasks=[],
+        reminders=[],
+        pets=[],
+        ledger=[],
+        upload_error=None,
+        upload_result=None,
+        transactions_watermark=None,
+        **lists,
+    )
+    assert f"claim #{claim_id}" in html
+    assert "not recorded" in html and "not stated" in html
+
+
 def test_parse_invoices_multi_and_legacy_shapes():
     multi = '{"invoices": [{"date": "2026-06-17", "amount": 141.87, "items": []}, {"date": "2026-07-06", "amount": 407.56, "items": []}]}'
     parsed = invoice_matching._parse_invoices(multi)

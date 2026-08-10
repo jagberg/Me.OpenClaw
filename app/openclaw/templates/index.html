@@ -295,12 +295,17 @@
              Show what the difference was made of — the link form would be a
              no-op here and link_event refuses an already-linked event. #}
           {% set d = e.detail|from_json %}
+          {# Only settlement-comparison events (mismatch_dismissed, settled,
+             approved) ever write these three keys. A manually-linked
+             `unclassified` reply carries neither — that absence is real, not
+             a bug — so read via .get() rather than dict attribute access,
+             which raises UndefinedError the moment the key is missing. #}
           <span>claim #{{ e.claim_id }}: we submitted
-            {{ '$%.2f'|format(d.claimable_subtotal) if d.claimable_subtotal is not none else 'not recorded' }},
+            {{ '$%.2f'|format(d.get('claimable_subtotal')) if d.get('claimable_subtotal') is not none else 'not recorded' }},
             Petcover assessed
-            {{ '$%.2f'|format(d.claimed_amount) if d.claimed_amount is not none else 'not stated' }},
+            {{ '$%.2f'|format(d.get('claimed_amount')) if d.get('claimed_amount') is not none else 'not stated' }},
             paid
-            {{ '$%.2f'|format(d.paid_amount) if d.paid_amount is not none else 'not stated' }}
+            {{ '$%.2f'|format(d.get('paid_amount')) if d.get('paid_amount') is not none else 'not stated' }}
             — waiting on Petcover</span>
           {% else %}
           <form class="inline" method="post" action="/events/{{ e.id }}/link">
