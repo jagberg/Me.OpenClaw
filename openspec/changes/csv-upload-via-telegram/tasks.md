@@ -116,5 +116,35 @@
       `CLAUDE.md` if the compose mount changed. Add an ADR only if 1.6 forces a real
       decision about the media boundary — the mount is the kind of thing the next reader
       will otherwise assume is arbitrary.
-- [ ] 8.7 Sync both capability deltas into `openspec/specs/` before archiving, or the
+- [x] 8.7 Sync both capability deltas into `openspec/specs/` before archiving, or the
       baseline rots.
+
+## Verified live (2026-08-10), and what changed from the plan
+
+- **Decision 6 resolved differently than planned.** Neither `message_received` nor
+  `before_dispatch` invokes a plugin's handler in this gateway version (2026.7.1):
+  `openclaw hooks list` reports both `claims-csv-upload` and `claims-pending-flow` as
+  `ready`, but a full gateway log across several real document sends shows zero
+  occurrences of either firing. Traced to the gateway's own `registerHook` wrapper
+  reading `evt.context` off a single parameter while the dispatcher calls
+  `hook.handler(event, ctx)` with two -- `ctx` is silently dropped. Not fixable from
+  the plugin. `/upload-tx`, a real registered COMMAND, is the actual working path:
+  send the CSV plain, then `/upload-tx` to import it (commands are the one dispatch
+  mechanism proven reliable in this project). The `before_dispatch` handler is left
+  registered as a zero-cost fallback in case a future gateway version closes the gap.
+- **Verified live, end to end:** file stages into `media/inbound` (mount+ownership
+  fix, task 1.6, confirmed); `/upload-tx` finds it, forwards it, imports 126 new
+  rows (130 read, 4 already held), scans and finds 1 claim, replies with the
+  watermark (`2026-08-06`) -- matches the live DB exactly (2105 rows). Re-running
+  `/upload-tx` against the same file reports 0 new / 130 already held: task 8.2's
+  dedup, confirmed.
+- **Not verified live:** 8.3 (malformed CSV / non-CSV document rejection) and full
+  dashboard-upload parity (8.4) -- covered by unit tests only.
+- **Found and fixed on the way, unrelated to this change:** `main.py` called the
+  deprecated `TemplateResponse(name, context)` signature; this Starlette version
+  (1.4.0) removed the positional swap entirely, so every dashboard load 500'd
+  (jinja tried to hash the context dict as a cache key). Fixed both call sites.
+- **A second, unrelated, pre-existing bug surfaced after that fix and was left
+  alone (out of scope):** `templates/index.html:299` reads `d.claimable_subtotal`
+  on a dashboard ledger row that lacks the key for some claims -- a data-shape
+  issue in `claim_status`/dashboard rendering, not touched by this change.

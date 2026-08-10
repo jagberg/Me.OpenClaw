@@ -5,7 +5,7 @@ Personal assistant that watches for vet expenses and does the insurance-claim le
 Built for one household (two dogs, two insurers). Three promises it never breaks:
 
 - **Never sends email.** Gmail drafts only — Justin reviews and hits send himself.
-- **Never stores bank logins.** Transactions arrive via manual NetBank CSV upload.
+- **Never stores bank logins.** Transactions arrive via manual NetBank CSV upload — the dashboard, or a document sent to the Telegram bot (`/upload-tx` to import a just-sent file; a caption-less document is also picked up directly when the gateway's dispatch hooks fire).
 - **Never guesses required claim fields.** Anything it can't derive from a document (the claimed condition, an ambiguous pet) is flagged and asked — on Telegram and the dashboard — not inferred.
 
 ## The goal
@@ -15,7 +15,7 @@ Vet visits generate a paper chase: a card charge, an emailed invoice (sometimes 
 ## The process, end to end
 
 ```
-NetBank CSV upload (dashboard)
+NetBank CSV upload (dashboard, or Telegram document + /upload-tx)
         │
         ▼
 vet_detection ── keyword match on merchant, LLM fallback, non-vet denylist
