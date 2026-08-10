@@ -294,11 +294,20 @@ const SAVED_DOCUMENT_PLACEHOLDER_RE = /^<media:document>/;
  * visible trace on our side. Confirmed live: a real document staged
  * correctly (media/inbound had the file) and still reached the agent as a
  * chat turn, with zero app-side log activity for the forward that should
- * have happened. `before_dispatch` does not hit this: its existing handler
- * (`claims-pending-flow`, above) has read `event.context.text` successfully
- * in production for months, so its wiring merges the two arguments
- * correctly where `message_received`'s does not -- a gateway inconsistency,
- * not a plugin bug, and not fixable from here.
+ * have happened.
+ *
+ * UPDATE, after switching to `before_dispatch`: it does not fire either.
+ * `openclaw hooks list` reports this hook `ready`, and a real document send
+ * produced zero occurrences of it (or of `claims-pending-flow`, its
+ * neighbour) anywhere in a 2.2MB gateway log. Staging into `media/inbound`
+ * itself is unaffected and confirmed reliable every time -- it is
+ * specifically a plugin hook's reaction to the message that this gateway
+ * version (2026.7.1) never runs, for either hook this plugin registers on
+ * `before_dispatch`. This handler is kept anyway: it costs nothing while it
+ * never matches, and would need no changes if a future gateway version
+ * fixes the dispatch gap. `registerUploadTxCommand` below is the path that
+ * actually works today, because commands are the one dispatch mechanism
+ * this project has verified live for months.
  *
  * WHY LOCATE THE FILE RATHER THAN READ A PATH OFF THE EVENT. `before_dispatch`
  * carries no media field at all (confirmed by reading `runBeforeDispatch`'s
@@ -376,14 +385,6 @@ function registerDocumentUpload(api) {
     async (event) => {
       const context = event?.context ?? {};
       const text = context.text ?? context.message?.text ?? event?.content ?? "";
-      // TEMPORARY (csv-upload-via-telegram spike, remove once the real shape
-      // is confirmed): the agent still ran on the last two real sends despite
-      // this hook being deployed, so log every invocation rather than only
-      // the ones that match -- proves whether the hook runs at all and what
-      // shape it actually receives.
-      api.logger?.info?.(
-        `claims: csv-upload before_dispatch saw text=${JSON.stringify(text)} event=${JSON.stringify(event).slice(0, 800)}`,
-      );
       if (!SAVED_DOCUMENT_PLACEHOLDER_RE.test(text)) return {};
 
       const correlation = correlationId("csv-upload", context);
@@ -406,32 +407,55 @@ function registerDocumentUpload(api) {
 }
 
 /**
- * `/upload-tx` as a PROMPT, not an attachment carrier. Telegram's own
- * clients do not offer a way to attach a caption while composing a slash
- * command (measured live -- Justin could not produce that combination), so
- * a command handler can never see the file at all; the two have to be two
- * separate messages.
+ * `/upload-tx`: send the CSV first (plain, no caption), then this command
+ * to actually import it. Two messages, not one -- Telegram's clients have no
+ * way to attach a caption while composing a slash command (measured live),
+ * so a command can never carry the file itself.
  *
- * So this asks for the file rather than trying to receive it: reply telling
- * Justin to send the CSV next, no caption. The caption-less path
- * (`registerDocumentUpload`, above) picks it up unconditionally the moment
- * it arrives -- nothing here needs to arm, remember or expire a pending
- * state, because that path was never waiting for `/upload-tx` to unlock it.
- * This command exists only because "attach a file" with no visible prompt
- * is not obviously the way in.
+ * WHY THIS IS THE ONLY RELIABLE PATH. `registerDocumentUpload`'s
+ * `before_dispatch` hook -- and, before that, a `message_received` hook --
+ * were both measured live to never invoke the plugin's handler at all,
+ * despite `openclaw hooks list` reporting both `claims-pending-flow` (this
+ * plugin's OTHER before_dispatch hook) and `claims-csv-upload` as
+ * `ready`, and despite a full 2.2MB gateway log carrying zero occurrences
+ * of either hook's own diagnostic output for a real inbound document. The
+ * file itself stages into `media/inbound` reliably every time (confirmed
+ * repeatedly) -- it is specifically the plugin's hook-driven reaction to it
+ * that this gateway version never runs. Commands are the one dispatch path
+ * that has worked throughout this project (mark/pet/resolve/etc, unchanged
+ * for months), so this reuses that path instead of a third attempt at a
+ * hook. The `before_dispatch` handler above is left in place in case a
+ * future gateway version fixes the dispatch gap; it costs nothing while
+ * broken since it simply never matches.
+ *
+ * A generous window (10 minutes) because the two messages are typed
+ * separately by a person, not machine-paced.
  */
 function registerUploadTxCommand(api) {
   if (typeof api.registerCommand !== "function") {
-    api.logger?.error?.("claims: api.registerCommand is unavailable -- /upload-tx cannot prompt for the file");
+    api.logger?.error?.("claims: api.registerCommand is unavailable -- /upload-tx cannot import the file");
     return;
   }
   api.registerCommand({
     name: "upload-tx",
-    description: "Import a NetBank CSV",
+    description: "Import the NetBank CSV just sent",
     acceptsArgs: false,
-    handler: async () => ({
-      text: "Send the NetBank CSV now as a document attachment, with no caption -- it imports automatically.",
-    }),
+    handler: async (ctx) => {
+      const correlation = correlationId("upload-tx", ctx);
+      const username = ctx.senderUsername ?? ctx.userName ?? ctx.username ?? null;
+      try {
+        const staged = await findNewestStagedFile(10 * 60 * 1000);
+        if (!staged) {
+          return {
+            text: "No recent file found -- send the CSV as a document attachment (no caption), then /upload-tx.",
+          };
+        }
+        const text = await forwardStagedCsv(staged.path, { username, correlation });
+        return { text };
+      } catch (err) {
+        return { text: `/upload-tx could not read or forward the file: ${String(err)}`.slice(0, 3500) };
+      }
+    },
   });
 }
 
