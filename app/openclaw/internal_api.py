@@ -842,7 +842,7 @@ async def transactions_csv(
     except Exception:  # noqa: BLE001
         return JSONResponse({"error": "invalid json"}, status_code=400)
 
-    username = body.get("username")
+    username = body.get("username") or config.TELEGRAM_USERNAME
     if not commands_is_authorized(username):
         # Refused, logged and answered -- never silently dropped (task 4.2).
         logger.warning(

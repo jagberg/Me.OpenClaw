@@ -372,7 +372,18 @@ async function forwardStagedCsv(mediaPath, { username, correlation }) {
     { filename: path.basename(mediaPath), content_b64: bytes.toString("base64"), username, chat_id: CHAT_ID },
     correlation,
   );
-  return status >= 400 ? `Upload failed (${status}). ${text}`.slice(0, 3500) : text.slice(0, 3500);
+  // The route answers with a JSON envelope ({status, route, correlation_id,
+  // result}), not plain text -- `text` here is the raw HTTP body. Measured
+  // live: without this, the reply Justin sees is the whole envelope as a
+  // string, not the human-readable result inside it.
+  let result = text;
+  try {
+    result = JSON.parse(text)?.result ?? text;
+  } catch {
+    // Not JSON (a 500 from something upstream, say) -- fall back to the raw
+    // body rather than hide it.
+  }
+  return status >= 400 ? `Upload failed (${status}). ${result}`.slice(0, 3500) : result.slice(0, 3500);
 }
 
 function registerDocumentUpload(api) {
