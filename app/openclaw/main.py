@@ -110,9 +110,9 @@ def dashboard(request: Request, upload_error: str | None = None, upload_result: 
     # matched / drafted parallel lists — every vet charge appears once, claims
     # nested beneath (see change unified-visit-claim-view).
     return templates.TemplateResponse(
+        request,
         "index.html",
         {
-            "request": request,
             "tasks": open_tasks,
             "reminders": due_reminders,
             "pets": pets,
@@ -140,7 +140,7 @@ def basic_status(request: Request):
                 outstanding.append(row)
     closed.sort(key=lambda r: r["claim"]["status"] != "settled")  # settled (has money) first
     return templates.TemplateResponse(
-        "basic.html", {"request": request, "outstanding": outstanding, "closed": closed}
+        request, "basic.html", {"outstanding": outstanding, "closed": closed}
     )
 
 
