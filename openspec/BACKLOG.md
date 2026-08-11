@@ -607,3 +607,16 @@ Worth knowing: **the charge date equalled Petcover's stated treatment date on al
   2026.7.1; this flow uses the identical mechanism and has not been independently re-checked
   against a real typed condition since. If it's also broken, condition text is falling through
   to the chat agent — the exact outcome the hard rules forbid.
+
+## From vet-invoice-auto-send-notify (archived 2026-08-11)
+
+- **Live send-and-notify path (ADR-0030) is deployed but not yet observed end-to-end.**
+  `invoice_matching.send_invoice_request` shipped 2026-08-11 (commit `b6023e3`, deployed
+  `6116c1a+deploy`), but no real claim has gone through it yet — read-only DB check at deploy
+  time found all 4 live `pending_match` claims already carry a legacy `draft_id`, which the
+  new path's own guard (`if invoice_request_sent_at or draft_id: return`) skips. The next
+  claim that ages `INVOICE_MATCH_WINDOW_DAYS` past its transaction with no invoice found is
+  the first real test. When it happens: confirm a real Gmail Sent message exists, the claim's
+  `flag` reads `invoice_request_auto_sent` with `invoice_request_sent_at` set and `draft_id`
+  still `NULL`, and a Telegram notification (no button, no ⚠) arrived. Per this repo's own
+  rule, a silent "nothing broke" is not evidence — this needs a positive confirmation.
