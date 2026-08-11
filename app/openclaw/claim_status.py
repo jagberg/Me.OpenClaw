@@ -2,7 +2,7 @@ import json
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from . import claim_forms, config, db
+from . import claim_forms, config, db, gmail_client, llm
 
 # "Automatic reply: ..." fires instantly on submission, before the real
 # Acknowledgement Letter (1-2 business days later per its own boilerplate) —
@@ -139,6 +139,10 @@ STATE_EVENTS = {
     "settled": "settled",
     "declined": "declined",
     "below_excess": "below_excess",
+    # settlement-clarification-email: entered only when "More Info" queues a
+    # claim into an open clarification draft, never while its review card is
+    # merely showing (claim-status-tracking).
+    "clarification_requested": "awaiting_petcover_clarification",
 }
 
 # Recorded, never move state. `unclassified` is the one that used to be a special
@@ -199,13 +203,24 @@ TRANSITIONS: dict[str | None, frozenset] = {
         {"suspended", "acknowledged", "approved", "settled", "declined", "below_excess"}
     ),
     "suspended": frozenset({"info_requested", "approved", "settled", "declined", "below_excess"}),
-    "approved": frozenset({"settled"}),
+    "approved": frozenset({"settled", "awaiting_petcover_clarification"}),
     "below_excess": frozenset({"sent", "acknowledged", "approved", "settled", "declined"}),
     # Terminal (ADR-0011): a later letter reusing the thread's reference must
     # never reopen them. Leaving one is reverting the event that closed it.
-    "settled": frozenset(),
+    # `settled` keeps ONE exception: Justin queuing a Check-B/unrecorded-
+    # subtotal flag into a clarification request (`clarification_requested`,
+    # settlement-clarification-email) — Justin-initiated only, never something
+    # a later Petcover letter can trigger, so it doesn't reopen the claim to
+    # their mail the way a real transition out of `settled` would.
+    "settled": frozenset({"awaiting_petcover_clarification"}),
     "declined": frozenset(),
     "absorbed": frozenset({"pending_match"}),
+    # No legal move out via apply_event: resolution (Acceptable / an
+    # auto-resolved reply) reuses `dismiss_mismatch`, which — like
+    # `confirm_resolved` for info_requested/suspended — clears the FLAG and
+    # leaves status alone rather than transitioning it again. Mirrors that
+    # existing pattern rather than inventing a second one.
+    "awaiting_petcover_clarification": frozenset(),
 }
 
 # Policy math (ADR-0011). Per-condition-thread excess and per-pet annual cap,
@@ -1150,6 +1165,50 @@ SETTLEMENT_FLAG_PREFIXES = (
 )
 
 
+# Which open settlement flags are eligible for a clarification request to
+# Petcover (settlement-validation, settlement-clarification-email). Narrower
+# than SETTLEMENT_FLAG_PREFIXES: Check A ("settlement mismatch") is a dispute
+# with Petcover's own arithmetic, not a question they can answer by confirming
+# a figure, and stays the old dismiss_mismatch-only path.
+CLARIFICATION_ELIGIBLE_PREFIXES = ("assessment difference", "claimable subtotal not recorded")
+
+
+def _clarification_eligible(flag: str | None) -> bool:
+    return bool(flag) and flag.startswith(CLARIFICATION_ELIGIBLE_PREFIXES)
+
+
+def _awaiting_petcover_clarification(claim: dict) -> bool:
+    """True while a claim genuinely still needs Petcover's reply.
+
+    `status` alone can't answer this: nothing moves a claim OUT of
+    `awaiting_petcover_clarification` via `apply_event` (see TRANSITIONS) —
+    resolution (Acceptable, or an auto-resolved reply) reuses
+    `dismiss_mismatch`, which only ever clears `flag`, the same way
+    `confirm_resolved` leaves `info_requested`/`suspended` in place. So a
+    resolved claim's `status` column stays `awaiting_petcover_clarification`
+    forever, and reading it alone reports "still waiting" long after it
+    isn't. This is the ONE place that combines both columns; every reader
+    (`_action_kind_from_row`, `settlement_review_claims`) asks here instead of
+    picking one column and disagreeing with the other."""
+    return claim["status"] == "awaiting_petcover_clarification" and _clarification_eligible(
+        claim["flag"]
+    )
+
+
+_REPLY_STATED_AMOUNT_RE = re.compile(r"Petcover's reply states \$([0-9,]+\.\d{2})")
+
+
+def _reply_stated_amount(flag: str | None) -> float | None:
+    """The dollar figure out of a resurfaced-card flag written by
+    `process_clarification_reply`'s no-match branch — parsing our OWN
+    generated string, not free text, so a plain regex is the deep-module's
+    problem to solve once rather than the template's to solve per-render."""
+    if not flag:
+        return None
+    match = _REPLY_STATED_AMOUNT_RE.search(flag)
+    return float(match.group(1).replace(",", "")) if match else None
+
+
 def _settlement_check_kind(flag: str | None) -> str | None:
     """Which check raised a flag. `assessment` is a question outstanding with
     Petcover; everything else is Justin's own review."""
@@ -1840,6 +1899,9 @@ ACTION_PRIORITY = (
     "assign_pet",
     "set_condition",
     "dismiss_mismatch",
+    # Queued into a clarification draft — genuinely waiting on Petcover, not on
+    # Justin, so it sits after dismiss_mismatch (which IS his to check).
+    "awaiting_petcover_clarification",
     # Last: it is review work, not a blocked claim. It is also the only kind that
     # is NOT about a claim — see `unlinked_letters`.
     "unlinked_letter",
@@ -1915,6 +1977,15 @@ _ACTION_META = {
         "Review settlement",
         "a paid-vs-expected difference is unreviewed",
         {"arithmetic": NOBODY_WAITING, "assessment": YOU_WAITING_ON_PETCOVER},
+    ),
+    # settlement-clarification-email: "More Info" queued this claim into an
+    # open clarification draft to Petcover. Distinct from dismiss_mismatch (the
+    # pre-send flag) so the dashboard/Telegram can tell "still to review" from
+    # "already asked, waiting on their reply" apart — claim-status-tracking.
+    "awaiting_petcover_clarification": (
+        "Settlement clarification requested",
+        "waiting on Petcover to confirm what they assessed",
+        YOU_WAITING_ON_PETCOVER,
     ),
     "blocked_insurer": (
         "Define claim process",
@@ -1994,6 +2065,13 @@ def _action_kind_from_row(claim: dict) -> str | None:
         return "invoice_request_sent"
     if flag.endswith(_INSURER_UNDEFINED):
         return "blocked_insurer"
+    # Checked before the general settlement-flag branch: once queued, the
+    # claim is waiting on Petcover, not on Justin, even though the flag text
+    # (still needed for eligibility/resurfacing) is unchanged. Uses the
+    # combined accessor, not raw `status` — status never reverts, so a
+    # resolved claim would otherwise report "still waiting" forever.
+    if _awaiting_petcover_clarification(claim):
+        return "awaiting_petcover_clarification"
     if flag.startswith(SETTLEMENT_FLAG_PREFIXES):
         return "dismiss_mismatch"
     if claim["status"] in CLOSED_STATUSES:
@@ -2438,11 +2516,21 @@ def unanswered_vet_requests() -> list[dict]:
     return out
 
 
-def dismiss_mismatch(claim_id: int) -> dict:
-    """Clears a settlement-mismatch flag once Justin has looked at it. Records a
+def dismiss_mismatch(claim_id: int, reply_confirmation: dict | None = None) -> dict:
+    """Clears a settlement-mismatch flag once Justin has looked at it — or once
+    a clarification reply has confirmed it for him. Records a
     `mismatch_dismissed` event rather than just wiping the flag — the append-only
     log (ADR-0008) is the audit trail, and a silently-erased discrepancy is
-    exactly the invisible failure the hard rules forbid."""
+    exactly the invisible failure the hard rules forbid.
+
+    `reply_confirmation`, when given, is settlement-clarification-email's ONE
+    reuse point for this mechanism rather than a second one: an exact-matching
+    Petcover reply resolves a claim identically to clicking Acceptable, but the
+    figure worth recording is what the REPLY just confirmed, not the original
+    approved/settled event's (that figure is what raised the question — quoting
+    it back would silently drop the answer). None (the default, the Acceptable
+    button's path) keeps today's behaviour exactly: figures read from the
+    claim's own approved/settled events."""
     with db.get_connection() as conn:
         claim = conn.execute(
             "SELECT flag, invoice_data FROM vet_claims WHERE id = ?", (claim_id,)
@@ -2467,6 +2555,8 @@ def dismiss_mismatch(claim_id: int) -> dict:
             figures = json.loads(row["detail"] or "{}")
             if figures.get("paid_amount") is not None:
                 stated = figures
+        if reply_confirmation:
+            stated = {**stated, **reply_confirmation}
         conn.execute(
             "UPDATE vet_claims SET flag = NULL, updated_at = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), claim_id),
@@ -2486,8 +2576,14 @@ def dismiss_mismatch(claim_id: int) -> dict:
             "non_claimable_stated": stated.get("non_claimable_stated"),
             "claimable_subtotal": claimable,
             "claimable_subtotal_recorded": recorded,
+            **({"confirmed_by_reply": True} if reply_confirmation else {}),
         },
     )
+    if reply_confirmation:
+        return {
+            "ok": True,
+            "message": f"Claim #{claim_id}: Petcover's reply confirmed the figure — settlement difference resolved.",
+        }
     if check == "assessment":
         # Justin has read it; Petcover still hasn't answered. Dismissal clears
         # the card, not the question — the claim stays in the review queue.
@@ -2496,6 +2592,353 @@ def dismiss_mismatch(claim_id: int) -> dict:
             "message": f"Claim #{claim_id}: noted. It stays in the review queue until Petcover answers.",
         }
     return {"ok": True, "message": f"Claim #{claim_id}: settlement difference marked reviewed."}
+
+
+# --- Settlement clarification (settlement-clarification-email) -------------
+# The review card's two actions and the reply that can resolve it without
+# Justin's tap. Reuses dismiss_mismatch above for BOTH terminal paths
+# (Acceptable, and an exact-matching reply) rather than a second writer.
+
+# Plain ASCII throughout (no em dashes) — mirrors the repo's own console-safe
+# convention, and keeps the MIME body a single us-ascii text/plain part rather
+# than switching to a base64-encoded one over one non-ASCII character.
+CLARIFICATION_SUBJECT = "Claim settlement clarification"
+CLARIFICATION_INTRO = (
+    "Hi,\n\n"
+    "Could you please confirm what was assessed for the following claim(s) - our own "
+    "figures don't reconcile with what came back:\n"
+)
+# Mirrors invoice_matching.INVOICE_REQUEST_BODY's tone: short, no first names,
+# one ask per claim, signed with the owner's name.
+CLARIFICATION_SIGNOFF = "\n\nMany thanks,\n\n{owner}"
+
+
+def _clarification_claim_line(claim) -> str:
+    claimable, recorded = claimable_subtotal(claim["invoice_data"])
+    ours = f"${claimable:.2f}" if recorded else "no claimable subtotal recorded"
+    ref = claim["petcover_reference"] or "no reference"
+    sr = claim["petcover_sr"]
+    where = f"{ref} Sr {sr}" if sr is not None else ref
+    condition = claim["condition_text"] or "condition not set"
+    assessed = _latest_stated_claimed_amount(claim["id"])
+    theirs = f" - you stated ${assessed:.2f} assessed" if assessed is not None else ""
+    return (
+        f"\n- Claim #{claim['id']} ({claim['pet_name'] or 'no pet'}, {condition}, {where}): "
+        f"we submitted {ours}{theirs}."
+    )
+
+
+def _render_clarification_body(claims: list) -> str:
+    owner = config.OWNER_NAME or "Justin Goldberg"
+    lines = "".join(_clarification_claim_line(c) for c in claims)
+    return CLARIFICATION_INTRO + lines + CLARIFICATION_SIGNOFF.format(owner=owner)
+
+
+def _clarification_batch_claims(conn, batch_id: int) -> list:
+    claim_ids = [
+        r["claim_id"]
+        for r in conn.execute(
+            "SELECT claim_id FROM clarification_batch_claims WHERE batch_id = ? ORDER BY claim_id",
+            (batch_id,),
+        )
+    ]
+    return [
+        conn.execute(
+            "SELECT vc.*, p.name AS pet_name FROM vet_claims vc "
+            "LEFT JOIN pets p ON p.id = vc.pet_id WHERE vc.id = ?",
+            (cid,),
+        ).fetchone()
+        for cid in claim_ids
+    ]
+
+
+def _open_clarification_batch_or_create(claim) -> dict:
+    """Find-or-create the single OPEN clarification draft — never `send()`.
+    "Open" is approximated as "no reply has proven it was sent yet"
+    (`sent_at IS NULL`); see db.py's clarification_batches comment for the
+    known gap this leaves."""
+    with db.get_connection() as conn:
+        existing = conn.execute(
+            "SELECT * FROM clarification_batches WHERE sent_at IS NULL ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if existing:
+            return dict(existing)
+        to = claim["claim_email"] or config.PETCOVER_STATUS_SENDERS[0]
+    message = claim_forms._build_mime_message(to, CLARIFICATION_SUBJECT, CLARIFICATION_INTRO, [])
+    service = gmail_client.build_service()
+    draft = service.users().drafts().create(userId="me", body={"message": message}).execute()
+    now = datetime.now(timezone.utc).isoformat()
+    thread_id = draft["message"]["threadId"]
+    with db.get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO clarification_batches (to_email, gmail_draft_id, gmail_thread_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (to, draft["id"], thread_id, now),
+        )
+        return {
+            "id": cur.lastrowid,
+            "to_email": to,
+            "gmail_draft_id": draft["id"],
+            "gmail_thread_id": thread_id,
+            "created_at": now,
+            "sent_at": None,
+        }
+
+
+def _rewrite_clarification_draft(batch_id: int) -> None:
+    """Re-renders the WHOLE draft body from every claim currently in the
+    batch, rather than text-splicing an append onto whatever Gmail holds — a
+    draft is small (≤ a handful of claims) and this can never drift from what
+    the join table says the batch covers."""
+    with db.get_connection() as conn:
+        batch = conn.execute(
+            "SELECT * FROM clarification_batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        claims = _clarification_batch_claims(conn, batch_id)
+    body = _render_clarification_body(claims)
+    message = claim_forms._build_mime_message(batch["to_email"], CLARIFICATION_SUBJECT, body, [])
+    service = gmail_client.build_service()
+    service.users().drafts().update(
+        userId="me", id=batch["gmail_draft_id"], body={"message": message}
+    ).execute()
+
+
+def queue_clarification(claim_id: int) -> dict:
+    """The "More Info" action. Branches on where the claim currently sits
+    (design.md): not yet asked -> queue it into the open draft and move it to
+    `awaiting_petcover_clarification`; already asked and the reply didn't
+    resolve it -> just note that Justin looked, no new draft or event type."""
+    with db.get_connection() as conn:
+        claim = conn.execute(
+            "SELECT vc.*, p.claim_email, p.name AS pet_name FROM vet_claims vc "
+            "LEFT JOIN pets p ON p.id = vc.pet_id WHERE vc.id = ?",
+            (claim_id,),
+        ).fetchone()
+    if claim is None:
+        return {"ok": False, "message": f"No claim #{claim_id} found."}
+    if claim["status"] == "awaiting_petcover_clarification":
+        _flag_claim(claim_id, "Justin reviewed — still unresolved after Petcover's reply")
+        return {
+            "ok": True,
+            "message": f"Claim #{claim_id}: noted as reviewed — still unresolved, no new email sent.",
+        }
+    if not _clarification_eligible(claim["flag"]):
+        return {
+            "ok": False,
+            "message": f"Claim #{claim_id} has no open settlement question to raise.",
+        }
+
+    batch = _open_clarification_batch_or_create(claim)
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO clarification_batch_claims (batch_id, claim_id, added_at) "
+            "VALUES (?, ?, ?)",
+            (batch["id"], claim_id, now),
+        )
+    _rewrite_clarification_draft(batch["id"])
+    apply_event(claim_id, "clarification_requested", {"batch_id": batch["id"]})
+    return {
+        "ok": True,
+        "message": f"Claim #{claim_id}: queued into the clarification draft to Petcover — "
+        "review and send it yourself when ready.",
+    }
+
+
+def settlement_review_claims() -> list[dict]:
+    """Every claim eligible for the settlement-review card: an open Check-B
+    assessment-difference flag, or an unrecorded-claimable-subtotal flag
+    (settlement-validation). Check A (arithmetic) is excluded — that stays the
+    old dismiss_mismatch-only path, a dispute with Petcover's own math rather
+    than a question they can answer.
+
+    Includes claims already `awaiting_petcover_clarification`: a reply that
+    didn't resolve things resurfaces the identical card (`awaiting_petcover`
+    tells the template which state it's in)."""
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT vc.*, p.name AS pet_name FROM vet_claims vc "
+            "LEFT JOIN pets p ON p.id = vc.pet_id "
+            "WHERE vc.flag IS NOT NULL"
+        ).fetchall()
+    out = []
+    for row in rows:
+        if not _clarification_eligible(row["flag"]):
+            continue
+        claimable, recorded = claimable_subtotal(row["invoice_data"])
+        invoice = json.loads(row["invoice_data"]) if row["invoice_data"] else {}
+        out.append(
+            {
+                "claim_id": row["id"],
+                "pet_name": row["pet_name"],
+                "reference": row["petcover_reference"],
+                "sr": row["petcover_sr"],
+                "condition_text": row["condition_text"],
+                "submitted": claimable,
+                "submitted_recorded": recorded,
+                "assessed": _latest_stated_claimed_amount(row["id"]),
+                "items": invoice.get("items") or [],
+                "invoice_file_path": row["invoice_file_path"],
+                "flag": row["flag"],
+                "reply_stated_amount": _reply_stated_amount(row["flag"]),
+                "awaiting_petcover": _awaiting_petcover_clarification(row),
+            }
+        )
+    return out
+
+
+def _latest_stated_claimed_amount(claim_id: int) -> float | None:
+    """The most recent `claimed_amount` Petcover has stated on this claim —
+    from an approved/settled event originally, or a later resurfaced reply's
+    figure once one has arrived. Read-only; never a substitute for
+    `claimable_subtotal` (that's OUR figure, this is theirs)."""
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT detail FROM claim_status_events WHERE claim_id = ? "
+            "AND event_type IN ('approved', 'settled') ORDER BY id",
+            (claim_id,),
+        ).fetchall()
+    amount = None
+    for row in rows:
+        detail = json.loads(row["detail"] or "{}")
+        if detail.get("claimed_amount") is not None:
+            amount = detail["claimed_amount"]
+    return amount
+
+
+_CLARIFICATION_EXTRACTION_PROMPT = """This is a reply from Petcover to an email asking them to confirm the \
+settlement amount for one or more claims. Extract every claim identifier (a reference like "DC1-27-5628", \
+a serial like "Sr 3", or a pet name — whatever the reply uses to identify the claim) together with the \
+dollar amount it confirms was assessed for that claim, as strict JSON:
+{{"claims": [{{"identifier": "<whatever identifies the claim in the reply>", "confirmed_amount": <number, or null if no amount is stated for it>}}, ...]}}
+
+Only include a pair where the reply is actually confirming or restating an assessed amount for a specific \
+claim — not a generic total, not the excess, not a percentage. Use {{"claims": []}} if none is stated.
+
+Reply:
+{body}
+"""
+
+
+def _extract_clarification_figures(body: str) -> list[dict]:
+    """`{claim identifier, confirmed amount}` pairs from a free-form reply —
+    the ONE new LLM call site this change adds (design.md), scoped to exactly
+    these two fields. Every other classification in this codebase is
+    regex/keyword on a fixed Petcover template; a clarification reply is human
+    prose answering our specific questions, with no fixed template to match."""
+    raw = llm.extract(
+        _CLARIFICATION_EXTRACTION_PROMPT.format(body=body), purpose="clarification_reply"
+    )
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end == -1:
+        return []
+    try:
+        data = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return []
+    claims = data.get("claims") if isinstance(data, dict) else None
+    return claims if isinstance(claims, list) else []
+
+
+def is_clarification_thread(thread_id: str | None) -> bool:
+    """Whether an incoming message's Gmail thread is a clarification batch's
+    — the correlation `process_clarification_reply` uses INSTEAD OF the
+    general reference/Sr/pet-condition router (design.md: a direct reply to
+    mail we sent is a different kind of evidence)."""
+    if not thread_id:
+        return False
+    with db.get_connection() as conn:
+        return (
+            conn.execute(
+                "SELECT 1 FROM clarification_batches WHERE gmail_thread_id = ?", (thread_id,)
+            ).fetchone()
+            is not None
+        )
+
+
+def _pair_identifies_claim(pair: dict, claim) -> bool:
+    """Whether an extracted `{identifier, confirmed_amount}` pair is talking
+    about THIS claim — reference or serial substring match, the same shape
+    Petcover's own letters use. Deliberately narrower than "any amount in the
+    reply": in a multi-claim batch, an unaddressed claim must stay unaddressed
+    rather than picking up a note about a figure that was never about it."""
+    identifier = str(pair.get("identifier") or "")
+    if not identifier:
+        return False
+    if claim["petcover_reference"] and claim["petcover_reference"] in identifier:
+        return True
+    if claim["petcover_sr"] is not None and re.search(
+        rf"\bSr\.?\s*0*{claim['petcover_sr']}\b", identifier, re.IGNORECASE
+    ):
+        return True
+    return False
+
+
+def process_clarification_reply(email_id: str, thread_id: str, body: str) -> None:
+    """Handles a reply on a clarification batch's thread. Per claim the batch
+    covers: the pair(s) the reply's identifiers name as belonging to it are
+    checked against its own recorded claimable subtotal — an exact match
+    resolves it exactly as Acceptable would; a named-but-not-matching figure
+    is appended to its flag so the resurfaced card shows it; a claim the
+    reply never mentions at all is left completely untouched (never guessed,
+    never silently dropped).
+
+    Idempotent on a re-read with NO extra bookkeeping and no new event type
+    (task 1.3): `dismiss_mismatch` clears the flag as its own side effect, so
+    a claim it already resolved fails `_clarification_eligible` on the next
+    pass and is skipped before anything runs twice. The not-matching branch's
+    `_flag_claim` append is separately idempotent (it no-ops on a repeated
+    identical reason) — see `_flag_claim`'s own docstring."""
+    with db.get_connection() as conn:
+        batch = conn.execute(
+            "SELECT * FROM clarification_batches WHERE gmail_thread_id = ?", (thread_id,)
+        ).fetchone()
+        if batch is None:
+            return
+        if batch["sent_at"] is None:
+            # A reply proves the draft was sent — close it to further appends.
+            conn.execute(
+                "UPDATE clarification_batches SET sent_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), batch["id"]),
+            )
+        claim_ids = [
+            r["claim_id"]
+            for r in conn.execute(
+                "SELECT claim_id FROM clarification_batch_claims WHERE batch_id = ?", (batch["id"],)
+            )
+        ]
+
+    pairs = [p for p in _extract_clarification_figures(body) if isinstance(p, dict)]
+
+    for claim_id in claim_ids:
+        with db.get_connection() as conn:
+            claim = conn.execute("SELECT * FROM vet_claims WHERE id = ?", (claim_id,)).fetchone()
+        # Not eligible any more (flag already cleared by an earlier resolve,
+        # manual or replied) — nothing left for this reply to do.
+        if claim is None or not _clarification_eligible(claim["flag"]):
+            continue
+        own_amounts = [
+            p["confirmed_amount"]
+            for p in pairs
+            if p.get("confirmed_amount") is not None and _pair_identifies_claim(p, claim)
+        ]
+        if not own_amounts:
+            continue  # the reply never named this claim — leave it untouched
+        claimable, recorded = claimable_subtotal(claim["invoice_data"])
+        matched_amount = next(
+            (a for a in own_amounts if recorded and abs(a - claimable) <= 0.005), None
+        )
+        if matched_amount is not None:
+            dismiss_mismatch(claim_id, reply_confirmation={"claimed_amount": matched_amount})
+        else:
+            # Named, just not with the right figure — visible on the
+            # resurfaced card rather than silently left off it.
+            ours = f"${claimable:,.2f}" if recorded else "unrecorded"
+            _flag_claim(
+                claim_id,
+                f"Petcover's reply states ${own_amounts[0]:,.2f} — "
+                f"still doesn't match our {ours} claimable",
+            )
 
 
 def mark_invoice_request_sent(claim_id: int) -> dict:

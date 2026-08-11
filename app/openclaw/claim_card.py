@@ -70,6 +70,7 @@ _STATUS_COLOURS = {
     "declined": ((224, 108, 96), (48, 23, 21)),
     "below_excess": ((150, 158, 175), (44, 48, 58)),
     "absorbed": ((120, 128, 145), (38, 42, 52)),
+    "awaiting_petcover_clarification": ((232, 138, 96), (48, 30, 22)),
 }
 
 PAD = 22

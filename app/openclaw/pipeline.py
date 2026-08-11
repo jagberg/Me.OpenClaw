@@ -846,6 +846,16 @@ def poll_petcover_status(reread: bool = False, since: str | None = None) -> dict
         headers = {h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])}
         subject = headers.get("Subject", "")
         body = gmail_client.full_message_text(service, message)
+        # A reply on a clarification batch's own thread is correlated by
+        # thread id, BEFORE the general reference/Sr/pet-condition router —
+        # it's a direct reply to mail we sent, not an unprompted Petcover
+        # letter (settlement-clarification-email design.md). Checked first so
+        # it never falls through to the general router's heuristics.
+        if claim_status.is_clarification_thread(message.get("threadId")):
+            claim_status.process_clarification_reply(message["id"], message["threadId"], body)
+            if not reread:
+                gmail_ingest._mark_processed(message["id"], None)
+            continue
         # From: classifies the dedicated required-info channel; To:/Cc: says who
         # owes any requested document (claims.au@ sends both kinds, so the sender
         # cannot answer that).

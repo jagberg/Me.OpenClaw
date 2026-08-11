@@ -259,6 +259,35 @@ CREATE TABLE IF NOT EXISTS job_runs (
     last_error TEXT,
     last_skipped_at TEXT
 );
+
+-- One open (unsent) Gmail draft asking Petcover to confirm settlement figures
+-- for several flagged claims at once (settlement-clarification-email). Brand
+-- new table, so CREATE TABLE IF NOT EXISTS alone is enough -- no ALTER needed
+-- (see _VET_CLAIMS_ADDED_COLUMNS above for the case where that would matter).
+-- `gmail_thread_id` is known from `drafts().create`'s own response and is how
+-- a later reply is correlated to this batch, not by the reference/Sr/pet
+-- router. `sent_at` stays NULL until a reply on this thread proves Justin sent
+-- it (there is no send() call here to observe directly -- ADR-0030 is not
+-- extended by this change) -- ponytail: a claim newly flagged in the window
+-- between an actual send and Petcover's first reply would still be appended
+-- to an already-sent draft; add an explicit "mark sent" action if that bites.
+CREATE TABLE IF NOT EXISTS clarification_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    to_email TEXT NOT NULL,
+    gmail_draft_id TEXT NOT NULL,
+    gmail_thread_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    sent_at TEXT
+);
+
+-- Join: which claims a batch's draft covers. A claim is queued into at most
+-- one OPEN batch at a time (More Info finds-or-creates the single open one).
+CREATE TABLE IF NOT EXISTS clarification_batch_claims (
+    batch_id INTEGER NOT NULL REFERENCES clarification_batches(id),
+    claim_id INTEGER NOT NULL REFERENCES vet_claims(id),
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (batch_id, claim_id)
+);
 """
 
 # vet_claims columns added after the table's initial release — CREATE TABLE IF

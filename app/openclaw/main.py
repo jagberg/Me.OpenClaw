@@ -4,8 +4,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from . import (
@@ -117,6 +117,7 @@ def dashboard(request: Request, upload_error: str | None = None, upload_result: 
             "reminders": due_reminders,
             "pets": pets,
             "ledger": claim_status.visit_ledger(),
+            "settlement_review": claim_status.settlement_review_claims(),
             "upload_error": upload_error,
             "upload_result": upload_result,
             "transactions_watermark": netbank_csv.latest_transaction_date(),
@@ -257,4 +258,29 @@ def link_event(event_id: int, claim_id: int = Form(...)):
 @app.post("/claims/{claim_id}/invoice-request-sent")
 def mark_invoice_request_sent(claim_id: int):
     claim_status.mark_invoice_request_sent(claim_id)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/claims/{claim_id}/invoice")
+def claim_invoice(claim_id: int):
+    """Serves a claim's own invoice PDF — the settlement-review card's fallback
+    when there are 5+ line items (or none parsed) to list inline."""
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT invoice_file_path FROM vet_claims WHERE id = ?", (claim_id,)
+        ).fetchone()
+    if row is None or not row["invoice_file_path"]:
+        raise HTTPException(404, f"No invoice file on file for claim #{claim_id}.")
+    return FileResponse(row["invoice_file_path"])
+
+
+@app.post("/claims/{claim_id}/settlement/acceptable")
+def settlement_acceptable(claim_id: int):
+    claim_status.dismiss_mismatch(claim_id)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/claims/{claim_id}/settlement/more-info")
+def settlement_more_info(claim_id: int):
+    claim_status.queue_clarification(claim_id)
     return RedirectResponse("/", status_code=303)

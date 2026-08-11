@@ -27,6 +27,7 @@ LABELS = {
     "declined": "Declined",
     "below_excess": "Below excess",
     "absorbed": "Absorbed",
+    "awaiting_petcover_clarification": "Awaiting Petcover clarification",
 }
 
 # A `matched` claim spans "needs one field from you" and "can never proceed".

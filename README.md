@@ -63,6 +63,20 @@ claimable subtotal, never the invoice total and never the bank charge: one acces
 test fails if any caller re-adds the old fallback, and where it was never recorded the surfaces say
 `Not recorded` instead of a plausible substitute.
 
+**Check B and unrecorded-subtotal flags have a resolution path, not just a flag.** Every claim
+carrying an open Check B (assessment-difference) or unrecorded-claimable-subtotal flag surfaces a
+settlement-review card on the dashboard — condition, submitted vs. assessed figures, and the invoice's
+line items or a PDF link — with two actions. **Acceptable** dismisses it terminally (reuses the same
+manual-dismiss mechanism as today; never rewrites `claimable_subtotal` or a paid amount). **More Info**
+queues the claim into a single open, consolidated Gmail draft to Petcover asking them to confirm what
+they assessed (draft only — Justin reviews and sends it himself); the claim then reads "waiting on
+Petcover", not "needs your action". When Petcover replies on that thread, the reply is correlated by
+Gmail thread id (not the usual reference/Sr/pet-condition router) and an LLM extracts `{claim
+identifier, confirmed amount}` pairs — the ONE new LLM call site this adds, everywhere else stays
+regex/keyword. A pair that matches a claim's recorded claimable subtotal to the cent resolves it
+exactly as Acceptable would; anything else — no match, an unaddressed claim, a different figure —
+leaves the claim waiting and resurfaces the same card with the reply's figure shown, never guessed.
+
 Petcover's own mail is also excluded from the assistant's task capture. Both pollers share
 `processed_emails` as their "seen it" gate, so whichever ran first won — which is how five approval
 letters became to-do items and reached no claim at all.

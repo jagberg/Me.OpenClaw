@@ -1,6 +1,7 @@
 """Runnable smoke checks — not a full suite. Run with: python tests/test_core.py"""
 
 import contextlib
+import json
 import os
 import sys
 import tempfile
@@ -30,6 +31,7 @@ from openclaw import (  # noqa: E402
     gemini,
     invoice_matching,
     llm,
+    main,
     netbank_csv,
     reminders,
     status_labels,
@@ -2341,6 +2343,11 @@ def _fresh_db():
         # them makes "did this refusal queue anything?" depend on test order.
         conn.execute("DELETE FROM pending_proposals")
         conn.execute("DELETE FROM pending_flows")
+        # settlement-clarification-email: batches/links reference claim ids
+        # that are about to be deleted above — leaving them stale would let a
+        # later test's "open batch" lookup resurrect a dead claim id.
+        conn.execute("DELETE FROM clarification_batch_claims")
+        conn.execute("DELETE FROM clarification_batches")
         conn.execute("UPDATE pets SET policy_anniversary = NULL")
 
 
@@ -5145,8 +5152,12 @@ def test_detach_reference_returns_a_claim_to_the_correlation_pool():
 def test_every_declared_transition_is_legal_and_the_terminals_are_dead_ends():
     """The table is the rule, so the table itself gets asserted: every declared
     pair must actually be applied by `apply_event`, and the two terminal states
-    must have no way out at all (ADR-0011: a later letter reusing a thread's
-    reference must never reopen a closed claim).
+    must have no way out via a Petcover LETTER (ADR-0011: a later letter
+    reusing a thread's reference must never reopen a closed claim). `settled`
+    gained exactly one Justin-initiated exception (settlement-clarification-
+    email's `clarification_requested`) — never something Petcover's own mail
+    can trigger, so it does not reopen the claim to their letters the way a
+    real transition out of `settled` would.
 
     This test used to assert `target in TRANSITIONS[from_state]` while iterating
     that same set — `x in S for x in S`, true of any table including an empty one,
@@ -5188,8 +5199,14 @@ def test_every_declared_transition_is_legal_and_the_terminals_are_dead_ends():
             checked += 1
     assert checked == sum(len(t) for s, t in claim_status.TRANSITIONS.items() if s is not None)
     assert checked >= 40, f"only {checked} pairs exercised — the table shrank unnoticed"
-    assert claim_status.TRANSITIONS["settled"] == frozenset()
+    assert claim_status.TRANSITIONS["settled"] == frozenset({"awaiting_petcover_clarification"}), (
+        "settlement-clarification-email's one Justin-initiated exception, and no other"
+    )
     assert claim_status.TRANSITIONS["declined"] == frozenset()
+    assert claim_status.TRANSITIONS["awaiting_petcover_clarification"] == frozenset(), (
+        "no way out via apply_event — dismiss_mismatch clears the flag and leaves status alone, "
+        "same as confirm_resolved does for info_requested/suspended"
+    )
     assert claim_status.TRANSITIONS[None] == frozenset({"pending_match"}), (
         "a new claim starts nowhere else"
     )
@@ -8618,6 +8635,588 @@ def test_dismissing_an_assessment_difference_keeps_it_reviewable():
     assert claim_status.dismiss_mismatch(assessed)["ok"] is False
     assert claim_status._already_recorded(assessed, "approved", f"mail{assessed}")
     assert _claim_row(assessed)["flag"] is None
+
+
+# --- settlement-clarification-email -----------------------------------------
+
+
+class _FakeClarificationExec:
+    def __init__(self, result):
+        self._result = result
+
+    def execute(self):
+        return self._result
+
+
+class _FakeClarificationDrafts:
+    """Records every drafts().create/update call to `store` (draft_id ->
+    message dict) so a test can inspect the rendered body without touching
+    real Gmail. `_n` mints unique draft/thread ids, mirroring how the real
+    API assigns a fresh thread on `create`."""
+
+    def __init__(self, store):
+        self.store = store
+        self._n = 0
+
+    def create(self, userId, body):
+        self._n += 1
+        draft_id = f"draft-{self._n}"
+        thread_id = f"thread-{self._n}"
+        message = {**body["message"], "id": f"msg-{self._n}", "threadId": thread_id}
+        self.store[draft_id] = message
+        return _FakeClarificationExec({"id": draft_id, "message": message})
+
+    def update(self, userId, id, body):
+        message = {**body["message"], "threadId": self.store[id]["threadId"]}
+        self.store[id] = message
+        return _FakeClarificationExec({"id": id, "message": message})
+
+
+class _FakeClarificationService:
+    def __init__(self, store):
+        self._drafts = _FakeClarificationDrafts(store)
+
+    def users(self):
+        return self
+
+    def drafts(self):
+        return self._drafts
+
+
+def _patch_clarification_gmail(store):
+    original = claim_status.gmail_client.build_service
+    claim_status.gmail_client.build_service = lambda: _FakeClarificationService(store)
+    return original
+
+
+def _draft_body_text(store, draft_id) -> str:
+    import base64 as _b64
+
+    return _b64.urlsafe_b64decode(store[draft_id]["raw"]).decode(errors="replace")
+
+
+def _flag_settlement(conn, claim_id, flag):
+    conn.execute("UPDATE vet_claims SET flag = ? WHERE id = ?", (flag, claim_id))
+
+
+def test_settlement_review_eligibility_includes_check_b_and_unrecorded_excludes_check_a():
+    """Task 8.1: the review card's eligibility query takes Check B assessment
+    differences and unrecorded-claimable-subtotal flags, and leaves Check A
+    (arithmetic) to the old dismiss_mismatch-only path (settlement-validation)."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        assessed = _insert_claim(
+            conn,
+            aari,
+            _relative_date(40),
+            status="settled",
+            reference="DC1-1",
+            sr=1,
+            invoice_data=json.dumps({"claimable_amount": 446.50}),
+        )
+        unrecorded = _insert_claim(conn, aari, _relative_date(41), status="settled")
+        arithmetic = _insert_claim(
+            conn,
+            aari,
+            _relative_date(42),
+            status="settled",
+            invoice_data=json.dumps({"claimable_amount": 500.0}),
+        )
+        _flag_settlement(
+            conn,
+            assessed,
+            f"assessment difference — claim #{assessed} (DC1-1 Sr 1): we submitted "
+            "$446.50, Petcover states they assessed $351.50.",
+        )
+        _flag_settlement(
+            conn,
+            unrecorded,
+            f"claimable subtotal not recorded — claim #{unrecorded}: Petcover states they "
+            "assessed $80.00 and paid $52.00, and their figures add up, but nothing was "
+            "recorded as this claim's claimable subtotal so there is nothing to check it "
+            "against — review",
+        )
+        _flag_settlement(
+            conn,
+            arithmetic,
+            "settlement mismatch — Petcover's own figures don't add up: they state claimed "
+            "$500.00 ... review",
+        )
+
+    ids = {c["claim_id"] for c in claim_status.settlement_review_claims()}
+    assert assessed in ids, "Check B is eligible"
+    assert unrecorded in ids, "unrecorded-subtotal is eligible"
+    assert arithmetic not in ids, "Check A stays the old manual-dispute path"
+
+
+def test_settlement_acceptable_is_terminal_and_never_rewrites_the_subtotal():
+    """Task 8.2: Acceptable reuses dismiss_mismatch — flag cleared, invoice_data
+    (and so claimable_subtotal) untouched — and a later, distinct figure is
+    still validated fully independently, per settlement-validation's existing
+    one-way dismissal semantics."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        claim = _insert_claim(
+            conn,
+            aari,
+            _relative_date(50),
+            status="settled",
+            reference="DC1-90",
+            sr=1,
+            invoice_data=json.dumps({"claimable_amount": 446.50}),
+        )
+        _flag_settlement(
+            conn,
+            claim,
+            f"assessment difference — claim #{claim} (DC1-90 Sr 1): we submitted "
+            "$446.50, Petcover states they assessed $351.50.",
+        )
+
+    assert claim_status.dismiss_mismatch(claim)["ok"] is True
+    row = _claim_row(claim)
+    assert row["flag"] is None, "Acceptable clears the flag"
+    assert json.loads(row["invoice_data"])["claimable_amount"] == 446.50, (
+        "never rewrites claimable_subtotal"
+    )
+
+    # A genuinely different figure is checked fully on its own terms, with no
+    # memory of the earlier dismissal — the earlier Acceptable never suppresses it.
+    claimable, recorded = claim_status.claimable_subtotal(row["invoice_data"])
+    assert recorded
+    new_flag = claim_status._check_what_petcover_assessed(
+        row, {"claimed_amount": 900.00}, claimable
+    )
+    assert new_flag and "900.00" in new_flag, "a genuinely different figure still flags"
+
+
+def test_more_info_queues_into_one_open_draft_shared_across_claims():
+    """Tasks 4.1-4.3 / 8.3: first More Info creates one Gmail draft and moves
+    the claim to awaiting_petcover_clarification; a second claim's More Info,
+    before that draft is sent, joins the SAME draft rather than opening another."""
+    _fresh_db()
+    store: dict = {}
+    original = _patch_clarification_gmail(store)
+    try:
+        with db.get_connection() as conn:
+            aari = _aari(conn)
+            c1 = _insert_claim(
+                conn,
+                aari,
+                _relative_date(40),
+                status="settled",
+                reference="DC1-1",
+                sr=1,
+                condition="Arthritis",
+                invoice_data=json.dumps({"claimable_amount": 100.0}),
+            )
+            c2 = _insert_claim(
+                conn,
+                aari,
+                _relative_date(30),
+                status="settled",
+                reference="DC1-2",
+                sr=1,
+                condition="Dermatitis",
+            )
+            _flag_settlement(
+                conn,
+                c1,
+                f"assessment difference — claim #{c1} (DC1-1 Sr 1): we submitted "
+                "$100.00, Petcover states they assessed $80.00.",
+            )
+            _flag_settlement(conn, c2, f"claimable subtotal not recorded — claim #{c2}: review")
+
+        r1 = claim_status.queue_clarification(c1)
+        assert r1["ok"], r1
+        assert _claim_row(c1)["status"] == "awaiting_petcover_clarification"
+        assert len(store) == 1, "exactly one draft created"
+        draft_id = next(iter(store))
+
+        r2 = claim_status.queue_clarification(c2)
+        assert r2["ok"], r2
+        assert _claim_row(c2)["status"] == "awaiting_petcover_clarification"
+        assert len(store) == 1, "second claim joins the SAME open draft, not a new one"
+
+        body = _draft_body_text(store, draft_id)
+        assert f"Claim #{c1}" in body and f"Claim #{c2}" in body, (
+            "both claims' details land in one consolidated draft"
+        )
+
+        with db.get_connection() as conn:
+            batches = conn.execute("SELECT * FROM clarification_batches").fetchall()
+            links = {
+                r["claim_id"]
+                for r in conn.execute("SELECT claim_id FROM clarification_batch_claims")
+            }
+        assert len(batches) == 1
+        assert links == {c1, c2}
+        assert batches[0]["gmail_thread_id"]
+        assert batches[0]["sent_at"] is None, "nothing has been sent — no send() call exists here"
+    finally:
+        claim_status.gmail_client.build_service = original
+
+
+def _queue_one_claim(conn, store):
+    """Shared setup for the reply-correlation tests: one flagged, queued claim
+    plus the batch's thread id."""
+    aari = _aari(conn)
+    claim = _insert_claim(
+        conn,
+        aari,
+        _relative_date(20),
+        status="settled",
+        reference="DC1-9",
+        sr=1,
+        invoice_data=json.dumps({"claimable_amount": 130.97}),
+    )
+    _flag_settlement(
+        conn,
+        claim,
+        f"assessment difference — claim #{claim} (DC1-9 Sr 1): we submitted "
+        "$130.97, Petcover states they assessed $351.50.",
+    )
+    return claim
+
+
+def test_clarification_reply_exact_match_resolves_like_acceptable():
+    """Tasks 5.3 / 8.4: an exact-matching reply applies the same terminal
+    dismissal as clicking Acceptable, recording the reply's own figures."""
+    _fresh_db()
+    store: dict = {}
+    original = _patch_clarification_gmail(store)
+    original_extract = llm.extract
+    try:
+        with db.get_connection() as conn:
+            claim = _queue_one_claim(conn, store)
+        claim_status.queue_clarification(claim)
+        with db.get_connection() as conn:
+            thread_id = conn.execute(
+                "SELECT gmail_thread_id FROM clarification_batches"
+            ).fetchone()[0]
+
+        llm.extract = (
+            lambda *a, **k: '{"claims": [{"identifier": "DC1-9", "confirmed_amount": 130.97}]}'
+        )
+        claim_status.process_clarification_reply(
+            "reply-1", thread_id, "Confirmed: DC1-9 Sr 1 assessed at $130.97."
+        )
+
+        row = _claim_row(claim)
+        assert row["flag"] is None, "resolved exactly like Acceptable"
+        assert row["status"] == "awaiting_petcover_clarification", (
+            "dismissal clears the flag, same as confirm_resolved does for "
+            "info_requested/suspended — it doesn't transition status again"
+        )
+        with db.get_connection() as conn:
+            events = [
+                (r["event_type"], json.loads(r["detail"] or "{}"))
+                for r in conn.execute(
+                    "SELECT event_type, detail FROM claim_status_events WHERE claim_id = ? ORDER BY id",
+                    (claim,),
+                )
+            ]
+        dismissed = next(d for t, d in events if t == "mismatch_dismissed")
+        assert dismissed["confirmed_by_reply"] is True
+        assert dismissed["claimed_amount"] == 130.97, (
+            "the reply's own figure, not the original letter's"
+        )
+
+        with db.get_connection() as conn:
+            batch_sent_at = conn.execute("SELECT sent_at FROM clarification_batches").fetchone()[0]
+        assert batch_sent_at, "a reply proves the draft was sent"
+    finally:
+        claim_status.gmail_client.build_service = original
+        llm.extract = original_extract
+
+
+def test_clarification_reply_no_match_resurfaces_the_card_with_the_figure():
+    """Tasks 5.3 / 8.5: a reply that states an amount not matching the claim's
+    claimable subtotal leaves it awaiting_petcover_clarification untouched,
+    with the reply's figure visible on the resurfaced card."""
+    _fresh_db()
+    store: dict = {}
+    original = _patch_clarification_gmail(store)
+    original_extract = llm.extract
+    try:
+        with db.get_connection() as conn:
+            claim = _queue_one_claim(conn, store)
+        claim_status.queue_clarification(claim)
+        with db.get_connection() as conn:
+            thread_id = conn.execute(
+                "SELECT gmail_thread_id FROM clarification_batches"
+            ).fetchone()[0]
+
+        llm.extract = (
+            lambda *a, **k: '{"claims": [{"identifier": "DC1-9", "confirmed_amount": 999.00}]}'
+        )
+        claim_status.process_clarification_reply("reply-2", thread_id, "text")
+
+        row = _claim_row(claim)
+        assert row["status"] == "awaiting_petcover_clarification", "state untouched"
+        assert row["flag"] and "999.00" in row["flag"], "the reply's figure is visible"
+
+        cards = {c["claim_id"]: c for c in claim_status.settlement_review_claims()}
+        assert claim in cards and cards[claim]["awaiting_petcover"] is True, (
+            "the card resurfaces rather than disappearing"
+        )
+        assert cards[claim]["reply_stated_amount"] == 999.00, (
+            "the reply's own figure is a structured field, not something the "
+            "template has to parse back out of `flag` prose"
+        )
+    finally:
+        claim_status.gmail_client.build_service = original
+        llm.extract = original_extract
+
+
+def test_clarification_reply_partial_batch_resolves_only_the_addressed_claim():
+    """Tasks 5.4 / 8.6: a batch covering two claims where the reply confirms
+    only one — that one resolves, the other stays open."""
+    _fresh_db()
+    store: dict = {}
+    original = _patch_clarification_gmail(store)
+    original_extract = llm.extract
+    try:
+        with db.get_connection() as conn:
+            aari = _aari(conn)
+            c1 = _insert_claim(
+                conn,
+                aari,
+                _relative_date(20),
+                status="settled",
+                reference="DC1-9",
+                sr=1,
+                invoice_data=json.dumps({"claimable_amount": 130.97}),
+            )
+            c2 = _insert_claim(
+                conn,
+                aari,
+                _relative_date(21),
+                status="settled",
+                reference="DC1-10",
+                sr=1,
+                invoice_data=json.dumps({"claimable_amount": 60.00}),
+            )
+            _flag_settlement(
+                conn,
+                c1,
+                f"assessment difference — claim #{c1} (DC1-9 Sr 1): we submitted $130.97, "
+                "Petcover states they assessed $351.50.",
+            )
+            _flag_settlement(
+                conn,
+                c2,
+                f"assessment difference — claim #{c2} (DC1-10 Sr 1): we submitted $60.00, "
+                "Petcover states they assessed $200.00.",
+            )
+        claim_status.queue_clarification(c1)
+        claim_status.queue_clarification(c2)
+        with db.get_connection() as conn:
+            thread_id = conn.execute(
+                "SELECT gmail_thread_id FROM clarification_batches"
+            ).fetchone()[0]
+
+        # Only c1's figure is confirmed — c2 is not addressed at all.
+        llm.extract = (
+            lambda *a, **k: '{"claims": [{"identifier": "DC1-9", "confirmed_amount": 130.97}]}'
+        )
+        claim_status.process_clarification_reply("reply-3", thread_id, "text")
+
+        assert _claim_row(c1)["flag"] is None, "the addressed claim resolves"
+        row2 = _claim_row(c2)
+        assert row2["status"] == "awaiting_petcover_clarification"
+        assert row2["flag"] is not None, "the unaddressed claim stays open, untouched by the reply"
+        assert "130.97" not in row2["flag"], "c1's figure must not leak onto c2's flag"
+    finally:
+        claim_status.gmail_client.build_service = original
+        llm.extract = original_extract
+
+
+def test_more_info_after_unresolved_reply_only_leaves_a_note():
+    """Tasks 6.1 / 8.7: More Info on a claim already awaiting_petcover_
+    clarification writes a flag note only — no new draft, no new batch, no
+    new event type, state unchanged."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        claim = _insert_claim(
+            conn,
+            aari,
+            _relative_date(15),
+            status="settled",
+            reference="DC1-5",
+            sr=1,
+            invoice_data=json.dumps({"claimable_amount": 90.00}),
+        )
+        _flag_settlement(
+            conn,
+            claim,
+            f"assessment difference — claim #{claim} (DC1-5 Sr 1): we submitted $90.00, "
+            "Petcover states they assessed $200.00.",
+        )
+    # Simulate "already queued, reply arrived, didn't resolve it" without
+    # touching Gmail — the state this represents is identical either way
+    # (design.md: the card resurfaces at the SAME state, not a new one).
+    claim_status.apply_event(claim, "clarification_requested", {})
+    assert _claim_row(claim)["status"] == "awaiting_petcover_clarification"
+
+    with db.get_connection() as conn:
+        batches_before = conn.execute("SELECT COUNT(*) FROM clarification_batches").fetchone()[0]
+        events_before = conn.execute(
+            "SELECT COUNT(*) FROM claim_status_events WHERE claim_id = ?", (claim,)
+        ).fetchone()[0]
+
+    result = claim_status.queue_clarification(claim)
+    assert result["ok"], result
+    assert "unresolved" in result["message"]
+
+    with db.get_connection() as conn:
+        batches_after = conn.execute("SELECT COUNT(*) FROM clarification_batches").fetchone()[0]
+        events_after = conn.execute(
+            "SELECT COUNT(*) FROM claim_status_events WHERE claim_id = ?", (claim,)
+        ).fetchone()[0]
+    assert batches_after == batches_before, "no new draft/batch"
+    assert events_after == events_before, "no new event — a flag note only"
+
+    row = _claim_row(claim)
+    assert row["status"] == "awaiting_petcover_clarification", "state unchanged"
+    assert "reviewed" in row["flag"].lower() and "unresolved" in row["flag"].lower()
+
+
+def test_unrelated_event_does_not_clear_awaiting_petcover_clarification():
+    """Tasks 1.2 / 8.8: nothing except Acceptable or an auto-resolved reply
+    moves a claim out of awaiting_petcover_clarification — an unrelated event
+    is refused by the transition table, not silently applied."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        claim = _insert_claim(
+            conn,
+            aari,
+            _relative_date(10),
+            status="settled",
+            invoice_data=json.dumps({"claimable_amount": 50.0}),
+        )
+    claim_status.apply_event(claim, "clarification_requested", {})
+    assert _claim_row(claim)["status"] == "awaiting_petcover_clarification"
+
+    outcome = claim_status.apply_event(claim, "acknowledged", {})
+    assert outcome["applied"] is False, (
+        "acknowledged is not a declared transition out of this state"
+    )
+    assert _claim_row(claim)["status"] == "awaiting_petcover_clarification"
+
+
+def test_resolved_clarification_claim_leaves_pending_actions():
+    """Regression: once Acceptable (or an auto-resolved reply) clears the
+    flag, the claim must stop appearing in pending_actions() everywhere, not
+    just the dashboard's own settlement_review section. `status` alone never
+    reverts out of `awaiting_petcover_clarification` (TRANSITIONS), so
+    `_action_kind_from_row` has to ask the combined flag+status accessor
+    (`_awaiting_petcover_clarification`), not raw `status` — otherwise
+    Telegram /actions, nudge_stale_actions and mcp_server keep nagging about
+    a claim that is already resolved, forever."""
+    _fresh_db()
+    store: dict = {}
+    original = _patch_clarification_gmail(store)
+    try:
+        with db.get_connection() as conn:
+            claim = _queue_one_claim(conn, store)
+            # _insert_claim's transaction isn't marked vet_flag=1 by default
+            # (most tests never route through visit_ledger/pending_actions at
+            # all) — this test specifically does, so it must be set here.
+            conn.execute(
+                "UPDATE bank_transactions SET vet_flag = 1 WHERE id = "
+                "(SELECT transaction_id FROM vet_claims WHERE id = ?)",
+                (claim,),
+            )
+        claim_status.queue_clarification(claim)
+        assert _claim_row(claim)["status"] == "awaiting_petcover_clarification"
+        assert claim in {a["claim_id"] for a in claim_status.pending_actions()}, (
+            "sanity: still open, still a pending action"
+        )
+
+        assert claim_status.dismiss_mismatch(claim)["ok"] is True
+
+        row = _claim_row(claim)
+        assert row["status"] == "awaiting_petcover_clarification", "status never reverts"
+        assert row["flag"] is None, "Acceptable cleared the flag"
+        assert claim_status._action_kind_from_row(row) is None, (
+            "resolved — the combined accessor must not still read as waiting"
+        )
+        assert claim not in {a["claim_id"] for a in claim_status.pending_actions()}, (
+            "must disappear from every surface, not just the dashboard's own "
+            "settlement_review section"
+        )
+    finally:
+        claim_status.gmail_client.build_service = original
+
+
+def test_settlement_review_card_template_actually_renders():
+    """Neither this suite nor test_telegram.py otherwise renders `index.html`
+    through Jinja at all — so a template-only bug (wrong Jinja syntax, a bad
+    variable name) would ship silently. Caught live while writing this
+    change: `item.items` resolves to dict.items (the bound METHOD) before
+    Jinja falls back to the `items` key, because `item` here is a plain dict
+    — `item['items']` is required, and this asserts the fix stays in place."""
+    settlement_review = [
+        {
+            "claim_id": 8,
+            "pet_name": "Aari",
+            "reference": "DC1-26-5992",
+            "sr": 1,
+            "condition_text": None,
+            "submitted": 446.50,
+            "submitted_recorded": True,
+            "assessed": 351.50,
+            "items": [{"description": "Consult", "amount": 90.0}],
+            "invoice_file_path": None,
+            "flag": "assessment difference - claim #8 ...",
+            "reply_stated_amount": None,
+            "awaiting_petcover": False,
+        },
+        {
+            "claim_id": 14,
+            "pet_name": "Aari",
+            "reference": None,
+            "sr": None,
+            "condition_text": "Arthritis",
+            "submitted": None,
+            "submitted_recorded": False,
+            "assessed": None,
+            "items": [],
+            "invoice_file_path": "/data/invoices/14.pdf",
+            "flag": "claimable subtotal not recorded - claim #14 ..., Petcover's reply states $999.00",
+            "reply_stated_amount": 999.00,
+            "awaiting_petcover": True,
+        },
+    ]
+    html = main.templates.env.get_template("index.html").render(
+        request=None,
+        tasks=[],
+        reminders=[],
+        pets=[],
+        ledger=[],
+        settlement_review=settlement_review,
+        upload_error=None,
+        upload_result=None,
+        transactions_watermark=None,
+        needs_action=[],
+        settled_reconciliation=[],
+        unclassified=[],
+    )
+    assert "Settlement review" in html
+    assert "claim #8" in html and "Consult" in html, "line items render when there are fewer than 5"
+    assert "View invoice PDF" in html, "the PDF-link fallback renders when there are none/5+"
+    assert "not set" in html, (
+        "claim #8's missing condition_text renders as 'not set', never guessed"
+    )
+    assert "Awaiting Petcover clarification" in html, (
+        "the awaiting_petcover_clarification claim is distinguished, via status_words "
+        "(the one vocabulary), not a hardcoded literal"
+    )
+    assert "999.00" in html, "the reply's stated figure renders on the resurfaced card"
 
 
 def test_petcover_letters_are_never_taken_by_the_task_ingest():

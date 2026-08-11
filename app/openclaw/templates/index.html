@@ -209,6 +209,53 @@
   </section>
   {% endif %}
 
+  {% if settlement_review %}
+  <section aria-labelledby="h-settlement">
+    <h2 id="h-settlement">Settlement review <span class="count">{{ settlement_review|length }}</span>
+      <span class="hint">Check B / unrecorded subtotal &middot; Acceptable is terminal</span>
+    </h2>
+    <div class="queue">
+      {% for item in settlement_review %}
+      <div class="qcard">
+        <div class="stripe"></div>
+        <div>
+          <div class="t">
+            <span class="who">{{ item.pet_name or 'no pet' }}</span>
+            &mdash; claim #{{ item.claim_id }}
+            {% if item.reference %} &mdash; ref {{ item.reference }}{% if item.sr is not none %} Sr {{ item.sr }}{% endif %}{% endif %}
+            {% if item.awaiting_petcover %}<span class="chip suspended">{{ status_words['awaiting_petcover_clarification'] }}</span>{% endif %}
+          </div>
+          <div class="why">
+            Condition: {{ item.condition_text or 'not set' }}<br>
+            We submitted: {% if item.submitted_recorded %}${{ '%.2f'|format(item.submitted) }}{% else %}not recorded{% endif %}
+            &mdash; Petcover assessed: {% if item.assessed is not none %}${{ '%.2f'|format(item.assessed) }}{% else %}not stated{% endif %}
+            {% if item.reply_stated_amount is not none %}<br>Petcover's reply states: ${{ '%.2f'|format(item.reply_stated_amount) }}{% endif %}
+          </div>
+          {# item['items'], NOT item.items: `item` is a plain dict and Jinja's
+             attribute lookup tries getattr() first, which would resolve to
+             dict.items (the bound method), never the "items" key. #}
+          {% if item['items'] and item['items']|length < 5 %}
+          <ul class="plain sub">
+            {% for line in item['items'] %}
+            <li>{{ line.description or 'item' }} &mdash; {% if line.amount is not none %}${{ '%.2f'|format(line.amount) }}{% else %}?{% endif %}</li>
+            {% endfor %}
+          </ul>
+          {% elif item.invoice_file_path %}
+          <div class="sub"><a href="/claims/{{ item.claim_id }}/invoice" target="_blank" rel="noopener">View invoice PDF</a></div>
+          {% else %}
+          <div class="sub muted">No invoice on file.</div>
+          {% endif %}
+        </div>
+        <span class="inline">
+          <form method="post" action="/claims/{{ item.claim_id }}/settlement/acceptable"><button type="submit" class="primary">Acceptable</button></form>
+          <form method="post" action="/claims/{{ item.claim_id }}/settlement/more-info"><button type="submit">More Info</button></form>
+        </span>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
   <section aria-labelledby="h-ledger">
     <h2 id="h-ledger">Visit ledger
       <span class="hint">each charge once &middot; claims nested &middot; charge = ceiling (ADR-0007)</span>
