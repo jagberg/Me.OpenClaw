@@ -281,8 +281,14 @@ def _summarize_matched_flag(claim, label: str) -> str:
 def _summarize_group(group) -> str | None:
     status = group[0]["status"]
     label = _submission_label(group)
-    if status == "pending_match":  # flagged-but-unmatched: surface the flag verbatim
+    if status == "pending_match":
         c = group[0]
+        if c["flag"] == "invoice_request_auto_sent":  # good news, not a warning (ADR-0030)
+            return (
+                f"✅ #{c['id']} {c['txn_merchant']}: invoice request sent — "
+                f"${abs(c['txn_amount']):.2f} ({c['txn_date']})"
+            )
+        # everything else here is flagged-but-unmatched: surface the flag verbatim
         lines = [f"⚠ {c['txn_merchant']} — {c['flag']}", "Affected charges:"]
         lines += [f" • #{m['id']} ${abs(m['txn_amount']):.2f} ({m['txn_date']})" for m in group]
         return "\n".join(lines)
@@ -456,7 +462,9 @@ def notify_claim_states(send_fn=None) -> None:
             f"WHERE vc.status IN ({','.join('?' * len(NOTIFY_STATUSES))}) "
             # pending claims with an actionable flag (unreadable attachment,
             # manual-match, merge pending) push too — transient LLM-outage and
-            # drafted-request flags are noise, not actions
+            # drafted-request flags are noise, not actions. 'invoice_request_auto_sent'
+            # is deliberately NOT excluded (ADR-0030) — it's an actual notify
+            # trigger, not noise. Do not add it here.
             "OR (vc.status = 'pending_match' AND vc.flag IS NOT NULL "
             "AND vc.flag != 'invoice_request_drafted' "
             "AND vc.flag NOT LIKE 'invoice extraction unavailable%' "
@@ -717,22 +725,44 @@ def nudge_unanswered_vet_requests(send_fn=None) -> dict:
     return {"sent": True, "outstanding": len(outstanding), "text": text}
 
 
-def _maybe_draft_invoice_request(claim) -> None:
+def _maybe_send_invoice_request(claim) -> None:
     if claim["invoice_request_sent_at"] or claim["draft_id"]:
-        return  # already sent (rolling recheck handles it), or already drafted awaiting Justin
+        return  # already sent, or a legacy draft still awaiting Justin (ADR-0030 doesn't touch those)
     txn_date = datetime.fromisoformat(claim["txn_date"]).replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) - txn_date < timedelta(days=config.INVOICE_MATCH_WINDOW_DAYS):
         return
 
-    draft_message_id = invoice_matching.draft_invoice_request(claim)
-    if draft_message_id is None:
-        flag = "no vet email on file — cannot draft invoice request, add merchant contact manually"
-    else:
-        flag = "invoice_request_drafted"
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        sent_message_id = invoice_matching.send_invoice_request(claim)
+    except Exception as exc:  # noqa: BLE001 — a failed send must not look like success
+        logger.exception("invoice request send failed for claim %s", claim["id"])
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ?",
+                (f"invoice request send failed: {exc}", now, claim["id"]),
+            )
+        return
+
+    if sent_message_id is None:
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE vet_claims SET flag = ?, updated_at = ? WHERE id = ?",
+                (
+                    "no vet email on file — cannot send invoice request, add merchant contact manually",
+                    now,
+                    claim["id"],
+                ),
+            )
+        return
+
+    # 'invoice_request_auto_sent' is deliberately absent from notify_claim_states'
+    # pending_match exclusion list below (ADR-0030) — it IS the notify
+    # trigger. Never add it to that list.
     with db.get_connection() as conn:
         conn.execute(
-            "UPDATE vet_claims SET flag = ?, draft_id = ?, updated_at = ? WHERE id = ?",
-            (flag, draft_message_id, datetime.now(timezone.utc).isoformat(), claim["id"]),
+            "UPDATE vet_claims SET flag = ?, invoice_request_sent_at = ?, updated_at = ? WHERE id = ?",
+            ("invoice_request_auto_sent", now, now, claim["id"]),
         )
 
 
@@ -996,7 +1026,7 @@ def run_once() -> None:
             invoice_matching._flag_claim(claim["id"], f"invoice matching error — {str(exc)[:120]}")
             continue
         if not matched:
-            _maybe_draft_invoice_request(claim)
+            _maybe_send_invoice_request(claim)
 
     _draft_matched_claims()
 

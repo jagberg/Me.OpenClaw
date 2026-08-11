@@ -1521,7 +1521,7 @@ def test_run_once_isolates_one_claims_failure():
         pipeline.vet_detection.classify_unflagged,
         pipeline.reconcile_sent_invoice_requests,
         pipeline.invoice_matching.match_claim,
-        pipeline._maybe_draft_invoice_request,
+        pipeline._maybe_send_invoice_request,
         pipeline.poll_petcover_status,
         pipeline.notify_claim_states,
         pipeline._ensure_gmail_auth,
@@ -1530,7 +1530,7 @@ def test_run_once_isolates_one_claims_failure():
     pipeline._ensure_gmail_auth = lambda: True
     pipeline.reconcile_sent_invoice_requests = lambda: stages.append("reconcile")
     pipeline.invoice_matching.match_claim = fake_match
-    pipeline._maybe_draft_invoice_request = lambda claim: stages.append(f"draft:{claim['id']}")
+    pipeline._maybe_send_invoice_request = lambda claim: stages.append(f"send:{claim['id']}")
     pipeline.poll_petcover_status = lambda: stages.append("poll")
     pipeline.notify_claim_states = lambda: stages.append("notify")
     try:
@@ -1540,7 +1540,7 @@ def test_run_once_isolates_one_claims_failure():
             pipeline.vet_detection.classify_unflagged,
             pipeline.reconcile_sent_invoice_requests,
             pipeline.invoice_matching.match_claim,
-            pipeline._maybe_draft_invoice_request,
+            pipeline._maybe_send_invoice_request,
             pipeline.poll_petcover_status,
             pipeline.notify_claim_states,
             pipeline._ensure_gmail_auth,
@@ -1548,7 +1548,7 @@ def test_run_once_isolates_one_claims_failure():
 
     assert attempted == [claim_a, claim_b], "claim B must still be attempted after claim A crashes"
     assert "poll" in stages and "notify" in stages, "downstream stages must run despite the failure"
-    assert f"draft:{claim_b}" in stages, "claim B continues through the normal no-match path"
+    assert f"send:{claim_b}" in stages, "claim B continues through the normal no-match path"
     with db.get_connection() as conn:
         flag_a = conn.execute("SELECT flag FROM vet_claims WHERE id = ?", (claim_a,)).fetchone()[0]
     assert flag_a and flag_a.startswith("invoice matching error"), (
@@ -1579,7 +1579,7 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
         pipeline.vet_detection.classify_unflagged,
         pipeline.reconcile_sent_invoice_requests,
         pipeline.invoice_matching.match_claim,
-        pipeline._maybe_draft_invoice_request,
+        pipeline._maybe_send_invoice_request,
         pipeline.poll_petcover_status,
         pipeline.notify_claim_states,
         pipeline._ensure_gmail_auth,
@@ -1588,7 +1588,7 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
     pipeline._ensure_gmail_auth = lambda: True
     pipeline.reconcile_sent_invoice_requests = lambda: None
     pipeline.invoice_matching.match_claim = unavailable_match
-    pipeline._maybe_draft_invoice_request = lambda claim: None
+    pipeline._maybe_send_invoice_request = lambda claim: None
     pipeline.poll_petcover_status = lambda: stages.append("poll")
     pipeline.notify_claim_states = lambda: stages.append("notify")
     try:
@@ -1619,7 +1619,7 @@ def test_run_once_llm_outage_skips_matching_but_runs_downstream():
             pipeline.vet_detection.classify_unflagged,
             pipeline.reconcile_sent_invoice_requests,
             pipeline.invoice_matching.match_claim,
-            pipeline._maybe_draft_invoice_request,
+            pipeline._maybe_send_invoice_request,
             pipeline.poll_petcover_status,
             pipeline.notify_claim_states,
             pipeline._ensure_gmail_auth,
@@ -2176,6 +2176,150 @@ def test_notify_messages_carry_claim_ids():
     pending_msg = next(t for t in sent if "IDCHECK PENDING" in t)
     assert f"#{needs_cond}" in cond_msg, cond_msg
     assert f"#{pending}" in pending_msg, pending_msg
+
+
+def test_send_invoice_request_calls_gmail_send_not_drafts_create():
+    """ADR-0030's one permitted send() call site — must call messages().send,
+    never drafts().create."""
+    from openclaw import invoice_matching
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        conn.execute(
+            "INSERT OR REPLACE INTO vet_contacts (merchant, email) VALUES (?, ?)",
+            ("SEND TEST VET", "vet@sendtest.example"),
+        )
+        cid = _insert_pending_claim(conn, "SEND TEST VET", -80.0, "2026-06-01")
+    claim = _matched_row(cid)
+
+    calls = {"send": 0, "drafts_create": 0}
+
+    class _Exec:
+        def execute(self):
+            return {"id": "sent-msg-1"}
+
+    class FakeDrafts:
+        def create(self, userId, body):
+            calls["drafts_create"] += 1
+            raise AssertionError("drafts().create must never be called from send_invoice_request")
+
+    class FakeMessages:
+        def send(self, userId, body):
+            calls["send"] += 1
+            return _Exec()
+
+    class FakeUsers:
+        def messages(self):
+            return FakeMessages()
+
+        def drafts(self):
+            return FakeDrafts()
+
+    class FakeService:
+        def users(self):
+            return FakeUsers()
+
+    original = invoice_matching.gmail_client.build_service
+    invoice_matching.gmail_client.build_service = lambda: FakeService()
+    try:
+        result = invoice_matching.send_invoice_request(claim)
+    finally:
+        invoice_matching.gmail_client.build_service = original
+
+    assert result == "sent-msg-1"
+    assert calls["send"] == 1 and calls["drafts_create"] == 0
+
+
+def test_maybe_send_invoice_request_success_sets_flag_and_timestamp():
+    from openclaw import invoice_matching, pipeline
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        cid = _insert_pending_claim(conn, "AUTOSEND VET", -90.0, "2020-01-01")
+    claim = _matched_row(cid)
+
+    original = invoice_matching.send_invoice_request
+    invoice_matching.send_invoice_request = lambda c: "sent-msg-2"
+    try:
+        pipeline._maybe_send_invoice_request(claim)
+    finally:
+        invoice_matching.send_invoice_request = original
+
+    row = _matched_row(cid)
+    assert row["flag"] == "invoice_request_auto_sent"
+    assert row["invoice_request_sent_at"] is not None
+    assert row["draft_id"] is None
+
+
+def test_maybe_send_invoice_request_failure_flags_visibly_never_silent():
+    from openclaw import invoice_matching, pipeline
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        cid = _insert_pending_claim(conn, "AUTOSEND FAIL VET", -90.0, "2020-01-01")
+    claim = _matched_row(cid)
+
+    original = invoice_matching.send_invoice_request
+
+    def boom(c):
+        raise RuntimeError("Gmail API down")
+
+    invoice_matching.send_invoice_request = boom
+    try:
+        pipeline._maybe_send_invoice_request(claim)
+    finally:
+        invoice_matching.send_invoice_request = original
+
+    row = _matched_row(cid)
+    assert row["flag"] == "invoice request send failed: Gmail API down"
+    assert row["invoice_request_sent_at"] is None
+
+
+def test_notify_pushes_once_when_invoice_request_auto_sent():
+    """The flag string alone drives this (pipeline.py's notify_claim_states
+    exclusion list deliberately omits it, ADR-0030) — regression-test the
+    coupling design.md flags as fragile-looking."""
+    from openclaw import pipeline
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        cid = _insert_pending_claim(conn, "NOTIFY SENT VET", -55.0, "2026-06-01")
+        conn.execute(
+            "UPDATE vet_claims SET flag = 'invoice_request_auto_sent', invoice_request_sent_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), cid),
+        )
+
+    sent, markups = [], []
+    pipeline.notify_claim_states(
+        send_fn=lambda text, markup=None: (sent.append(text), markups.append(markup))
+    )
+    assert len(sent) == 1
+    assert "invoice request sent" in sent[0] and f"#{cid}" in sent[0]
+    assert "⚠" not in sent[0], "sending is good news, not a warning"
+    assert markups[0] is None, "nothing for Justin to tap — informational only"
+
+
+def test_notify_stays_silent_for_legacy_drafted_flag():
+    from openclaw import pipeline
+
+    db.init_db()
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM vet_claims")
+        conn.execute("DELETE FROM bank_transactions")
+        cid = _insert_pending_claim(conn, "LEGACY DRAFT VET", -55.0, "2026-06-01")
+        conn.execute("UPDATE vet_claims SET flag = 'invoice_request_drafted' WHERE id = ?", (cid,))
+
+    sent = []
+    pipeline.notify_claim_states(send_fn=lambda text, markup=None: sent.append(text))
+    assert sent == [], "a legacy drafted-but-unsent flag must stay noise, unaffected by ADR-0030"
 
 
 # ---------------------------------------------------------------------------
@@ -7694,8 +7838,11 @@ def test_a_gateway_delivered_event_and_its_replies_carry_the_same_correlation_id
     assert nudge["correlation_id"] is None, "an unprompted send invented a correlation"
 
 
-def test_nothing_in_the_app_can_send_mail_and_no_tool_offers_to():
-    """Task 10.3, guarding the first hard rule: Gmail DRAFTS only, never send.
+def test_nothing_but_the_one_named_exception_can_send_mail_and_no_tool_offers_to():
+    """Task 10.3, guarding the first hard rule: Gmail DRAFTS only, never send —
+    narrowed by ADR-0030 to one named exception, `invoice_matching.py`'s
+    `send_invoice_request` (vet invoice-request emails only). Every other file
+    must still have zero send call sites.
 
     Two halves, because there are two ways to break it. The code half greps for
     Gmail's send call rather than for the word "send" — `bot.send_message` is a
@@ -7705,16 +7852,29 @@ def test_nothing_in_the_app_can_send_mail_and_no_tool_offers_to():
     that stands between a model and an outgoing email."""
     from openclaw import mcp_server
 
+    permitted_file = "invoice_matching.py"
+    send_patterns = ("messages().send", "messages() .send", ".send(userId", "drafts().send")
+
     offenders = []
+    permitted_file_has_send = False
     for path in (Path(__file__).resolve().parent.parent / "openclaw").glob("*.py"):
         text = path.read_text(encoding="utf-8")
-        for pattern in ("messages().send", "messages() .send", ".send(userId", "drafts().send"):
+        for pattern in send_patterns:
             # Only real call sites: this file's own prose says "never send()", and
             # so do several module docstrings.
             for line in text.splitlines():
                 if pattern in line and not line.lstrip().startswith("#"):
-                    offenders.append(f"{path.name}: {line.strip()[:80]}")
-    assert not offenders, f"a Gmail send call exists: {offenders}"
+                    if path.name == permitted_file:
+                        permitted_file_has_send = True
+                    else:
+                        offenders.append(f"{path.name}: {line.strip()[:80]}")
+    assert not offenders, (
+        f"a Gmail send call exists outside the one ADR-0030 exception: {offenders}"
+    )
+    assert permitted_file_has_send, (
+        "the one permitted send call site (ADR-0030, invoice_matching.send_invoice_request) "
+        "is missing — this test must not pass by the send path having been deleted or moved"
+    )
 
     named = [t["name"] for t in mcp_server.TOOLS]
     for tool in named:

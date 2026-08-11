@@ -1138,9 +1138,11 @@ def _lookup_vet_email(merchant: str) -> str | None:
     return headers.get("From")
 
 
-def draft_invoice_request(claim) -> str | None:
-    """Drafts (never sends) an email asking the vet for the invoice. Returns the
-    draft's message id, or None if no vet email is on file yet."""
+def send_invoice_request(claim) -> str | None:
+    """Sends (ADR-0030: the one permitted send() call site — never any other
+    email type) an email asking the vet for the invoice. Returns None if no
+    vet email is on file yet; raises on a Gmail API failure so the caller can
+    flag it visibly rather than silently no-op."""
     to = _lookup_vet_email(claim["txn_merchant"])
     if not to:
         return None
@@ -1166,5 +1168,5 @@ def draft_invoice_request(claim) -> str | None:
     ).decode()
 
     service = gmail_client.build_service()
-    draft = service.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
-    return draft["message"]["id"]
+    sent = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+    return sent["id"]

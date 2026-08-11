@@ -9,6 +9,16 @@ that offers file, shell and browser tools in principle is the one part of the
 gateway swap that can regress a hard rule, which is why this is a capability
 rather than a design note.
 
+**Amendment (2026-08-11, ADR-0030).** "The absence of `send()`" is no longer
+absolute: `invoice_matching.send_invoice_request` is one named, narrow exception
+(vet invoice-request emails only, Justin's explicit override), guarded by an
+automated test (`app/tests/test_core.py`,
+`test_nothing_but_the_one_named_exception_can_send_mail_and_no_tool_offers_to`)
+that asserts every *other* file in the package still has zero Gmail send call
+sites. The requirements below — credential isolation, no agent tool reach, query
+construction in Python — are unaffected; only this rationale paragraph's
+absoluteness needed correcting.
+
 This capability covers the boundary as it stands with both runtimes running: the
 gateway holds no Gmail credential and no Gmail-scoped Google key, the agent holds
 no tool that could reach the credential store or a webmail origin, and every

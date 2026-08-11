@@ -17,7 +17,7 @@ Personal assistant for Justin: task/reminder capture from Gmail, plus a vet-insu
 
 ## Hard rules (non-negotiable)
 
-- **Never send email.** Gmail drafts only — `drafts().create`/`update`, never `send()`. Justin reviews and sends himself.
+- **Never send email — one named exception.** Gmail drafts only — `drafts().create`/`update`, never `send()`. Justin reviews and sends himself. **Exception (ADR-0030, 2026-08-11):** `invoice_matching.send_invoice_request` — the vet invoice-request email only — is the one permitted `send()` call site, by Justin's explicit override. Every other email type stays draft-only; a test in `app/tests/test_core.py` (`test_nothing_but_the_one_named_exception_can_send_mail_and_no_tool_offers_to`) asserts no other file contains a Gmail send call.
 - **Never guess required claim fields.** `condition_text` and anything else Justin must supply gets flagged on the dashboard, not inferred.
 - **Never store bank login credentials.** Transactions arrive via manual NetBank CSV upload only.
 - **Failures are visible.** Follow the existing pattern: write a human-readable reason to `vet_claims.flag` / surface on the dashboard. No silent no-ops, no swallowed exceptions.
