@@ -42,9 +42,16 @@ _MATCHED_LABELS = {
 # only Cc'd on the vet's copy. `claim_status.resolve_owed_by` records which;
 # unrecorded stays neutral rather than guessing, because naming the wrong party
 # is how a claim quietly dies waiting for someone who was never asked.
+#
+# "petcover" (vet-reply-auto-resolves-info-request): the vet says its part is
+# done — sent straight to Petcover, not to us — so the document is no longer
+# vet-owed, but nothing confirms Petcover has it either. A fourth explicit
+# branch, not a fallback onto "justin"'s wording: that would tell Justin to
+# send Petcover something he doesn't have.
 _INFO_REQUEST_LABELS = {
     "vet": "More vet info required",
     "justin": "Petcover needs info from you",
+    "petcover": "Awaiting Petcover confirmation",
 }
 
 # Petcover names the document it wants, so the label says so: "more vet info
@@ -98,6 +105,8 @@ def label(claim, owed_by: str | None = None) -> str:
             return _INFO_REQUEST_LABELS[owed]
         if owed == "vet":
             return f"Vet: {doc} needed"
+        if owed == "petcover":
+            return f"Petcover to confirm {doc}"
         return f"{doc[0].upper()}{doc[1:]} needed from you"
     return LABELS.get(status, status)
 
@@ -115,6 +124,7 @@ _WAITING = {
 _INFO_REQUEST_NEEDS = {
     "vet": "Chase vet for the info",
     "justin": "Petcover needs info from you",
+    "petcover": "Follow up with Petcover to confirm",
 }
 
 
@@ -131,6 +141,8 @@ def needs(claim, owed_by: str | None = None) -> str:
             return f"Chase vet for {doc}" if doc else _INFO_REQUEST_NEEDS["vet"]
         if owed == "justin":
             return f"Send Petcover the {doc}" if doc else _INFO_REQUEST_NEEDS["justin"]
+        if owed == "petcover":
+            return f"Confirm Petcover received {doc}" if doc else _INFO_REQUEST_NEEDS["petcover"]
         return "Petcover needs info"
     return _WAITING.get(status) or label(claim, owed_by)
 

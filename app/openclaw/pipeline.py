@@ -873,6 +873,86 @@ def poll_petcover_status(reread: bool = False, since: str | None = None) -> dict
     }
 
 
+def poll_vet_replies() -> dict:
+    """Watches for a reply from a clinic email address that currently owes an
+    open, unresolved vet-directed information request — Justin chases vets by
+    his own email today, outside the app, and this gives the app visibility
+    into that reply (vet-reply-auto-resolves-info-request). Shape mirrors
+    `poll_petcover_status`: raises on Gmail API failure, unprocessed messages
+    stay unmarked so they retry, oldest-first so a later reply is read after
+    an earlier one in the same tick.
+
+    Scoped fresh every call from `claim_status.unanswered_vet_requests()` — a
+    claim that resolves, or moves to `owed_by: "petcover"`, drops out of the
+    search on its own next tick; nothing here tracks that separately (task
+    4.3). The actual guard against `gmail_ingest.poll_once`'s own,
+    more-frequent schedule racing this one for `processed_emails` is
+    `gmail_ingest`'s own exclusion (skip the message AND leave it unmarked) —
+    the same mechanism that protects Petcover's mail, and correct regardless
+    of which scheduled job happens to run first. Being called here, ahead of
+    `poll_petcover_status`, gives this poller the same tick position for the
+    same reason, but that position alone does not make it safe."""
+    outstanding = claim_status.unanswered_vet_requests()
+    since_by_clinic: dict[str, str] = {}
+    for r in outstanding:
+        email = (r["clinic_email"] or "").lower()
+        if not email or not r["asked_at"]:
+            continue
+        asked = r["asked_at"][:10]
+        if email not in since_by_clinic or asked < since_by_clinic[email]:
+            since_by_clinic[email] = asked
+    if not since_by_clinic:
+        return {"checked": 0, "events": 0, "claims_changed": []}
+
+    before_event_id = _latest_event_id()
+    service = gmail_client.build_service()
+    unprocessed = []
+    for email, asked in since_by_clinic.items():
+        # A day of slack before the ask: Gmail's `after:` is a date boundary,
+        # and a same-day reply must not be missed.
+        since = (datetime.fromisoformat(asked).date() - timedelta(days=1)).strftime("%Y/%m/%d")
+        page_token = None
+        while True:
+            response = (
+                service.users()
+                .messages()
+                .list(
+                    userId="me",
+                    q=f"from:{email} after:{since}",
+                    maxResults=100,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            for item in response.get("messages", []):
+                if gmail_ingest._already_processed(item["id"]):
+                    continue
+                message = (
+                    service.users()
+                    .messages()
+                    .get(userId="me", id=item["id"], format="full")
+                    .execute()
+                )
+                unprocessed.append(message)
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+    unprocessed.sort(key=lambda m: int(m.get("internalDate", 0)))
+    for message in unprocessed:
+        headers = {h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])}
+        subject = headers.get("Subject", "")
+        body = gmail_client.full_message_text(service, message)
+        claim_status.process_vet_reply(message["id"], subject, body, headers.get("From", ""))
+        gmail_ingest._mark_processed(message["id"], None)
+
+    return {
+        "checked": len(unprocessed),
+        "events": _latest_event_id() - before_event_id,
+        "claims_changed": _claims_touched_since(before_event_id),
+    }
+
+
 # flags run_once writes on match failure — cleared before the next attempt so
 # a recovered claim doesn't carry a stale error
 _TRANSIENT_MATCH_FLAGS = ("invoice extraction unavailable", "invoice matching error")
@@ -1041,7 +1121,10 @@ def run_once() -> None:
     _draft_matched_claims()
 
     # Poll before notifying so status changes from fresh Petcover replies
-    # push to Telegram in the same tick, not the next one.
+    # push to Telegram in the same tick, not the next one. Vet replies first,
+    # same position poll_petcover_status has always had (see poll_vet_replies'
+    # own docstring for what actually keeps this safe against gmail_ingest).
+    poll_vet_replies()
     poll_petcover_status()
     notify_claim_states()
     notify_split_proposals()

@@ -1,7 +1,7 @@
 import re
 from datetime import datetime, timezone
 
-from . import config, db, gmail_client, tasks
+from . import claim_status, config, db, gmail_client, tasks
 from .scheduler import scheduler
 
 # Real inbox survey (78 auto-captured "tasks", 2026-07-20): every marketing,
@@ -44,6 +44,21 @@ def _belongs_to_the_claims_service(headers: dict) -> bool:
     return _sender_address(headers).lower() in {s.lower() for s in config.PETCOVER_STATUS_SENDERS}
 
 
+def _currently_owed_clinic_emails() -> set[str]:
+    """Clinic addresses that owe an open vet-directed request RIGHT NOW
+    (vet-reply-auto-resolves-info-request) — computed fresh every poll, never
+    a static list and never all of `vet_contacts`: most of a clinic's mail has
+    nothing to do with an open request and should still become a task
+    normally. Mirrors `_belongs_to_the_claims_service`'s exact carve-out
+    (skip AND leave unmarked) for a population that changes claim to claim
+    rather than Petcover's small, fixed sender list."""
+    return {
+        r["clinic_email"].lower()
+        for r in claim_status.unanswered_vet_requests()
+        if r["clinic_email"]
+    }
+
+
 def _already_processed(message_id: str) -> bool:
     with db.get_connection() as conn:
         row = conn.execute(
@@ -68,6 +83,7 @@ def poll_once() -> None:
     response = (
         service.users().messages().list(userId="me", maxResults=20, labelIds=["INBOX"]).execute()
     )
+    owed_clinic_emails = _currently_owed_clinic_emails()
 
     for item in response.get("messages", []):
         message_id = item["id"]
@@ -90,6 +106,12 @@ def poll_once() -> None:
         # Leave it UNMARKED as well as un-tasked: marking is what locked the
         # claims poller out, so skipping without marking is the whole fix.
         if _belongs_to_the_claims_service(headers):
+            continue
+
+        # Same carve-out, for a clinic currently owing an open vet-directed
+        # request instead of Petcover's fixed sender list — its reply is
+        # pipeline.poll_vet_replies' input, not a task.
+        if _sender_address(headers).lower() in owed_clinic_emails:
             continue
 
         task_id = None

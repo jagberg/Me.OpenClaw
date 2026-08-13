@@ -9339,6 +9339,473 @@ def test_an_html_only_email_yields_its_table_not_a_snippet():
     assert gmail_client._message_text(message) == "plain wins"
 
 
+def _seed_vet_owed_claim(
+    pet_id,
+    clinic_email,
+    *,
+    subject_reference=None,
+    subject_sr=None,
+    txn_date="2026-07-01",
+    merchant="TEST VET",
+    document="Consultation notes dated 18/05/2026",
+):
+    """A claim sitting on an unresolved, vet-owed information request — the
+    shape `unanswered_vet_requests()` (and so `claims_owed_by_clinic`) reads:
+    an `info_requested` event with `owed_by: vet` and a clinic address, no
+    subsequent `confirmed_resolved`. Mirrors test_telegram.py's
+    `_seed_unanswered_vet_request` fixture, adapted to this file's own
+    `_insert_claim` helper."""
+    with db.get_connection() as conn:
+        claim_id = _insert_claim(
+            conn,
+            pet_id,
+            txn_date,
+            status="info_requested",
+            reference=subject_reference,
+            sr=subject_sr,
+            merchant=merchant,
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        detail = {
+            "owed_by": "vet",
+            "clinic": merchant,
+            "clinic_email": clinic_email,
+            "requested_document": document,
+        }
+        conn.execute(
+            "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
+            "VALUES (?, 'info_requested', ?, ?, ?)",
+            (claim_id, f"m-req-{claim_id}", json.dumps(detail), now),
+        )
+    return claim_id
+
+
+def _owed_ids() -> set:
+    return {r["claim_id"] for r in claim_status.unanswered_vet_requests()}
+
+
+def test_vet_reply_provided_resolves_via_the_same_confirm_resolved_path():
+    """'Provided' must not grow a second resolution path — it calls the exact
+    function Justin's own dashboard/Telegram tap calls."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+    claim = _seed_vet_owed_claim(
+        aari, "reception@shirevet.example", subject_reference="DC1-27-5628", subject_sr=8
+    )
+    assert claim in _owed_ids()
+
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: '{"outcome": "provided", "note": "attached the notes"}'
+    try:
+        claim_status.process_vet_reply(
+            "m-vet-1",
+            "Re: Petcover claim for Ari - DC1-27-5628 sr.8",
+            "Hi, please find the consult notes attached.",
+            "Shire Vet Reception <reception@shirevet.example>",
+        )
+    finally:
+        llm.extract = original_extract
+
+    with db.get_connection() as conn:
+        types = [
+            r["event_type"]
+            for r in conn.execute(
+                "SELECT event_type FROM claim_status_events WHERE claim_id = ? ORDER BY id",
+                (claim,),
+            )
+        ]
+    assert "confirmed_resolved" in types
+    assert claim not in _owed_ids()
+
+
+def test_vet_reply_sent_to_petcover_records_owed_by_petcover_without_resolving():
+    """The live case this change exists for: the vet says it went straight to
+    Petcover, not to us. Not resolved — a new info_requested event, owed_by
+    petcover, so the claim drops off the vet-owed list without anyone having
+    confirmed Petcover actually has it."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+    claim = _seed_vet_owed_claim(
+        aari, "reception@shirevet.example", subject_reference="DC1-27-5628", subject_sr=8
+    )
+
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: (
+        '{"outcome": "sent_to_petcover", "note": "sent directly to Petcover weeks ago"}'
+    )
+    try:
+        claim_status.process_vet_reply(
+            "m-vet-2",
+            "Re: Petcover claim for Ari - DC1-27-5628 sr.8",
+            "All required clinic notes were sent to your insurance company several weeks ago.",
+            "Shire Vet Reception <reception@shirevet.example>",
+        )
+    finally:
+        llm.extract = original_extract
+
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT status, flag FROM vet_claims WHERE id = ?", (claim,)).fetchone()
+        events = conn.execute(
+            "SELECT event_type, detail FROM claim_status_events WHERE claim_id = ? ORDER BY id",
+            (claim,),
+        ).fetchall()
+    assert row["status"] == "info_requested", "not resolved"
+    assert row["flag"] is None, (
+        f"the second info_requested event must be a declared transition, not refused: {row['flag']}"
+    )
+    info_events = [json.loads(e["detail"]) for e in events if e["event_type"] == "info_requested"]
+    assert len(info_events) == 2
+    assert info_events[-1]["owed_by"] == "petcover"
+    assert claim not in _owed_ids(), "no longer a vet chase"
+
+
+def test_vet_reply_unavailable_leaves_it_vet_owed_with_a_visible_note():
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+    claim = _seed_vet_owed_claim(
+        aari, "reception@shirevet.example", subject_reference="DC1-27-5628", subject_sr=8
+    )
+
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: (
+        '{"outcome": "unavailable", "note": "cannot locate the 2025 consult notes"}'
+    )
+    try:
+        claim_status.process_vet_reply(
+            "m-vet-3",
+            "Re: Petcover claim for Ari - DC1-27-5628 sr.8",
+            "Sorry, we can't find those notes.",
+            "Shire Vet Reception <reception@shirevet.example>",
+        )
+    finally:
+        llm.extract = original_extract
+
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT status, flag FROM vet_claims WHERE id = ?", (claim,)).fetchone()
+        events = conn.execute(
+            "SELECT event_type FROM claim_status_events WHERE claim_id = ? ORDER BY id", (claim,)
+        ).fetchall()
+    assert row["status"] == "info_requested"
+    assert "cannot locate the 2025 consult notes" in (row["flag"] or ""), "visible, not silent"
+    assert [e["event_type"] for e in events] == ["info_requested"], "no new event"
+    assert claim in _owed_ids(), "still a vet chase"
+
+
+def test_vet_reply_unclear_leaves_the_claim_completely_untouched():
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+    claim = _seed_vet_owed_claim(
+        aari, "reception@shirevet.example", subject_reference="DC1-27-5628", subject_sr=8
+    )
+    with db.get_connection() as conn:
+        before = dict(
+            conn.execute("SELECT status, flag FROM vet_claims WHERE id = ?", (claim,)).fetchone()
+        )
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM claim_status_events WHERE claim_id = ?", (claim,)
+        ).fetchone()[0]
+
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: '{"outcome": "unclear", "note": ""}'
+    try:
+        claim_status.process_vet_reply(
+            "m-vet-4",
+            "Re: Petcover claim for Ari - DC1-27-5628 sr.8",
+            "Can you confirm the appointment time for next Tuesday?",
+            "Shire Vet Reception <reception@shirevet.example>",
+        )
+    finally:
+        llm.extract = original_extract
+
+    with db.get_connection() as conn:
+        after = dict(
+            conn.execute("SELECT status, flag FROM vet_claims WHERE id = ?", (claim,)).fetchone()
+        )
+        after_events = conn.execute(
+            "SELECT COUNT(*) FROM claim_status_events WHERE claim_id = ?", (claim,)
+        ).fetchone()[0]
+    assert after == before
+    assert after_events == before_events
+
+
+def test_vet_reply_correlates_to_one_of_two_open_requests_by_reference_and_sr():
+    """Kings Vet owing claim #6 and claim #8 simultaneously (confirmed live) —
+    a reply naming one by (reference, Sr) must act on that one alone."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+    claim_a = _seed_vet_owed_claim(
+        aari,
+        "reception@kingsvet.example",
+        subject_reference="DC1-26-5992",
+        subject_sr=1,
+        txn_date="2026-06-01",
+        merchant="Kings Vet",
+    )
+    claim_b = _seed_vet_owed_claim(
+        aari,
+        "reception@kingsvet.example",
+        subject_reference="DC1-27-5628",
+        subject_sr=5,
+        txn_date="2026-07-01",
+        merchant="Kings Vet",
+    )
+
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: '{"outcome": "provided", "note": ""}'
+    try:
+        claim_status.process_vet_reply(
+            "m-vet-5",
+            "Re: Petcover claim for Ari - DC1-26-5992 sr.1",
+            "Attached.",
+            "Kings Vet <reception@kingsvet.example>",
+        )
+    finally:
+        llm.extract = original_extract
+
+    owed = _owed_ids()
+    assert claim_a not in owed, "the named claim resolved"
+    assert claim_b in owed, "the other claim, sharing the same clinic, is untouched"
+
+
+def test_vet_reply_ambiguous_correlation_never_interprets_content():
+    """Neither named, or both named: the reply doesn't disambiguate, so content
+    must never even be looked at — a correlation failure, not a content one."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+    claim_a = _seed_vet_owed_claim(
+        aari,
+        "reception@kingsvet.example",
+        subject_reference="DC1-26-5992",
+        subject_sr=1,
+        txn_date="2026-06-01",
+    )
+    claim_b = _seed_vet_owed_claim(
+        aari,
+        "reception@kingsvet.example",
+        subject_reference="DC1-27-5628",
+        subject_sr=5,
+        txn_date="2026-07-01",
+    )
+
+    calls = []
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: calls.append(1) or '{"outcome": "provided", "note": ""}'
+    try:
+        claim_status.process_vet_reply(
+            "m-vet-6",
+            "Re: your enquiry",
+            "Yes, all set — thanks!",
+            "Kings Vet <reception@kingsvet.example>",
+        )
+    finally:
+        llm.extract = original_extract
+
+    assert calls == [], "content must never be interpreted on an ambiguous correlation"
+    owed = _owed_ids()
+    assert claim_a in owed and claim_b in owed, "neither claim changes"
+
+
+def test_unanswered_vet_requests_excludes_owed_by_petcover():
+    """Same exclusion mechanism that already drops owed_by: justin — a positive
+    check for 'vet', so a claim whose latest info_requested event says
+    owed_by: petcover falls out without a second branch."""
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+    claim = _seed_vet_owed_claim(aari, "reception@shirevet.example")
+    assert claim in _owed_ids()
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        conn.execute(
+            "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
+            "VALUES (?, 'info_requested', 'm-later', ?, ?)",
+            (claim, json.dumps({"owed_by": "petcover"}), now),
+        )
+    assert claim not in _owed_ids()
+
+
+def test_owed_by_petcover_gets_its_own_label_and_waiting_party():
+    """`owed_by` gains a third value with its own explicit branch everywhere it
+    is read — never a default onto the vet or Justin wording, which would
+    send Justin chasing the wrong party."""
+    base = {"status": "info_requested", "flag": None, "pet_id": 1, "condition_text": "x"}
+    label = status_labels.label({**base, "owed_by": "petcover", "requested_document": None})
+    assert label not in ("More vet info required", "Petcover needs info from you")
+    assert "Petcover" in label
+
+    needs = status_labels.needs({**base, "owed_by": "petcover", "requested_document": None})
+    assert needs != "Chase vet for the info" and needs != "Petcover needs info from you"
+
+    assert (
+        claim_status.waiting_party("confirm_resolved", "petcover")
+        == claim_status.YOU_WAITING_ON_PETCOVER
+    )
+
+
+def test_gmail_ingest_currently_owed_clinic_is_excluded_from_task_capture():
+    """Mirrors `test_petcover_letters_are_never_taken_by_the_task_ingest`'s own
+    level: the exclusion predicate, not a full Gmail-mocked poll loop — narrower
+    than excluding all of vet_contacts, since most vet mail has nothing to do
+    with an open request."""
+    from openclaw import gmail_ingest
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+    _seed_vet_owed_claim(aari, "reception@shirevet.example")
+
+    owed = gmail_ingest._currently_owed_clinic_emails()
+    assert "reception@shirevet.example" in owed
+    assert (
+        gmail_ingest._sender_address(
+            {"From": "Shire Vet Reception <reception@shirevet.example>"}
+        ).lower()
+        in owed
+    )
+
+    # An unrelated clinic's mail — no open request against it — must stay
+    # eligible for normal task capture.
+    assert (
+        gmail_ingest._sender_address({"From": "reception@otherclinic.example"}).lower() not in owed
+    )
+
+
+def test_gmail_ingest_skips_a_currently_owed_clinic_reply_without_marking_it():
+    """The exact mechanism that saved Petcover's mail, proven for a vet clinic:
+    skip the message AND leave it unmarked, so pipeline.poll_vet_replies can
+    still read it on a later tick — marking here would lock that poller out
+    permanently under the shared processed_emails gate."""
+    from openclaw import gmail_ingest
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+    _seed_vet_owed_claim(aari, "reception@shirevet.example")
+
+    message_id = "m-vet-unrelated-reply"
+    headers = [
+        {"name": "Subject", "value": "Re: Petcover claim for Ari - DC1-27-5628 sr.8"},
+        {"name": "From", "value": "Shire Vet Reception <reception@shirevet.example>"},
+    ]
+
+    class _FakeExec:
+        def __init__(self, result):
+            self._result = result
+
+        def execute(self):
+            return self._result
+
+    class _FakeMessages:
+        def list(self, userId, maxResults, labelIds):
+            return _FakeExec({"messages": [{"id": message_id}]})
+
+        def get(self, userId, id, format, metadataHeaders):
+            return _FakeExec({"payload": {"headers": headers}, "snippet": "attached"})
+
+    class _FakeUsers:
+        def messages(self):
+            return _FakeMessages()
+
+    class _FakeService:
+        def users(self):
+            return _FakeUsers()
+
+    original = gmail_ingest.gmail_client.build_service
+    gmail_ingest.gmail_client.build_service = lambda: _FakeService()
+    try:
+        gmail_ingest.poll_once()
+    finally:
+        gmail_ingest.gmail_client.build_service = original
+
+    assert not gmail_ingest._already_processed(message_id), (
+        "must stay unmarked so pipeline.poll_vet_replies can still read it"
+    )
+
+
+def test_poll_vet_replies_reports_only_new_events_and_is_idempotent_on_replay():
+    """Mirrors `test_poll_petcover_status_summary_counts_only_new_events`'s
+    shape at the level `pipeline.poll_vet_replies` actually operates on: once
+    a claim resolves it drops out of `unanswered_vet_requests()`, so a second
+    call finds nothing left to search and changes nothing (task 4.3/6.10)."""
+    from openclaw import pipeline
+
+    _fresh_db()
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+    claim = _seed_vet_owed_claim(
+        aari, "reception@shirevet.example", subject_reference="DC1-27-5628", subject_sr=8
+    )
+
+    message_id = "m-vet-poller-1"
+    headers = [
+        {"name": "Subject", "value": "Re: Petcover claim for Ari - DC1-27-5628 sr.8"},
+        {"name": "From", "value": "Shire Vet Reception <reception@shirevet.example>"},
+    ]
+
+    class _FakeExec:
+        def __init__(self, result):
+            self._result = result
+
+        def execute(self):
+            return self._result
+
+    class _FakeMessages:
+        def list(self, userId, q, maxResults, pageToken):
+            if pageToken:
+                return _FakeExec({"messages": []})
+            return _FakeExec({"messages": [{"id": message_id}]})
+
+        def get(self, userId, id, format):
+            return _FakeExec(
+                {
+                    "id": message_id,
+                    "internalDate": "1",
+                    "payload": {
+                        "headers": headers,
+                        "mimeType": "text/plain",
+                        "body": {
+                            "data": __import__("base64")
+                            .urlsafe_b64encode(b"Attached, please find the notes.")
+                            .decode()
+                        },
+                    },
+                }
+            )
+
+    class _FakeUsers:
+        def messages(self):
+            return _FakeMessages()
+
+    class _FakeService:
+        def users(self):
+            return _FakeUsers()
+
+    original = pipeline.gmail_client.build_service
+    pipeline.gmail_client.build_service = lambda: _FakeService()
+    original_extract = llm.extract
+    llm.extract = lambda *a, **k: '{"outcome": "provided", "note": ""}'
+    try:
+        result = pipeline.poll_vet_replies()
+        assert result["checked"] == 1
+        assert claim in result["claims_changed"]
+
+        # Replay: the claim resolved, so it no longer owes anything and the
+        # search scope is empty — nothing left to check, nothing re-applied.
+        again = pipeline.poll_vet_replies()
+        assert again == {"checked": 0, "events": 0, "claims_changed": []}
+    finally:
+        pipeline.gmail_client.build_service = original
+        llm.extract = original_extract
+
+    assert claim not in _owed_ids()
+
+
 def test_an_assessment_difference_names_whose_invoice_the_figure_actually_is():
     """Petcover's stated figure has never been a mystery number: on 2026-08-04
     every letter carrying one matched some real claim of ours to the cent, and

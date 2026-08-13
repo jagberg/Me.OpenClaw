@@ -200,7 +200,26 @@ TRANSITIONS: dict[str | None, frozenset] = {
         {"info_requested", "suspended", "approved", "settled", "declined", "below_excess"}
     ),
     "info_requested": frozenset(
-        {"suspended", "acknowledged", "approved", "settled", "declined", "below_excess"}
+        # Self-loop added for vet-reply-auto-resolves-info-request, but it is a
+        # real pre-existing gap, not a poller-only special case: claim #8's live
+        # log holds `acknowledged -> info_requested -> info_requested` (a second
+        # Petcover request letter while the first was still unresolved,
+        # confirmed live 2026-07-29), and without this entry that second event
+        # was silently REFUSED — appended to the log, but flagged
+        # "not a declared transition" even though nothing was actually wrong.
+        # Mirrors the `matched`->`matched` precedent (a legitimate re-apply).
+        # This new poller hits the identical case: recording a second
+        # info_requested event (this time with owed_by: "petcover") while a
+        # claim is still sitting at `info_requested`.
+        {
+            "info_requested",
+            "suspended",
+            "acknowledged",
+            "approved",
+            "settled",
+            "declined",
+            "below_excess",
+        }
     ),
     "suspended": frozenset({"info_requested", "approved", "settled", "declined", "below_excess"}),
     "approved": frozenset({"settled", "awaiting_petcover_clarification"}),
@@ -1579,13 +1598,21 @@ def _sent_group_ids(conn, claim_id: int, draft_id: str | None) -> list[int]:
     return [r["id"] for r in rows] or [claim_id]
 
 
-def confirm_resolved(claim_id: int) -> dict:
+def confirm_resolved(
+    claim_id: int, detail: dict | None = None, email_id: str | None = None
+) -> dict:
     """Clears a needs-action flag (info_requested/suspended) by Justin's explicit
     confirmation — ADR-0008.
 
     Idempotent on purpose: an update can be replayed after a crash, and two
     confirmations of the same request would otherwise write two audit events for
-    one decision. Nothing outstanding means nothing to confirm."""
+    one decision. Nothing outstanding means nothing to confirm.
+
+    `detail`/`email_id` are how an AUTOMATIC resolution (vet-reply-auto-resolves-
+    info-request: a matched clinic reply saying the document was supplied)
+    records that it fired from a reply, not Justin's own tap — one resolution
+    path, not two. Justin's manual confirm (dashboard/Telegram) calls this with
+    neither, exactly as before."""
     with db.get_connection() as conn:
         events = conn.execute(
             "SELECT event_type FROM claim_status_events WHERE claim_id = ? ORDER BY id",
@@ -1597,7 +1624,7 @@ def confirm_resolved(claim_id: int) -> dict:
     )
     if last_flag is None or "confirmed_resolved" in types[last_flag + 1 :]:
         return {"ok": False, "message": f"Claim #{claim_id} has nothing outstanding to confirm."}
-    _record_event(claim_id, "confirmed_resolved", None, {})
+    _record_event(claim_id, "confirmed_resolved", email_id, detail or {})
     return {"ok": True, "message": f"Claim #{claim_id} confirmed resolved."}
 
 
@@ -1959,7 +1986,14 @@ _ACTION_META = {
     "confirm_resolved": (
         "Confirm resolved",
         "a Petcover request is still open",
-        {"justin": PETCOVER_WAITING_ON_YOU, "vet": YOU_WAITING_ON_THE_VET},
+        # "petcover" (vet-reply-auto-resolves-info-request): the vet says its
+        # part is done, so Justin is the one waiting on PETCOVER now, not the
+        # vet — a fourth explicit branch, never a fallthrough to "justin".
+        {
+            "justin": PETCOVER_WAITING_ON_YOU,
+            "vet": YOU_WAITING_ON_THE_VET,
+            "petcover": YOU_WAITING_ON_PETCOVER,
+        },
     ),
     "mark_sent": ("Send Gmail draft", "Petcover reply tracking hasn't started", NOBODY_WAITING),
     "invoice_request_sent": (
@@ -2023,7 +2057,15 @@ def _waiting_key(kind: str, claim: dict) -> str | None:
     if kind == "dismiss_mismatch":
         return _settlement_check_kind(claim.get("flag")) or "arithmetic"
     if kind == "confirm_resolved":
-        return "vet" if claim.get("owed_by") == "vet" else "justin"
+        # Never default to "justin": that used to be safe when owed_by only
+        # ever held "vet"/"justin" (`resolve_owed_by` never returns anything
+        # else), but "petcover" is now a real third value and defaulting it
+        # here would tell Justin Petcover is waiting on him when he's actually
+        # the one waiting on Petcover.
+        owed = claim.get("owed_by")
+        if owed == "petcover":
+            return "petcover"
+        return "vet" if owed == "vet" else "justin"
     return None
 
 
@@ -2482,7 +2524,12 @@ def unanswered_vet_requests() -> list[dict]:
     for row in rows:
         info = json.loads(row["info"] or "{}")
         if info.get("owed_by") != "vet":
-            continue  # asked of Justin, or unrecorded — not a vet chase
+            # Asked of Justin, unrecorded, or (vet-reply-auto-resolves-info-
+            # request) "petcover" — the vet's part is done, so it is no longer
+            # a vet chase either. Positive check against "vet", not a negative
+            # check against the other values, so a future fourth value is
+            # excluded by construction rather than needing another branch here.
+            continue
         treated_on, from_invoice = treatment_date(row["invoice_data"], row["txn_date"])
         days_left = (
             config.INFO_REQUEST_DEADLINE_DAYS - (today - date.fromisoformat(treated_on)).days
@@ -2514,6 +2561,160 @@ def unanswered_vet_requests() -> list[dict]:
         )
     out.sort(key=lambda r: r["days_left"])
     return out
+
+
+# --- Vet reply auto-resolution (vet-reply-auto-resolves-info-request) -------
+# Justin chases vets by his own email, outside the app; this correlates a
+# clinic's reply to the specific claim it answers and interprets what it says,
+# reusing unanswered_vet_requests()'s own eligibility rather than re-deriving
+# it — a clinic's mail is otherwise indistinguishable from any other vet email.
+
+
+def claims_owed_by_clinic(clinic_email: str) -> list[dict]:
+    """Claims one clinic address currently owes an open vet-directed request
+    for — `unanswered_vet_requests()`'s own eligibility (owed_by == vet, not
+    yet confirmed resolved, within the treatment deadline), filtered to one
+    sender. Never re-derived: getting the eligibility rules out of sync here
+    is exactly how a resolved or Justin-owed claim would get reopened by a
+    clinic's unrelated reply."""
+    email = (clinic_email or "").lower()
+    if not email:
+        return []
+    return [r for r in unanswered_vet_requests() if (r["clinic_email"] or "").lower() == email]
+
+
+def _correlate_vet_reply(owed: list[dict], subject: str, body: str) -> dict | None:
+    """Which of a clinic's currently-owed claims a reply names, by
+    (petcover_reference, petcover_sr) — the same pair Justin's own follow-up
+    subjects already carry ("Re: Petcover claim for Ari - DC1-26-5992 sr.1",
+    confirmed against real mail), and the same one the reply itself echoes
+    back. Reuses `extract_reference`/`extract_sr` rather than a second regex —
+    they already carry every confirmed real subject/Sr shape.
+
+    Exactly one match proceeds; zero or more than one means the reply doesn't
+    disambiguate a clinic owing several requests at once (Kings Vet: claim #6
+    and claim #8 simultaneously, confirmed live) and NOTHING is touched — a
+    correlation failure, never guessed on top of."""
+    if not owed:
+        return None
+    text = f"{subject}\n{body}"
+    reference = extract_reference(subject) or extract_reference(body)
+    sr = extract_sr(text, reference)
+    if not reference or sr is None:
+        return None
+    with db.get_connection() as conn:
+        placeholders = ",".join("?" * len(owed))
+        rows = conn.execute(
+            f"SELECT id FROM vet_claims WHERE id IN ({placeholders}) "
+            "AND petcover_reference = ? AND petcover_sr = ?",
+            [*(o["claim_id"] for o in owed), reference, sr],
+        ).fetchall()
+    if len(rows) != 1:
+        return None
+    matched_id = rows[0]["id"]
+    return next(o for o in owed if o["claim_id"] == matched_id)
+
+
+_VET_REPLY_CLASSIFICATION_PROMPT = """This is a reply from a vet clinic, following up on a document our pet \
+insurer (Petcover) has asked the clinic for. Classify what the clinic's reply says into exactly one \
+outcome, as strict JSON:
+{{"outcome": "provided" | "sent_to_petcover" | "unavailable" | "unclear", "note": "<one short sentence \
+summarising what the vet said, or empty string if nothing worth quoting>"}}
+
+- "provided": the clinic says it has supplied/attached the requested document to US.
+- "sent_to_petcover": the clinic says it already sent the requested document directly to Petcover/the \
+insurer, not to us.
+- "unavailable": the clinic says it cannot find the document, or declines to provide it.
+- "unclear": the reply does not actually address the request at all.
+
+Reply:
+{body}
+"""
+
+_VET_REPLY_OUTCOMES = ("provided", "sent_to_petcover", "unavailable", "unclear")
+
+
+def _classify_vet_reply(body: str) -> dict:
+    """`{outcome, note}` from a free-form clinic reply — the ONE new LLM call
+    site this change adds (design.md), scoped as tightly as
+    `_extract_clarification_figures`: a fixed closed set of outcomes, nothing
+    else. A vet's reply has no fixed template to match, unlike every other
+    classification in this codebase (regex/keyword on Petcover's own
+    boilerplate), which is why this one isn't regex. Malformed or missing
+    output defaults to "unclear" — the safe, do-nothing outcome — never a
+    guess at what the vet meant."""
+    raw = llm.extract(
+        _VET_REPLY_CLASSIFICATION_PROMPT.format(body=body), purpose="vet_reply_outcome"
+    )
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end == -1:
+        return {"outcome": "unclear", "note": ""}
+    try:
+        data = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return {"outcome": "unclear", "note": ""}
+    if not isinstance(data, dict):
+        return {"outcome": "unclear", "note": ""}
+    outcome = data.get("outcome")
+    if outcome not in _VET_REPLY_OUTCOMES:
+        outcome = "unclear"
+    note = data.get("note")
+    return {"outcome": outcome, "note": note if isinstance(note, str) else ""}
+
+
+def process_vet_reply(email_id: str, subject: str, body: str, sender: str | None) -> None:
+    """Handles one reply from a clinic address that currently owes an open
+    vet-directed request. Correlation first (never guessed), content second:
+
+    - no owed claim for this sender, or the reply doesn't name exactly one of
+      several -> nothing happens, nothing touched.
+    - "provided" -> `confirm_resolved`, the SAME path Justin's own tap uses.
+    - "sent_to_petcover" -> a new `info_requested` event, `owed_by: "petcover"`
+      — the vet's job is done, Petcover confirming receipt is the open
+      question now, and that's Justin's to chase, not the app's.
+    - "unavailable" -> no event; the vet's stated reason is appended to the
+      claim's flag as a visible note (mirrors `queue_clarification`'s
+      "still unresolved" note) — the request stays owed by the vet exactly as
+      before.
+    - "unclear" -> nothing at all.
+    """
+    if any(kw in _normalize(subject).lower() for kw in IGNORE_KEYWORDS):
+        return  # an auto-reply/out-of-office is noise, not an answer
+    match = _EMAIL_IN_HEADER.search(sender or "")
+    if not match:
+        return
+    clinic_email = match.group(0)
+    owed = claims_owed_by_clinic(clinic_email)
+    if not owed:
+        return
+    claim = _correlate_vet_reply(owed, subject, body)
+    if claim is None:
+        return
+
+    result = _classify_vet_reply(body)
+    outcome = result["outcome"]
+    claim_id = claim["claim_id"]
+    if outcome == "provided":
+        confirm_resolved(
+            claim_id,
+            detail={"source": "auto_matched_vet_reply", "clinic_email": clinic_email},
+            email_id=email_id,
+        )
+    elif outcome == "sent_to_petcover":
+        detail = {
+            "owed_by": "petcover",
+            "clinic": claim.get("clinic"),
+            "clinic_email": clinic_email,
+            "subject": subject,
+        }
+        if result["note"]:
+            detail["vet_reply_note"] = result["note"]
+        apply_event(claim_id, "info_requested", detail, email_id)
+    elif outcome == "unavailable":
+        note = result["note"] or "cannot locate the requested document"
+        _flag_claim(claim_id, f"vet reply: {note}")
+    # "unclear" -> nothing at all, per spec: never guess on top of a reply
+    # that doesn't answer the request.
 
 
 def dismiss_mismatch(claim_id: int, reply_confirmation: dict | None = None) -> dict:
