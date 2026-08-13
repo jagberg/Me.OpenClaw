@@ -2829,6 +2829,246 @@ def test_process_reply_approved_validates_and_flags_from_real_shape():
     assert detail["paid_amount"] == 22.75
 
 
+# --- auto-confirm-resolved-on-clean-settlement ------------------------------
+# "Settled clean" (CONTEXT.md glossary): reached `settled`, a real `paid_amount`
+# was on the triggering event, and `_validate_settlement` found no Check A/B
+# mismatch for it. Only that precise combination auto-confirms an outstanding
+# info_requested/suspended event via the same `confirm_resolved` Justin's own
+# tap uses — everything else (not yet settled, settled with a mismatch, a
+# dollar-less event with nothing validated) must change nothing.
+
+
+def _insert_info_requested_event(conn, claim_id, owed_by, email_id, created_at=None):
+    import json as _json
+
+    conn.execute(
+        "INSERT INTO claim_status_events (claim_id, event_type, raw_email_id, detail, created_at) "
+        "VALUES (?, 'info_requested', ?, ?, ?)",
+        (
+            claim_id,
+            email_id,
+            _json.dumps({"owed_by": owed_by}),
+            created_at or datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+
+def _confirmed_resolved_details(claim_id) -> list:
+    import json as _json
+
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT detail FROM claim_status_events WHERE claim_id = ? AND event_type = "
+            "'confirmed_resolved' ORDER BY id",
+            (claim_id,),
+        ).fetchall()
+    return [_json.loads(r["detail"] or "{}") for r in rows]
+
+
+def test_settled_clean_auto_confirms_outstanding_info_request():
+    """Claim #13's real shape: acknowledged, an unresolved info_requested sits
+    on it, then a settlement letter states a paid_amount that reconciles
+    exactly (no Check A/B mismatch) — the outstanding request is auto-confirmed
+    via the SAME path as Justin's own tap, with a detail distinguishing it from
+    both a manual tap and the vet-reply auto-confirm."""
+    _fresh_db()
+    import json as _json
+
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        anniversary = _anniversary_days_ago(10)  # current policy year just opened
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+        txn = _relative_date(5)
+        cid = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="acknowledged",
+            reference="DC1-CLEAN-1",
+            sr=1,
+            invoice_data=_json.dumps({"claimable_amount": 500.0}),
+        )
+        _insert_info_requested_event(conn, cid, "justin", "m-req-1")
+
+    # expected = 500 - 150 fresh excess = 350; paid exactly that -> clean
+    claim_status.process_reply(
+        "m-settled-clean-1",
+        "Claim settlement",
+        "Claim Reference:DC1-CLEAN-1 Sr 1\nAmount Claimed $350.00 Total Payable $350.00",
+    )
+    row = _claim_row(cid)
+    assert row["status"] == "settled"
+    assert row["flag"] is None, row["flag"]
+    confirmed = _confirmed_resolved_details(cid)
+    assert len(confirmed) == 1
+    assert confirmed[0]["source"] == "auto_confirmed_clean_settlement"
+
+
+def test_settled_with_mismatch_does_not_auto_confirm():
+    """Same shape, but Petcover pays short of the expected figure — Check A/B
+    flags a mismatch, so the existing manual-confirm rule stands exactly as
+    before: nothing is auto-confirmed."""
+    _fresh_db()
+    import json as _json
+
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        anniversary = _anniversary_days_ago(10)
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+        txn = _relative_date(5)
+        cid = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="acknowledged",
+            reference="DC1-MISMATCH-1",
+            sr=1,
+            invoice_data=_json.dumps({"claimable_amount": 500.0}),
+        )
+        _insert_info_requested_event(conn, cid, "justin", "m-req-2")
+
+    # expected = 350; paid way short -> settlement mismatch
+    claim_status.process_reply(
+        "m-settled-mismatch-1",
+        "Claim settlement",
+        "Claim Reference:DC1-MISMATCH-1 Sr 1\nAmount Claimed $350.00 Total Payable $100.00",
+    )
+    row = _claim_row(cid)
+    assert row["status"] == "settled"
+    assert row["flag"] and "settlement mismatch" in row["flag"]
+    assert _confirmed_resolved_details(cid) == []
+
+
+def test_dollarless_settled_event_does_not_auto_confirm():
+    """A dollar-less 'payment processed' notice that follows an earlier
+    approval has nothing for `_validate_settlement` to check — it returns
+    `None`, but that is NOT the same as "clean". Must not auto-confirm."""
+    _fresh_db()
+    import json as _json
+
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        txn = _relative_date(5)
+        cid = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="approved",
+            reference="DC1-NODOLLAR-1",
+            sr=1,
+            invoice_data=_json.dumps({"claimable_amount": 500.0}),
+        )
+        _insert_info_requested_event(conn, cid, "justin", "m-req-3")
+
+    claim_status.process_reply(
+        "m-settled-nodollar-1",
+        "Claim settlement",
+        "Claim Reference:DC1-NODOLLAR-1 Sr 1\nYour payment has been processed.",
+    )
+    row = _claim_row(cid)
+    assert row["status"] == "settled"
+    assert row["flag"] is None, row["flag"]
+    assert _confirmed_resolved_details(cid) == [], (
+        "a dollar-less event validates nothing and must not auto-confirm"
+    )
+
+
+def test_settled_clean_auto_confirms_regardless_of_owed_by():
+    """The settlement is evidence about the OUTCOME, not about which party the
+    app last recorded as owing an intermediate step — vet/justin/petcover must
+    all auto-confirm the same way."""
+    for owed_by in ("vet", "justin", "petcover"):
+        _fresh_db()
+        import json as _json
+
+        with db.get_connection() as conn:
+            aari = _aari(conn)
+            anniversary = _anniversary_days_ago(10)
+            conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+            txn = _relative_date(5)
+            cid = _insert_claim(
+                conn,
+                aari,
+                txn,
+                status="acknowledged",
+                reference="DC1-OWED-1",
+                sr=1,
+                invoice_data=_json.dumps({"claimable_amount": 500.0}),
+            )
+            _insert_info_requested_event(conn, cid, owed_by, "m-req-owed")
+
+        claim_status.process_reply(
+            "m-settled-owed-1",
+            "Claim settlement",
+            "Claim Reference:DC1-OWED-1 Sr 1\nAmount Claimed $350.00 Total Payable $350.00",
+        )
+        confirmed = _confirmed_resolved_details(cid)
+        assert len(confirmed) == 1, f"owed_by={owed_by} should still auto-confirm"
+
+
+def test_not_yet_settled_no_auto_confirm():
+    """An 'approved' reply (not yet 'settled') that validates clean does not
+    auto-confirm — only reaching `settled` itself is the trigger."""
+    _fresh_db()
+    import json as _json
+
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        anniversary = _anniversary_days_ago(10)
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+        txn = _relative_date(5)
+        cid = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="acknowledged",
+            reference="DC1-APPROVEDONLY-1",
+            sr=1,
+            invoice_data=_json.dumps({"claimable_amount": 500.0}),
+        )
+        _insert_info_requested_event(conn, cid, "justin", "m-req-4")
+
+    claim_status.process_reply(
+        "m-approved-clean-1",
+        "Petcover Insurance Claim for Ari",
+        "Claim Reference:DC1-APPROVEDONLY-1 Sr 1\nYour claim has been approved\n"
+        "Amount Claimed $350.00 Total Payable $350.00",
+    )
+    row = _claim_row(cid)
+    assert row["status"] == "approved"
+    assert row["flag"] is None, row["flag"]
+    assert _confirmed_resolved_details(cid) == []
+
+
+def test_settled_clean_auto_confirm_is_idempotent_on_replay():
+    """Re-processing the same settled email twice must not double-confirm —
+    `_already_recorded` short-circuits the second pass before the hook ever
+    runs again."""
+    _fresh_db()
+    import json as _json
+
+    with db.get_connection() as conn:
+        aari = _aari(conn)
+        anniversary = _anniversary_days_ago(10)
+        conn.execute("UPDATE pets SET policy_anniversary = ? WHERE id = ?", (anniversary, aari))
+        txn = _relative_date(5)
+        cid = _insert_claim(
+            conn,
+            aari,
+            txn,
+            status="acknowledged",
+            reference="DC1-REPLAY-1",
+            sr=1,
+            invoice_data=_json.dumps({"claimable_amount": 500.0}),
+        )
+        _insert_info_requested_event(conn, cid, "justin", "m-req-5")
+
+    body = "Claim Reference:DC1-REPLAY-1 Sr 1\nAmount Claimed $350.00 Total Payable $350.00"
+    claim_status.process_reply("m-settled-replay-1", "Claim settlement", body)
+    claim_status.process_reply("m-settled-replay-1", "Claim settlement", body, replaying=True)
+    assert len(_confirmed_resolved_details(cid)) == 1, "replay must not double-confirm"
+
+
 def test_reconcile_clears_stale_draft_on_404():
     """Real failure: a deleted Gmail draft 404s every 15-minute tick forever
     (confirmed live, claim #17, 10+/day in logs). A 404 specifically means the

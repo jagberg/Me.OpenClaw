@@ -1165,6 +1165,27 @@ def process_reply(
             conn.execute(
                 f"UPDATE vet_claims SET {', '.join(updates)} WHERE id = ?", (*params, claim["id"])
             )
+        # auto-confirm-resolved-on-clean-settlement: "settled clean" (CONTEXT.md
+        # glossary) auto-confirms an outstanding info_requested/suspended event,
+        # via the SAME path Justin's own tap uses. "Clean" is stricter than
+        # `settlement_flag is None` alone — that's also true of a dollar-less
+        # settled event with nothing to validate (_validate_settlement's early
+        # `paid_amount is None` return), which must NOT auto-confirm. So all
+        # three: reached settled (outcome["state"], the post-transition state,
+        # not the pre-event `claim["status"]` fetched above), a real paid_amount
+        # was on this event, and _validate_settlement found no Check A/B
+        # mismatch for it. `confirm_resolved` already no-ops when nothing is
+        # outstanding, so there's nothing to re-derive here.
+        if (
+            outcome["state"] == "settled"
+            and detail.get("paid_amount") is not None
+            and settlement_flag is None
+        ):
+            confirm_resolved(
+                claim["id"],
+                detail={"source": "auto_confirmed_clean_settlement"},
+                email_id=email_id,
+            )
 
 
 def _policy_year_start(anniversary_mmdd: str, on: date) -> date:
