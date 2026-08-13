@@ -108,16 +108,30 @@ The system SHALL show, on the dashboard: claims with an open `info_requested` or
 - **WHEN** a claim's `settled` event includes a paid amount that differs from the originally claimed amount
 - **THEN** both amounts are shown side by side on the dashboard (e.g. after an excess deduction) rather than showing only one
 
-### Requirement: An info-requested or suspended claim stays flagged until Justin explicitly confirms it resolved
-A new event arriving on a claim (even `settled` or `declined`) SHALL NOT automatically clear its "needs your action" status. The claim SHALL only leave the action list when Justin explicitly confirms it resolved via the dashboard, so a claim isn't silently dropped when Petcover's own follow-through is inconsistent (real pattern observed: repeated "request for X" emails on the same claim before resolution).
+### Requirement: An info-requested or suspended claim stays flagged until Justin explicitly confirms it resolved, or the claim settles clean
+A new event arriving on a claim (even settled or declined) SHALL NOT automatically clear its "needs your action" status, so a claim isn't silently dropped when Petcover's own follow-through is inconsistent (real pattern observed: repeated "request for X" emails on the same claim before resolution). The claim SHALL leave the action list either when Justin explicitly confirms it resolved via the dashboard, or automatically, when both of the following hold: the claim reaches `settled`, and its settlement validates with no Check A/B mismatch (`settlement-validation`). A claim that settles WITH a mismatch is unaffected by the automatic path — the manual-confirm requirement stands exactly as before, since that is precisely the "inconsistent follow-through" case this requirement exists to protect against.
+
+The automatic path SHALL apply regardless of which party (`owed_by`) the outstanding request names — the clean settlement is evidence about the outcome, not about who the app last recorded as responsible for an intermediate step.
 
 #### Scenario: New event arrives on an already-flagged claim
-- **WHEN** a claim already in the "needs your action" list (e.g. `suspended`) receives a new event (e.g. `settled`)
+- **WHEN** a claim already in the "needs your action" list (e.g. `suspended`) receives a new event (e.g. `settled`) and that settlement does NOT validate clean
 - **THEN** the claim remains visible on the action list, now showing both events, until Justin confirms it resolved
 
 #### Scenario: Justin confirms a claim resolved
 - **WHEN** Justin clicks "confirm resolved" on a flagged claim
 - **THEN** the claim is removed from the "needs your action" list; this confirmation is itself recorded as an event in the claim's status history
+
+#### Scenario: Claim settles clean with an outstanding info request
+- **WHEN** a claim carrying an unresolved `info_requested`/`suspended` event reaches `settled`, and Check A and Check B both find no mismatch
+- **THEN** the outstanding event is auto-confirmed via the same path as Justin's explicit tap, and the claim leaves the "needs your action" list without requiring one
+
+#### Scenario: Claim settles with a mismatch
+- **WHEN** a claim carrying an unresolved `info_requested`/`suspended` event reaches `settled`, but Check A or Check B flags a mismatch
+- **THEN** the outstanding event is NOT auto-confirmed; the claim requires Justin's explicit confirm exactly as before
+
+#### Scenario: Auto-confirm is indifferent to who was owed
+- **WHEN** a claim settling clean carries an outstanding request with `owed_by: "vet"`, `"justin"`, or `"petcover"`
+- **THEN** the automatic path applies the same way regardless of that value
 
 ### Requirement: An information request records the document it asked for
 Petcover's letter names the document in a fixed template phrase (confirmed live: *"To assess your claim, we need a copy of / Consultation notes dated 18/05/2026"*). The system SHALL extract that phrase and record it on the `info_requested` event alongside who owes it, using pattern matching only — no LLM. When no recognized phrase is present the system SHALL record no document rather than inferring one.

@@ -46,6 +46,10 @@ _Avoid_: bill, statement (a statement is precisely NOT an invoice — running to
 A bank transaction from the NetBank CSV. The ceiling on what its Claim can be worth, never the claimed amount itself.
 _Avoid_: payment, transaction (ambiguous with Petcover payouts)
 
+**Settled clean**:
+A claim at `settled` status where at least one of its `approved`/`settled` events carried a real `paid_amount` and `_validate_settlement` found no Check A/B mismatch against it. Distinct from merely `settled`: a claim can reach `settled` via a dollar-less "payment processed" notice that follows an earlier `approved` email — nothing gets validated on that event, so it is NOT clean, just unvalidated. The distinction matters because only "settled clean" auto-confirms an outstanding `info_requested`/`suspended` event (`auto-confirm-resolved-on-clean-settlement`); "settled" alone never did and still doesn't.
+_Avoid_: treating "settled" as implying "clean" — they are independent facts about a claim.
+
 ## Language — assistant side
 
 This half of OpenClaw (`tasks.py`, `reminders.py`, `gmail_ingest.py`) is independent of claims and shares none of the vocabulary above. It had no entry here at all until 2026-07-25, when it gained its first interface (Telegram chat) and the ambiguity started to matter.
