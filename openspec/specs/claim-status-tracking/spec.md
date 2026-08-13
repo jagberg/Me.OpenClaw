@@ -155,6 +155,10 @@ The deadline SHALL be anchored on the date the pet was **treated**, not on the b
 - **WHEN** a claim's outstanding information request is owed by Justin, not the vet
 - **THEN** it does not appear in the vet-unanswered list
 
+#### Scenario: The vet has already sent it to Petcover directly
+- **WHEN** a claim's latest information request has `owed_by: "petcover"` (vet-reply-auto-resolves-info-request)
+- **THEN** it does not appear in the vet-unanswered list — the vet is no longer who Justin needs to chase
+
 ### Requirement: A claim awaiting Petcover clarification is a distinct pending-action state
 The system SHALL support an `awaiting_petcover_clarification` pending-action state, entered only when a claim is queued into an open clarification draft to Petcover (see `settlement-clarification-email`) — never while it is merely showing the pre-send settlement-review card, since at that point nothing has been asked of Petcover yet. It is distinct from `info_requested`/`suspended` on the dashboard's "needs your action" list, since this state means Justin is waiting on Petcover rather than needing to act himself. It follows the same persistence rule as `info_requested`/`suspended`: a new unrelated event SHALL NOT clear it — only an exact-match auto-resolved reply or an explicit Acceptable/dismiss action does.
 
@@ -173,4 +177,49 @@ The system SHALL support an `awaiting_petcover_clarification` pending-action sta
 #### Scenario: Cleared only by resolve or explicit action
 - **WHEN** a claim in `awaiting_petcover_clarification` receives any event other than an exact-match clarification reply
 - **THEN** it remains in that state until either an exact match resolves it or Justin explicitly clicks Acceptable
+
+### Requirement: A vet clinic's reply is interpreted and mapped to the state it actually represents
+When a reply arrives from a clinic's email address that currently owes an open, unresolved information request, and the reply's subject or thread names exactly one of that clinic's open requests by Petcover reference and Sr, the system SHALL interpret the reply's content and map it to exactly one of:
+
+- **Provided** — the vet has supplied what was asked (towards Justin/the app). The system SHALL resolve the claim's information request via the same path as Justin's explicit "confirm resolved" action, not a second one.
+- **Sent to Petcover directly** — the vet states they already supplied it to Petcover, not to Justin. The system SHALL record a new `info_requested` event on the claim with `owed_by: "petcover"` rather than resolving it — the claim is no longer waiting on the vet, but it is not confirmed as done either.
+- **Unavailable or declined** — the vet cannot find it or declines. The system SHALL leave the request owed by the vet exactly as before, and SHALL record the vet's stated reason visibly rather than silently.
+- **Unclear** — the reply does not answer the request. The system SHALL leave the claim untouched.
+
+Where the clinic currently owes more than one open request and the reply does not name which one (no reference/Sr match, or more than one matches), the system SHALL NOT interpret the reply's content at all, and SHALL NOT change any claim — correlation failure is handled before content, never guessed on top of an ambiguous match.
+
+#### Scenario: Vet provides the document
+- **WHEN** a clinic owing exactly one open request replies confirming it has supplied the requested document to Justin/the app
+- **THEN** that claim's information request is resolved via the same path as an explicit "confirm resolved" tap
+
+#### Scenario: Vet says it went straight to Petcover
+- **WHEN** a clinic owing exactly one open request replies stating the requested notes were already sent directly to Petcover
+- **THEN** the claim is not resolved; a new `info_requested` event is recorded with `owed_by: "petcover"`
+
+#### Scenario: Vet can't find it
+- **WHEN** a clinic owing exactly one open request replies that they cannot locate the requested document
+- **THEN** the request remains owed by the vet, and the reply's content is recorded visibly on the claim rather than silently dropped
+
+#### Scenario: Reply doesn't answer the request
+- **WHEN** a clinic's reply doesn't address the open request at all (e.g. an unrelated question)
+- **THEN** the claim is left completely untouched
+
+#### Scenario: Clinic owes two open requests, reply names one
+- **WHEN** a clinic owes open requests for claims #6 and #8, and a reply's subject names claim #6's reference and Sr only
+- **THEN** claim #6's content is interpreted and acted on per the outcomes above; claim #8 remains untouched
+
+#### Scenario: Clinic owes two open requests, reply is ambiguous
+- **WHEN** a clinic owes open requests for claims #6 and #8, and a reply's subject/thread names neither (or both)
+- **THEN** neither claim's content is interpreted, and neither claim changes
+
+### Requirement: `owed_by` gains a third value — Petcover
+The `info_requested` event's `owed_by` field SHALL accept `"petcover"` alongside its existing `"vet"`/`"justin"` values, meaning: the vet has said its part is done, and Justin needs to confirm with Petcover rather than chase the vet again. Every existing reader keyed on `owed_by` (dashboard/Telegram labels, the vet-nudge list) SHALL treat a claim whose latest `info_requested` event carries `owed_by: "petcover"` as excluded from the vet-owed list and labelled distinctly from both the vet-owed and Justin-owed cases.
+
+#### Scenario: Label reflects the new value
+- **WHEN** a claim's latest information request has `owed_by: "petcover"`
+- **THEN** its dashboard/Telegram label names Petcover as who Justin should follow up with, distinct from "more vet info required" and "Petcover needs info from you"
+
+#### Scenario: Vet-nudge list excludes it
+- **WHEN** the weekly vet-nudge job runs
+- **THEN** a claim whose latest information request has `owed_by: "petcover"` is not listed as an unanswered vet-owed request, since the vet is no longer who Justin needs to chase
 
