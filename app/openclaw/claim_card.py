@@ -292,6 +292,9 @@ _ACTION_COLOURS = {
     "set_condition": ((255, 176, 66), (58, 42, 20)),
     "dismiss_mismatch": ((150, 158, 175), (44, 48, 58)),
     "blocked_insurer": ((224, 108, 96), (48, 23, 21)),
+    # Same tone as _STATUS_COLOURS's entry for this status -- waiting on
+    # Petcover, not on Justin.
+    "awaiting_petcover_clarification": ((232, 138, 96), (48, 30, 22)),
 }
 
 SUMMARY_ROW_H = 34

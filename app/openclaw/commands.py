@@ -172,6 +172,16 @@ def handle_dismiss(username: str | None, claim_id: int) -> dict:
     return claim_status.dismiss_mismatch(claim_id)
 
 
+def handle_more_info(username: str | None, claim_id: int) -> dict:
+    """Settlement-clarification-email's "More Info" button, on Telegram.
+    `queue_clarification` itself branches on whether the claim is already
+    `awaiting_petcover_clarification` (queue into the draft, vs. just note
+    still-unresolved) -- same function the dashboard route calls."""
+    if not is_authorized(username):
+        return {"ok": False, "message": "Not authorized."}
+    return claim_status.queue_clarification(claim_id)
+
+
 def _command_button(label: str, command: str) -> dict:
     verb = command[1:].split(" ", 1)[0]
     # Belt and braces with build_buttons, which refuses the same thing. Here it
@@ -234,6 +244,7 @@ _ACTION_EMOJI = {
     "set_condition": "⚠️",
     "dismiss_mismatch": "🔍",
     "unlinked_letter": "🔗",
+    "awaiting_petcover_clarification": "⏳",
 }
 
 
@@ -358,6 +369,17 @@ def history_card(page: int = 1) -> dict | None:
     return {"png": png, "caption": f"Claim history — page {page}/{total_pages}", "buttons": buttons}
 
 
+def _clarification_buttons(claim_id: int) -> list[dict]:
+    """The settlement-review card's two actions, shared by both places it can
+    appear on Telegram: a not-yet-queued dismiss_mismatch flag, and an
+    already-queued awaiting_petcover_clarification claim (ADR-0031 -- one
+    card, two actions, reused at both points, not two different UIs)."""
+    return [
+        _command_button("✅ Acceptable", f"/dismiss {claim_id}"),
+        _command_button("❓ More Info", f"/moreinfo {claim_id}"),
+    ]
+
+
 def _action_buttons(action: dict) -> list[dict]:
     """Command buttons for one action card. Empty means nothing to tap.
 
@@ -380,7 +402,15 @@ def _action_buttons(action: dict) -> list[dict]:
     if kind == "invoice_request_sent":
         return [_command_button("📧 I've sent it", f"/invreq {claim_id}")]
     if kind == "dismiss_mismatch":
+        # settlement-clarification-email: a Check B / unrecorded-subtotal flag
+        # is eligible for the Acceptable/More Info pair; a Check A (arithmetic)
+        # flag keeps the old single "reviewed, dismiss" button -- it's a
+        # dispute with Petcover's own math, not something to ask them about.
+        if claim_status._clarification_eligible(action.get("flag")):
+            return _clarification_buttons(claim_id)
         return [_command_button("👍 Reviewed", f"/dismiss {claim_id}")]
+    if kind == "awaiting_petcover_clarification":
+        return _clarification_buttons(claim_id)
     if kind == "set_condition":
         # Prior conditions only. "Other" needs free-text capture, which depends
         # on a plugin conditionally claiming an inbound text message — task 0.10,
@@ -546,7 +576,7 @@ def dispatch(name: str, args: str, username: str | None) -> dict:
         handler = handle_merge if name == "merge" else handle_reject_merge
         return {"text": handler(username, claim_id)["message"], "cards": []}
 
-    if name in ("mark", "pet", "resolve", "unmatch", "invreq", "dismiss"):
+    if name in ("mark", "pet", "resolve", "unmatch", "invreq", "dismiss", "moreinfo"):
         if claim_id is None:
             return {"text": f"/{name} needs a claim id. Example: /{name} 7", "cards": []}
         if name == "mark":
@@ -566,6 +596,8 @@ def dispatch(name: str, args: str, username: str | None) -> dict:
             return {"text": handle_invoice_request_sent(username, claim_id)["message"], "cards": []}
         if name == "dismiss":
             return {"text": handle_dismiss(username, claim_id)["message"], "cards": []}
+        if name == "moreinfo":
+            return {"text": handle_more_info(username, claim_id)["message"], "cards": []}
 
     # Never a silent no-op: an unknown command here means the plugin registered
     # something this app cannot serve, which is a deploy-time mistake worth

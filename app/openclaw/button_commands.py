@@ -26,6 +26,7 @@ BUTTON_COMMANDS = (
     "unmatch",
     "invreq",
     "dismiss",
+    "moreinfo",
     "merge",
     "reject",
     "item",

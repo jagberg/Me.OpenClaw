@@ -9153,6 +9153,52 @@ def test_resolved_clarification_claim_leaves_pending_actions():
         claim_status.gmail_client.build_service = original
 
 
+def test_dismiss_mismatch_telegram_buttons_split_by_clarification_eligibility():
+    """A Check A (arithmetic) flag keeps the old single "Reviewed" button; a
+    Check B / unrecorded-subtotal flag (eligible for the settlement-review
+    card) gets the same Acceptable/More Info pair as the dashboard and
+    awaiting_petcover_clarification — ADR-0031, one card/pair of actions,
+    reused everywhere it appears, not a Telegram-specific third UI."""
+    from openclaw import commands
+
+    eligible = {"kind": "dismiss_mismatch", "claim_id": 8, "flag": "assessment difference - x"}
+    arithmetic = {"kind": "dismiss_mismatch", "claim_id": 9, "flag": "settlement mismatch - x"}
+
+    eligible_buttons = commands._action_buttons(eligible)
+    assert [b["command"] for b in eligible_buttons] == ["/dismiss 8", "/moreinfo 8"]
+    assert eligible_buttons[0]["label"] == "✅ Acceptable"
+    assert eligible_buttons[1]["label"] == "❓ More Info"
+
+    arithmetic_buttons = commands._action_buttons(arithmetic)
+    assert [b["command"] for b in arithmetic_buttons] == ["/dismiss 9"]
+    assert arithmetic_buttons[0]["label"] == "👍 Reviewed"
+
+
+def test_awaiting_petcover_clarification_gets_the_same_two_buttons():
+    from openclaw import commands
+
+    buttons = commands._action_buttons({"kind": "awaiting_petcover_clarification", "claim_id": 14})
+    assert [b["command"] for b in buttons] == ["/dismiss 14", "/moreinfo 14"]
+
+
+def test_moreinfo_command_dispatches_to_queue_clarification():
+    """End to end through commands.dispatch — the same path a Telegram/gateway
+    tap takes, not just the button label."""
+    from openclaw import commands
+
+    _fresh_db()
+    store: dict = {}
+    original = _patch_clarification_gmail(store)
+    try:
+        with db.get_connection() as conn:
+            claim = _queue_one_claim(conn, store)
+        out = commands.dispatch("moreinfo", str(claim), config.TELEGRAM_USERNAME)
+        assert "queued" in out["text"].lower(), out
+        assert _claim_row(claim)["status"] == "awaiting_petcover_clarification"
+    finally:
+        claim_status.gmail_client.build_service = original
+
+
 def test_settlement_review_card_template_actually_renders():
     """Neither this suite nor test_telegram.py otherwise renders `index.html`
     through Jinja at all — so a template-only bug (wrong Jinja syntax, a bad

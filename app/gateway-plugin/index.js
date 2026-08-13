@@ -70,6 +70,10 @@ const COMMANDS = [
   { name: "unmatch", description: "This invoice is the wrong one" },
   { name: "invreq", description: "I have sent the invoice request" },
   { name: "dismiss", description: "Reviewed, dismiss the mismatch" },
+  // Settlement-clarification-email: Acceptable reuses "dismiss" above; this is
+  // the More Info side -- queues the claim into an open clarification draft to
+  // Petcover, or (if already queued) just notes it's still unresolved.
+  { name: "moreinfo", description: "Ask Petcover to confirm / note still unresolved" },
   { name: "merge", description: "One invoice, one claim -- merge these charges" },
   { name: "reject", description: "Not the same invoice" },
   // The per-item condition walk. `/item <n>` picks a prior condition,

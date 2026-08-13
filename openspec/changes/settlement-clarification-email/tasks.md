@@ -55,3 +55,14 @@
 - [x] 9.2 Update README's matching-algorithm section with the clarification loop
 - [ ] 9.3 If Justin approves a second `send()` exception during review: write the ADR (mirrors ADR-0030), update the CLAUDE.md hard-rule line, and extend `test_nothing_but_the_one_named_exception_can_send_mail_and_no_tool_offers_to`
       **Blocked on Justin's explicit sign-off** — not authorized in this implementation session. This change ships draft-only (design.md's default); no ADR written, no CLAUDE.md hard-rule edit made, no second `send()` call site added anywhere.
+
+## 10. Telegram surface (added after initial ship — original scope was dashboard-only)
+
+**Correction (2026-08-13): this change was marked complete without a Telegram surface.** The dashboard shipped the settlement-review card; Telegram/gateway taps for these same claims still showed the pre-existing generic `dismiss_mismatch` button ("👍 Reviewed") with no way to trigger More Info at all, and the new `awaiting_petcover_clarification` action kind had no button case whatsoever (silently rendered no buttons). Found live, post-deploy, by Justin.
+
+- [x] 10.1 New verb `moreinfo` in `button_commands.BUTTON_COMMANDS` and `gateway-plugin/index.js`'s `COMMANDS` (same position in both — the order-preserving guard test checks this)
+- [x] 10.2 `commands.handle_more_info` → `claim_status.queue_clarification`, wired into `dispatch()`
+- [x] 10.3 `commands._clarification_buttons(claim_id)` — the shared Acceptable/More Info pair (ADR-0031: one card, one pair of actions, reused everywhere it appears, not a Telegram-specific third UI)
+- [x] 10.4 `_action_buttons`: `dismiss_mismatch` now checks `claim_status._clarification_eligible(flag)` — eligible gets the pair, Check A (arithmetic) keeps the old single "Reviewed" button; `awaiting_petcover_clarification` gets the pair unconditionally
+- [x] 10.5 `commands._ACTION_EMOJI` and `claim_card._STATUS_COLOURS`/`_ACTION_COLOURS` — `awaiting_petcover_clarification` entries (the status/action-card colour dicts were already covered for the dashboard; the action-card one was not)
+- [x] 10.6 Tests: button split by eligibility, `awaiting_petcover_clarification`'s buttons, `/moreinfo` dispatch end-to-end — plus the two pre-existing guard tests (`test_every_card_button_names_a_command_the_plugin_registered`, `test_the_plugin_registers_exactly_the_commands_a_button_may_emit`) passed unmodified, proving the new verb is registered consistently
