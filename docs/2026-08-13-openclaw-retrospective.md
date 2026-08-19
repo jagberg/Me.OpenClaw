@@ -71,6 +71,78 @@ drifted at least three times, a plugin-hook bug that silently never fired
 | Domain logic never enters the gateway | 0024 | gmail-isolation-boundary enforced by container, not config | ✅ right call, 🔍 ongoing tax (see architecture above) |
 | Telegram's full generic command menu (`/exec`, `/elevated`, `/approve`, 50+ commands) ships alongside the 13 domain commands | — none | Never audited | 🔍 not yet checked whether ADR-0023's own principle was applied one layer too low |
 
+## Capability map: what could it be leveraging more
+
+The honest answer to "have I clipped its wings": **once, by accident, not by any of the
+decisions above.** Everything else in the table above was clipped on purpose, with a
+reason written down. This one wasn't — it's scope that slipped through a rewrite and
+nothing ever caught it.
+
+```mermaid
+flowchart TB
+    subgraph Live["live today — mcp_server.TOOLS, 12 entries"]
+        direction LR
+        L1[query_claims]
+        L2[pending_actions]
+        L3[claim_detail / claim_history]
+        L4[submissions_awaiting_reply]
+        L5[list_tasks — read only]
+        L6["propose_* — mark_sent, set_condition,<br/>assign_pet, mark_resolved, split_between_pets"]
+    end
+
+    subgraph Regressed["built + tested, NOT reachable — planned in the gateway design doc, dropped in the rewrite"]
+        direction LR
+        R1[reconcile_sent_invoice_requests]
+        R2[rematch_claims]
+        R3[poll_petcover_now]
+        R4["propose_create_task /<br/>propose_close_task"]
+    end
+
+    subgraph Deferred["available in the product, deliberately shelved — door left open"]
+        direction LR
+        D1["Additional channels<br/>WhatsApp / Signal"]
+        D2["~60 generic gateway commands<br/>/exec /subagents /acp /steer ..."]
+    end
+
+    subgraph Rejected["considered and rejected — won't revisit without new evidence"]
+        direction LR
+        X1[Filesystem / shell / browser tools]
+        X2[Mailbox search or read]
+        X3[Model-issued commits]
+        X4[ClawHub skills]
+        X5[Reading its own code / docs / specs]
+    end
+
+    style Live fill:#0f3d2e,stroke:#10b981,color:#fff
+    style Regressed fill:#4a3510,stroke:#f59e0b,color:#fff
+    style Deferred fill:#1e3a5f,stroke:#3b82f6,color:#fff
+    style Rejected fill:#3f1d1d,stroke:#ef4444,color:#fff
+```
+
+**The regression, in one sentence:** ADR-0016 (2026-07-25) explicitly carved out three
+Gmail sweeps as safe for the chat agent to run on request — *"check if Petcover
+replied," "recheck this claim's matching," "reconcile what I've sent."* The gateway
+migration's own design doc (`openclaw-gateway-core/design.md`, D4) restated this as a
+requirement, word for word: *"Mail is reachable only through the three existing named
+sweeps."* Then `mcp_server.py` — the only tool list the live agent actually sees — was
+built with 12 tools and never one of the three. No comment, no ADR amendment, no test
+against the live surface (the tests that exist check `agent.py`'s schema, which belongs
+to the Telegram poller that's been switched off since the cutover — they've been
+testing dead code). Same story for `propose_create_task`/`propose_close_task`, minus
+the paper trail saying they were ever meant to ship.
+
+| Bucket | What "leveraging it more" looks like | Effort |
+|---|---|---|
+| 🟡 Regressed — 3 sweeps | Ask the bot to check Petcover, recheck a match, or reconcile sent requests, and it actually can again | Low — 3 tool entries + existing `_impls`, no new logic |
+| 🟡 Regressed — task tools | Create/close a household task from chat, not just list them | Low, but needs a scope call first: `AGENTS.md` currently says "claims and nothing else" |
+| 🔵 Deferred — command audit | Confirm the ~60 stock gateway commands are actually inert from this chat, or close the hole | Low — one audit pass, closes issue #11 item 2 |
+| 🔵 Deferred — channels | Same assistant reachable on WhatsApp/Signal, if ever wanted | Medium — re-opens the single-authorized-user question |
+
+Everything in the ⬛ rejected bucket should **stay** rejected — each one is backed by a
+live incident (a fabricated mail-check, a model overriding an explicit prompt rule), not
+caution for its own sake. Widening any of those is the wrong kind of "leveraging it
+more."
+
 ## Findings filed as follow-ups
 
 Full detail in [issue #11](https://github.com/jagberg/Me.OpenClaw/issues/11).
